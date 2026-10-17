@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.storage.db import Database
 
 DEFAULT_TTL_DAYS = 14
@@ -19,8 +20,9 @@ def _hash(token: str) -> str:
 
 
 class SessionRepo:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, clock: Clock = SYSTEM_CLOCK) -> None:
         self.db = db
+        self.clock = clock
 
     def issue(self, user_id: str, *, ttl_days: int = DEFAULT_TTL_DAYS) -> str:
         if ttl_days <= 0:
@@ -28,7 +30,7 @@ class SessionRepo:
         token = secrets.token_urlsafe(32)
         self.db.execute(
             "INSERT INTO user_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
-            [_hash(token), user_id, datetime.now(UTC) + timedelta(days=ttl_days)],
+            [_hash(token), user_id, self.clock.now_utc() + timedelta(days=ttl_days)],
         )
         return token
 
@@ -39,9 +41,9 @@ class SessionRepo:
         return self.db.scalar(
             """
             SELECT user_id FROM user_sessions
-            WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now()
+            WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?
             """,
-            [_hash(token)],
+            [_hash(token), self.clock.now_utc()],
         )
 
     def revoke(self, token: str) -> None:

@@ -19,6 +19,8 @@ E = TypeVar("E", bound="Event")
 
 @dataclass(frozen=True, kw_only=True)
 class Event:
+    #: 事件发生的真实时刻。历史重放与 M5 回测必须显式传入 `ts`，
+    #: 依赖这个默认值等于把「重算历史」写成「今天又发生了一次」。
     ts: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property

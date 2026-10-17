@@ -6,9 +6,31 @@ fixture 只能注入值，没法拿来当类继承或反复构造。
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import polars as pl
+
+
+class FrozenClock:
+    """可控时钟：时间只能由测试推进。
+
+    有了它，「会话过期」「重放两次结果相同」这类断言才不必靠 sleep 或墙钟碰运气——
+    生产代码里的时间一律来自注入的 Clock，所以这里冻住它就能钉死行为。
+    """
+
+    name = "frozen"
+
+    def __init__(self, moment: datetime) -> None:
+        self.moment = moment
+
+    def now_utc(self) -> datetime:
+        return self.moment
+
+    def today(self) -> date:
+        return self.moment.date()
+
+    def advance(self, **kwargs) -> None:
+        self.moment += timedelta(**kwargs)
 
 
 def sample_bars(

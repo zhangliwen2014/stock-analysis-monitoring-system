@@ -83,3 +83,40 @@ def test_unmigrated_database_lists_pending(tmp_path, settings):
         assert report.calendar_years == {}, "未建库时日历覆盖应报空而不是崩"
     finally:
         fresh.close()
+
+
+def test_never_attempted_source_is_unverified_not_degraded(db, settings):
+    """未调用的源既不算故障也不能被忽略：它要出现在报告里，但不把退出码变成失败。"""
+    registry = AdapterRegistry(
+        adapters={"yfinance": StubAdapter("yfinance", ["US"], sample_bars("US", "AAPL"))},
+        market_sources={"US": ("yfinance",)},
+        sleep=lambda seconds: None,
+    )
+    report = HealthService(db, registry, CalendarRepo(db), settings).report()
+    assert [s.name for s in report.unverified_sources] == ["yfinance"]
+    assert report.degraded_sources == []
+
+
+def test_calendar_window_is_taken_from_the_injected_clock(db, settings):
+    """健康报告的「今年」来自注入的时钟：用墙钟的话，同一次重放换个日子跑结论就不同。"""
+    from datetime import UTC, datetime
+
+    from support import FrozenClock
+
+    asked: list[int] = []
+
+    class RecordingStore:
+        def year_covered(self, market: str, year: int) -> bool:
+            asked.append(year)
+            return False
+
+    service = HealthService(
+        db,
+        AdapterRegistry(adapters={}, market_sources={}, sleep=lambda s: None),
+        RecordingStore(),
+        settings,
+        clock=FrozenClock(datetime(2030, 5, 1, tzinfo=UTC)),
+        year_horizon=1,
+    )
+    assert service.report().calendar_years["A"] == []
+    assert asked == [2029, 2030, 2031] * len(settings.markets)

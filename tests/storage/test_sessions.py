@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
+from support import FrozenClock
 
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.users import UserRepo
@@ -62,3 +65,14 @@ def test_revoke_all_counts_only_active_sessions(db, repo, user_id):
 def test_ttl_must_be_positive(repo, user_id):
     with pytest.raises(ValueError, match="ttl_days"):
         repo.issue(user_id, ttl_days=0)
+
+
+def test_expiry_follows_the_injected_clock(db, user_id):
+    """过期判定靠注入的时钟，不靠墙钟也不靠 sleep：重放时同一条会话必须同判。"""
+    clock = FrozenClock(datetime(2026, 1, 1, tzinfo=UTC))
+    repo = SessionRepo(db, clock)
+    token = repo.issue(user_id, ttl_days=1)
+    assert repo.verify(token) == user_id
+
+    clock.advance(days=2)
+    assert repo.verify(token) is None

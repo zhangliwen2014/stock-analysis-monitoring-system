@@ -17,8 +17,10 @@ class SourceRecord:
 
     name: str
     markets: tuple[str, ...]
-    #: True 表示「没有未恢复的失败」；从未被调用过的源也算 True
-    ok: bool = True
+    #: 三态，不是布尔：`None` 表示这个源从未被路由过。
+    #: 把「没调用过」显示成 ok 是最坏的误导——港美股只有 yfinance 一个源，
+    #: 它被限流时若备源位显示 ok，健康检查就永远指不出真正的单点。
+    ok: bool | None = None
     last_error: str | None = None
     last_ok_at: date | None = None
     consecutive_failures: int = 0

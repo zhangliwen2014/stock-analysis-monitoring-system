@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
 
 from sams.core.calendar import CalendarStore
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.sources import SourceHealthView, SourceRecord
 from sams.storage.db import Database
@@ -36,7 +36,13 @@ class HealthReport:
 
     @property
     def degraded_sources(self) -> list[SourceRecord]:
-        return [s for s in self.sources if not s.ok]
+        # 只认真正失败过：`ok is None` 是从未被路由到的源，把它算成故障会让
+        # 「单源市场」永远显示为降级，而把真的降级淹没在噪音里
+        return [s for s in self.sources if s.ok is False]
+
+    @property
+    def unverified_sources(self) -> list[SourceRecord]:
+        return [s for s in self.sources if s.ok is None]
 
 
 class HealthService:
@@ -48,12 +54,14 @@ class HealthService:
         settings: Settings,
         *,
         year_horizon: int = 3,
+        clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self.db = db
         self.registry = registry
         self.calendar_store = calendar_store
         self.settings = settings
         self.year_horizon = year_horizon
+        self.clock = clock
 
     def report(self) -> HealthReport:
         tables = {
@@ -71,7 +79,7 @@ class HealthService:
         if "trading_calendar" not in self.db.table_names():
             # 库还没迁移时健康检查更要能跑完：它正是用来发现这件事的命令
             return {}
-        this_year = date.today().year
+        this_year = self.clock.today().year
         years = range(this_year - self.year_horizon, this_year + 2)
         return {
             market: [y for y in years if self.calendar_store.year_covered(market, y)]
