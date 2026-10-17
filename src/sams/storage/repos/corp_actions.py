@@ -74,6 +74,18 @@ class CorpActionRepo:
             ],
         )
 
+    def upsert_many(self, frame: pl.DataFrame) -> int:
+        """整批写入，返回入库行数（空帧返回 0）。
+
+        逐行走 `_check` 而不是批量 insert：D34 的字段搭配是每条记录的事实，
+        一条不自洽的记录不该把同批其余的好数据一起挡在库外，也不该静默进去。
+        """
+        if frame.is_empty():
+            return 0
+        for row in frame.iter_rows(named=True):
+            self.upsert(CorpAction(**row))
+        return frame.height
+
     def _check(self, action: CorpAction) -> None:
         """字段与类型是否互相自洽（D34）。
 

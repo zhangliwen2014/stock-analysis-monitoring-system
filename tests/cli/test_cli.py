@@ -4,7 +4,7 @@ from datetime import date
 
 import polars as pl
 import pytest
-from support import StubAdapter, sample_bars
+from support import StubActionsAdapter, StubAdapter, sample_bars
 
 import sams.cli as cli
 from sams.bootstrap import build_container
@@ -14,6 +14,8 @@ from sams.storage.db import Database
 from sams.storage.migrate import apply_migrations, discover
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
+from sams.storage.repos.corp_actions import CorpActionRepo
+from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.symbols import SymbolRepo
 
 PASSWORD = "correct horse battery"
@@ -110,8 +112,11 @@ def cli_run_on(container, argv: list[str]) -> int:
 
 
 def stub_adapters() -> dict:
-    """每个替身都返回标了自己 source 的两日帧：能区分「谁取的数」。"""
-    return {
+    """每个替身都返回标了自己 source 的两日帧：能区分「谁取的数」。
+
+    akshare 额外带公司行为能力（D38）：`sync actions` 的降级与跳过报告要有一条链可测。
+    """
+    built = {
         name: StubAdapter(name, markets, sample_bars(source=name))
         for name, markets in (
             ("akshare", ["A"]),
@@ -119,6 +124,8 @@ def stub_adapters() -> dict:
             ("yfinance", ["HK", "US"]),
         )
     }
+    built["akshare"] = StubActionsAdapter("akshare", ["A"], sample_bars(source="akshare"))
+    return built
 
 
 def broken(name: str, markets) -> StubAdapter:
@@ -141,6 +148,7 @@ def container(config_path):
 def sync_argv(code="600519"):
     return [
         "sync",
+        "daily",
         "--market",
         "A",
         "--code",
@@ -172,6 +180,39 @@ def test_sync_falls_back_and_says_so(container, capsys):
     out = capsys.readouterr().out
     assert "源=eastmoney" in out and "降级: akshare✗ → eastmoney✓" in out
     assert container.registry.records["akshare"].consecutive_failures == 1
+
+
+def actions_argv(code="601088"):
+    return ["sync", "actions", "--market", "A", "--code", code]
+
+
+def test_sync_actions_writes_rows_and_coverage(container, capsys):
+    assert cli_run_on(container, actions_argv()) == 0
+    out = capsys.readouterr().out
+    assert "源=akshare" in out and "入库=1" in out and "全历史" in out
+    assert CorpActionRepo(container.db).count() == 1
+    claim = CorpActionsCoverageRepo(container.db).get("A", "601088", src="akshare")
+    assert claim.full_history is True
+
+
+def test_sync_actions_names_the_sources_it_skipped(container, capsys):
+    """「0 条」与「这个源根本不给除权记录」必须长得不一样（D38）。"""
+    container.registry.market_sources["A"] = ("eastmoney", "akshare")
+    assert cli_run_on(container, actions_argv()) == 0
+    assert "跳过 eastmoney：不提供公司行为" in capsys.readouterr().out
+
+
+def test_sync_actions_refuses_a_chain_with_no_capability(container):
+    """链上一个能答公司行为的源都没有：报错要说清是谁被跳过了，而不是「没有数据」。"""
+    container.registry.market_sources["A"] = ("eastmoney",)
+    with pytest.raises(DatasourceError, match="不提供公司行为"):
+        cli_run_on(container, actions_argv())
+
+
+def test_sync_actions_defaults_to_the_whole_history(container, capsys):
+    """不给区间也要能跑：默认起点早于任何 A 股上市日，终点是今天。"""
+    assert cli_run_on(container, actions_argv()) == 0
+    assert "确认至=" in capsys.readouterr().out
 
 
 def test_calendar_check_and_refresh(container, capsys):

@@ -186,3 +186,29 @@ def test_result_is_frozen_and_carries_its_own_reason():
     assert isinstance(result, IntervalReturn)
     with pytest.raises(FrozenInstanceError):
         result.raw = 0.5  # type: ignore[misc]
+
+
+def test_an_ex_date_before_the_window_needs_no_bars_from_that_day():
+    """首根之前的除权对首尾之比是同一个常数：不该逼调用方取出自上市以来的 K 线。
+
+    这条断言的另一种写法是「少取一段历史就报『库里没有前一根 K 线』」，那是
+    `sams sync daily --start` 之后随手的区间查询最容易踩到的坑。
+    """
+    bars = frame([45.10, 45.20, 45.30, 45.40, 45.50, 45.60, 45.70, 45.80, 42.80, 43.00, 43.30])
+    result = get(
+        bars=bars,
+        actions=actions((date(2008, 6, 4), "dividend", 2.55, None, None)),
+    )
+    assert result.ex_dates == 0
+    assert result.raw == pytest.approx(result.adjusted)
+
+
+def test_the_ex_date_on_the_first_bar_of_the_window_is_not_double_counted():
+    """首根已经是除权后的价格：这一天的事件不该再进区间之比。"""
+    ex_day = START
+    result = get(
+        bars=frame([42.80, 43.00, 43.30, 43.40, 43.50, 43.60, 43.70, 43.80, 44.00, 44.10, 44.20]),
+        actions=actions((ex_day, "dividend", 2.26, None, None)),
+    )
+    assert result.ex_dates == 0
+    assert result.adjusted == pytest.approx(result.raw)

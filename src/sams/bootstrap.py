@@ -20,6 +20,7 @@ from sams.datasource.registry import AdapterRegistry
 from sams.datasource.sources import build as build_source
 from sams.services.accounts import AccountService
 from sams.services.calendar import CalendarService
+from sams.services.corp_actions import CorpActionSyncService
 from sams.services.health import HealthService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
@@ -28,6 +29,7 @@ from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
+from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
@@ -63,6 +65,7 @@ class Container:
     symbols: SymbolRepo
     bars: BarRepo
     corp_actions: CorpActionRepo
+    corp_actions_coverage: CorpActionsCoverageRepo
     watchlists: WatchlistRepo
     calendar_store: CalendarRepo
     source_health: SourceHealthRepo
@@ -71,6 +74,7 @@ class Container:
     accounts: AccountService
     calendar: CalendarService
     sync: SyncService
+    corp_action_sync: CorpActionSyncService
     health: HealthService
     source_admin: SourceAdminService
 
@@ -147,6 +151,7 @@ def build_container(
     users = UserRepo(database)
     sessions = SessionRepo(database, clock)
     corp_actions = CorpActionRepo(database)
+    corp_actions_coverage = CorpActionsCoverageRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
 
@@ -164,6 +169,7 @@ def build_container(
         symbols=symbols,
         bars=bars,
         corp_actions=corp_actions,
+        corp_actions_coverage=corp_actions_coverage,
         watchlists=WatchlistRepo(database),
         calendar_store=calendar_store,
         source_health=source_health,
@@ -173,5 +179,8 @@ def build_container(
         accounts=AccountService(users, sessions),
         calendar=calendar,
         sync=SyncService(registry, bars, symbols, cfg.markets),
+        corp_action_sync=CorpActionSyncService(
+            registry, corp_actions, corp_actions_coverage, clock=clock
+        ),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )

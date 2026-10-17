@@ -31,6 +31,8 @@ class CorpActionAdapter(Protocol):
     有日线的源不一定有除权记录，反过来也成立。"""
 
     name: str
+    #: 接口不带日期参数、一次给全史的源置 True（见 `answers_full_history`）
+    corp_actions_full_history: bool
 
     def corp_actions(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         """返回 ACTION_COLUMNS（D34 口径：每股现金、股数乘数、每股配股价）。
@@ -45,6 +47,15 @@ def has_actions(obj: Any) -> bool:
     """按能力判断，不按类判断。用 `isinstance(..., CorpActionAdapter)` 会把协议写成名义类型，
     测试里的桩就得继承实现类——那等于取消了「能力可单独实现」这条设计。"""
     return callable(getattr(obj, "corp_actions", None))
+
+
+def answers_full_history(obj: Any) -> bool:
+    """这个源给的是不是「这只票的全部历史公司行为」（D36 的覆盖标记要看这个）。
+
+    默认按否处理：没声明过的源只能确认它被请求的那段区间。把没说过的事当成说过，
+    覆盖守卫就会在最窄的一次取数上放行最宽的历史——那正是 U12 要挡的错法。
+    """
+    return bool(getattr(obj, "corp_actions_full_history", False))
 
 
 def empty_actions() -> pl.DataFrame:

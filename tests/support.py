@@ -92,3 +92,44 @@ class StubAdapter:
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome
+
+
+def sample_actions(
+    market: str = "A",
+    code: str = "601088",
+    source: str = "akshare",
+    ex_date: date = date(2024, 7, 8),
+) -> pl.DataFrame:
+    """一条「10 派 22.60 元」的派息记录（D34 口径：每股 2.26 元）。"""
+    return pl.DataFrame(
+        {
+            "market": [market],
+            "code": [code],
+            "ex_date": [ex_date],
+            "kind": ["dividend"],
+            "cash_per_share": [2.26],
+            "ratio": [None],
+            "price": [None],
+            "src": [source],
+            "note": ["10派22.60元(含税,扣税后20.34元)"],
+        }
+    )
+
+
+class StubActionsAdapter(StubAdapter):
+    """日线 + 公司行为双能力替身：`corp_actions_full_history` 走默认的全历史口径。"""
+
+    corp_actions_full_history = True
+
+    def __init__(self, name, markets, outcome, actions_outcome=None) -> None:
+        super().__init__(name, markets, outcome)
+        self.actions_outcome = (
+            sample_actions(source=name) if actions_outcome is None else actions_outcome
+        )
+        self.actions_calls = 0
+
+    def corp_actions(self, market, code, start, end):
+        self.actions_calls += 1
+        if isinstance(self.actions_outcome, BaseException):
+            raise self.actions_outcome
+        return self.actions_outcome

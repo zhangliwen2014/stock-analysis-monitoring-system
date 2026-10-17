@@ -20,7 +20,8 @@ from sams.core.config import Settings
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited, TransientError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.sources import SourceHealthStore, SourceRecord
-from sams.datasource.base import BarAdapter
+from sams.datasource.actions import answers_full_history, has_actions
+from sams.datasource.base import BarAdapter, has_bars
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
 from sams.datasource.sources import known
@@ -84,8 +85,33 @@ class FetchResult:
     frame: pl.DataFrame
     source: str
     attempts: tuple[Attempt, ...] = ()
+    #: 链上因「没有日线能力」被跳过的源，见 `fetch_actions` 的同一约定（D38）
+    skipped: tuple[tuple[str, str], ...] = ()
     #: 所有源都回答「没有数据」（停牌、区间过短），不是失败
     empty_everywhere: bool = False
+
+    @property
+    def degraded(self) -> bool:
+        return len(self.attempts) > 1
+
+
+@dataclass(frozen=True)
+class ActionsResult:
+    """公司行为取数的结果，带「链上谁被跳过了」。
+
+    `skipped` 不是装饰：`sams sync actions --market HK` 报「0 条」时，运维必须能一眼
+    分清「这只票没分过红」与「这条链上根本没有能做这件事的源」（D38 / D36）。
+    """
+
+    market: str
+    code: str
+    frame: pl.DataFrame
+    source: str
+    attempts: tuple[Attempt, ...] = ()
+    skipped: tuple[tuple[str, str], ...] = ()
+    #: 源是否说「这只票的历史我给全了」。决定覆盖标记的写法（D36）：全历史源的确认
+    #: 与按区间拉的确认，对「区间之外有没有除权」的回答能力不同
+    full_history: bool = False
 
     @property
     def degraded(self) -> bool:
@@ -202,8 +228,13 @@ class AdapterRegistry:
 
     def fetch_daily(self, market: str, code: str, start: date, end: date) -> FetchResult:
         attempts: list[Attempt] = []
+        skipped: list[tuple[str, str]] = []
         empties: list[str] = []
         for name in self.sources_for(market):
+            if not has_bars(self.adapter(name)):
+                skipped.append((name, "不提供日线"))
+                logger.info("日线跳过 %s（%s %s 链上没有这个能力）", name, market, code)
+                continue
             try:
                 frame = self._call(name, market, code, start, end)
             except _SourceFailed as failed:
@@ -215,18 +246,73 @@ class AdapterRegistry:
                 continue
             self._mark_ok(name)
             attempts.append(Attempt(name, True))
-            return FetchResult(market, code, frame, name, tuple(attempts))
+            return FetchResult(market, code, frame, name, tuple(attempts), tuple(skipped))
 
         if empties:
             return FetchResult(
                 market, code, EMPTY_BARS, empties[0],
-                tuple(attempts), empty_everywhere=True,
+                tuple(attempts), tuple(skipped), empty_everywhere=True,
             )
         detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
         raise DatasourceError("registry", f"{market} {code} 所有源均失败 → {detail}")
 
-    def _call(self, name: str, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+    def fetch_actions(self, market: str, code: str, start: date, end: date) -> ActionsResult:
+        """公司行为链：按同一条路由顺序走，但**只走有这个能力的源**。
+
+        缺能力的源进 `skipped` 并在日志里说明，不是静默跳过（D38）。区别在后果上：
+        静默跳过后，「HK 没有任何源能给公司行为」这件事表现为「腾讯从没分过红」，
+        而裸价跨除权日算出来的涨跌是一个看起来完全正常的数。
+        """
+        attempts: list[Attempt] = []
+        skipped: list[tuple[str, str]] = []
+        for name in self.sources_for(market):
+            adapter = self.adapter(name)
+            if not has_actions(adapter):
+                skipped.append((name, "不提供公司行为"))
+                logger.info("公司行为跳过 %s（%s %s 链上没有这个能力）", name, market, code)
+                continue
+            try:
+                frame = self._call(name, market, code, start, end, method="corp_actions")
+            except _SourceFailed as failed:
+                attempts.append(Attempt(failed.source, False, failed.tries, failed.error))
+                continue
+            except EmptyResponse as exc:
+                # 公司行为的「无数据」不能当成功：覆盖标记（D36）会把「没查过」写成「查过
+                # 且没有」。所以它只是这个源答不上来，换下一个；全都答不上来就整体失败。
+                attempts.append(Attempt(name, False, 1, f"无数据: {exc}"))
+                logger.info("公司行为 %s 回答无数据（%s %s），换源", name, market, code)
+                continue
+            self._mark_ok(name)
+            attempts.append(Attempt(name, True))
+            return ActionsResult(
+                market,
+                code,
+                frame,
+                name,
+                tuple(attempts),
+                tuple(skipped),
+                answers_full_history(adapter),
+            )
+
+        detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
+        raise DatasourceError(
+            "registry",
+            f"{market} {code} 取不到公司行为。链 {list(self.sources_for(market))} 里"
+            f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}",
+        )
+
+    def _call(
+        self,
+        name: str,
+        market: str,
+        code: str,
+        start: date,
+        end: date,
+        *,
+        method: str = "daily_bars",
+    ) -> pl.DataFrame:
         adapter = self.adapter(name)
+        invoke_bound = getattr(adapter, method)
         if self.bucket is not None:
             self.bucket.acquire()
 
@@ -235,7 +321,7 @@ class AdapterRegistry:
         def invoke() -> pl.DataFrame:
             nonlocal calls
             calls += 1
-            return adapter.daily_bars(market, code, start, end)
+            return invoke_bound(market, code, start, end)
 
         try:
             # FieldDrift / EmptyResponse 不在 RETRYABLE 里：一次就定性，立刻换源

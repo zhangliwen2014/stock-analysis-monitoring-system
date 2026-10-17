@@ -34,9 +34,12 @@ uv run sams db migrate                     # 建表（幂等，重跑不重复�
 uv run sams user add --username admin --admin   # 创建第一个管理员（口令交互式询问）
 uv run sams login --username admin              # 校验口令并签发会话 token
 
-uv run sams sync --market A  --code 600519 --start 2024-01-01 --end 2024-02-01
-uv run sams sync --market US --code AAPL   --start 2024-01-01 --end 2024-02-01
-uv run sams sync --market HK --code 00700  --start 2024-01-01 --end 2024-02-01
+uv run sams sync daily --market A  --code 600519 --start 2024-01-01 --end 2024-02-01
+uv run sams sync daily --market US --code AAPL   --start 2024-01-01 --end 2024-02-01
+uv run sams sync daily --market HK --code 00700  --start 2024-01-01 --end 2024-02-01
+
+# 除权除息/送转配：区间收益要靠它才不被跨除权日的裸价涨跌骗到
+uv run sams sync actions --market A --code 601088
 
 uv run sams calendar refresh --market HK --year 2026
 uv run sams calendar check   --market US --date 2026-03-09   # 是否交易日 + 时段（本地 / UTC）
@@ -45,6 +48,8 @@ uv run sams health                                             # 各表行数、
 
 除 `db` 外的命令都会顺手补齐迁移，新装环境直接 `user add` 不会报缺表。
 `sync` 可重复执行：主键 + `INSERT OR REPLACE` 保证同一区间重跑后行数不变。
+两个子命令走两条独立的能力链（D38）：`daily` 只走有日线的源，`actions` 只走能给除权记录的源，
+链上被跳过的源会打印出来——「这只票没分过红」与「这条链没人能给」是两件事。
 
 ## 结构
 

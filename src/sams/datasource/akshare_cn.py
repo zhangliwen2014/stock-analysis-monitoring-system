@@ -68,7 +68,7 @@ def akshare_fetch(symbol: str, start: date, end: date) -> pl.DataFrame:
 def akshare_fhps(symbol: str) -> pl.DataFrame:
     """真实网络调用：某只 A 股的分红送配**全历史**（东财明细页）。
 
-    这个接口不带日期参数，一次给全史——所以 A 股的公司行为可以标 `full_history`（D36），
+    这个接口不带日期参数，一次给全史——所以适配器标了 `corp_actions_full_history`（D36），
     而「给了全史」与「这一行是 0 条」是两件事，后者要区分「从没分过红」和「没查过」。
     另外它**不回写代码**（列里没有股票代码），换错票不会在任何一列上露出破绽：
     代码只能信任请求参数，因此这里坚持先 `code_in_market` 归一再传入。
@@ -86,6 +86,8 @@ def akshare_fhps(symbol: str) -> pl.DataFrame:
 class AkshareAdapter:
     name = "akshare"
     markets = frozenset({"A"})
+    #: 分红送配接口不带日期参数，一次给全史，所以确认能做到「截至今天的全部历史」
+    corp_actions_full_history = True
 
     def __init__(
         self,

@@ -90,9 +90,8 @@ def interval_return(
 ) -> IntervalReturn:
     """[start, end] 的区间涨跌。拒绝时抛 `NotAdjustable` 并带上原因。
 
-    `bars` 需要含 `start` 之前的数据也无妨：本函数只取窗口内的首尾两根，但因子由
-    全量传入的 `bars` 推（除权参考价要用「除权日前一根」，窗口本身可能正好从
-    除权日开头）。
+    `bars` 可以只取到 `start` 附近：本函数只取窗口内的首尾两根，而除权因子只吃
+    落在这两根之间的记录（更早的因子对两端是同一个常数，见 `_inside`）。
     """
     window = bars.filter((pl.col("date") >= start) & (pl.col("date") <= end)).sort("date")
     if window.height < 2:
@@ -106,13 +105,11 @@ def interval_return(
             "裸价区间涨跌在第二种情况下是错数。先跑 `sams sync actions --market "
             f"{market} --code {code}`"
         )
-    adjusted = hfq_frame(bars, actions)
     first, last = window["date"].to_list()[0], window["date"].to_list()[-1]
+    inside = _inside(actions, first, last)
+    adjusted = hfq_frame(bars, inside)
     raw = _ratio(adjusted, first, last, "close")
     hfq = _ratio(adjusted, first, last, "close_hfq")
-    ex_dates = actions.filter(
-        (pl.col("ex_date") > first) & (pl.col("ex_date") <= last)
-    ).height
     return IntervalReturn(
         market=market,
         code=code,
@@ -120,9 +117,21 @@ def interval_return(
         end=last,
         raw=raw,
         adjusted=hfq,
-        ex_dates=ex_dates,
+        ex_dates=inside.height,
         covered_by=span.src,
     )
+
+
+def _inside(actions: pl.DataFrame, first: date, last: date) -> pl.DataFrame:
+    """只留下落在首尾两根 K 线**之间**（首根当日除外）的除权日。
+
+    区间涨跌取的是首尾之比：首根之前的因子对两端是同一个常数，约掉了；末根之后的
+    因子两根都不沾。留着它们不但没有影响，还会让 `day_factors` 去要那些日子的
+    前一根 K 线——于是「算一周的涨跌」得把上市以来的 K 线全取出来，取不到就报
+    「库里没有前一根 K 线」，而未来那几天根本还没行情。
+    绝对的后复权序列（M2-B 的指标）确实需要全历史，那是 `hfq_frame` 的口径，不在这里。
+    """
+    return actions.filter((pl.col("ex_date") > first) & (pl.col("ex_date") <= last))
 
 
 def _ratio(frame: pl.DataFrame, start: date, end: date, column: str) -> float:

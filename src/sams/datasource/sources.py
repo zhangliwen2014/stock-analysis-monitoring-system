@@ -50,18 +50,32 @@ class SourceEntry:
     options: tuple[str, ...] = ()
     note: str = ""
     module: str = ""
+    #: 这个实现提供的能力（D38）：`bars` / `actions`。路由按它跳过缺能力的源，
+    #: 管理后台按它回答「为什么这个源在公司行为链上不发挥作用」
+    capabilities: tuple[str, ...] = ()
 
 
 _REGISTRY: dict[str, SourceEntry] = {}
 
 
 def source(kind: str, *, options: tuple[str, ...] = (), note: str = "") -> Callable[[type], type]:
-    """把适配器类登记进本表。类必须声明 `name` 与 `markets`（`BarAdapter` 契约）。"""
+    """把适配器类登记进本表。类必须声明 `name` 与 `markets`（`BarAdapter` 契约）。
+
+    能力（D38）由方法是否存在推出来，不让类自己再声明一遍：声明与实现会漂移，
+    而漂移的方向恰好是「看起来有这个能力，调用了才知道没有」。
+    """
 
     def decorate(cls: type) -> type:
         markets = frozenset(getattr(cls, "markets", ()))
         if not markets:
             raise DatasourceError("sources", f"{cls.__name__} 未声明 markets，无法注册为数据源")
+        if not callable(getattr(cls, "daily_bars", None)) and not callable(
+            getattr(cls, "corp_actions", None)
+        ):
+            raise DatasourceError(
+                "sources",
+                f"{cls.__name__} 既没有 daily_bars 也没有 corp_actions：注册进来也谁都路由不到",
+            )
         _validate_options(cls, options)
         _REGISTRY[kind] = SourceEntry(
             kind=kind,
@@ -70,10 +84,20 @@ def source(kind: str, *, options: tuple[str, ...] = (), note: str = "") -> Calla
             options=options,
             note=note,
             module=cls.__module__.rsplit(".", 1)[-1],
+            capabilities=_capabilities(cls),
         )
         return cls
 
     return decorate
+
+
+def _capabilities(cls: type) -> tuple[str, ...]:
+    found = []
+    if callable(getattr(cls, "daily_bars", None)):
+        found.append("bars")
+    if callable(getattr(cls, "corp_actions", None)):
+        found.append("actions")
+    return tuple(found)
 
 
 def _validate_options(cls: type, options: tuple[str, ...]) -> None:

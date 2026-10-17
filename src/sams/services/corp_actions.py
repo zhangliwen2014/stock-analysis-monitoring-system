@@ -1,0 +1,110 @@
+"""公司行为同步用例：能力路由取数 → 入库 → 写下覆盖确认（D36）。
+
+与 `services.sync` 同构，多出来的只有第三步。前两步失败就整体失败，第三步成功才算
+「这段区间我查过了」——覆盖标记是读取层守卫（`analysis/returns.py`）唯一的放行依据，
+它说「截至这天，这只票的除权记录是齐的」。所以这里宁可少写一段覆盖面：
+取数失败时什么都不记，让区间收益继续拒绝，而不是记下一条没根据的确认。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import date
+
+from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.codes import canonical_code
+from sams.core.errors import DatasourceError
+from sams.datasource.registry import AdapterRegistry, Attempt
+from sams.storage.repos.corp_actions import CorpActionRepo
+from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
+
+logger = logging.getLogger("sams.services.corp_actions")
+
+
+@dataclass(frozen=True)
+class CorpActionSyncSummary:
+    market: str
+    code: str
+    source: str = ""
+    #: 取回的公司行为条数（0 条是合法答案：这只票这段区间确实没有除权）
+    fetched: int = 0
+    written: int = 0
+    degraded: bool = False
+    #: 链上因「没有公司行为能力」被跳过的源（D38）
+    skipped: tuple[tuple[str, str], ...] = ()
+    attempts: tuple[Attempt, ...] = ()
+    #: 这次确认写到了哪里。全历史源的 `covered_to` 是今天而不是请求的末日
+    covered_from: date | None = None
+    covered_to: date | None = None
+    full_history: bool = False
+    #: 请求终点在今天之后时被截断到的那天；没截断就是 None
+    clamped_to: date | None = None
+
+
+class CorpActionSyncService:
+    def __init__(
+        self,
+        registry: AdapterRegistry,
+        actions: CorpActionRepo,
+        coverage: CorpActionsCoverageRepo,
+        clock: Clock = SYSTEM_CLOCK,
+    ) -> None:
+        self.registry = registry
+        self.actions = actions
+        self.coverage = coverage
+        self.clock = clock
+
+    def sync_actions(self, market: str, code: str, start: date, end: date) -> CorpActionSyncSummary:
+        """幂等：同区间重复执行行数不变（(market, code, ex_date, kind) 主键覆盖写）。
+
+        `end` 截到今天：今天之后的除权日没有任何源能替我们确认，取回来也不该写成
+        「确认过的覆盖面」——那等于让未来的公告替过去的区间背书（PIT）。
+        """
+        code = canonical_code(market, code)
+        today = self.clock.today()
+        until = min(end, today)
+        if start > until:
+            raise DatasourceError(
+                "corp_actions",
+                f"{market} {code} 的请求区间 {start}~{end} 整体在今天（{today}）之后："
+                "还没发生的日子无从确认",
+            )
+        clamped = until if until < end else None
+
+        result = self.registry.fetch_actions(market, code, start, until)
+        written = self.actions.upsert_many(result.frame)
+        # 全历史源的答复是「截至今天，这只票的除权记录就这些」，与请求窗口多窄无关；
+        # 按区间拉的源只能确认它被拉的那一段
+        covered_to = today if result.full_history else until
+        self.coverage.record(
+            market,
+            code,
+            covered_from=start,
+            covered_to=covered_to,
+            full_history=result.full_history,
+            src=result.source,
+        )
+        logger.info(
+            "%s %s 公司行为 %d 条（源 %s，确认至 %s%s）",
+            market,
+            code,
+            written,
+            result.source,
+            covered_to,
+            "，全历史" if result.full_history else "",
+        )
+        return CorpActionSyncSummary(
+            market=market,
+            code=code,
+            source=result.source,
+            fetched=result.frame.height,
+            written=written,
+            degraded=result.degraded,
+            skipped=result.skipped,
+            attempts=result.attempts,
+            covered_from=start,
+            covered_to=covered_to,
+            full_history=result.full_history,
+            clamped_to=clamped,
+        )

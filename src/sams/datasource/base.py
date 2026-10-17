@@ -105,6 +105,11 @@ class BarAdapter(Protocol):
         ...
 
 
+def has_bars(obj: object) -> bool:
+    """按能力判断，不按类判断（与 `datasource.actions.has_actions` 同一约定，D38）。"""
+    return callable(getattr(obj, "daily_bars", None))
+
+
 def normalize_bars(
     raw: pl.DataFrame,
     *,

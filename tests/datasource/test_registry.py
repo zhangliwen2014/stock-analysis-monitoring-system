@@ -267,3 +267,89 @@ def test_unattempted_source_stays_unknown_across_processes(db):
 
     reopened = registry(FakeAdapter("akshare", ["A"], frame("akshare")), store=store)
     assert reopened.health()[0].ok is None
+
+
+# --- 公司行为链：按能力路由（D38） ------------------------------------------------
+
+
+def actions_frame(source: str) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "market": ["A"],
+            "code": ["601088"],
+            "ex_date": [date(2024, 7, 8)],
+            "kind": ["dividend"],
+            "cash_per_share": [2.26],
+            "ratio": [None],
+            "price": [None],
+            "src": [source],
+            "note": ["10派22.60元(含税)"],
+        }
+    )
+
+
+class ActionsAdapter:
+    """只有公司行为能力的源；`full_history=False` 模拟按区间拉的接口。"""
+
+    def __init__(
+        self, name: str, markets=("A",), outcome=None, *, full_history=True, error=None
+    ) -> None:
+        self.name = name
+        self.markets = frozenset(markets)
+        self.outcome = actions_frame(name) if outcome is None else outcome
+        self.corp_actions_full_history = full_history
+        self.error = error
+        self.calls = 0
+
+    def corp_actions(self, market, code, start, end):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.outcome
+
+
+def test_actions_chain_skips_sources_without_the_capability():
+    """跳过要留名：静默跳过的症状是「这只票从没分过红」，而真相是链上没人能给。"""
+    bars_only = FakeAdapter("tencent", ["A"], frame("tencent"))
+    reg = registry(bars_only, ActionsAdapter("akshare"))
+    result = reg.fetch_actions("A", "601088", D1, D2)
+    assert (result.source, result.frame.height) == ("akshare", 1)
+    assert result.skipped == (("tencent", "不提供公司行为"),)
+    assert bars_only.calls == 0
+
+
+def test_daily_chain_skips_sources_without_bars():
+    acts_only = ActionsAdapter("akshare_actions_only")
+    reg = registry(acts_only, FakeAdapter("eastmoney", ["A"], frame("eastmoney")))
+    result = reg.fetch_daily("A", "600519", D1, D2)
+    assert result.source == "eastmoney"
+    assert result.skipped == (("akshare_actions_only", "不提供日线"),)
+    assert acts_only.calls == 0
+
+
+def test_full_history_flag_follows_the_adapter():
+    reg = registry(ActionsAdapter("akshare", full_history=True))
+    assert reg.fetch_actions("A", "601088", D1, D2).full_history is True
+    reg2 = registry(ActionsAdapter("sina", full_history=False))
+    assert reg2.fetch_actions("A", "601088", D1, D2).full_history is False
+
+
+def test_actions_empty_response_switches_source_without_burning_health():
+    """公司行为的「无数据」不是成功：覆盖标记会把没查过写成查过（D36）。"""
+    quiet = ActionsAdapter("yfinance", error=EmptyResponse("yfinance", "区间无数据"))
+    reg = registry(quiet, ActionsAdapter("akshare"))
+    result = reg.fetch_actions("A", "601088", D1, D2)
+    assert result.source == "akshare"
+    assert result.degraded is True
+    record = {r.name: r for r in reg.health()}["yfinance"]
+    assert (record.ok, record.consecutive_failures) == (None, 0)
+
+
+def test_actions_failure_names_both_the_skipped_and_the_failed():
+    """运维只读一行就要分清「链上没有这个能力」与「有能力但这次挂了」。"""
+    broken = ActionsAdapter("akshare", error=FieldDrift("akshare", "列名改版"))
+    reg = registry(FakeAdapter("tencent", ["A"], frame("tencent")), broken)
+    with pytest.raises(DatasourceError, match="不提供公司行为"):
+        reg.fetch_actions("A", "601088", D1, D2)
+    with pytest.raises(DatasourceError, match="列名改版"):
+        reg.fetch_actions("A", "601088", D1, D2)
