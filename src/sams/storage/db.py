@@ -42,6 +42,10 @@ class Database:
     def register(self, name: str, df: pl.DataFrame) -> None:
         self.conn.register(name, df.to_arrow())
 
+    def unregister(self, name: str) -> None:
+        """注册视图是连接级的、会一直挂着：不注销的话，下一批数据可能读到上一批的残留。"""
+        self.conn.unregister(name)
+
     def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
         row = self.conn.execute(sql, params or []).fetchone()
         return row[0] if row else None

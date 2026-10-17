@@ -56,7 +56,7 @@ class SymbolRepo:
             FROM incoming_symbols
             """
         )
-        self.db.conn.unregister("incoming_symbols")
+        self.db.unregister("incoming_symbols")
         return prepared.height
 
     def get(self, market: str, code: str) -> dict | None:

@@ -53,7 +53,7 @@ class CalendarRepo:
             FROM incoming_calendar
             """
         )
-        self.db.conn.unregister("incoming_calendar")
+        self.db.unregister("incoming_calendar")
         return frame.height
 
     def get(self, market: str, day: date) -> CalendarDay | None:

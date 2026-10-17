@@ -114,3 +114,22 @@ def test_list_market_filters_delisted(symbols):
     )
     assert set(symbols.list_market("A")["code"]) == {"live"}
     assert set(symbols.list_market("A", listed_only=False)["code"]) == {"live", "gone"}
+
+
+def test_adj_factor_placeholder_column_is_gone(bars, db):
+    """没有生产者的列会被下游当成可信口径，所以直接删掉（0003 迁移）。"""
+    assert "adj_factor" not in db.query("SELECT * FROM bars_daily").columns
+
+
+def test_adjust_is_part_of_the_primary_key(bars, db, bars_frame):
+    """同一天允许 raw 与推导序列并存：主键没这个维度，M2 就只能重建库。"""
+    assert bars.upsert(bars_frame) == 3
+    db.execute(
+        "INSERT INTO bars_daily (market, code, date, adjust, close, source)"
+        " VALUES ('A', '600519', ?, 'hfq', 9.9, 'derived')",
+        [D1],
+    )
+    assert db.scalar("SELECT count(*) FROM bars_daily") == 4
+    loaded = bars.load("A", ["600519"])
+    assert loaded.height == 3, "读取默认只回不复权口径，混着两种价的序列会算错指标"
+    assert set(loaded["adjust"].to_list()) == {"raw"}

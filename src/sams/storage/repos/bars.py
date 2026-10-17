@@ -1,12 +1,15 @@
 """日线仓库：幂等 upsert 与读取。
 
-幂等靠 (market, code, date) 主键 + INSERT OR REPLACE，因此采集重试安全（spec §5.3）。
+幂等靠 (market, code, date, adjust) 主键 + INSERT OR REPLACE，因此采集重试安全（spec §5.3）。
+读取一律带 `adjust = 'raw'`：库里目前只有一种口径，但把口径写进查询而不是靠约定，
+是为了让 M2 引入后复权序列时不可能悄悄读到混着两种价的同一根 K 线。
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import date, datetime
+from uuid import uuid4
 
 import polars as pl
 
@@ -16,6 +19,8 @@ from sams.storage.db import Database
 logger = logging.getLogger("sams.storage.bars")
 
 REQUIRED = ("market", "code", "date", "close", "source")
+#: 入库唯一口径：不复权。后复权序列在读取层由 corp_actions 现算（0003 迁移的注释里写明理由）。
+ADJUST = "raw"
 COLUMNS = (
     "market",
     "code",
@@ -27,7 +32,6 @@ COLUMNS = (
     "volume",
     "amount",
     "turnover",
-    "adj_factor",
     "source",
 )
 
@@ -40,8 +44,7 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
     for col in COLUMNS:
         if col not in out.columns:
             dtype = pl.Date if col == "date" else pl.Float64
-            default = 1.0 if col == "adj_factor" else None
-            out = out.with_columns(pl.lit(default, dtype=dtype).alias(col))
+            out = out.with_columns(pl.lit(None, dtype=dtype).alias(col))
     out = out.select(list(COLUMNS))
     out = out.with_columns(
         pl.col("market").cast(pl.Utf8),
@@ -71,23 +74,28 @@ class BarRepo:
         prepared = _prepare(df)
         if prepared.is_empty():
             return 0
-        self.db.register("incoming_bars", prepared)
-        self.db.execute(
-            """
-            INSERT OR REPLACE INTO bars_daily
-                (market, code, date, open, high, low, close, volume, amount,
-                 turnover, adj_factor, source)
-            SELECT market, code, date, open, high, low, close, volume, amount,
-                   turnover, adj_factor, source
-            FROM incoming_bars
-            """
-        )
+        # 名字唯一 + finally 注销：同名视图会被后一批覆盖，异常路径下残留会喂错下一批
+        view = f"incoming_bars_{uuid4().hex[:8]}"
+        self.db.register(view, prepared)
+        try:
+            self.db.execute(
+                f"""
+                INSERT OR REPLACE INTO bars_daily
+                    (market, code, date, open, high, low, close, volume, amount,
+                     turnover, source)
+                SELECT market, code, date, open, high, low, close, volume, amount,
+                       turnover, source
+                FROM {view}
+                """
+            )
+        finally:
+            self.db.unregister(view)
         return prepared.height
 
     def latest_date(self, market: str, code: str) -> date | None:
         value = self.db.scalar(
-            "SELECT max(date) FROM bars_daily WHERE market = ? AND code = ?",
-            [market, code],
+            "SELECT max(date) FROM bars_daily WHERE adjust = ? AND market = ? AND code = ?",
+            [ADJUST, market, code],
         )
         if value is None:
             return None
@@ -104,8 +112,8 @@ class BarRepo:
         if not codes:
             schema = {c: pl.Float64 for c in COLUMNS if c != "date"} | {"date": pl.Date}
             return pl.DataFrame(schema=schema)
-        sql = ["SELECT * FROM bars_daily WHERE market = ? AND code = ANY(?)"]
-        params: list = [market, codes]
+        sql = ["SELECT * FROM bars_daily WHERE adjust = ? AND market = ? AND code = ANY(?)"]
+        params: list = [ADJUST, market, codes]
         if start is not None:
             sql.append("AND date >= ?")
             params.append(start)
