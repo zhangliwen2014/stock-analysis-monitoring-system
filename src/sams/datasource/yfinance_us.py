@@ -16,6 +16,7 @@ from sams.datasource.base import (
     classify_error,
     code_in_market,
     normalize_bars,
+    parses_as_date,
 )
 
 #: 标准列 → 源列（yfinance 首字母大写）。
@@ -64,14 +65,22 @@ def normalize_history(frame, *, market: str, code: str) -> pl.DataFrame:
         raise EmptyResponse("yfinance", f"{market} {code} 区间无数据")
     prepared = frame.reset_index()
     prepared.columns = [str(c) for c in prepared.columns]
-    date_column = next((c for c in prepared.columns if c.lower() in DATE_INDEX_NAMES), None)
+    pl_frame = pl.from_pandas(prepared)
+    date_column = None
+    for candidate in pl_frame.columns:
+        if candidate.lower() in DATE_INDEX_NAMES and parses_as_date(pl_frame, candidate):
+            date_column = candidate
+            break
     if date_column is None:
+        # 装着 0/1/2 的整数索引名字再像日期也不算：那是改版，不是「这个区间没数据」
         raise FieldDrift(
-            "yfinance", f"{market} {code} 找不到日期列，实际列 {list(prepared.columns)}"
+            "yfinance",
+            f"{market} {code} 找不到可解析为日期的列，实际列 {pl_frame.columns}",
         )
-    prepared = prepared.rename(columns={date_column: "date"})
+    if date_column != "date":
+        pl_frame = pl_frame.rename({date_column: "date"})
     return normalize_bars(
-        pl.from_pandas(prepared),
+        pl_frame,
         market=market,
         code=code,
         source="yfinance",

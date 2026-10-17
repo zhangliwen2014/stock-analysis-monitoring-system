@@ -134,4 +134,16 @@ def test_market_without_currency_config_is_rejected(db, settings):
 
 def test_currency_comes_from_market_config_not_the_adapter(db, settings):
     svc, _, _, _ = make_service(db, settings, ok_result())
-    assert svc.currency_of("A") == "CNY" and svc.currency_of("HK") == "HKD"
+    assert svc.currency_of("A", "600519") == "CNY" and svc.currency_of("HK", "00700") == "HKD"
+
+
+def test_currency_is_overridden_by_the_code_segment(db, settings):
+    """市场级默认币种的两个真实例外：B 股与港股人民币双柜台。
+
+    错币会顺着 symbols.currency 一路进到展示与换算，而且没有任何一处会报错。
+    """
+    svc, _, _, _ = make_service(db, settings, ok_result())
+    assert svc.currency_of("A", "900901") == "USD"  # 沪市 B 股
+    assert svc.currency_of("A", "200011") == "HKD"  # 深市 B 股
+    assert svc.currency_of("HK", "80700") == "CNY"  # 腾讯人民币双柜台
+    assert svc.currency_of("HK", "08100") == "HKD"  # 08xxx 是港股创业板，仍是 HKD

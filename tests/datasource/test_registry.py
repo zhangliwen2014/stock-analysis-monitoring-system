@@ -142,12 +142,14 @@ def test_all_sources_empty_is_reported_as_empty_not_failure():
     assert result.frame.columns == BAR_COLUMNS
 
 
-def test_source_that_doesnt_cover_the_market_is_skipped_with_a_note():
-    reg = registry(FakeAdapter("yfinance", ["US"], frame("yfinance")), markets=("A",))
-    result = None
-    with pytest.raises(DatasourceError, match="不支持市场"):
-        reg.fetch_daily("A", "600519", D1, D2)
-    assert result is None
+def test_source_that_doesnt_cover_the_market_is_caught_at_construction():
+    """把源派给它不支持的市场是配置错误，不该等到采集时「跳过但不留痕」：
+    那样健康检查只会看到「这个源从没被调用过」，而采集早就少了一个源。"""
+    with pytest.raises(DatasourceError, match="不支持它"):
+        AdapterRegistry(
+            adapters={"yfinance": FakeAdapter("yfinance", ["US"], frame("yfinance"))},
+            market_sources={"A": ("yfinance",)},
+        )
 
 
 def test_market_without_sources_or_unknown_market_fails_clearly():

@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date
 from typing import Protocol
 
 import polars as pl
 
+from sams.core.codes import canonical_code
 from sams.core.errors import (
     DatasourceError,
     EmptyResponse,
@@ -24,13 +26,15 @@ from sams.core.errors import (
 logger = logging.getLogger("sams.datasource")
 
 _RATE_HINTS = (
-    "429",
     "too many requests",
     "rate limit",
     "frequency",
     "请求过于频繁",
     "抱歉，您发出的请求过频",
 )
+#: 429 必须是独立一个数：`ValueError: could not convert '429元' to float` 里也含 429，
+#: 按子串匹配会把一个永久性的解析错误当成限流，白等 1+4 秒再重试三轮
+_RATE_STATUS = re.compile(r"\b429\b")
 _TRANSIENT_HINTS = ("timeout", "timed out", "connection", "reset by peer", "try again")
 
 
@@ -41,7 +45,7 @@ def classify_error(source: str, exc: Exception) -> DatasourceError:
     对字段漂移做退避重试是纯浪费，对 429 立即换源则会白白打爆备源。
     """
     text = f"{type(exc).__name__}: {exc}".lower()
-    if any(hint in text for hint in _RATE_HINTS):
+    if _RATE_STATUS.search(text) or any(hint in text for hint in _RATE_HINTS):
         return RateLimited(source, str(exc))
     if isinstance(exc, (TimeoutError, ConnectionError)) or any(
         hint in text for hint in _TRANSIENT_HINTS
@@ -65,15 +69,12 @@ BAR_COLUMNS = [
 #: A 股两个源的成交量都给「手」，港美股给「股」。入库统一为股。
 LOTS_TO_SHARES = 100.0
 
-#: 市场 → 把用户输入的代码翻译成数据源所需的 symbol
+#: 市场 → 把用户输入的代码翻译成数据源所需的 symbol（归一规则见 core.codes）
 def code_in_market(market: str, code: str) -> str:
-    cleaned = (code or "").strip().upper()
-    if not cleaned:
-        raise ValueError("code 不能为空")
+    canonical = canonical_code(market, code)
     if market == "HK":
-        digits = cleaned.removeprefix("HK")
-        return f"{int(digits):05d}.HK" if digits.isdigit() else cleaned
-    return cleaned
+        return f"{canonical}.HK" if canonical.isdigit() else canonical
+    return canonical
 
 
 class BarAdapter(Protocol):
@@ -121,6 +122,17 @@ def normalize_bars(
         src: std for std, src in column_map.items() if src in raw.columns and src != std
     }
     out = raw.rename(renames)
+    missing_optional = [
+        column_map[name]
+        for name in ("open", "high", "low", "volume", "amount")
+        if name in column_map and column_map[name] not in raw.columns
+    ]
+    if missing_optional and not raw.is_empty():
+        # 静默填 null 是取舍，静默地「整列没了」不是：成交量整列改名会让
+        # 放量与换手阈值从此永不触发，而日志里一行提示都没有
+        logger.warning(
+            "%s %s %s 缺少可选列 %s，按 NULL 入库", source, market, code, missing_optional
+        )
     for column in ("open", "high", "low", "close", "volume", "amount"):
         if column not in out.columns:
             out = out.with_columns(pl.lit(None, dtype=pl.Float64).alias(column))
@@ -131,24 +143,41 @@ def normalize_bars(
     out = out.with_columns(_to_date_expr(pl.col("date")))
 
     before = out.height
-    out = out.filter(pl.col("close").is_not_null() & pl.col("date").is_not_null())
+    # is_not_null 挡不住 NaN：pandas 侧的「缺数据」恰恰是 NaN，存进去会覆盖上一根好 K 线
+    out = out.filter(pl.col("close").is_finite() & pl.col("date").is_not_null())
     dropped = before - out.height
     if dropped:
-        logger.warning("丢弃 %s %s 的 %d 行（无收盘价或无日期）", market, code, dropped)
+        logger.warning("丢弃 %s %s 的 %d 行（收盘价缺失或非法）", market, code, dropped)
+    # 成交量/成交额缺得就缺，不必连收盘价一起丢：非有限值置空
+    out = out.with_columns(
+        pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c)
+        for c in ("open", "high", "low", "volume", "amount")
+    )
 
     if out.is_empty():
         raise EmptyResponse(source, f"{market} {code} 无有效日线数据")
 
     return (
         out.with_columns(
+            pl.lit(canonical_code(market, code)).alias("code"),
             pl.lit(market).alias("market"),
-            pl.lit(code).alias("code"),
             pl.lit(source).alias("source"),
         )
         .select(BAR_COLUMNS)
         .unique(subset=["date"], keep="last")
         .sort("date")
     )
+
+
+def parses_as_date(df: pl.DataFrame, column: str) -> bool:
+    """这一列能不能当日期读。
+
+    挑日期列不能只按名字：名字对了却装着 0/1/2 的索引，会把真正的日期列顶掉，
+    于是「结构漂移」被伪装成「这个区间没有数据」——方向完全相反的两种结论。
+    """
+    if df.is_empty():
+        return True
+    return bool(df.select(_to_date_expr(pl.col(column)).is_not_null().any()).item())
 
 
 def _to_date_expr(col: pl.Expr) -> pl.Expr:

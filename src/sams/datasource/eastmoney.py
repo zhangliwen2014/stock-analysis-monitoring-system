@@ -12,6 +12,7 @@ from datetime import date
 
 import polars as pl
 
+from sams.core.codes import canonical_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.datasource.base import (
     LOTS_TO_SHARES,
@@ -59,6 +60,13 @@ def parse_eastmoney_daily(payload: object, *, market: str, code: str) -> pl.Data
     klines = data.get("klines")
     if not klines:
         raise EmptyResponse("eastmoney", f"{market} {code} 区间无数据")
+    # 响应里带着它认为自己的代码：不核对的话，secid 错位或缓存串包
+    # 会把别的票的 K 线存进本票名下，而下游无从分辨
+    returned = str(data.get("code") or "")
+    if returned and canonical_code(market, returned) != canonical_code(market, code):
+        raise FieldDrift(
+            "eastmoney", f"响应代码 {returned} 与请求代码 {code} 不一致（secid 错位或串包）"
+        )
 
     rows = []
     for line in klines:

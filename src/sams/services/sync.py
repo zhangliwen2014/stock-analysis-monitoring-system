@@ -12,6 +12,7 @@ from datetime import date
 
 import polars as pl
 
+from sams.core.codes import canonical_code, currency_override, lot_size_of
 from sams.core.config import MarketCfg
 from sams.core.errors import DatasourceError
 from sams.datasource.registry import AdapterRegistry, Attempt
@@ -49,14 +50,20 @@ class SyncService:
         self.symbols = symbols
         self.markets = markets
 
-    def currency_of(self, market: str) -> str:
+    def currency_of(self, market: str, code: str) -> str:
         try:
-            return self.markets[market].currency
+            default = self.markets[market].currency
         except KeyError:
             raise DatasourceError("sync", f"市场 {market} 未配置币种") from None
+        return currency_override(market, code) or default
 
     def sync_daily(self, market: str, code: str, start: date, end: date) -> SyncSummary:
-        """幂等：同区间重复执行行数不变（bars_daily 主键 + INSERT OR REPLACE）。"""
+        """幂等：同区间重复执行行数不变（bars_daily 主键 + INSERT OR REPLACE）。
+
+        代码在入口就归一：主档、K 线、读取回看用同一个形态，否则别名会把同一只票
+        存成多份主键。
+        """
+        code = canonical_code(market, code)
         result = self.registry.fetch_daily(market, code, start, end)
         if result.empty_everywhere:
             logger.info("%s %s 区间内所有源均无数据", market, code)
@@ -90,6 +97,13 @@ class SyncService:
             return
         self.symbols.upsert(
             pl.DataFrame(
-                [{"market": market, "code": code, "currency": self.currency_of(market)}]
+                [
+                    {
+                        "market": market,
+                        "code": code,
+                        "currency": self.currency_of(market, code),
+                        "lot_size": lot_size_of(market),
+                    }
+                ]
             )
         )

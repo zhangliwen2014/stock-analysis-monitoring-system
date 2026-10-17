@@ -59,8 +59,20 @@ EMPTY_BARS = pl.DataFrame(
 class Attempt:
     source: str
     ok: bool
+    #: 真实调用次数。`attempts_per_source` 是配置值：FieldDrift 一次就定性、只调 1 次，
+    #: 把它抄进这里等于对调用方说不存在的事
     tries: int = 1
     error: str | None = None
+
+
+class _SourceFailed(Exception):
+    """内部信号：把「这个源这次实际被调了几次」带出 `_call`。"""
+
+    def __init__(self, source: str, tries: int, error: str) -> None:
+        super().__init__(error)
+        self.source = source
+        self.tries = tries
+        self.error = error
 
 
 @dataclass(frozen=True)
@@ -106,6 +118,15 @@ class AdapterRegistry:
                     "registry",
                     f"市场 {market} 配置了未注册的源 {unknown}，可用: {sorted(self.adapters)}",
                 )
+            # 源不支持该市场是配置错误，不是运行时状况：当场失败胜过之后每次采集
+            # 都「跳过」却不留痕——那样健康检查看到的是「这个源从没被调用过」
+            mismatched = [s for s in sources if market not in self.adapters[s].markets]
+            if mismatched:
+                raise DatasourceError(
+                    "registry",
+                    f"市场 {market} 配置了不支持它的源 {mismatched}；"
+                    f"各源支持: { {n: sorted(a.markets) for n, a in self.adapters.items()} }",
+                )
         if self.store is not None:
             # 上一次的失败要能被这次看到，否则「源挂了」只在挂的那一刻有人知道
             persisted = self.store.load()
@@ -123,6 +144,7 @@ class AdapterRegistry:
         store: SourceHealthStore | None = None,
         bus: EventBus | None = None,
         clock: Clock = SYSTEM_CLOCK,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> AdapterRegistry:
         built = adapters if adapters is not None else {
             name: builder() for name, builder in SOURCE_BUILDERS.items()
@@ -130,10 +152,18 @@ class AdapterRegistry:
         return cls(
             adapters=built,
             market_sources={m: cfg.sources for m, cfg in settings.markets.items()},
-            bucket=bucket if bucket is not None else TokenBucket(settings.rate_limit_per_s),
+            # 桶跟着注入时钟与 sleep 走：否则「429 之后退避多久」只能靠真等来测
+            bucket=bucket
+            if bucket is not None
+            else TokenBucket(
+                settings.rate_limit_per_s,
+                clock=lambda: clock.now_utc().timestamp(),
+                sleep=sleep,
+            ),
             store=store,
             clock=clock,
             bus=bus,
+            sleep=sleep,
         )
 
     def sources_for(self, market: str) -> tuple[str, ...]:
@@ -154,19 +184,14 @@ class AdapterRegistry:
         attempts: list[Attempt] = []
         empties: list[str] = []
         for name in self.sources_for(market):
-            adapter = self.adapter(name)
-            if market not in adapter.markets:
-                # 配置把源派给了它不支持的市场：跳过但必须留痕，否则静默少一个源最难查
-                attempts.append(Attempt(name, False, 0, f"不支持市场 {market}"))
-                continue
             try:
                 frame = self._call(name, market, code, start, end)
+            except _SourceFailed as failed:
+                attempts.append(Attempt(failed.source, False, failed.tries, failed.error))
+                continue
             except EmptyResponse as exc:
                 empties.append(name)
                 attempts.append(Attempt(name, True, 1, f"无数据: {exc}"))
-                continue
-            except DatasourceError as exc:
-                attempts.append(Attempt(name, False, self.attempts_per_source, str(exc)))
                 continue
             self._mark_ok(name)
             attempts.append(Attempt(name, True))
@@ -185,7 +210,11 @@ class AdapterRegistry:
         if self.bucket is not None:
             self.bucket.acquire()
 
+        calls = 0
+
         def invoke() -> pl.DataFrame:
+            nonlocal calls
+            calls += 1
             return adapter.daily_bars(market, code, start, end)
 
         try:
@@ -197,13 +226,18 @@ class AdapterRegistry:
                 sleep=self.sleep,
                 label=f"{name}:{market}/{code}",
             )
+        except EmptyResponse:
+            # 源正常应答了，只是这个区间没有数据（停牌、新股、区间过短）。
+            # 记成失败会让几只停牌票就烧掉一个源的预算，还把「无数据」和「挂了」混成一条告警；
+            # 也不标成功：全空本身是可疑状况，不该抹掉之前的故障记录。
+            raise
         except DatasourceError as exc:
             self._mark_failure(name, exc)
-            raise
+            raise _SourceFailed(name, calls, str(exc)) from exc
         except BaseException as exc:  # noqa: BLE001 — 适配器漏归类时兜底，路由不能被打断
             wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
             self._mark_failure(name, wrapped)
-            raise wrapped from exc
+            raise _SourceFailed(name, calls, str(wrapped)) from exc
         return frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
 
     def _mark_ok(self, name: str) -> None:
@@ -236,6 +270,8 @@ class AdapterRegistry:
                 SystemAlarm(
                     component=f"datasource:{name}",
                     message=f"连续 {failures} 次失败，最后错误 {exc}",
+                    # 用注入时钟：告警时刻必须跟着这次运行的时间走，而不是墙钟
+                    ts=self.clock.now_utc(),
                 )
             )
 
