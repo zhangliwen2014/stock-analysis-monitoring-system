@@ -17,17 +17,23 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1] / "src"
 SRC = ROOT / "sams"
 
-#: 每个层允许 import 的其它层。缺的方向一律禁止，包括同层横串（storage ↔ datasource）
+#: 每个层允许 import 的其它层。缺的方向一律禁止，包括同层横串（storage ↔ datasource）。
+#: 后四行是 spec §3.1 声明但尚未落地的层：先把依赖规则写全，M2 建目录时才不必开后门
+#: ——守卫一旦为了临时方便被放宽，就再也不会被收紧。
 ALLOWED: dict[str, set[str]] = {
     "core": set(),
     "storage": {"core"},
     "datasource": {"core"},
     "services": {"core", "storage", "datasource"},
+    "analysis": {"core", "storage", "services"},
+    "monitor": {"core", "storage", "datasource", "services", "analysis"},
+    "trading": {"core", "storage", "services", "analysis"},
     "cli": {"core", "services"},
 }
 
-#: 组装根不受限（它的工作就是认识所有实现），且各层都能引用它取依赖
+#: 组装根不受限（它的工作就是认识所有实现），但只有 cli 可以引用它取依赖
 ASSEMBLY = "bootstrap"
+ASSEMBLY_CONSUMERS = {"cli"}
 
 
 def _resolved(name: str, level: int, module_parts: tuple[str, ...]) -> str:
@@ -91,8 +97,14 @@ def test_imports_point_downward(path: Path):
     own = _layer(path)
     if own not in ALLOWED:
         return
+    may_use_assembly = own in ASSEMBLY_CONSUMERS
     for target in imported_layers(path):
-        if target in (own, ASSEMBLY):
+        if target == own:
+            continue
+        if target == ASSEMBLY:
+            # 各层回头 import 组装根会构成环（storage → bootstrap → storage），
+            # 而环恰好是这个测试要防的那类东西
+            assert may_use_assembly, f"{path.relative_to(SRC)}：{own} 层不得 import 组装根"
             continue
         assert target in ALLOWED[own], (
             f"{path.relative_to(SRC)}：{own} 层不得 import {target} 层，"
