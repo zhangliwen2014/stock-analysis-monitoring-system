@@ -4,7 +4,8 @@
 
 **Goal:** 让 M1 的库能回答「这只票现在值不值得做」——正确的复权价、可解释的分项打分、合理区间/买入区/止损/目标/赔率，以及承载它们的 thesis 生命周期。
 
-**Architecture:** 新增 `analysis` 层（分层守卫 §3.1 已预留，允许 import core/storage/services，被 monitor/trading 复用）。三层职责：**`datasource` 只负责把外部响应变成公司行为事实**（不猜因子）；**`storage` 只负责存事实与覆盖区间**（不解释）；**`analysis` 才做推导**（hfq 现算、指标、打分），且任何「不可信就不给数」的判定都发生在这一层并带上原因。CLI 仍是薄壳，编排走 `services`。
+**Architecture:** 新增 `analysis` 层（分层守卫 §3.1 已预留，只允许 import core/storage——
+services 调 analysis，反向不通；被 monitor/trading 复用）。三层职责：**`datasource` 只负责把外部响应变成公司行为事实**（不猜因子）；**`storage` 只负责存事实与覆盖区间**（不解释）；**`analysis` 才做推导**（hfq 现算、指标、打分），且任何「不可信就不给数」的判定都发生在这一层并带上原因。CLI 仍是薄壳，编排走 `services`。
 
 **Tech Stack:** Python 3.13（uv）、Polars、DuckDB、akshare/东财/yfinance/腾讯 gtimg、pytest + ruff。
 
@@ -155,7 +156,36 @@ docs/superpowers/specs/…design.md   §5.5/§7/§8/§18 同步 D34–D38 与 U4
 - [x] 实测：00700 全历史 26 条（4 条实物分派 unknown：分京东/分美团/分阅文/分腾讯音乐），
       yfinance 被 429 时降级到 akshare_hk 并显式跳过 tencent；跨 2023-01-05 那天的区间收益拒绝出数
 
-**A-7 交易员 agent 试用（A 块收口）**：并行派「对抗测试 agent」+「架构师评审 agent」，收口后派交易员 agent，报告问题逐条修复或记入 §18。
+**A-7 三道闸收口（对抗测试 agent + 架构师评审 agent + 交易员 agent）**——前两道 ✅（提交 `15fc8c6`），第三道见下
+
+对抗测试 agent 查出 6 条、架构师评审 agent 查出 2 条，全部先写复现用例再修：
+
+| # | 症状（真实数据能复现的那句） | 处置 |
+|---|---|---|
+| 1 | 按窗口同步 `601088 2024-01-01~03-01` 之后，跨 2015 年那次除权的区间数字照样变了——库里只剩窗口内的除权事实，而覆盖标记声称「全历史到今天」 | **D40**：全历史源不再按请求窗口切片（三个适配器各删一行 `filter`），`covered_from` 改取实际入库的最小 `ex_date`。切片让库与自己的声明互相矛盾，守卫只能给出裸价 |
+| 2 | 同一 `(ex_date, kind)` 的两行（10 送 10 与 10 转 10 同日）静默丢弃一行 ⇒ 少乘一次 | **D41**：`merge_same_day` 相加现金与新增股数，`price` 按新增股数加权（推导端算的是 `price×(ratio−1)`）；整行重复先 `.unique()` 去掉，不重复计数 |
+| 3 | 已记录在案的 10 送 10（裸价 −50%）被 D37 判成「一定有未记录的公司行为」而拒绝出数 | **D37 改写**：跳变若对得上当天记录的除权参考价（`abs(close − ex_ref) ≤ ex_ref×limit`）即豁免——守卫的指控对象是「没记录」，不是「跌得多」 |
+| 4 | 上市首日的豁免按「第 N 根 K 线」数，窗口化的帧数根本不代表从上市起过了几根 | 改成日历天宽限（`_IPO_GRACE_DAYS = 10`），且**只有调用方传了 `listed_on` 才豁免**；不传就是拒绝，理由里说明可以补 |
+| 5 | `close` 为空 ⇒ traceback，而不是「这只票的序列我不能用」 | 第五道拒绝 `require_real_closes`（null 与非有限一起查：先 `is_null()` 再 `~is_finite()`，null 过 `~` 会漏） |
+| 6 | 守卫只挂在 `interval_return` 上；`hfq_frame` 把裸的 open/high/low 留给调用方，指标引擎一接手就会拿到未复权的四列 | **D42**：`analysis/adjust.adjusted_series()` 是唯一出数入口（过闸后生成四列 `_hfq`）；`hfq_frame` 降级为「无守卫的原语，只用于单测因子算术」，文档写明 |
+| 7 | 架构师：`analysis` 允许 import `services` 与 spec §3.1 相反 | `tests/test_layering.py` 收紧为 `analysis: {core, storage}`，`guard.py` 只按 `TYPE_CHECKING` 引用 `adjust` 的类型以免成环 |
+| 8 | 架构师：`is_covered`/`ConfirmedSpan`/`_reject_unmarked_ex_dates` 长在 `returns.py` 里，等于守卫挂在某个调用方的习惯上 | 抽出 `analysis/guard.py`（三道闸 + 收盘价体检），`returns.py` 重写 65% 后只剩窗口过滤与两端读数 |
+
+**修完留下的四条债**（都是有意推迟，不是漏掉；下一块开工前先读这几行）：
+
+- [ ] **M2-C 开工前**：能力声明有两份（`registry.CAPABILITIES` 与各适配器的 `_capabilities`）、
+      降级循环有两份近乎重复（`fetch_daily` / `fetch_actions`）。基本面源是第三次复制同一段循环——
+      先收敛再往里加数据种类。
+- [ ] **M3 开工前**：拒绝只以异常表达。批量调用方（监控扫描、回测）拿到的是 try/except 循环而不是
+      结果集合；M3 需要 `Ok | Refused` 的并集类型，且不能靠异常文案分支。
+- [ ] `normalize_actions` 的空输入会抛 `EmptyResponse`，而「这只票确实没分过红」应当给空帧：
+      已把契约写进 docstring（空答案走 `empty_actions()`），没有重构——重构会牵动三个适配器。
+- [ ] `corp_actions_coverage` 在「不相交窗口重复同步」时会把区间写窄还是写宽，只有一条用例覆盖。
+      M2-C 若复用这张表的形状（基本面也要覆盖标记），先补齐这个判据再复用。
+
+实测验收（本机真实网络）：`sync actions A 601088` 全历史落库 21 条（2008-06-04~2026-07-13）、
+`covered_from=2008-06-04`；跨 2016-07-04 那次除权的区间 **裸价 +1.4873% / 后复权 +3.8270%**；
+把 `today` 传到覆盖终点之后 ⇒ D36 按预期拒绝（新鲜度失效），改回当天 ⇒ 出数。
 
 ### B 块：指标引擎（§8.2）
 
