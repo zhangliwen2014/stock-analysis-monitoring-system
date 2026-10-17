@@ -14,6 +14,7 @@ import polars as pl
 
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.datasource.base import (
+    LOTS_TO_SHARES,
     classify_error,
     code_in_market,
     normalize_bars,
@@ -75,7 +76,13 @@ def parse_eastmoney_daily(payload: object, *, market: str, code: str) -> pl.Data
         pl.col("amount").cast(pl.Float64, strict=False),
     )
     return normalize_bars(
-        frame, market=market, code=code, source="eastmoney", column_map=COLUMN_MAP
+        frame,
+        market=market,
+        code=code,
+        source="eastmoney",
+        column_map=COLUMN_MAP,
+        # 东财 A 股 kline 的成交量是手；若将来接港美股则是股，不能沿用这个系数
+        volume_scale=LOTS_TO_SHARES if market == "A" else 1.0,
     )
 
 

@@ -18,7 +18,9 @@ from sams.datasource.base import (
     normalize_bars,
 )
 
-#: 标准列 → 源列（yfinance 首字母大写）
+#: 标准列 → 源列（yfinance 首字母大写）。
+#: 这里刻意不映射 amount：`Ticker.history()` 不提供成交额，写个假列名只会让
+#: 「港美股成交额不可得」这件事在代码里隐身——规则引擎因此不得对 US/HK 用金额阈值。
 COLUMN_MAP = {
     "date": "date",
     "open": "Open",
@@ -26,7 +28,6 @@ COLUMN_MAP = {
     "low": "Low",
     "close": "Close",
     "volume": "Volume",
-    "amount": "Amount",
 }
 
 #: 索引列在 reset_index 之后必须认出来：yfinance 各版本给的名字不一样

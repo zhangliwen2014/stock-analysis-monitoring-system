@@ -6,7 +6,13 @@ import polars as pl
 import pytest
 
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited, TransientError
-from sams.datasource.base import BAR_COLUMNS, classify_error, code_in_market, normalize_bars
+from sams.datasource.base import (
+    BAR_COLUMNS,
+    LOTS_TO_SHARES,
+    classify_error,
+    code_in_market,
+    normalize_bars,
+)
 
 MAP = {
     "date": "日期",
@@ -161,3 +167,22 @@ def test_classify_error(message, expected):
 def test_oserror_and_connectionerror_instances_are_transient():
     assert isinstance(classify_error("akshare", TimeoutError("x")), TransientError)
     assert isinstance(classify_error("akshare", ConnectionError("x")), TransientError)
+
+
+def normalize_scaled(raw_frame, **kwargs):
+    return normalize_bars(
+        raw_frame, market="A", code="600519", source="akshare", column_map=MAP, **kwargs
+    )
+
+
+def test_volume_scale_converts_lots_to_shares():
+    """A 股两个源给的是「手」，港美股给的是「股」：不换算的话量能类阈值跨市场差 100 倍。"""
+    scaled = normalize_scaled(raw(), volume_scale=LOTS_TO_SHARES)
+    assert scaled["volume"].to_list() == [10000.0, 20000.0, 30000.0]
+    assert normalize_scaled(raw())["volume"].to_list() == [100.0, 200.0, 300.0]
+
+
+def test_scale_leaves_amount_untouched():
+    """成交额两个源都给元，只有量需要换算——搞反一次就是万亿级的错。"""
+    scaled = normalize_scaled(raw(), volume_scale=LOTS_TO_SHARES)
+    assert scaled["amount"].to_list() == [120.0, 440.0, 960.0]

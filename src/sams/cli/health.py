@@ -26,11 +26,17 @@ def show(container: Container, args: argparse.Namespace) -> int:
         print(f"  {market:<4} {shown}")
     print("[数据源]")
     for source in report.sources:
-        state = "ok" if source.ok else f"失败×{source.consecutive_failures}"
-        line = f"  {source.name:<10} {state:<9} 市场 {','.join(source.markets)}"
+        state = (
+            "ok" if source.ok is True
+            else "未知（未调用）" if source.ok is None
+            else f"失败×{source.consecutive_failures}"
+        )
+        line = f"  {source.name:<10} {state:<13} 市场 {','.join(source.markets)}"
         if source.last_error:
             line += f"  最近错误 {source.last_error[:60]}"
         print(line)
     for source in report.degraded_sources:
         print(f"  ⚠ {source.name} 未恢复，检查网络或换源")
+    for source in report.unverified_sources:
+        print(f"  · {source.name} 尚未被调用过，健康状态未知")
     return 0 if not report.degraded_sources and not report.pending_migrations else 1

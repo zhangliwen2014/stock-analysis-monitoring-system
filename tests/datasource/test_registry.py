@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import polars as pl
 import pytest
+from support import FrozenClock
 
+from sams.core.clock import SYSTEM_CLOCK
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited, TransientError
+from sams.core.events import EventBus, SystemAlarm
 from sams.datasource.base import BAR_COLUMNS
 from sams.datasource.ratelimit import TokenBucket
 from sams.datasource.registry import AdapterRegistry
@@ -48,13 +51,17 @@ class FakeAdapter:
         return outcome
 
 
-def registry(*adapters, markets=("A",), store=None) -> AdapterRegistry:
+def registry(
+    *adapters, markets=("A",), store=None, bus=None, clock=SYSTEM_CLOCK
+) -> AdapterRegistry:
     by_name = {a.name: a for a in adapters}
     return AdapterRegistry(
         adapters=by_name,
         market_sources={m: tuple(by_name) for m in markets},
         sleep=lambda seconds: None,
         store=store,
+        bus=bus,
+        clock=clock,
     )
 
 
@@ -217,3 +224,44 @@ def test_recovered_source_clears_the_stored_failure(db):
     fixed = registry(FakeAdapter("akshare", ["A"], frame("akshare")), store=store)
     fixed.fetch_daily("A", "600519", D1, D2)
     assert SourceHealthRepo(db).load()["akshare"].ok is True
+
+
+def test_source_never_called_is_unknown_not_ok():
+    """三态健康：没被路由过的源不能显示成 ok。
+
+    港美股只有 yfinance 一个源，若「未知」被渲染成正常，单点故障就永远不出现在报告上。
+    """
+    reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")))
+    assert reg.health()[0].ok is None
+
+
+def test_consecutive_failures_publish_exactly_one_system_alarm():
+    bus = EventBus()
+    seen: list[SystemAlarm] = []
+    bus.subscribe(SystemAlarm, seen.append)
+    reg = registry(FakeAdapter("akshare", ["A"], RateLimited("akshare", "429")), bus=bus)
+
+    for _ in range(4):
+        with pytest.raises(DatasourceError):
+            reg.fetch_daily("A", "600519", D1, D2)
+
+    # 只在跨过阈值那一次告警：之后每次都通知等于没有通知
+    assert [a.component for a in seen] == ["datasource:akshare"]
+    assert "连续 3 次失败" in seen[0].message
+
+
+def test_success_stamp_comes_from_the_injected_clock():
+    clock = FrozenClock(datetime(2024, 5, 6, tzinfo=UTC))
+    reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")), clock=clock)
+    reg.fetch_daily("A", "600519", D1, D2)
+    assert reg.health()[0].last_ok_at == date(2024, 5, 6)
+
+
+def test_unattempted_source_stays_unknown_across_processes(db):
+    """库里没有这个源的行 ≠ 库里记录为失败：读回来必须仍是未知。"""
+    store = SourceHealthRepo(db)
+    registry(FakeAdapter("akshare", ["A"], frame("akshare")), store=store)
+    assert SourceHealthRepo(db).load() == {}, "没人调用过就不该有记录"
+
+    reopened = registry(FakeAdapter("akshare", ["A"], frame("akshare")), store=store)
+    assert reopened.health()[0].ok is None

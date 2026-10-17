@@ -135,3 +135,8 @@ def test_http_layer_rate_limit_hint_becomes_rate_limited():
             "A", "600519", date(2024, 1, 2), date(2024, 1, 3)
         )
     assert callable(http_get)
+
+
+def test_a_share_volume_is_normalised_to_shares():
+    """东财 kline 的成交量同样是手：两个 A 股源必须归一到同一个单位，否则降级=换算法。"""
+    assert parse()["volume"].to_list() == [3_000_000.0, 2_800_000.0]

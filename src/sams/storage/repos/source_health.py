@@ -43,7 +43,8 @@ def _to_record(row: dict) -> SourceRecord:
     return SourceRecord(
         name=row["name"],
         markets=tuple(markets.split(",")) if markets else (),
-        ok=bool(row["ok"]),
+        # 三态要能原样回来：把 NULL 变成 False 会让「没调用过」在下次启动时变成「坏了」
+        ok=None if row["ok"] is None else bool(row["ok"]),
         last_error=row["last_error"],
         last_ok_at=row["last_ok_at"],
         consecutive_failures=int(row["consecutive_failures"] or 0),

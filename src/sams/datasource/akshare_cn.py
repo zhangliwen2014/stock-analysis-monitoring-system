@@ -13,6 +13,7 @@ import polars as pl
 
 from sams.core.errors import DatasourceError, EmptyResponse
 from sams.datasource.base import (
+    LOTS_TO_SHARES,
     classify_error,
     code_in_market,
     normalize_bars,
@@ -61,7 +62,12 @@ class AkshareAdapter:
             if raw.is_empty():
                 raise EmptyResponse(self.name, f"{market} {code} 区间无数据")
             bars = normalize_bars(
-                raw, market=market, code=code, source=self.name, column_map=COLUMN_MAP
+                raw,
+                market=market,
+                code=code,
+                source=self.name,
+                column_map=COLUMN_MAP,
+                volume_scale=LOTS_TO_SHARES,
             )
         except DatasourceError:
             raise  # 已经是本域异常（EmptyResponse / FieldDrift），别二次归类

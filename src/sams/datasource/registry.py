@@ -15,8 +15,10 @@ from datetime import date
 
 import polars as pl
 
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited, TransientError
+from sams.core.events import EventBus, SystemAlarm
 from sams.core.sources import SourceHealthStore, SourceRecord
 from sams.datasource.akshare_cn import AkshareAdapter
 from sams.datasource.base import BarAdapter
@@ -88,6 +90,11 @@ class AdapterRegistry:
     #: 源健康的落库出口；不传就只在进程内记（单测与离线场景）
     store: SourceHealthStore | None = None
     records: dict[str, SourceRecord] = field(default_factory=dict)
+    #: 只用于给源健康打日期标记；真正的交易日判定归 CalendarService
+    clock: Clock = SYSTEM_CLOCK
+    #: 连续失败到阈值时发 SystemAlarm（spec §12：监控系统监控自己）
+    bus: EventBus | None = None
+    alarm_after_failures: int = 3
 
     def __post_init__(self) -> None:
         for name, adapter in self.adapters.items():
@@ -114,6 +121,8 @@ class AdapterRegistry:
         adapters: dict[str, BarAdapter] | None = None,
         bucket: TokenBucket | None = None,
         store: SourceHealthStore | None = None,
+        bus: EventBus | None = None,
+        clock: Clock = SYSTEM_CLOCK,
     ) -> AdapterRegistry:
         built = adapters if adapters is not None else {
             name: builder() for name, builder in SOURCE_BUILDERS.items()
@@ -123,6 +132,8 @@ class AdapterRegistry:
             market_sources={m: cfg.sources for m, cfg in settings.markets.items()},
             bucket=bucket if bucket is not None else TokenBucket(settings.rate_limit_per_s),
             store=store,
+            clock=clock,
+            bus=bus,
         )
 
     def sources_for(self, market: str) -> tuple[str, ...]:
@@ -201,7 +212,7 @@ class AdapterRegistry:
                 name=name,
                 markets=self.records[name].markets,
                 ok=True,
-                last_ok_at=date.today(),
+                last_ok_at=self.clock.today(),
             )
         )
 
@@ -217,9 +228,16 @@ class AdapterRegistry:
                 consecutive_failures=previous.consecutive_failures + 1,
             )
         )
-        logger.warning(
-            "源 %s 连续失败 %d 次: %s", name, self.records[name].consecutive_failures, exc
-        )
+        failures = self.records[name].consecutive_failures
+        logger.warning("源 %s 连续失败 %d 次: %s", name, failures, exc)
+        # 只在跨过阈值那一次发告警：之后每次失败都通知，等于没有通知
+        if self.bus is not None and failures == self.alarm_after_failures:
+            self.bus.publish(
+                SystemAlarm(
+                    component=f"datasource:{name}",
+                    message=f"连续 {failures} 次失败，最后错误 {exc}",
+                )
+            )
 
     def _remember(self, record: SourceRecord) -> None:
         self.records[record.name] = record

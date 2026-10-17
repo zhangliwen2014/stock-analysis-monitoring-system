@@ -62,6 +62,9 @@ BAR_COLUMNS = [
     "source",
 ]
 
+#: A 股两个源的成交量都给「手」，港美股给「股」。入库统一为股。
+LOTS_TO_SHARES = 100.0
+
 #: 市场 → 把用户输入的代码翻译成数据源所需的 symbol
 def code_in_market(market: str, code: str) -> str:
     cleaned = (code or "").strip().upper()
@@ -93,6 +96,7 @@ def normalize_bars(
     source: str,
     column_map: dict[str, str],
     required: tuple[str, ...] = ("date", "close"),
+    volume_scale: float = 1.0,
 ) -> pl.DataFrame:
     """把源侧 DataFrame 规范化为标准列集。
 
@@ -100,6 +104,10 @@ def normalize_bars(
     只有 `required`（默认日期与收盘价）缺列才算字段漂移并失败；
     其余列缺失填 null —— 免费源少给一列成交额是常态，不该因此丢整天数据。
     丢弃规则：无收盘价或无日期的行丢弃并记警告，存成 close=0 会污染后续全部指标。
+
+    volume_scale: 将源侧成交量换算成「股」的系数——A 股两个源给的是「手」（=100），
+    港美股给的是「股」（=1）。不换算的话，`放量 > 5 日均量 x 倍`、换手率、
+    成交额阈值会在三个市场之间各差 100 倍，且没有任何一处会报错。
     """
     absent_required = [
         column_map[name] for name in required if column_map.get(name) not in raw.columns
@@ -117,6 +125,8 @@ def normalize_bars(
         if column not in out.columns:
             out = out.with_columns(pl.lit(None, dtype=pl.Float64).alias(column))
         out = out.with_columns(pl.col(column).cast(pl.Float64, strict=False))
+    if volume_scale != 1.0:
+        out = out.with_columns(pl.col("volume") * pl.lit(volume_scale))
 
     out = out.with_columns(_to_date_expr(pl.col("date")))
 

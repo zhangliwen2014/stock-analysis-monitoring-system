@@ -173,3 +173,19 @@ def test_unclassified_failure_becomes_datasource_error():
 
     with pytest.raises(DatasourceError):
         YfinanceAdapter(fetch=broken).daily_bars("US", "AAPL", date(2024, 1, 2), date(2024, 1, 3))
+
+
+def test_akshare_volume_is_normalised_to_shares():
+    """单位契约：akshare 的成交量是「手」，出库必须是「股」。
+
+    这条断言读的是录制数据里的真实口径，不是代码注释——源改成给股时它会红。
+    """
+    adapter = AkshareAdapter(fetch=lambda *_: RECORDED_CN)
+    out = adapter.daily_bars("A", "600519", date(2024, 1, 2), date(2024, 1, 3))
+    assert out["volume"].to_list() == [3_000_000.0, 2_800_000.0]
+
+
+def test_yfinance_volume_is_already_shares():
+    """美股不需要换算：把两处口径都写死，才有人会发现哪天源变了。"""
+    out = normalize_history(pandas_history(), market="US", code="AAPL")
+    assert out["volume"].to_list() == [30000.0, 28000.0]
