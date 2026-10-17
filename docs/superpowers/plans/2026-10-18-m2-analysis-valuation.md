@@ -55,13 +55,14 @@ src/sams/analysis/valuation/styles.py                       value/trend 模板�
 src/sams/analysis/valuation/scoring.py                      分项打分 + evidence
 src/sams/analysis/valuation/compose.py                      fair/entry/stop/target/reward_risk 合成
 src/sams/services/corp_actions.py                           用例：采集入库 + 覆盖标记（编排 registry 与仓库）
-src/sams/services/analysis.py                               用例：读价→指标→估值→写快照
+src/sams/services/analysis.py                               用例：读价→指标→估值→写快照（A 块只落区间涨跌那半）
 src/sams/services/theses.py                                 用例：状态机 + 事件留痕
 src/sams/storage/repos/corp_actions_coverage.py             覆盖区间仓库
 src/sams/storage/repos/financials.py                        financials 仓库
 src/sams/storage/repos/funding_flow.py                      funding_flow 仓库
 src/sams/storage/repos/theses.py                            theses + thesis_events 仓库（用户隔离）
 src/sams/storage/repos/valuation_snapshots.py               快照仓库
+src/sams/cli/analysis.py                                    `sams analysis return`（守卫唯一的人类出口，D44）
 src/sams/cli/thesis.py                                      `sams thesis add/list/show/advance/close`
 tests/…                                                     镜像上述每个文件
 
@@ -75,7 +76,7 @@ tests/test_layering.py              已预留 analysis，无需放宽（确认�
 docs/superpowers/specs/…design.md   §5.5/§7/§8/§18 同步 D34–D38 与 U4/U12/U13/U14 状态
 ```
 
-**A 块落地后的三处改名/合并**（下面的勾选按实际文件为准）：
+**A 块落地后的四处偏离计划**（下面的勾选按实际文件为准）：
 
 - `datasource/yfinance_actions.py` 没单独成文件——港美股的公司行为与日线同一个源、同一个
   上游会话，拆两个模块会让 `@source` 注册表里出现两个名字指向同一故障域，管理后台就会把
@@ -84,7 +85,11 @@ docs/superpowers/specs/…design.md   §5.5/§7/§8/§18 同步 D34–D38 与 U4
   **因子**（`day_factors`/`hfq_frame`）。名字错了的下一个人会在指标引擎里再写一份价格读取。
 - 港股公司行为是**新增的第 6 个源** `datasource/akshare_hk.py` + 迁移 `0010_hk_actions_source.sql`，
   计划里没有这一条：A-5 做完才发现 HK 的 actions 链上一个能给的源都没有（Yahoo 在本机长期 429），
-  而漏一次港股除权没有 D37 那样的硬证据兜底。
+  而漏一次港股除权没有 D37 那样的硬证据兜底。A 股同理补了第 7 个源 `akshare_ths.py` + 迁移 `0011`
+  （交易员闸：东财对部分票抛 `TypeError`，单源意味着那些票永远零覆盖）。
+- `tests/test_layering.py` 那行「无需放宽（确认即可）」是错的：交易员闸补 `services/analysis.py`
+  读用例时必须放开 **services → analysis** 单向。这不违反 §3.1（它禁的是反向），
+  但没有这条边，守卫就没有人能敲的出口，`interval_return` 会成为零消费者函数（实际就是）。
 
 ---
 
@@ -186,6 +191,39 @@ docs/superpowers/specs/…design.md   §5.5/§7/§8/§18 同步 D34–D38 与 U4
 实测验收（本机真实网络）：`sync actions A 601088` 全历史落库 21 条（2008-06-04~2026-07-13）、
 `covered_from=2008-06-04`；跨 2016-07-04 那次除权的区间 **裸价 +1.4873% / 后复权 +3.8270%**；
 把 `today` 传到覆盖终点之后 ⇒ D36 按预期拒绝（新鲜度失效），改回当天 ⇒ 出数。
+
+**A-7 第三道闸：交易员试用（股票交易专家 agent）** ✅（提交 `e3fabfe`、`7c75b75`）
+
+verdict 是「**谨慎用**」：9 个真实区间的对账全部对齐，数字没错，但**能拿到数的那条路径本身是错的**——
+下面第 7 条是这一轮最重的一条。
+
+| # | 症状（真实数据能复现的那句） | 处置 |
+|---|---|---|
+| 1 | `probe A 601088 2024-01-02 2024-12-31` 返回 −6.24%，而它实际算的是 06-20~07-31 那段 | `returns.py` 的锚点体检：两端 15 个日历日内算常态（周末、长假、短暂停牌）并在输出里说明锚点了哪两根，再多就拒绝。`IntervalReturn.start/end` 一直诚实，但读的人知道自己请求了什么、不知道库里有什么 |
+| 2 | `sams health` 的「`corp_actions` 47 行」说明不了 600028 有没有除权，而读取层对这种票只会拒绝 | `MarketData.codes_without_actions`（`bars_daily LEFT JOIN corp_actions_coverage`）＋「⚠ N 只有 K 线但除权记录从没确认过」，并给出该跑的那条命令 |
+| 3 | 所有源都失败时 `sync daily` 打印「所有源都回答没有数据」并以 0 结尾 | 区分「源故障」与「这只票真没数据」：前者逐源打错误并以 1 结尾——对着一个空库什么也不做，是最贵的一种误读 |
+| 4 | `sync actions --market A --code 002450/600636/600608` 全部 `TypeError: 'NoneType' object is not subscriptable`，而同花顺同一页有 8~28 条除权记录 | 崩溃不是源故障：akshare 内部对空响应做 `None` 下标。直连一次只读 GET 取东财自己的判据（`result is None && code == 9201`）来分类，「查无此票」与「这个源挂了」从此长得不一样 |
+| 5 | 第 4 条修完暴露出一个更坏的：0 行被当成答案，于是写下「源=akshare 取回=0 确认至 2026-10-17（全历史）」——**一条没根据的覆盖确认** | **D43**：一个源的「查无记录」既不终止降级链也不单独成确认；只有链上每个有能力的源都答了「无」，才逐源写确认，中途有源失败则一个都不写。删掉本次自测写坏的那两行（`002450`/`600636`，`corp_actions` 行数不变）后重跑 ⇒ 两行都是 `akshare_ths` 的真记录 |
+| 6 | A 股公司行为单源：解析器一崩那只票就永远零覆盖，区间涨跌一路拒绝 | 新增 `datasource/akshare_ths.py`（同花顺分红送配，**仅公司行为**）+ 迁移 `0011` 播种到 A 链尾。方案说明是一段自由文本，形状全部从真实响应枚举，读不出来记 `unknown`（D39）而不是猜一个数；`price` 恒空（配股仍无来源，U16） |
+| 7 | 「`interval_return` 在 src/ 里零消费者」——命令行根本拿不到复权数，人能用的路径只有裸价相除 | **D44**：`services/analysis.py` 读用例（K 线 + `until=today` 的公司行为 + 覆盖确认，三份事实一起交给同一个闸）+ `sams analysis return`。分层放开 `services → analysis` 单向，`analysis` 不得反向认识任何服务 |
+| 8 | 对账证据（不是待修项，记在这里证明守卫给的数是对的） | 601088 2024-07-05→07-08 复权 **+1.2605%** = 交易所参考价公式；00700 2025-05-15→05-16 复权 **−1.4549%** = 港交所除权口径；多段与新浪 hfq 差在 0.03pp 内；美团-B 实物分派与模拟的 10 送 10 均按预期拒绝 |
+
+**这一轮之后仍然没修的**（逐条写进 spec §18，不是遗漏）：
+
+- [ ] U18：`symbols` 没有「上市首日」列 ⇒ D37 的上市豁免永远走不到（`listed_on` 恒缺，后果是多拒不放行）。
+      M2-C 的基本面源顺手给这一列最便宜。
+- [ ] U19：拒绝文案给的下一步在 US 跑不通（公司行为只有 Yahoo 一家），`sams source probe` 的入参形态
+      与 §7.6 不一致。两者都要把「这个源此刻能不能用」读回来拼进文案 ⇒ 与 M3 的告警文案一起做。
+- [ ] U20：命令行只出区间涨跌，还出不了「一条复权序列」⇒ M2-B 指标引擎落地时一并给 `series`，
+      别让列名与窗口语义在指标口径定下来之前被写死。
+- [ ] U16 更新：A 股现在两个源，但**两家都不给配股**，且两个源只对齐「都说无」、不对齐「某一家漏了一条」。
+      漏记一笔已存在的现金分红仍然看不见（典型 10 派 22.6 元 ⇒ 跳变 −5%，在 15% 的证据阈值之内）。
+
+实测验收（本机真实网络，提交 `7c75b75`）：`sams analysis return --market A --code 601088
+--start 2024-07-05 --end 2024-07-08` ⇒ **复权 +1.26% / 裸价 −3.81%**（交易所公布 +1.26%）；
+`2024-07-01~07-15` ⇒ 复权 −1.44% / 裸价 −6.38%；`2024-01-01~12-31` ⇒ 拒绝并说明库里只有 07-01~07-15；
+`--market HK --code 00700 --start 2022-12-01 --end 2023-03-01` ⇒ 拒绝（2023-01-05 那条实物分派
+`kind=unknown`，D39）；`sh601088` 与 `601088` 给同一个数。离线 `uv run pytest -q` 905 passed / 8 deselected。
 
 ### B 块：指标引擎（§8.2）
 

@@ -46,6 +46,9 @@ uv run sams sync actions --market HK --code 00700    # 港股的公司行为来�
 uv run sams calendar refresh --market HK --year 2026
 uv run sams calendar check   --market US --date 2026-03-09   # 是否交易日 + 时段（本地 / UTC）
 uv run sams health                                             # 各表行数、日历覆盖、各源最近错误
+
+# 区间涨跌：裸价与复权并列，过不了守卫就拒绝出数（退出码 1，原因照打）
+uv run sams analysis return --market A --code 601088 --start 2024-07-05 --end 2024-07-08
 ```
 
 除 `db` 外的命令都会顺手补齐迁移，新装环境直接 `user add` 不会报缺表。
@@ -76,7 +79,7 @@ A 股裸价跳变超过涨跌停上限且对不上这天的记录（多半是漏
 | `src/sams/storage/` | DuckDB 包装、迁移、仓库层。用户数据隔离在这里兜底。 |
 | `src/sams/analysis/` | 现算层：复权因子、区间收益、（后续的）指标与估值。只依赖 core + storage——「谁调我」不影响我能看见谁，所以 `services` 调它而不是反过来。所有「不可信就不给数」的判定都在这层，并带上原因。 |
 | `src/sams/datasource/` | 「外部接口 → 标准列集」规范化，按市场路由与降级、限速。 |
-| `src/sams/services/` | 用例编排（注册、同步、日历、健康）。 |
+| `src/sams/services/` | 用例编排（注册、同步、日历、健康、复权读数）。`services/analysis.py` 是守卫唯一的读用例：取三份事实（K 线、`until=today` 的公司行为、覆盖确认）交给 `analysis`，判定一条都不在这里写——人类出口是 `sams analysis return`。 |
 | `src/sams/cli/` | argparse 分发，逻辑都在可测函数里。 |
 | `src/sams/bootstrap.py` | 把上面几层装配成 `Container`。 |
 
