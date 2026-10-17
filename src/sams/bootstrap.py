@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from sams.core.calendar import CalendarProvider
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
-from sams.core.events import EventBus
+from sams.core.events import EventBus, SystemAlarm
 from sams.datasource.base import BarAdapter
 from sams.datasource.calendar_providers import default_providers
 from sams.datasource.registry import AdapterRegistry
@@ -23,11 +25,28 @@ from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
+from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
 from sams.storage.repos.symbols import SymbolRepo
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
+
+logger = logging.getLogger("sams.bootstrap")
+
+
+def attach_log_sink(bus: EventBus) -> None:
+    """让 SystemAlarm 至少有一条落地路径。
+
+    总线没有订阅者时 publish 是静默 no-op：spec §12 的「采集连续失败降系统告警」
+    会在没人察觉的情况下不成立。日志是那条最小路径，
+    M3 的 admin 通知渠道订阅同一事件即可，不必改这里。
+    """
+
+    def log_alarm(event: SystemAlarm) -> None:
+        logger.error("[alarm] %s: %s", event.component, event.message)
+
+    bus.subscribe(SystemAlarm, log_alarm)
 
 
 @dataclass
@@ -35,10 +54,12 @@ class Container:
     settings: Settings
     db: Database
     bus: EventBus
+    clock: Clock
     users: UserRepo
     sessions: SessionRepo
     symbols: SymbolRepo
     bars: BarRepo
+    corp_actions: CorpActionRepo
     watchlists: WatchlistRepo
     calendar_store: CalendarRepo
     source_health: SourceHealthRepo
@@ -67,19 +88,26 @@ def build_container(
     *,
     db: Database | None = None,
     bus: EventBus | None = None,
+    clock: Clock | None = None,
     adapters: dict[str, BarAdapter] | None = None,
     providers: dict[str, CalendarProvider] | None = None,
 ) -> Container:
     cfg = settings or Settings.load()
     database = db or Database.open(cfg.db_path)
     event_bus = bus or EventBus()
+    attach_log_sink(event_bus)
+    clock = clock or SYSTEM_CLOCK
     bars = BarRepo(database)
     symbols = SymbolRepo(database)
     calendar_store = CalendarRepo(database)
-    users, sessions = UserRepo(database), SessionRepo(database)
+    users = UserRepo(database)
+    sessions = SessionRepo(database, clock)
+    corp_actions = CorpActionRepo(database)
     source_health = SourceHealthRepo(database)
 
-    registry = AdapterRegistry.from_settings(cfg, adapters=adapters, store=source_health)
+    registry = AdapterRegistry.from_settings(
+        cfg, adapters=adapters, store=source_health, bus=event_bus, clock=clock
+    )
     providers = providers if providers is not None else default_providers()
     calendar = CalendarService(calendar_store, providers, bus=event_bus)
 
@@ -87,10 +115,12 @@ def build_container(
         settings=cfg,
         db=database,
         bus=event_bus,
+        clock=clock,
         users=users,
         sessions=sessions,
         symbols=symbols,
         bars=bars,
+        corp_actions=corp_actions,
         watchlists=WatchlistRepo(database),
         calendar_store=calendar_store,
         source_health=source_health,
@@ -98,5 +128,5 @@ def build_container(
         accounts=AccountService(users, sessions),
         calendar=calendar,
         sync=SyncService(registry, bars, symbols, cfg.markets),
-        health=HealthService(database, registry, calendar_store, cfg),
+        health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )
