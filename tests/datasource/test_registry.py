@@ -77,7 +77,7 @@ def test_primary_success_is_not_degraded():
 def test_rate_limited_primary_falls_back_and_is_recorded():
     primary = FakeAdapter("akshare", ["A"], RateLimited("akshare", "429"))
     backup = FakeAdapter("eastmoney", ["A"], frame("eastmoney"))
-    reg = registry(primary, backup)
+    reg = registry(primary, backup, clock=FrozenClock(datetime(2024, 1, 3, tzinfo=UTC)))
 
     result = reg.fetch_daily("A", "600519", D1, D2)
     assert result.source == "eastmoney", "主源被限流要立刻换备源"
@@ -85,7 +85,7 @@ def test_rate_limited_primary_falls_back_and_is_recorded():
     assert [a.source for a in result.attempts] == ["akshare", "eastmoney"]
     by_name = {h.name: h for h in reg.health()}
     assert not by_name["akshare"].ok and by_name["akshare"].consecutive_failures == 1
-    assert by_name["eastmoney"].ok and by_name["eastmoney"].last_ok_at == date.today()
+    assert by_name["eastmoney"].ok and by_name["eastmoney"].last_ok_at == date(2024, 1, 3)
 
 
 def test_field_drift_switches_source_without_wasting_retries():
