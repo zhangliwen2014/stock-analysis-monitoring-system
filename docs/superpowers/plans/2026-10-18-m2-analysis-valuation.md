@@ -31,6 +31,7 @@
 | D36 | 新增 `corp_actions_coverage(market, code, covered_from, covered_to, src, fetched_at)`：采集成功后 upsert 覆盖区间。**区间收益只在覆盖到位时给出，否则 `NotAdjustable(原因)`** | 从未分红的票在 `corp_actions` 里就是 0 行，和「没采集」长得一模一样。没有覆盖标记就没有资格说「我不能算」 |
 | D37 | A 股额外一道硬证据：窗口内出现超过涨跌停的裸价跳变 ⇒ 一定有未标记的除权 ⇒ 即使声称覆盖也拒绝 | 沪深主板 ±10%、创业/科创 ±20%、ST ±5%、北交所 ±30%；港美股没有涨跌停，这道判不了，只依赖 D36 的覆盖标记 |
 | D38 | 采集器按能力而非按源分类：一个 `@source(kind)` 类可以实现 `BarAdapter`、`CorpActionAdapter` 或两者。降级链与市场路由沿用 M1 的两张表，**缺能力的源在 actions 链里显式跳过并打印**，不静默 | M1 已经把「源是什么」和「源能干什么」分开了；静默跳过会让「没有备源」再次看不出来 |
+| D39 | 发生过但折不出数的公司行为记 `kind=unknown`（三个数值全空 + `note` 必须带源原话），读取层见到它**拒绝**出数 | 港股的实物分派（分美团股/分阅文股）与认股权证既不是每股现金也不是股数乘数。硬凑一个数会把猜测乘进序列；丢掉它等于「这天没发生」，而跨那天的涨跌是错数。A 股还有 D37 兜着，港股没有涨跌停边界，只能靠这条 |
 
 ---
 
@@ -73,48 +74,88 @@ tests/test_layering.py              已预留 analysis，无需放宽（确认�
 docs/superpowers/specs/…design.md   §5.5/§7/§8/§18 同步 D34–D38 与 U4/U12/U13/U14 状态
 ```
 
+**A 块落地后的三处改名/合并**（下面的勾选按实际文件为准）：
+
+- `datasource/yfinance_actions.py` 没单独成文件——港美股的公司行为与日线同一个源、同一个
+  上游会话，拆两个模块会让 `@source` 注册表里出现两个名字指向同一故障域，管理后台就会把
+  它们当成互为备源（D38 禁止的正是这个）。解析函数 `expand_actions` 放在 `yfinance_us.py` 里。
+- `analysis/prices.py` → `analysis/adjust.py`：`prices` 说的是「价格」，而这个模块给的其实是
+  **因子**（`day_factors`/`hfq_frame`）。名字错了的下一个人会在指标引擎里再写一份价格读取。
+- 港股公司行为是**新增的第 6 个源** `datasource/akshare_hk.py` + 迁移 `0010_hk_actions_source.sql`，
+  计划里没有这一条：A-5 做完才发现 HK 的 actions 链上一个能给的源都没有（Yahoo 在本机长期 429），
+  而漏一次港股除权没有 D37 那样的硬证据兜底。
+
 ---
 
 ## 任务
 
 ### A 块：除权链路（闭合 U12）
 
-**A-1 字段语义与迁移**
+**A-1 字段语义与迁移** ✅（提交 `f4e59fd`）
 
-- [ ] 写失败测试：`ratio` 只接受 >0 的乘数语义、`price` 只允许与 `rights` 同时出现、`dividend` 必须有 `cash_per_share`、同一 `(market, code, ex_date, kind)` 重写覆盖
-- [ ] `0008_corp_action_price.sql`：`ALTER TABLE corp_actions ADD COLUMN price DOUBLE`（DuckDB 支持 `ADD COLUMN IF NOT EXISTS`，重放安全）
-- [ ] `CorpAction` 加 `price` 字段；`upsert` 的校验按 D34 重写，`list_for` 返回带 `price`
-- [ ] 跑 `uv run pytest -q tests/storage/test_corp_actions.py` 全绿 → 提交
+- [x] 写失败测试：`ratio` 只接受 >0 的乘数语义、`price` 只允许与 `rights` 同时出现、`dividend` 必须有 `cash_per_share`、同一 `(market, code, ex_date, kind)` 重写覆盖
+- [x] `0008_corp_action_price.sql`：`ALTER TABLE corp_actions ADD COLUMN price DOUBLE`（DuckDB 支持 `ADD COLUMN IF NOT EXISTS`，重放安全）
+- [x] `CorpAction` 加 `price` 字段；`upsert` 的校验按 D34 重写，`list_for` 返回带 `price`
+- [x] 跑 `uv run pytest -q tests/storage/test_corp_actions.py` 全绿 → 提交
 
-**A-2 覆盖区间仓库**
+**A-2 覆盖区间仓库** ✅
 
-- [ ] 失败测试：`covered_through(market, code)` 在未采集时返回 `None`、upsert 后区间取并集、`(market, code)` 唯一、跨源采集不丢原区间
-- [ ] `0009_corp_actions_coverage.sql` + `repos/corp_actions_coverage.py`
-- [ ] 提交
+- [x] 失败测试：`covered_through(market, code)` 在未采集时返回 `None`、upsert 后区间取并集、`(market, code)` 唯一、跨源采集不丢原区间
+- [x] `0009_corp_actions_coverage.sql` + `repos/corp_actions_coverage.py`
+- [x] 提交
 
-**A-3 hfq 现算与区间守卫**
+落地时改了两处计划里的写法：**主键加 `src`**（`(market, code, src)`）——A 股主源确认过的区间
+与备源确认过的区间不是一回事，合成一段等于凭空造出一个谁都没看过的覆盖面；以及
+`full_history` 标记（D36 的「确认到今天，今天越界即失效」）。
 
-- [ ] 黄金样例用例（手算对齐）：纯现金分红、送股、拆股 1→2、合股、配股各一条，`ex_ref` 与因子逐位对齐
-- [ ] 多事件连乘、`ex_date` 当天生效（≤ t）、无 corp_actions ⇒ 序列等于裸价
-- [ ] `returns.py`：覆盖不足 ⇒ `NotAdjustable`；A 股超涨跌停跳变 ⇒ 即使声称覆盖也拒绝（D37）；601088 的 −3.81% vs +1.26% 写成回归用例
-- [ ] 提交
+**A-3 hfq 现算与区间守卫** ✅（`analysis/adjust.py` + `analysis/returns.py`）
 
-**A-4 A 股采集器**
+- [x] 黄金样例用例（手算对齐）：纯现金分红、送股、拆股 1→2、合股、配股各一条，`ex_ref` 与因子逐位对齐
+- [x] 多事件连乘、`ex_date` 当天生效（≤ t）、无 corp_actions ⇒ 序列等于裸价
+- [x] `returns.py`：覆盖不足 ⇒ `NotAdjustable`；A 股超涨跌停跳变 ⇒ 即使声称覆盖也拒绝（D37）；601088 的 −3.81% vs +1.26% 写成回归用例
+- [x] 提交
 
-- [ ] 读 akshare 安装包源码确认函数与列名（不靠记忆）：`stock_fhps_detail_em` 的返回列与「每10股」口径
-- [ ] `CorpActionAdapter` 协议进 `datasource/actions.py` + `normalize_actions`（列集、类型、日期解析、被丢行计数）
-- [ ] 纯解析函数 + 录制 payload 的离线用例；单位换算（每10股 → 每股）用「10派X元(含税)」描述列交叉验证
-- [ ] `live` 用例：拉一只真实票，与交易所公布的除权参考价对齐
-- [ ] 提交
+**这里发现的一条契约错**（真实数据抓出来的，不是用例抓出来的）：跨 2008-06-04 那次除权的区间
+报 `库里没有它前一根 K 线`。原因是 `interval_return` 原本要求 `bars` 覆盖整个历史，而区间涨跌
+只吃两端那两根 K 线、因子只吃落在两端之间的记录——更早的除权对两端是同一个常数，会约掉。
+改为窗口内取因子（`ex_date ∈ (first, last]`），并把「窗口内的除权日必须在库里对得上 K 线」
+单独做成守卫（D39 的前身）。绝对 hfq 序列仍然只能从**全历史**首根开始乘，这一点写进了文档：
+拿窗口化的 `close_hfq` 当绝对价格，等于宣称「首根那天的因子是 1」。
 
-**A-5 港美股采集器 + registry 双能力链**
+**A-4 A 股采集器** ✅（`datasource/actions.py` + `datasource/akshare_actions.py`，提交 `c02f2d4`）
 
-- [ ] `yfinance Ticker.actions` → Dividends（每股）/Stock Splits（比率），exchange-local 日期索引的时区处理
-- [ ] registry：`fetch_actions` 链、缺能力的源显式跳过并在结果里记 `skipped`；`Attempt.tries` 只算真调用
-- [ ] `services/corp_actions.py` 编排采集→入库→覆盖标记；`sams sync actions --market A --code 601088 --start … --end …`
-- [ ] 提交
+- [x] 读 akshare 安装包源码确认函数与列名（不靠记忆）：`stock_fhps_detail_em` 的返回列与「每10股」口径
+- [x] `CorpActionAdapter` 协议进 `datasource/actions.py` + `normalize_actions`（列集、类型、日期解析、被丢行计数）
+- [x] 纯解析函数 + 录制 payload 的离线用例；单位换算（每10股 → 每股）用「10派X元(含税)」描述列交叉验证
+- [x] `live` 用例：拉一只真实票，与交易所公布的除权参考价对齐
+- [x] 提交
 
-**A-6 交易员 agent 试用（A 块收口）**：并行派「对抗测试 agent」+「架构师评审 agent」，收口后派交易员 agent，报告问题逐条修复或记入 §18。
+三条口径都是这个模块存在的全部理由：单位是「每 10 股」（神华 2024 真实值 10派22.60元 ⇒ 每股
+2.26 元）；同一行的派息与送转是两个独立事实必须拆行；只有「实施分配」才是发生过的事——
+未实施的行没有除权日，把没发生的除权乘进序列比漏一次更难被发现。**配股不在这里**（见 spec U16）。
+
+**A-5 港美股采集器 + registry 双能力链** ✅（提交 `e718c29`、`0d89d06`）
+
+- [x] yfinance `Ticker.get_actions` → Dividends（每股）/Stock Splits（比率）/Capital Gains，exchange-local 日期索引的时区处理（**函数并进 `yfinance_us.py`**，不单独建 `yfinance_actions.py`，理由见上面的「三处改名」）
+- [x] registry：`fetch_actions` 链、缺能力的源显式跳过并在结果里记 `skipped`；`Attempt.tries` 只算真调用
+- [x] `services/corp_actions.py` 编排采集→入库→覆盖标记；`sams sync actions --market A --code 601088 --start … --end …`
+- [x] 提交
+
+**A-6 港股公司行为源 + D39** ✅（新增块，计划外——A-5 做完才看清缺口的大小）
+
+派 A-5 的活去跑真实港股时发现：**0007 之后 HK 链上两个源都只有日线能力**，
+`sams sync actions --market HK` 的症状是「这只票从没分过红」。而港股没有涨跌停，D37 那道
+证据守卫在那里不生效，漏一次除权在图上什么都不留下。于是补了：
+
+- [x] `datasource/akshare_hk.py`（东财港股分红派息，**只有公司行为能力**）+ 迁移 `0010_hk_actions_source.sql`
+      播种进 HK 链尾；金额一律取港币等价（没有等价 ⇒ 不猜汇率），「每 N 股派送 M 股权证」不是送股
+- [x] D39：`kind=unknown` 的词汇、仓库校验（数值必须全空 + `note` 必须有原话）、`adjust` 见到它拒绝出数
+- [x] 按能力数备源：`registry.chain_for(market, method)` 成为 `sams health` 的 ⚠ 判据与
+      `sams source` 的「不许弄瞎市场」判据——只报公司行为的源不算日线的备源
+- [x] 实测：00700 全历史 26 条（4 条实物分派 unknown：分京东/分美团/分阅文/分腾讯音乐），
+      yfinance 被 429 时降级到 akshare_hk 并显式跳过 tencent；跨 2023-01-05 那天的区间收益拒绝出数
+
+**A-7 交易员 agent 试用（A 块收口）**：并行派「对抗测试 agent」+「架构师评审 agent」，收口后派交易员 agent，报告问题逐条修复或记入 §18。
 
 ### B 块：指标引擎（§8.2）
 
