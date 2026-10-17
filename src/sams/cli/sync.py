@@ -40,10 +40,22 @@ def add_to(subparsers) -> None:
 
 def run_daily(container: Container, args: argparse.Namespace) -> int:
     start, end = iso_date(args.start), iso_date(args.end)
+    rc = 0
     for code in args.code:
         summary = container.sync.sync_daily(args.market, code, start, end)
         if summary.empty:
-            print(f"{code:<10} 所有源均无 {start}~{end} 的数据")
+            # 「这只票这段没数据」与「问它的源都挂了」是两件事：前者的下一步是换区间，
+            # 后者的下一步是修源。混成一行会让运维对着一个空库什么也不做
+            failed = [a for a in summary.attempts if not a.ok]
+            if failed:
+                rc = 1
+                print(
+                    f"{code:<10} 无数据，但有 {len(failed)} 个源失败："
+                    f"{'；'.join(f'{a.source}: {a.error}' for a in failed)}"
+                )
+                print(f"{'':<10} 不能断定这只票这段没有数据：先修上面的源，再重跑同一条命令")
+            else:
+                print(f"{code:<10} 所有源都回答「{start}~{end} 没有数据」（停牌、新股、区间过短）")
             continue
         line = (
             f"{code:<10} 源={summary.source} 取回={summary.fetched} 入库={summary.written} "
@@ -52,7 +64,7 @@ def run_daily(container: Container, args: argparse.Namespace) -> int:
         if summary.degraded:
             line += f" [降级: {_trail(summary.attempts)}]"
         print(line)
-    return 0
+    return rc
 
 
 def run_actions(container: Container, args: argparse.Namespace) -> int:
@@ -65,6 +77,8 @@ def run_actions(container: Container, args: argparse.Namespace) -> int:
             f"确认至={summary.covered_to}"
             f"{'（全历史：取回与入库不受请求窗口约束）' if summary.full_history else ''}"
         )
+        if summary.confirmed_empty_by:
+            line += f" 确认查无={'+'.join(summary.confirmed_empty_by)}"
         if summary.clamped_to is not None:
             line += f" [请求终点在未来，按今天截断至 {summary.clamped_to}]"
         if summary.degraded:

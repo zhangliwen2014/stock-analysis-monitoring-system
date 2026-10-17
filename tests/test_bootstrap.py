@@ -73,7 +73,9 @@ def test_registry_chain_comes_from_the_database(migrated):
     built = build_container(migrated)
     try:
         assert built.registry.market_sources == {
-            "A": ("akshare", "eastmoney", "tencent", "sina"),
+            # akshare_ths 只报公司行为（D38）：它在日线链上会被显式跳过，但它确实在库里，
+            # 所以 market_sources 这条「链上排了谁」的事实要把它算进来
+            "A": ("akshare", "eastmoney", "tencent", "sina", "akshare_ths"),
             # 链是「按市场的路由」，不是「谁能取日线」：akshare_hk 只报公司行为，
             # 采集时被跳过（D38），备源判据走 registry.chain_for(market, method)
             "HK": ("yfinance", "tencent", "akshare_hk"),
@@ -81,7 +83,7 @@ def test_registry_chain_comes_from_the_database(migrated):
         }
         assert built.registry.chain_for("HK", "daily_bars") == ("yfinance", "tencent")
         assert built.registry.chain_for("HK", "corp_actions") == ("yfinance", "akshare_hk")
-        assert built.registry.chain_for("A", "corp_actions") == ("akshare",)
+        assert built.registry.chain_for("A", "corp_actions") == ("akshare", "akshare_ths")
     finally:
         built.close()
 
@@ -96,7 +98,12 @@ def test_disabling_a_source_takes_it_out_of_the_next_container(migrated):
 
     second = build_container(migrated)
     try:
-        assert second.registry.market_sources["A"] == ("eastmoney", "tencent", "sina")
+        assert second.registry.market_sources["A"] == (
+            "eastmoney",
+            "tencent",
+            "sina",
+            "akshare_ths",
+        )
         assert "akshare" not in second.registry.adapters, "停用源连适配器都不该建"
     finally:
         second.close()

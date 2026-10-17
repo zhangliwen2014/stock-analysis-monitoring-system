@@ -62,6 +62,7 @@ def interval_return(
     window = bars.filter((pl.col("date") >= start) & (pl.col("date") <= end)).sort("date")
     if window.height < 2:
         raise NotAdjustable(f"{market}/{code} 在 {start}~{end} 不足两根 K 线，无从比较")
+    _require_window_backed_by_bars(market, code, window, start, end)
     series = adjusted_series(
         market,
         code,
@@ -92,3 +93,34 @@ def _ratio(frame: pl.DataFrame, start: date, end: date, column: str) -> float:
     if len(rows) != 2 or not rows[0]:
         raise NotAdjustable(f"{column} 在 {start} 或 {end} 缺失/为零，区间涨跌无从计算")
     return rows[1] / rows[0] - 1
+
+
+#: 请求边上的这几天缺口是常态（周末、长假、短暂停牌），不算「这段没数据」。
+#: 15 个日历日够覆盖最长连休加一周停牌，又远小于「少了半个月」那种真缺口。
+_ANCHOR_GRACE_DAYS = 15
+
+
+def _require_window_backed_by_bars(
+    market: str, code: str, window: pl.DataFrame, start: date, end: date
+) -> None:
+    """两端必须有 K 线，否则这个数就不是请求的那个区间的数。
+
+    `IntervalReturn.start/end` 一直诚实地带着真实锚点，但读的人知道自己请求了什么、
+    不知道库里有什么：请求一整年、库里只有一个半月，他看见的就是一个「年度涨跌」。
+    少这一段数据不会让数字看起来异常，只会让它安静地变成另一个区间的数。
+    """
+    first, last = window["date"].to_list()[0], window["date"].to_list()[-1]
+    missing_before = (first - start).days
+    missing_after = (end - last).days
+    if missing_before <= _ANCHOR_GRACE_DAYS and missing_after <= _ANCHOR_GRACE_DAYS:
+        return
+    if missing_before > _ANCHOR_GRACE_DAYS:
+        head, gap = "起点", missing_before
+    else:
+        head, gap = "终点", missing_after
+    raise NotAdjustable(
+        f"{market}/{code} 请求 {start}~{end}，但库里的 K 线只覆盖 {first}~{last}"
+        f"（{head}之外缺 {gap} 天）：这段没同步到，不能按 {start}~{end} 给涨跌。"
+        f"先 `sams sync daily --market {market} --code {code} --start {start} --end {end}`，"
+        f"或把区间收到 {first}~{last} 以内"
+    )

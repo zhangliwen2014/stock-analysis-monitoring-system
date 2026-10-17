@@ -9,7 +9,7 @@ from support import StubActionsAdapter, StubAdapter, sample_bars
 import sams.cli as cli
 from sams.bootstrap import build_container
 from sams.core.config import Settings
-from sams.core.errors import DatasourceError, RateLimited
+from sams.core.errors import DatasourceError, EmptyResponse, RateLimited
 from sams.storage.db import Database
 from sams.storage.migrate import apply_migrations, discover
 from sams.storage.repos.bars import BarRepo
@@ -180,6 +180,29 @@ def test_sync_falls_back_and_says_so(container, capsys):
     out = capsys.readouterr().out
     assert "源=eastmoney" in out and "降级: akshare✗ → eastmoney✓" in out
     assert container.registry.records["akshare"].consecutive_failures == 1
+
+
+def test_source_failures_are_not_reported_as_a_stock_that_has_no_data(container, capsys):
+    """交易员试用报告 P1：`sync daily 600028 2005→2026` 报「所有源均无数据」、退出码 0，
+    而同期日志是 akshare/eastmoney 网络失败、sina 撞 1023 根上限、tencent 回空。
+    「这个源挂了」与「这只票没数据」的下一步完全相反，屏幕上不能长一样。"""
+    container.registry.adapters["akshare"] = broken("akshare", ["A"])
+    container.registry.adapters["eastmoney"] = StubAdapter(
+        "eastmoney", ["A"], EmptyResponse("eastmoney", "区间无数据")
+    )
+    assert cli_run_on(container, sync_argv()) == 1
+    out = capsys.readouterr().out
+    assert "429" in out and "不能断定" in out
+
+
+def test_every_source_answering_no_data_is_a_clean_answer(container, capsys):
+    """两只源都答「这段没有数据」（停牌、新股）：这是事实，不是故障，退出码 0。"""
+    for name in ("akshare", "eastmoney"):
+        container.registry.adapters[name] = StubAdapter(
+            name, ["A"], EmptyResponse(name, "区间无数据")
+        )
+    assert cli_run_on(container, sync_argv()) == 0
+    assert "所有源都回答" in capsys.readouterr().out
 
 
 def actions_argv(code="601088"):
@@ -404,6 +427,23 @@ def test_health_shows_when_the_last_bar_is_and_that_prices_are_raw(container, ca
     assert "最新 2024-01-03" in out
     # 库里没有公司行为时跨除权日的区间涨跌是错的（专家复核 #1），必须在这里露头
     assert "corp_actions 0 行" in out and "裸价" in out
+
+
+def test_health_names_the_stocks_whose_ex_rights_were_never_confirmed(container, capsys):
+    """有 K 线、零覆盖确认的票在这一屏上必须与「一切正常」长得不一样。
+
+    `corp_actions 47 行` 说明不了 600028 有没有除权：库里那 47 行可能一行都不属于它，
+    而读取层的守卫对这种票只会拒绝出数。看不见这一格，用户以为自己有一库可用数据。
+    """
+    assert cli_run_on(container, sync_argv()) == 0
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "1 只有 K 线但除权记录从没确认过" in out
+
+    # 确认过之后这一格就应当消失：它报的是缺口，不是一个恒定的口径提示
+    assert cli_run_on(container, actions_argv("600519")) == 0
+    assert cli_run_on(container, ["health"]) == 0
+    assert "从没确认过" not in capsys.readouterr().out
 
 
 def test_health_names_a_field_the_serving_sources_do_not_provide(container, capsys):

@@ -20,7 +20,7 @@ from sams.core.config import Settings
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited, TransientError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.sources import SourceHealthStore, SourceRecord
-from sams.datasource.actions import answers_full_history, has_actions
+from sams.datasource.actions import answers_full_history, empty_actions, has_actions
 from sams.datasource.base import BarAdapter, has_bars
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
@@ -112,6 +112,9 @@ class ActionsResult:
     #: 源是否说「这只票的历史我给全了」。决定覆盖标记的写法（D36）：全历史源的确认
     #: 与按区间拉的确认，对「区间之外有没有除权」的回答能力不同
     full_history: bool = False
+    #: 说「查无记录」的源，且只有当链上每个有能力的源都这么说时才有值（D36）：
+    #: 一个源的空答复不能替另一个源的沉默发覆盖确认，而服务层要给每个确认各记一行
+    confirmed_empty_by: tuple[str, ...] = ()
 
     @property
     def degraded(self) -> bool:
@@ -275,9 +278,16 @@ class AdapterRegistry:
         缺能力的源进 `skipped` 并在日志里说明，不是静默跳过（D38）。区别在后果上：
         静默跳过后，「HK 没有任何源能给公司行为」这件事表现为「腾讯从没分过红」，
         而裸价跨除权日算出来的涨跌是一个看起来完全正常的数。
+
+        **「这个源说没有」不是一次成功的取数**：它只说明这只票在那张表里没有记录，
+        而同一只票在另一张表里可能有（实测 002450：东财回查无记录，同花顺有 8 条除权）。
+        所以空答复不许终结这条链——记下谁说空、继续问，整条链都说没有才算一句可写的确认
+        （`confirmed_empty_by`）。只要有源没答上来，就不给它发覆盖标记。
         """
         attempts: list[Attempt] = []
         skipped: list[tuple[str, str]] = []
+        empties: list[tuple[str, bool]] = []
+        unanswered: list[str] = []
         for name in self.sources_for(market):
             adapter = self.adapter(name)
             if not has_actions(adapter):
@@ -288,12 +298,18 @@ class AdapterRegistry:
                 frame = self._call(name, market, code, start, end, method="corp_actions")
             except _SourceFailed as failed:
                 attempts.append(Attempt(failed.source, False, failed.tries, failed.error))
+                unanswered.append(name)
                 continue
             except EmptyResponse as exc:
-                # 公司行为的「无数据」不能当成功：覆盖标记（D36）会把「没查过」写成「查过
-                # 且没有」。所以它只是这个源答不上来，换下一个；全都答不上来就整体失败。
+                # 源连「没有」这句话都没说清（接口回空/解析不了）：不能替它写成查过（D36）
                 attempts.append(Attempt(name, False, 1, f"无数据: {exc}"))
+                unanswered.append(name)
                 logger.info("公司行为 %s 回答无数据（%s %s），换源", name, market, code)
+                continue
+            if frame.height == 0:
+                empties.append((name, answers_full_history(adapter)))
+                attempts.append(Attempt(name, True, 1, "查无记录"))
+                logger.info("公司行为 %s 说 %s %s 查无记录，继续问下一个源", name, market, code)
                 continue
             self._mark_ok(name)
             attempts.append(Attempt(name, True))
@@ -307,11 +323,27 @@ class AdapterRegistry:
                 answers_full_history(adapter),
             )
 
+        if empties and not unanswered:
+            # 每个有能力的源都独立答了「没有」：这才是一句可以写成覆盖标记的答复
+            return ActionsResult(
+                market,
+                code,
+                empty_actions(),
+                empties[0][0],
+                tuple(attempts),
+                tuple(skipped),
+                full_history=all(full for _, full in empties),
+                confirmed_empty_by=tuple(name for name, _ in empties),
+            )
+
         detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
+        said_no = "、".join(name for name, _ in empties)
         raise DatasourceError(
             "registry",
             f"{market} {code} 取不到公司行为。链 {list(self.sources_for(market))} 里"
-            f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}",
+            f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}"
+            + (f"；说查无记录的 {said_no}（因为 {('、'.join(unanswered))} 没答上来，"
+               f"这些「没有」还不能写成确认）" if empties else ""),
         )
 
     def _call(

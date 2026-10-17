@@ -9,6 +9,7 @@ from support import FrozenClock
 from sams.core.clock import SYSTEM_CLOCK
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited, TransientError
 from sams.core.events import EventBus, SystemAlarm
+from sams.datasource.actions import empty_actions
 from sams.datasource.base import BAR_COLUMNS
 from sams.datasource.ratelimit import TokenBucket
 from sams.datasource.registry import AdapterRegistry
@@ -353,3 +354,52 @@ def test_actions_failure_names_both_the_skipped_and_the_failed():
         reg.fetch_actions("A", "601088", D1, D2)
     with pytest.raises(DatasourceError, match="列名改版"):
         reg.fetch_actions("A", "601088", D1, D2)
+
+
+# --- 「这个源说没有」不等于「这只票没有」：空答复不许终结这条链 ----------------------
+
+
+def test_an_empty_answer_does_not_end_the_chain_when_another_source_has_records():
+    """实测 002450：东财回「返回数据为空」，同花顺有 8 条除权。
+
+    空帧在旧语义里是一次成功取数，于是主源一句「我这儿没有」就把链走完了：服务层写下
+    「全历史，确认至今天」，库里 0 行——覆盖标记与库互相打脸，跨那天的区间退回裸价（D36/D40）。
+    """
+    quiet = ActionsAdapter("akshare", outcome=empty_actions())
+    rich = ActionsAdapter("akshare_ths")
+    reg = registry(quiet, rich)
+    result = reg.fetch_actions("A", "002450", D1, D2)
+    assert result.source == "akshare_ths"
+    assert result.frame.height == 1
+    assert result.confirmed_empty_by == ()
+    assert result.degraded is True
+
+
+def test_the_whole_chain_saying_no_records_is_an_answer_we_can_record():
+    """两个独立的源都说没有，「这只票从没分过红」才配写成覆盖标记。"""
+    reg = registry(ActionsAdapter("akshare", outcome=empty_actions()),
+                   ActionsAdapter("akshare_ths", outcome=empty_actions()))
+    result = reg.fetch_actions("A", "600000", D1, D2)
+    assert result.frame.is_empty()
+    assert result.confirmed_empty_by == ("akshare", "akshare_ths")
+    assert result.full_history is True
+    assert result.source == "akshare"
+
+
+def test_a_corroborated_claim_needs_every_source_to_have_answered():
+    """一个说没有 + 一个挂了 ⇒ 谁都不能替挂掉的那个确认「没有」。拒绝写覆盖，继续换天再查。"""
+    reg = registry(
+        ActionsAdapter("akshare", outcome=empty_actions()),
+        ActionsAdapter("akshare_ths", error=FieldDrift("akshare_ths", "列名改版")),
+    )
+    with pytest.raises(DatasourceError, match="列名改版"):
+        reg.fetch_actions("A", "600000", D1, D2)
+
+
+def test_a_window_scoped_source_cannot_corroborate_a_full_history_claim():
+    """按区间拉的源说「这段没有」，与全历史源说的「历史里没有」是两句话（D36）。"""
+    reg = registry(
+        ActionsAdapter("akshare", outcome=empty_actions(), full_history=True),
+        ActionsAdapter("sina", outcome=empty_actions(), full_history=False),
+    )
+    assert reg.fetch_actions("A", "600000", D1, D2).full_history is False

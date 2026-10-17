@@ -34,6 +34,12 @@ def _print_data(report) -> None:
         if data.negative_volume:
             # 库里原样存负量（见 bars 仓库的文件头），所以必须在这里露头
             line += f"  ⚠ {data.negative_volume} 行成交量为负，量比一类指标不可用"
+        if data.codes_without_actions:
+            # 这一格是「能不能算」的判据，不是数据量：这些票的区间涨跌会撞守卫
+            line += (
+                f"  ⚠ {data.codes_without_actions} 只有 K 线但除权记录从没确认过，"
+                f"跨除权日的区间涨跌拒绝出数（sams sync actions --market {market} --code …）"
+            )
         print(line)
     has_bars = any(d.rows for d in report.market_data.values())
     if has_bars and not report.tables.get("corp_actions"):

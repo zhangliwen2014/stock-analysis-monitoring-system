@@ -234,3 +234,43 @@ def test_the_ex_date_on_the_first_bar_of_the_window_is_not_double_counted():
     )
     assert result.ex_dates == 0
     assert result.adjusted == pytest.approx(result.raw)
+
+
+# --- 请求窗口与读数锚点 -----------------------------------------------------------
+
+
+def test_a_window_the_bars_do_not_really_cover_is_refused_not_answered_for_a_shorter_one():
+    """请求一整年、库里只有一个半月 ⇒ 绝不能给数：那个数会顶着「年度涨跌」的名字出门。
+
+    交易员试用报告里最伤的一条：`probe A 601088 2024-01-02 2024-12-31` 返回 −6.24%，
+    实际算的是 06-20~07-31。`IntervalReturn.start/end` 诚实地带着真实锚点，但读的人
+    知道自己请求了什么、不知道库里有什么，于是他看见的就是一个年度数。
+    """
+    days = [date(2024, 6, 20) + timedelta(days=i) for i in range(30)]
+    with pytest.raises(NotAdjustable, match="只覆盖"):
+        get(
+            bars=frame([10.0] * 30, days=days),
+            start=date(2024, 1, 2),
+            end=date(2024, 12, 31),
+        )
+
+
+def test_a_window_starting_after_the_last_bar_is_refused_too():
+    """尾端缺一样危险：拿 1 月的价格当「到 7 月为止的涨跌」报出去。"""
+    days = [date(2024, 1, 2) + timedelta(days=i) for i in range(11)]
+    with pytest.raises(NotAdjustable, match="只覆盖"):
+        get(
+            bars=frame([10.0] * 11, days=days),
+            start=date(2024, 1, 2),
+            end=date(2024, 7, 1),
+        )
+
+
+def test_a_holiday_or_suspension_at_the_edge_of_the_window_is_not_a_refusal():
+    """边上的几天缺口是常态（长假、短暂停牌），不能把它当成「这段没数据」。
+
+    阈值因此取 15 个日历日：够覆盖最长的连休加一周停牌，又远小于「少了半个月」。
+    """
+    result = get(bars=frame([10.0] * 11), start=START, end=END)
+    assert result.start == START
+    assert result.end == date(2024, 7, 11)

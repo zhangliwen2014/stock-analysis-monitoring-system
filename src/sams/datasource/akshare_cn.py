@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import date
 
@@ -21,6 +22,8 @@ from sams.datasource.base import (
     normalize_bars,
 )
 from sams.datasource.sources import source
+
+logger = logging.getLogger("sams.datasource")
 
 COLUMN_MAP = {
     "date": "日期",
@@ -65,7 +68,44 @@ def akshare_fetch(symbol: str, start: date, end: date) -> pl.DataFrame:
     return pl.from_pandas(frame)
 
 
-def akshare_fhps(symbol: str) -> pl.DataFrame:
+def eastmoney_says_no_records(symbol: str) -> bool:
+    """直接问一次东财：这只票的分红送配表是不是「查无记录」（只在崩了之后走这一趟）。
+
+    akshare 的 `stock_fhps_detail_em` 在 `data_json["result"]` 为 null 时拿 None 做下标，
+    抛 `TypeError: 'NoneType' object is not subscriptable`（实测 002450、600636，而这两个
+    代码在表里确实没有记录，同花顺各有 8~28 条）。崩在它自己的解析里，所以「东财回查无记录」
+    与「接口改版/别的 None」在异常上长得一模一样。两者要的下一步相反：前者应当继续问下一个源
+    并把这句当成一句答复，后者应当报警。多花一个请求换这个区分，只在失败路径上付。
+    """
+    import requests
+
+    try:
+        response = requests.get(
+            "https://datacenter-web.eastmoney.com/api/data/v1/get",
+            params={
+                "sortColumns": "REPORT_DATE",
+                "sortTypes": "-1",
+                "pageSize": "500",
+                "pageNumber": "1",
+                "reportName": "RPT_SHAREBONUS_DET",
+                "columns": "ALL",
+                "quoteColumns": "",
+                "js": '{"data":(x),"pages":(tp)}',
+                "source": "WEB",
+                "client": "WEB",
+                "filter": f'(SECURITY_CODE="{symbol}")',
+            },
+            timeout=15,
+        )
+        body = response.json()
+    except Exception:  # noqa: BLE001 — 问不出结论就退回「这不是查无记录」，让原异常说话
+        return False
+    return body.get("result") is None and str(body.get("code")) == "9201"
+
+
+def akshare_fhps(
+    symbol: str, *, is_no_records: Callable[[str], bool] = eastmoney_says_no_records
+) -> pl.DataFrame:
     """真实网络调用：某只 A 股的分红送配**全历史**（东财明细页）。
 
     这个接口不带日期参数，一次给全史——所以适配器标了 `corp_actions_full_history`（D36），
@@ -75,7 +115,16 @@ def akshare_fhps(symbol: str) -> pl.DataFrame:
     """
     import akshare as ak
 
-    frame = ak.stock_fhps_detail_em(symbol=symbol)
+    try:
+        frame = ak.stock_fhps_detail_em(symbol=symbol)
+    except TypeError as exc:
+        if not is_no_records(symbol):
+            raise
+        # 「这张表里没有这只票的记录」：先当一句答复交回空帧，让降级链继续问下一个源。
+        # 说成故障会烧掉 akshare 的健康预算，说成答复又会让覆盖标记撒谎——两边都不行，
+        # 所以这里只回空帧，写不写覆盖由服务层按「有没有源真的答上来」决定（D36）。
+        logger.info("东财分红送配对 %s 回「返回数据为空」，换下一个源（%s）", symbol, exc)
+        return pl.DataFrame()
     if frame is None or len(frame) == 0:
         # 一次都没有过分红是一家真实存在的公司的正常状态，不是故障：返回空帧，
         # 让服务层把「查过了、没有」写成覆盖标记（D36）

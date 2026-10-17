@@ -264,3 +264,38 @@ def test_live_derived_reference_price_matches_the_open_on_ex_date():
     opened = float(bars.filter(pl.col("date") == date(2024, 7, 8))["open"][0])
     reference = ex_reference(prev_close, cash=cash, paid=0.0, share_multiplier=1.0)
     assert abs(reference - opened) / opened < 0.02, f"参考价 {reference} vs 开盘 {opened}"
+
+
+# --- 「东财说查无记录」与「东财崩了」必须长得不一样 ---------------------------------
+
+
+def crash_on_none_result(monkeypatch):
+    """复刻 akshare `stock_fhps_detail_em` 的真实崩溃：`data_json["result"]` 是 None。
+
+    002450、600636 实测走的就是这条路（东财回 code 9201「返回数据为空」），
+    而它抛出来的是 `TypeError: 'NoneType' object is not subscriptable`——一句答复
+    与一场故障在异常上完全同形。
+    """
+    import akshare as ak
+
+    def boom(symbol: str):
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    monkeypatch.setattr(ak, "stock_fhps_detail_em", boom)
+
+
+def test_a_no_records_answer_from_eastmoney_becomes_an_empty_frame_not_a_crash(monkeypatch):
+    """查无记录是一句答复：交回空帧，让降级链继续问同花顺，而不是烧掉这个源的健康预算。"""
+    from sams.datasource.akshare_cn import akshare_fhps
+
+    crash_on_none_result(monkeypatch)
+    assert akshare_fhps("002450", is_no_records=lambda symbol: True).is_empty()
+
+
+def test_a_crash_that_is_not_a_no_records_answer_still_raises(monkeypatch):
+    """接口改版也会让 `result` 是 None。分不清就照故障处理：静默当「没有记录」会把整只票抹平。"""
+    from sams.datasource.akshare_cn import akshare_fhps
+
+    crash_on_none_result(monkeypatch)
+    with pytest.raises(TypeError, match="NoneType"):
+        akshare_fhps("002450", is_no_records=lambda symbol: False)

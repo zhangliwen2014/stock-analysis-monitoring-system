@@ -40,6 +40,9 @@ class CorpActionSyncSummary:
     full_history: bool = False
     #: 请求终点在今天之后时被截断到的那天；没截断就是 None
     clamped_to: date | None = None
+    #: 这次一起说「查无记录」的源（0 条时才有值）。写覆盖确认时每个源各记一行，
+    #: 屏幕上也要说出来：否则「akshare 一家说没有」看起来与「akshare 与同花顺都说没有」一样
+    confirmed_empty_by: tuple[str, ...] = ()
 
 
 class CorpActionSyncService:
@@ -82,14 +85,17 @@ class CorpActionSyncService:
         covered_from = start
         if result.full_history and not result.frame.is_empty():
             covered_from = min(result.frame["ex_date"].to_list())
-        self.coverage.record(
-            market,
-            code,
-            covered_from=covered_from,
-            covered_to=covered_to,
-            full_history=result.full_history,
-            src=result.source,
-        )
+        # 「查无记录」是每个源各自说的一句话，确认就按源各记一行（覆盖表主键含 src）：
+        # 一句空答复只有在链上每个有能力的源都说了没有之后，才配写成「这只票没分过红」
+        for src in result.confirmed_empty_by or (result.source,):
+            self.coverage.record(
+                market,
+                code,
+                covered_from=covered_from,
+                covered_to=covered_to,
+                full_history=result.full_history,
+                src=src,
+            )
         logger.info(
             "%s %s 公司行为 %d 条（源 %s，确认至 %s%s）",
             market,
@@ -112,4 +118,5 @@ class CorpActionSyncService:
             covered_to=covered_to,
             full_history=result.full_history,
             clamped_to=clamped,
+            confirmed_empty_by=result.confirmed_empty_by,
         )

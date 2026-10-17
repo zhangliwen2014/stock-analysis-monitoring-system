@@ -17,6 +17,7 @@ from sams.datasource.sources import catalog, discover, kinds, known, markets_of,
 ADAPTER_MODULES = {
     "akshare_cn",
     "akshare_hk",
+    "akshare_ths",
     "eastmoney",
     "sina",
     "tencent",
@@ -68,6 +69,7 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
     """
     entries = catalog().by_kind()
     assert entries["akshare_hk"].capabilities == ("actions",)
+    assert entries["akshare_ths"].capabilities == ("actions",)
     assert entries["tencent"].capabilities == ("bars",)
     assert entries["akshare"].capabilities == ("bars", "actions")
 

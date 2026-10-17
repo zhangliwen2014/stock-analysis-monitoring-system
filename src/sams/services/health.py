@@ -30,6 +30,7 @@ KEY_TABLES = (
     "symbols",
     "bars_daily",
     "corp_actions",
+    "corp_actions_coverage",
     "trading_calendar",
     "users",
     "user_sessions",
@@ -51,6 +52,9 @@ class MarketData:
     latest: date | None
     with_amount: int
     negative_volume: int
+    #: 有 K 线但一条除权覆盖确认都没有的只数。这些票的跨除权日区间涨跌算不出来
+    #: （读取层的守卫会拒绝），而它们在行数上看起来与别的票一模一样
+    codes_without_actions: int = 0
 
     @property
     def amount_missing(self) -> int:
@@ -116,6 +120,7 @@ class HealthService:
         """
         if "bars_daily" not in self.db.table_names():
             return {}
+        uncovered = self._codes_without_coverage()
         rows = self.db.query(
             """
             SELECT market,
@@ -137,9 +142,33 @@ class HealthService:
                 latest=_as_date(r["latest"]),
                 with_amount=int(r["with_amount"]),
                 negative_volume=int(r["negative_volume"]),
+                codes_without_actions=uncovered.get(r["market"], 0),
             )
             for r in rows
         }
+
+    def _codes_without_coverage(self) -> dict[str, int]:
+        """每个市场里有 K 线、却没有一条除权覆盖确认的只数。
+
+        这一格是 D36 那一对的屏幕版本：`corp_actions` 的行数说的是「查到的记录」，
+        而「这只票从没分过红」与「从没查过这只票」只有覆盖表能分清。不列出来，
+        一库 30000 行看起来什么都有，实际上一半的票算不出区间涨跌。
+        """
+        tables = self.db.table_names()
+        if "corp_actions_coverage" not in tables or "bars_daily" not in tables:
+            return {}
+        rows = self.db.query(
+            """
+            SELECT b.market AS market,
+                   count(DISTINCT b.code) FILTER (WHERE c.code IS NULL) AS uncovered
+            FROM bars_daily b
+            LEFT JOIN corp_actions_coverage c ON b.market = c.market AND b.code = c.code
+            WHERE b.adjust = ?
+            GROUP BY b.market
+            """,
+            [ADJUST],
+        ).to_dicts()
+        return {r["market"]: int(r["uncovered"]) for r in rows}
 
     def _calendar_years(self) -> dict[str, list[int]]:
         if "trading_calendar" not in self.db.table_names():
