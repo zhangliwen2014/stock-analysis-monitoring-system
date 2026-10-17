@@ -460,7 +460,7 @@ def tz_frame(aware: datetime) -> pl.DataFrame:
 
 def test_should_reject_non_date_column_types(bars):
     """`cast(pl.Date)` 对带时区的 Datetime 一律取 **UTC 日历日**：
-    A 股 2024-01-01 00:30+08:00 会写成 2023-12-31。采集层 `base._to_date_expr`
+    A 股 2024-01-01 00:30+08:00 会写成 2023-12-31。采集层 `base.to_date_expr`
     先转字符串再解析，所以经过适配器的数据是对的；但直接调用 BarRepo 的写入方
     （M2 的推导序列、任何未来的第二写入路径）会静默错一天。
     仓库层无从知道市场时区，因此只接受 pl.Date，其它 dtype 报 StorageError。

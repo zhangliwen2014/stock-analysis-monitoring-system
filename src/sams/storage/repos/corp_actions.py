@@ -17,11 +17,12 @@ from datetime import date
 
 import polars as pl
 
+from sams.core.actions import ACTION_KINDS
 from sams.core.errors import ValidationError
 from sams.storage.db import Database
 
-#: 已知的公司行为类型。裸 VARCHAR 会让 M2 各写各的拼写
-KINDS = frozenset({"dividend", "split", "bonus", "transfer", "rights"})
+#: 词汇表在 core：采集侧与仓库侧认同一套拼写（见 core/actions 的说明）
+KINDS = ACTION_KINDS
 
 #: 每种类型允许带哪些数（D34）。缺了这张表，`ratio` 就会一列装三种语义：
 #: 「每股送 0.5 股」与「除权后是原来的 1.5 倍」是同一个事实的两种写法，

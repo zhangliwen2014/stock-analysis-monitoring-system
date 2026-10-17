@@ -22,8 +22,21 @@ from typing import Any
 from sams.core.errors import DatasourceError
 from sams.datasource.base import BarAdapter
 
-#: 本包里的基础设施模块，不是适配器，不参与自动发现
-_NOT_ADAPTERS = frozenset({"base", "registry", "ratelimit", "sources", "calendar_providers"})
+#: 本包里的基础设施模块，不是适配器，不参与自动发现。
+#: `*_actions.py` 是纯解析件：能力（`CorpActionAdapter`）由适配器类实现，注册表按 kind
+#: 建索引，同名的两个类会互相覆盖——所以一个源只能有一个适配器类，解析函数放外面。
+_NOT_ADAPTERS = frozenset(
+    {
+        "base",
+        "registry",
+        "ratelimit",
+        "sources",
+        "calendar_providers",
+        "actions",
+        "akshare_actions",
+        "yfinance_actions",
+    }
+)
 
 
 @dataclass(frozen=True)

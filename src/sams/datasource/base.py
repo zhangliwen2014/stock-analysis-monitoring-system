@@ -156,7 +156,7 @@ def normalize_bars(
     if volume_scale != 1.0:
         out = out.with_columns(pl.col("volume") * pl.lit(volume_scale))
 
-    out = out.with_columns(_to_date_expr(pl.col("date")))
+    out = out.with_columns(to_date_expr(pl.col("date")))
 
     before = out.height
     # is_not_null 挡不住 NaN：pandas 侧的「缺数据」恰恰是 NaN，存进去会覆盖上一根好 K 线
@@ -193,10 +193,10 @@ def parses_as_date(df: pl.DataFrame, column: str) -> bool:
     """
     if df.is_empty():
         return True
-    return bool(df.select(_to_date_expr(pl.col(column)).is_not_null().any()).item())
+    return bool(df.select(to_date_expr(pl.col(column)).is_not_null().any()).item())
 
 
-def _to_date_expr(col: pl.Expr) -> pl.Expr:
+def to_date_expr(col: pl.Expr) -> pl.Expr:
     """源侧日期形态不一：date、datetime、'YYYY-MM-DD'、'YYYYMMDD' 都出现过。
 
     统一先转成字符串再逐个格式尝试：Polars 2.0 起不允许把字符串列直接 cast 成 Date
