@@ -23,6 +23,7 @@
 ### 1.2 非目标
 
 - **不做实盘交易**：无券商接口，只有模拟账本。将来若需实盘，属新立项。
+- **不接券商持仓同步**：真实账户持仓通过手动录入或 CSV 导入形成镜像账本（D18），系统不读取也不写入券商。富途/IB 的查询接口对接属 M5 之后的独立决定，A 股个人无官方接口只能手工。
 - **不做机器学习黑盒预测**：所有估值与信号必须可解释到具体数据来源。LLM 在 M5 后仅允许用于**公告/新闻的分类打标**（利空/利好/无关 + 类别），其输出不参与价格区间、赔率与胜率的计算。
 - **不做细粒度 RBAC**：只有 admin / 普通用户两种角色。
 - **不做多写入高并发存储**：单进程写入，服务化拆分留到演进阶段。
@@ -51,6 +52,10 @@
 | D15 | 通知渠道与自选股导入两块直接移植 DSA（MIT）的成熟实现，不自研 | 这两处重复造轮子性价比最低 |
 | D16 | 与 DSA 并行使用而非 fork 改造：它做每日信息报告，本系统做盘中风控内核 | 其架构无常驻事件总线、无 thesis 对象、无账户风险语义，硬塞成本高于自研 |
 | D17 | LLM 仅用于公告/新闻分类打标，不参与估值计算 | 补住"突发事件钝感"短板，同时不破坏可解释性原则 |
+| D18 | 账本定位 = 真实券商账户的手动/CSV 录入镜像，一个用户可持多账户；持仓粒度 (account_id, code)；展示为分账户 + 跨账户按报告币种汇总 | 多账户的现实动机是"各账户分别盯止损，同时知道总暴露"；不建 mirror/sim 双模式，一套模型覆盖两种用途 |
+| D19 | 币种三权分立：标的币种（存储与计算）、账户多币种现金池、报告币种（仅展示）；录入永不折算 | 一个券商账户可同时含 HKD/USD/CNY 持仓；录入时折算一次会导致汇率变动后市值错账 |
+| D20 | 盈亏拆分为 price_pnl（标的币种）与 fx_pnl（汇兑），汇总单列汇兑贡献 | 否则无法解释"持仓币种涨 5% 而账户只赚 2%"，也无法判断该怪股票还是怪汇率 |
+| D21 | 交易规则（T+1、涨跌停、时段、日历）绑定标的市场；账户只决定现金/佣金/保证金/汇总币种 | 账户与市场不是一一对应关系 |
 
 ---
 
@@ -186,11 +191,15 @@ valuation_snapshots(id, thesis_id, date, scores_json, breakdown_json,
                     reward_risk, computed_at)
   breakdown_json 必须能追溯到具体输入数据（可解释性要求）
 
-rules(id, user_id, name, enabled, target_type, target_ref,
+rules(id, user_id, account_id, name, enabled, target_type, target_ref,
       kind, condition_kind, params_json, filters_json, cooldown_min,
       severity, channel_ids, thesis_id, created_at, updated_at)
+  account_id: 持仓/账户类规则必填（成本价与止损基准来自该账户持仓）；
+              纯行情类规则为 NULL（同一规则可服务多账户）
   condition_kind: 'template' | 'expression'(M5) | 'python'(不实现)
   thesis_id 为空 = 手工规则；非空 = 观点派生规则（不可删只可停用）
+  thesis 是标的层唯一判断，可被 1:N 个账户执行；账户级 override 止损参数
+  （如信用账户需更早止损）写入本表 params_json 并留 rule_revisions 痕迹
 
 rule_revisions(id, rule_id, changed_by, before_json, after_json, changed_at)
   防止"跌破后偷偷下移止损线"可追溯
@@ -207,10 +216,35 @@ alerts(id, user_id, rule_id, code, market, triggered_at, stage,
 
 notify_log(id, alert_id, channel_id, ts, success, error, attempt)
 
-sim_accounts(id, user_id, name, init_cash, currency)
-sim_orders(id, account_id, code, side, qty, price, ts, fee, thesis_id)
-sim_positions(account_id, code, qty, avg_cost, open_ts, last_price)
-  peak_price 不入库，由开仓日起 bars_daily.high 推导（保证规则评估是纯函数）
+sim_accounts(id, user_id, name, broker, market_scope, fee_model,
+             margin_enabled, report_currency)
+  一个用户可持多个账户（对应真实券商账户），持仓手动或 CSV 录入（D18）
+  账户不持单一币种：同一券商账户可同时含港股(HKD)、美股(USD)、沪港通标的(CNY)，
+  故本表不设 currency 字段，币种余额见 sim_cash_balances
+  本表只声明券商、可交易市场范围、佣金模型、是否信用账户、汇总展示币种
+  market_scope 仅用于校验"该账户能否下这个市场的单"，不决定交易规则
+
+sim_cash_balances(account_id, currency, amount, updated_at)
+  多币种现金池：同一账户每个币种一行余额
+  自然键: (account_id, currency)
+
+sim_orders(id, account_id, code, market, currency, side, qty, price, ts,
+           fee, fee_currency, fx_rate_applied, thesis_id)
+  currency 恒等于 symbols.currency（标的币种），录入与存储一律不做折算
+  fx_rate_applied 仅当该笔订单伴随换汇时记录，用于现金池对账
+
+sim_positions(account_id, code, market, currency, qty, avg_cost, open_ts,
+              last_price, last_price_ts)
+  粒度 (account_id, code)：同一只票在不同账户有各自独立的成本与数量
+  全部以标的币种计价；peak_price 不入库，由开仓日起 bars_daily.high 推导
+  （保证规则评估是纯函数）
+
+fx_trades(id, account_id, from_ccy, to_ccy, from_amt, to_amt, rate, ts)
+  账户内换汇流水；缺这张表则多币种现金池无法与券商对账
+
+fx_rates(date, base_ccy, quote_ccy, rate, source, is_stale)
+  需覆盖实际持币组合对：USD/CNY、HKD/CNY、USD/HKD、CNY/HKD 等；
+  缺失时沿用最近值并置 is_stale，汇总页必须显示"汇率截至 X 日"
 
 annotations(id, user_id, target_type, target_ref, body_md, tags_json,
              attachments_json, pinned, visibility, created_at, updated_at)
@@ -231,6 +265,33 @@ task_runs(id, job_name, market, started_at, finished_at, status,
 - **幂等**：所有采集写入按自然键 upsert，重试不产生重复行。
 - **陈旧标记**：采集失败时保留上次数据并置 `is_stale=true`；规则引擎遇 stale 数据**跳过不评估**。
 - **归档**：`quotes_snapshot` 按日滚动清理；原始接口响应落 Parquet 保留 30 天便于回放排查。
+
+### 5.4 多币种模型（一个账户含多币种持仓）
+
+**币种三权分立**——混淆这三者是跨市场账本最常见的错误来源：
+
+| 角色 | 定义 | 用在何处 |
+|---|---|---|
+| **标的币种** `symbols.currency` | 股票报价与结算币种（A股 CNY / 港股 HKD / 美股 USD / 沪港通港股 CNY 交收） | 行情、订单价、持仓成本、盈亏**存储与计算的唯一口径** |
+| **账户现金池币种** `sim_cash_balances` | 账户按币种分行的可用余额 | 判断"该账户有无钱买这只票"，必须同币种匹配 |
+| **报告币种** `sim_accounts.report_currency` | 用户选定的汇总展示币种（默认 CNY） | **只出现在展示层**，从不回写存储 |
+
+四条硬规则：
+
+1. **录入与存储永远用标的币种，不做折算**。折算只在展示层发生，每次展示按当日汇率重算。录入时折算一次并保存，是"汇率变了而市值不动"这类错账的根源。
+2. **收益拆成两段显示**，否则无法解释"美股涨 5%、账户只赚 2%"：
+
+```
+price_pnl = (last_price - avg_cost) × qty        // 标的币种，反映投资本身
+fx_pnl    = 本币市值 × (今日汇率/基准汇率 - 1)     // 报告币种，反映汇率贡献
+持仓总变动(报告币种) = price_pnl × 基准汇率 + fx_pnl
+```
+
+分账户与跨账户汇总均给本币口径与报告币种口径两套数字，并单列 `fx_pnl` 合计。
+3. **阈值类规则的币种口径必须明确**：百分比类（浮亏 >8%、单日涨跌 >5%）无币种歧义，优先采用；金额类（主力净流入 >1000 万）恒用**标的币种**，界面同时显示折算值。系统内不允许出现未标注币种的金额阈值。
+4. **换汇是显式流水**（`fx_trades`），不是直接改余额字段——缺它多币种现金池无法与券商对账。M3 允许手工调整现金余额并写审计记录，`fx_trades` 完整实现排 M5。
+
+附带影响：交易日历、时段、T+1/T+0、涨跌停由**标的所属市场**决定（§6、§10.2）；账户只决定现金、佣金、保证金与汇总币种。同一只美股在不同券商账户的成本差异来自佣金与换汇价，而非交易规则。
 
 ---
 
@@ -398,7 +459,9 @@ MA(5/10/20/60/120/250)、EMA、MACD、RSI(6/14)、BOLL(20,2)、KDJ、ATR(14)、O
 - `exclude_halt`：停牌不推
 - `no_open_alert`：该股票已有未处理告警时不重复推
 
-**节流**：`cooldown_min`（默认 30），同规则同标的冷却期内不重复推送。进程重启从 `alerts` 表恢复冷却状态，不重复推送。防刷屏是监控系统体验的生死线。
+**节流**：`cooldown_min`（默认 30），去重键为 `(rule_id, market, code, account_id)`——同一只票在两个账户分别破止损必须各报一次，账户为 NULL 的行情类规则退化为 `(rule_id, market, code)`。进程重启从 `alerts` 表恢复冷却状态，不重复推送。防刷屏是监控系统体验的生死线。
+
+**组合级指标按账户计算**：单票浮盈浮亏、距止损距离、仓位占比在账户内算；当日盈亏、最大回撤、板块集中度提供两个口径——分账户 + 跨账户汇总（多币种按 `fx_rates` 当日汇率折 CNY）。跨账户重复持有同一标的需单独提示（合计暴露可能被低估）。
 
 **评估是纯函数**：`evaluate(event, rule, history, state) -> Hit | None`，不发通知、不碰 IO。因此可单测全覆盖，也可在历史数据上重放验证规则写得好不好（`cli rules replay`）。
 
@@ -418,10 +481,12 @@ MA(5/10/20/60/120/250)、EMA、MACD、RSI(6/14)、BOLL(20,2)、KDJ、ATR(14)、O
 
 **三级触发**：`pre`（距止损 3%，弱渠道）→ `hit`（跌破，企微+桌面+语音）→ `urgent`（跳空低开破位，集合竞价阶段即报，不给拖延机会）。
 
-**A 股执行约束必须写进告警文案**（否则告警误导决策）：
+**执行约束必须写进告警文案**（否则告警误导决策）。约束由**标的所属市场**决定，不由账户决定——同一账户里的 A 股仍 T+1、美股仍 T+0（见 §5.4）：
 
-- T+1：文案标「今日买入，受 T+1 限制无法当日卖出」
-- 跌停封板：文案标「跌停封板，可能无法按预期价执行」
+- 标的市场为 A 股且 `settlement` 为 T+1 且今日买入：文案标「今日买入，受 T+1 限制无法当日卖出」
+- 标的市场为 A 股且跌停封板：文案标「跌停封板，可能无法按预期价执行」
+- 账户 `margin_enabled=true`：追加维持担保比例提示（规则本身 M5）
+- 金额型阈值与盈亏额一律带币种标注（标的币种 + 报告币种折算值）
 
 **除权除息**：`bars_daily.adj_factor` 驱动成本价与止损价换算，避免每次除权误报"跌破止损"——列为 M3 强制验收用例。
 
@@ -463,7 +528,7 @@ class Notifier(Protocol):
 - **路由**：规则绑定渠道列表；未指定时降级到用户默认渠道；默认渠道也没有则写 `notify_log` 失败记录，不静默丢弃。
 - **严重级别 → 渠道默认映射**（可覆盖）：`强`(止损/赔率崩塌/停牌/解禁) → 语音+企微+桌面；`中` → 企微；`弱`(盘后总结/扫描) → 邮件或仅 Web 查看。
 - **重试**：失败退避重试 3 次；最终失败不影响规则引擎继续运行；`NotifyFailed` 事件让 admin 后台可见。
-- **消息格式**：`[市场] 名称 代码 | 规则描述 | 当前值/阈值 | 时间 | 阶段`，附操作提示（如"距止损 2.1%，T+1 限制"）；各渠道按长度限制裁剪。
+- **消息格式**：`[市场][账户名] 名称 代码 | 规则描述 | 当前值/阈值 | 时间 | 阶段`，账户名为空则省略该段——多账户下不带账户名的止损告警无法行动。附操作提示（如"该账户为 T+1，今日买入无法当日卖出"）；各渠道按长度限制裁剪。
 - **静默**：非交易时段/节假日由调度层控制，不写进规则本身；用户级免打扰时段独立配置。
 - 凭据 Fernet 加密，日志与 admin 界面一律脱敏。
 
@@ -500,6 +565,8 @@ class Notifier(Protocol):
 | **反未来函数** | 专项用例 | 篡改 T+1 数据后 T 日指标逐位不变；盘中未定型 K 线不产出收盘结论 |
 | 交易日历 | 单测 + 真实快照 fixture | A 股调休补班、港股半天与临时停市、美股夏令时切换日、美股提前收市 |
 | 止损止盈 | 状态推导单测 | trailing 的 peak 推导正确；**除权除息后不误报跌破止损**；T+1/跌停文案分支 |
+| 多账户 | 单测 | 同一标的两账户不同成本 → 各自止损价正确且不互相覆盖；节流键含 account_id（A 触发后 B 仍报）；持仓类规则缺 account_id 被拒 |
+| 多币种 | 单测（固定汇率 fixture） | 录入不折算（存储值恒为标的币种）；price_pnl 与 fx_pnl 之和等于本币总变动；汇率缺失时标 stale 并在汇总页显示截止日；未标注币种的金额阈值被拒 |
 | 采集适配器 | 契约测试（录制真实响应） | 空数据、字段缺失、429 限流、停牌异常值 → 不崩且标记 stale |
 | 仓库层 | 内存 DuckDB 单测 | 幂等 upsert 重跑无重复行；**用户隔离**（查 A 拿不到 B）；非法状态跳转被拒 |
 | 指标/估值 | 黄金样例对比 | MA/MACD/RSI 与已知值一致；赔率公式与手算一致；分项 evidence 可追溯 |
@@ -537,9 +604,9 @@ core（配置/事件总线/交易日历/类型）、storage（全部表 + 仓库
 
 ### M3 监控告警（详设 §10 §11 §12）
 
-规则模板引擎与止损止盈九种（模板集合按 M0 裁剪结果实现，§10.3 的 40 个为能力目录而非承诺数量）、过滤条件组合、三级触发、事件总线、**五个通知渠道**（企微钉钉/邮件/桌面/语音/PushPlus）、按市场调度器、stale 处理、崩溃恢复、admin 系统健康页、**模拟账本基础**（手动录入订单与持仓，供持仓类与止损止盈规则使用；不含回测）。
+规则模板引擎与止损止盈九种（模板集合按 M0 裁剪结果实现，§10.3 的 40 个为能力目录而非承诺数量）、过滤条件组合、三级触发、事件总线、**五个通知渠道**（企微钉钉/邮件/桌面/语音/PushPlus）、按市场调度器、stale 处理、崩溃恢复、admin 系统健康页、**多账户多币种账本**（一个用户多账户、账户内多币种现金池、订单与持仓手动/CSV 录入、汇率日采集与折算、盈亏拆 price_pnl/fx_pnl，供持仓类与止损止盈规则使用；不含回测与 fx_trades）。
 
-**验收**：**挂机运行一个真实 A 股交易日**——自选股无漏报、无同规则 30 分钟内刷屏、非交易时段全静默、除权股无误报、重启后不重复推送；录入一笔模拟持仓后 `stop.pct`/`stop.trailing` 规则可按成本价正确评估。
+**验收**：**挂机运行一个真实 A 股交易日**——自选股无漏报、无同规则 30 分钟内刷屏、非交易时段全静默、除权股无误报、重启后不重复推送；建两个账户（一个持 A 股 CNY、一个同时持港股 HKD 与美股 USD），同一标的两账户设不同成本 → 各自止损按自己成本正确触发、两条告警不互相吞、汇总页本币与报告币种两套数字一致且汇兑贡献单列。
 
 ### M4 范围（本 spec 不展开实施细节）
 
@@ -547,7 +614,7 @@ Streamlit 看板（行情/观点/持仓对比/告警历史/admin 全量只读）
 
 ### M5 范围
 
-backtrader 回测引擎（复用 M3 已有的模拟账本模型，不另建一套）、胜率回填（标注样本数）、止损参数横向比较（8% vs 12% vs trailing vs ATR）、表达式 DSL、资金流/事件公告（含 LLM 分类打标，D17）/估值分位/全市场扫描/指数板块盘后监控（配置开关）、规则忽略率统计、Docker 化与服务器部署、qlib 因子后端可选接入。
+backtrader 回测引擎（复用 M3 已有的模拟账本模型，不另建一套）、胜率回填（标注样本数）、止损参数横向比较（8% vs 12% vs trailing vs ATR）、表达式 DSL、资金流/事件公告（含 LLM 分类打标，D17）/估值分位/全市场扫描/指数板块盘后监控（配置开关）、规则忽略率统计、`fx_trades` 换汇流水与现金池对账、信用账户维持担保比例告警、Docker 化与服务器部署、qlib 因子后端可选接入。
 
 ---
 
