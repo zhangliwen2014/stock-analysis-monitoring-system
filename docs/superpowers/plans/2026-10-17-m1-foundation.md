@@ -161,7 +161,7 @@ CLI 实跑（独立临时库，不碰开发库）：
 
 ### 有意不修的东西写进了 spec §18
 
-负成交量原样入库、停牌 vs 日历缺口不交叉核对（§6.5 给了可实现的替代口径）、告警粒度暂为「源」而非「源×市场」、`list_for()` 不带 `until` 会返回未来除权日、`SAMS_SECRET_KEY` 必填但 M1 无消费者、港美股单源无降级目标——spec §18 的 U1–U11 每条各自记了「为什么不修」和「何时必须处理」，不留在口头。
+负成交量原样入库、停牌 vs 日历缺口不交叉核对（§6.5 给了可实现的替代口径）、告警粒度暂为「源」而非「源×市场」、`list_for()` 不带 `until` 会返回未来除权日、`SAMS_SECRET_KEY` 必填但 M1 无消费者——spec §18 的 U1–U11 每条各自记了「为什么不修」和「何时必须处理」，不留在口头。（原列在此处的「港美股单源无降级目标」已随 §7.1 补齐备源而闭合，见 U5。）
 
 分层守卫顺手加了一条：`tests/test_layering.py::test_third_party_imports_are_gated` 按 AST 检查第三方库的落点——`duckdb` 只在 `storage/db.py`、`requests`/`akshare`/`yfinance`/`exchange_calendars` 只在 `datasource/`、`bcrypt` 只在 `storage/repos/users.py`、`pandas` 全库禁止。「换存储只动一层」这句话能不能兑现，取决于有没有人在方便的地方顺手 import 了 duckdb。
 
