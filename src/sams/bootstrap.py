@@ -19,6 +19,7 @@ from sams.datasource.calendar_providers import default_providers
 from sams.datasource.registry import AdapterRegistry
 from sams.datasource.sources import build as build_source
 from sams.services.accounts import AccountService
+from sams.services.analysis import AnalysisService
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.health import HealthService
@@ -75,6 +76,7 @@ class Container:
     calendar: CalendarService
     sync: SyncService
     corp_action_sync: CorpActionSyncService
+    analysis: AnalysisService
     health: HealthService
     source_admin: SourceAdminService
 
@@ -182,5 +184,6 @@ def build_container(
         corp_action_sync=CorpActionSyncService(
             registry, corp_actions, corp_actions_coverage, clock=clock
         ),
+        analysis=AnalysisService(bars, corp_actions, corp_actions_coverage, clock=clock),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )

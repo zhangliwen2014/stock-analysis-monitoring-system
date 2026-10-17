@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 import pytest
@@ -465,3 +465,100 @@ def test_health_shows_negative_volume_rows(container, capsys):
 def test_health_says_a_market_has_no_bars_yet(container, capsys):
     assert cli_run_on(container, ["health"]) == 0
     assert "（无日线，还没采集过）" in capsys.readouterr().out
+
+
+# --- `sams analysis return`：唯一一条过闸的读数路径 ---------------------------------
+
+
+def analysis_argv(start="2024-07-01", end="2024-07-11", code="601088"):
+    return [
+        "analysis",
+        "return",
+        "--market",
+        "A",
+        "--code",
+        code,
+        "--start",
+        start,
+        "--end",
+        end,
+    ]
+
+
+def seed_crossing_ex_date(container, *, cover=True):
+    """601088 那一次：除息前收 42.00、每股派 2.10 ⇒ 参考价 39.90，除息当天收 40.40。
+
+    裸价读作 −3.81%、交易所口径读作 +1.26% 的那一对数，就是这条命令要区分的两件事。
+    """
+    days = [date(2024, 7, 1) + timedelta(days=i) for i in range(11)]
+    closes = [41.00, 41.20, 41.40, 41.60, 41.80, 42.00, 42.00, 40.40, 41.00, 41.40, 42.00]
+    container.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * 11,
+                "code": ["601088"] * 11,
+                "date": days,
+                "close": closes,
+                "source": ["akshare"] * 11,
+            }
+        )
+    )
+    container.corp_actions.upsert_many(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["601088"],
+                "ex_date": [date(2024, 7, 8)],
+                "kind": ["dividend"],
+                "cash_per_share": [2.10],
+                "ratio": [None],
+                "price": [None],
+                "src": ["akshare"],
+                "note": ["10派21.00元(含税)"],
+            }
+        )
+    )
+    if cover:
+        container.corp_actions_coverage.record(
+            "A",
+            "601088",
+            covered_from=date(2024, 7, 1),
+            covered_to=date(2024, 7, 11),
+            full_history=False,
+            src="akshare",
+        )
+
+
+def test_analysis_return_prints_both_calibers_and_which_one_to_trust(container, capsys):
+    """守卫再严，敲不出来就等于没有：这条命令是复权数唯一的出口。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv()) == 0
+    out = capsys.readouterr().out
+    # 42.00/41.00-1 = +2.44%（裸价）；42.00×(42.00/39.90)/41.00-1 = +7.83%（复权）
+    assert "+7.83%" in out and "+2.44%" in out
+    assert "采信这个" in out and "覆盖确认：akshare" in out
+    assert "错数" in out
+
+
+def test_analysis_return_refuses_an_unconfirmed_window(container, capsys):
+    """没确认过的区间一个字都不给：半截裸价数比拒绝危险得多。"""
+    seed_crossing_ex_date(container, cover=False)
+    assert cli_run_on(container, analysis_argv()) == 1
+    out = capsys.readouterr().out
+    assert "拒绝出数" in out and "sync actions" in out
+    assert "+2.44%" not in out
+
+
+def test_analysis_return_says_which_two_bars_it_anchored_on(container, capsys):
+    """请求 7-15 而库里到 7-11 为止：数照样给（几天缺口是常态），但锚点要写在脸上。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv(end="2024-07-15")) == 0
+    out = capsys.readouterr().out
+    assert "这两根出的数" in out and "2024-07-11" in out
+
+
+def test_analysis_return_names_a_window_the_bars_do_not_cover(container, capsys):
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv(end="2024-12-31")) == 1
+    assert "只覆盖" in capsys.readouterr().out
+

@@ -20,11 +20,13 @@ SRC = ROOT / "sams"
 #: 每个层允许 import 的其它层。缺的方向一律禁止，包括同层横串（storage ↔ datasource）。
 #: 后四行是 spec §3.1 声明但尚未落地的层：先把依赖规则写全，M2 建目录时才不必开后门
 #: ——守卫一旦为了临时方便被放宽，就再也不会被收紧。
+#: services → analysis 是单向的：读用例负责取数与定口径，分析层不反向认识任何服务，
+#: 否则指标引擎将来被 monitor/trading 复用时会出现第二条绕过守卫的取数路径。
 ALLOWED: dict[str, set[str]] = {
     "core": set(),
     "storage": {"core"},
     "datasource": {"core"},
-    "services": {"core", "storage", "datasource"},
+    "services": {"core", "storage", "datasource", "analysis"},
     "analysis": {"core", "storage"},
     "monitor": {"core", "storage", "datasource", "services", "analysis"},
     "trading": {"core", "storage", "services", "analysis"},
