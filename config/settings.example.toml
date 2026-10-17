@@ -1,0 +1,39 @@
+# SAMS 配置模板：复制为 config/settings.toml 后修改。
+# 秘密（secret_key）不要写在这里，用环境变量 SAMS_SECRET_KEY 提供。
+
+[storage]
+db_path = "data/sams.duckdb"
+
+[general]
+report_currency = "CNY"      # 汇总页折算目标币种
+rate_limit_per_s = 5         # 单源请求上限（spec §6.1）
+polling_interval_s = 10      # 盘中轮询间隔
+cooldown_min = 30            # 同一规则命中后的冷却
+
+# sources 是降级顺序：前一个失败才用后一个。
+# post_close_min 是盘后任务的延迟分钟数，美股给大些让任务落到工作日上午。
+[markets.A]
+tz = "Asia/Shanghai"
+currency = "CNY"
+post_close_min = 30
+sources = ["akshare", "eastmoney"]
+
+[markets.HK]
+tz = "Asia/Hong_Kong"
+currency = "HKD"
+post_close_min = 30
+sources = ["yfinance"]
+
+[markets.US]
+tz = "America/New_York"
+currency = "USD"
+post_close_min = 60
+sources = ["yfinance"]
+# 盘前/盘后默认不参与轮询，规则需要时才显式启用（spec §6.1）
+[markets.US.extended.pre]
+open = "04:00"
+close = "09:30"
+
+[markets.US.extended.post]
+open = "16:00"
+close = "20:00"
