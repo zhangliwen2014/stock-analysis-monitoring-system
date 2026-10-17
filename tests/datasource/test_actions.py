@@ -82,6 +82,7 @@ def test_missing_required_column_is_drift_not_nulls():
 
 
 def test_no_numeric_column_at_all_is_drift():
+    """列整个不见了是改版；列在但值为空才是「这件事折不出数」（D39）。"""
     with pytest.raises(FieldDrift, match="三类数值列全缺"):
         get(pl.DataFrame({"ex_date": [date(2024, 7, 8)], "kind": ["dividend"]}))
 
@@ -161,3 +162,32 @@ def test_empty_actions_is_a_successful_empty_frame_not_a_failure():
         "note",
     ]
     assert frame.schema["ex_date"] == pl.Date
+
+
+#: 三条数值列齐备但全空：这是「源报了一件折不出数的事」的形状，不是改版
+_NO_NUMBERS = {"cash_per_share": [None], "ratio": [None], "price": [None]}
+
+
+def test_an_unpriceable_row_is_kept_rather_than_dropped_as_noise():
+    """D39：unknown 带着空数值是**有意**的记录，不是「三个数值全空」的那类噪声行。
+
+    丢掉的后果不对称：多留一行噪声只是多一条拒答，少一行实物分派则让跨那天的涨跌
+    悄悄偏掉几个点，而港美股没有涨跌停证据规则（D37）可兜。
+    """
+    frame = pl.DataFrame(
+        {
+            "ex_date": [date(2024, 7, 8)],
+            "kind": ["unknown"],
+            "note": ["以股代息，比例未披露"],
+            **_NO_NUMBERS,
+        }
+    )
+    out = get(frame)
+    assert out["kind"].to_list() == ["unknown"]
+    assert out["cash_per_share"].to_list() == [None]
+
+
+def test_a_pricable_kind_with_no_numbers_at_all_is_still_noise():
+    """反过来也成立：dividend 而三个数值全空，是没定案的预案，不该留下。"""
+    with pytest.raises(EmptyResponse):
+        get(pl.DataFrame({"ex_date": [date(2024, 7, 8)], "kind": ["dividend"], **_NO_NUMBERS}))

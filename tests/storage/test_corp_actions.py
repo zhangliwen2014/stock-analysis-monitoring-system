@@ -39,9 +39,30 @@ def test_same_ex_date_different_kind_coexist(repo):
     assert repo.count() == 2, "同一天既派息又送股是真实存在的情形"
 
 
-def test_unknown_kind_is_rejected(repo):
+def test_an_unrecognized_kind_spelling_is_rejected(repo):
     with pytest.raises(ValidationError, match="未知公司行为类型"):
         repo.upsert(_action(kind="分紅"))
+
+
+def test_an_unpriceable_action_is_stored_with_its_source_text(repo):
+    """D39：unknown 是一种**记录**，不是缺数据——它带的原文是下游拒绝时的依据。"""
+    repo.upsert(
+        _action(
+            kind="unknown", cash_per_share=None, ratio=None, price=None, note="以股代息，比例未披露"
+        )
+    )
+    assert repo.count() == 1
+
+
+def test_an_unpriceable_action_without_a_note_is_rejected(repo):
+    with pytest.raises(ValidationError, match="原文"):
+        repo.upsert(_action(kind="unknown", cash_per_share=None, note=None))
+
+
+def test_an_unpriceable_action_carrying_a_number_is_rejected(repo):
+    """能给出数值就说明知道它是哪一种，标 unknown 是在逃避类型校验。"""
+    with pytest.raises(ValidationError, match="不该带数值"):
+        repo.upsert(_action(kind="unknown", cash_per_share=None, ratio=1.5))
 
 
 def test_action_without_amount_or_ratio_is_rejected(repo):

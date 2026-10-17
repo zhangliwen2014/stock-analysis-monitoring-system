@@ -131,6 +131,24 @@ def test_unroute_is_refused_for_the_last_source(admin):
         admin.unroute("HK", "yfinance")
 
 
+def test_an_actions_only_source_is_not_a_backup_for_bars(admin):
+    """摘掉最后一个能取日线的源，链上还剩 akshare_hk——它一个价格都拉不到。
+
+    「还剩几个源」不是判据，「还剩几个能取日线的源」才是（D38）：按前者放行，
+    `sams health` 会说 HK 有两个源，而采集要到下一次才发现 HK 失明。
+    """
+    assert admin.unroute("HK", "tencent")
+    with pytest.raises(ValidationError, match="先加备源"):
+        admin.unroute("HK", "yfinance")
+
+
+def test_disable_follows_the_same_capability_rule(admin):
+    admin.unroute("HK", "tencent")
+    with pytest.raises(ValidationError, match="完全取不到数"):
+        admin.set_enabled("yfinance", False)
+    assert admin.chains()["HK"] == ("yfinance", "akshare_hk"), "被拒绝的操作不许改库"
+
+
 def test_a_second_source_unblocks_disabling_the_first(admin):
     admin.add("yf2", "yfinance", ["HK"])
     admin.set_enabled("yfinance", False)

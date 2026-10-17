@@ -74,9 +74,14 @@ def test_registry_chain_comes_from_the_database(migrated):
     try:
         assert built.registry.market_sources == {
             "A": ("akshare", "eastmoney", "tencent", "sina"),
-            "HK": ("yfinance", "tencent"),
+            # 链是「按市场的路由」，不是「谁能取日线」：akshare_hk 只报公司行为，
+            # 采集时被跳过（D38），备源判据走 registry.chain_for(market, method)
+            "HK": ("yfinance", "tencent", "akshare_hk"),
             "US": ("yfinance", "tencent"),
         }
+        assert built.registry.chain_for("HK", "daily_bars") == ("yfinance", "tencent")
+        assert built.registry.chain_for("HK", "corp_actions") == ("yfinance", "akshare_hk")
+        assert built.registry.chain_for("A", "corp_actions") == ("akshare",)
     finally:
         built.close()
 

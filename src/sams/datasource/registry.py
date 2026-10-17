@@ -226,6 +226,19 @@ class AdapterRegistry:
         except KeyError:
             raise DatasourceError("registry", f"数据源 {name} 未注册") from None
 
+    #: 两类能力各自的判据，取数与健康检查共用（D38）
+    CAPABILITIES = {"daily_bars": has_bars, "corp_actions": has_actions}
+
+    def chain_for(self, market: str, method: str) -> tuple[str, ...]:
+        """链上真有这个能力的源。
+
+        缺能力的源在 `fetch_daily`/`fetch_actions` 里被跳过，所以「这个市场有几个备源」
+        必须按同一口径数：把只有公司行为的 akshare_hk 算成港股日线的备源，健康页就会在
+        「HK 只剩一个源在拉价格」的时候显示一切正常。
+        """
+        probe = self.CAPABILITIES[method]
+        return tuple(name for name in self.sources_for(market) if probe(self.adapter(name)))
+
     def fetch_daily(self, market: str, code: str, start: date, end: date) -> FetchResult:
         attempts: list[Attempt] = []
         skipped: list[tuple[str, str]] = []

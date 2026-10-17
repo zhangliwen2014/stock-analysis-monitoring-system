@@ -88,8 +88,10 @@ def normalize_actions(
       * `kind` 出现不认识的值 ⇒ 整批失败（FieldDrift）。少认一种类型就是少乘一次除权，
         而序列上看不出任何异常；改版导致的新类型必须当场响。
       * 数值出现负数 ⇒ 整批失败。负派息不存在，出现就是解析错位，乘进因子会漂一整段。
-      * 缺 `ex_date`、缺 `kind`、三个数值全空 ⇒ 丢掉并计数告警。这些是源里的常态噪声
-        （预案未定、不分红的报告期），不是改版。
+      * 缺 `ex_date`、缺 `kind`、非 unknown 却三个数值全空 ⇒ 丢掉并计数告警。这些是源里的
+        常态噪声（预案未定、不分红的报告期），不是改版。
+      * `kind = unknown` 允许三个数值全空：它记的是「这天确实有件事，但我折不出数」（D39），
+        读取层见到它就拒绝，而不是把它当成没发生过。
     """
     column_map = dict(column_map or {c: c for c in ACTION_COLUMNS})
     absent = [column_map[k] for k in ("ex_date", "kind") if column_map.get(k) not in raw.columns]
@@ -138,8 +140,11 @@ def normalize_actions(
     out = out.filter(pl.col("ex_date").is_not_null() & pl.col("kind").is_not_null())
     no_date = before - out.height
     before = out.height
+    # `unknown` 带着空数值是**有意**的：那是「这一天确实动了东西，但我折算不出数」的记录（D39），
+    # 读取层见到它就拒绝出数。其余类型三个数值全空才是源里的噪声行（未定预案、不分红的报告期）
     out = out.filter(
-        pl.col("cash_per_share").is_not_null()
+        (pl.col("kind") == "unknown")
+        | pl.col("cash_per_share").is_not_null()
         | pl.col("ratio").is_not_null()
         | pl.col("price").is_not_null()
     )

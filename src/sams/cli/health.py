@@ -60,9 +60,24 @@ def show(container: Container, args: argparse.Namespace) -> int:
     print(f"[降级链]（{'库里的记录' if from_db else '配置文件兜底'}）")
     for market in sorted(container.settings.markets):
         chain = container.registry.market_sources.get(market, ())
-        mark = "  ⚠ 单源，主源挂了就没有备源" if len(chain) == 1 else ""
-        mark = mark or ("  ⚠ 没有任何可用源" if not chain else "")
-        print(f"  {market:<4} {' → '.join(chain) or '（空）'}{mark}")
+        # 按能力数备源（D38）：只有公司行为的源兜不住日线，把它算进日线备源
+        # 会让「HK 只有一个源在拉价格」显示成正常
+        bars = container.registry.chain_for(market, "daily_bars") if chain else ()
+        actions = container.registry.chain_for(market, "corp_actions") if chain else ()
+        marks = []
+        if not chain:
+            marks.append("没有任何可用源")
+        else:
+            if len(bars) == 1:
+                marks.append("日线单源，主源挂了就没有备源")
+            if not actions:
+                marks.append("没有公司行为源，跨除权日的区间涨跌无从计算")
+            elif len(actions) == 1:
+                marks.append(f"公司行为单源（{actions[0]}）")
+        shown = " → ".join(
+            n if n in bars else f"{n}(仅公司行为)" for n in chain
+        ) or "（空）"
+        print(f"  {market:<4} {shown}" + "".join(f"  ⚠ {m}" for m in marks))
     print("[数据源]")
     for source in report.sources:
         state = (

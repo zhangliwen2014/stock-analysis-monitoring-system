@@ -7,8 +7,9 @@
 两条不可绕过的规则：
   * `kind` 必须是注册表里已有的实现名——配置里不接受模块路径或 import 字符串，
     否则管理后台就成了远程代码执行入口。
-  * 停用/删除不能把某个市场弄成**零可用源**：那样下次启动 registry 直接抛错，
+  * 停用/删除不能把某个市场弄成**没有能取日线的源**：那样下次启动 registry 直接抛错，
     而现场看起来「刚才是好的」。要真撤干净，得先把备源加上。
+    （只报公司行为的源不算数——它兜不住价格，见 D38。）
 """
 
 from __future__ import annotations
@@ -140,7 +141,7 @@ class SourceAdminService:
         dark = self._would_go_dark(market, dropping={name})
         if dark:
             raise ValidationError(
-                f"市场 {market} 只有 {name} 一个源，摘掉它就没有任何源可用了；先加备源"
+                f"市场 {market} 摘掉 {name} 就没有能取日线的源了；先加备源"
             )
         return self.repo.remove_route(market, name)
 
@@ -238,15 +239,9 @@ class SourceAdminService:
             raise ValidationError(f"市场 {market} 没在配置里定义，不能建路由")
 
     def _require_markets_keep_sources(self, name: str, *, keeping: bool) -> None:
-        """停用/删除前确认不会把某个市场弄成零源。"""
-        markets = [m for m, n, _ in self.repo.routes() if n == name]
-        for market in markets:
-            others = {
-                n
-                for m, n, _ in self.repo.routes()
-                if m == market and n != name and self._is_enabled(n)
-            }
-            if not others:
+        """停用/删除前确认不会把某个市场弄成「没有能取日线的源」。"""
+        for market in self._markets_of(name):
+            if not self._bars_sources_in(market, dropping={name}):
                 verb = "删除" if keeping else "停用"
                 raise ValidationError(
                     f"市场 {market} 只有 {name} 一个可用源，{verb}它会让该市场完全取不到数；"
@@ -255,12 +250,29 @@ class SourceAdminService:
                 )
 
     def _would_go_dark(self, market: str, *, dropping: set[str]) -> bool:
-        remaining = {
+        return not self._bars_sources_in(market, dropping)
+
+    def _markets_of(self, name: str) -> set[str]:
+        return {m for m, n, _ in self.repo.routes() if n == name}
+
+    def _bars_sources_in(self, market: str, dropping: set[str]) -> set[str]:
+        """市场上还剩几个**能取日线**的启用源。
+
+        「还有源」不等于「还能取到价格」：D38 之后链上可以只有一个只报公司行为的源
+        （akshare_hk），把它当备源，`sams source` 会允许把最后一个拉价格的源摘掉，
+        而 registry 只在采集时才发现链上没人能提供日线。
+        """
+        left = {
             n
             for m, n, _ in self.repo.routes()
             if m == market and n not in dropping and self._is_enabled(n)
         }
-        return not remaining
+        return {n for n in left if self._has_bars(n)}
+
+    def _has_bars(self, name: str) -> bool:
+        row = self.repo.get(name)
+        entry = known().get(row.kind) if row else None
+        return bool(entry and "bars" in entry.capabilities)
 
     def _is_enabled(self, name: str) -> bool:
         row = self.repo.get(name)

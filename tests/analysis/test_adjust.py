@@ -144,3 +144,20 @@ def test_factors_accumulate_over_several_ex_dates():
     )
     # 97 是真的跌了一元（98→97），不是又一次除权：复权后按 100 的基准读作 −1.02%
     assert frame["close_hfq"].to_list() == pytest.approx([100.0, 100.0, 100.0, 98.9796], abs=1e-4)
+
+
+def test_an_unpriceable_action_refuses_the_whole_series():
+    """D39：折不出数的公司行为（港股实物分派这类）不能当没发生过。
+
+    少乘一次除权在图上看不出来，而港美股没有涨跌停证据规则（D37）可兜——这条拒绝
+    就是唯一那道闸。
+    """
+    with pytest.raises(NotAdjustable, match="以股代息"):
+        hfq_frame(bars(100.0, 99.0), actions((D1, "unknown", None, None, None))
+                  .with_columns(pl.lit("以股代息，比例未披露").alias("note")))
+
+
+def test_a_known_kind_still_derives_a_factor():
+    """拒绝只认 unknown：其余类型照常推导，别把整条链一起挡死。"""
+    frame = hfq_frame(bars(100.0, 99.0), actions((D1, "dividend", 1.0, None, None)))
+    assert frame["adj_factor"].to_list() == pytest.approx([1.0, 100.0 / 99.0])

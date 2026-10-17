@@ -39,14 +39,16 @@ def row(name="alpha", kind="tencent", enabled=True, options=None, note=None) -> 
     return SourceRow(name=name, kind=kind, enabled=enabled, options=options, note=note)
 
 
-def test_migration_seeds_five_sources_and_three_chains(repo):
+def test_migration_seeds_six_sources_and_three_chains(repo):
     """种子的意义：老库跑完迁移就有备源，不需要谁来手工插记录。"""
     assert repo.chains() == {
         "A": ("akshare", "eastmoney", "tencent", "sina"),
-        "HK": ("yfinance", "tencent"),
+        # akshare_hk 只报公司行为（D38）：它在日线链上会被跳过，在这儿是为了让
+        # 除权同步有一条能走的链——港美股的除权记录比价格更难拿
+        "HK": ("yfinance", "tencent", "akshare_hk"),
         "US": ("yfinance", "tencent"),
     }
-    assert len(repo.list()) == 5
+    assert len(repo.list()) == 6
 
 
 def test_seeded_kinds_match_names(repo):
@@ -56,7 +58,7 @@ def test_seeded_kinds_match_names(repo):
 
 def test_migrations_are_idempotent_for_the_seed(repo):
     apply_migrations(repo.db)
-    assert len(repo.list()) == 5
+    assert len(repo.list()) == 6
 
 
 def test_upsert_and_get_roundtrip_with_options(repo):

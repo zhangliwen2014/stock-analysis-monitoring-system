@@ -8,8 +8,11 @@
 
 from __future__ import annotations
 
-#: 已知的公司行为类型。新增一种要同时改因子推导（`analysis/adjust.py`）与校验（D34）
-ACTION_KINDS = frozenset({"dividend", "split", "bonus", "transfer", "rights"})
+#: 已知的公司行为类型。新增一种要同时改因子推导（`analysis/adjust.py`）与校验（D34）。
+#: `unknown` 是其中唯一「不推因子」的一种：它记的是源确实报了这么一件事，但它无法折算
+#: 成每股现金或股数乘数（港股的以股代息、实物分派就是这种）。留空数值而不是硬解析一个
+#: 数出来，是因为猜错的因子会一路乘进序列，而 `analysis.adjust` 看到 unknown 会直接拒绝出数。
+ACTION_KINDS = frozenset({"dividend", "split", "bonus", "transfer", "rights", "unknown"})
 
 #: 一条已展开、可直接入库的公司行为。数值列的语义见 D34：
 #: `ratio` 是除权后/除权前的股数乘数，`price` 是每股新股应付的现金（只有 rights 用）。

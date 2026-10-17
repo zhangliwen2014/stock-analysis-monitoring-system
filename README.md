@@ -10,8 +10,9 @@
 
 不接券商实盘；真实持仓以手动录入 / CSV 导入形成镜像账本。
 
-**当前进度：M1 地基已完成并自测通过**（配置、事件总线、分市场交易日历、DuckDB 存储与仓库层、A 股主备源与港美股日线采集、CLI 运维入口）。
-M2 指标与估值、M3 规则与告警尚未开始。设计文档见
+**当前进度：M1 地基完成并自测通过**（配置、事件总线、分市场交易日历、DuckDB 存储与仓库层、A 股主备源与港美股日线采集、CLI 运维入口）；
+**M2-A 除权链路完成**（公司行为采集与覆盖确认、D34 因子口径、区间收益跨除权日的拒绝出数规则）。
+M2 剩余（指标、估值、Thesis）与 M3 规则告警尚未开始。设计文档见
 [`docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md`](docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md)。
 
 ## 安装
@@ -39,7 +40,8 @@ uv run sams sync daily --market US --code AAPL   --start 2024-01-01 --end 2024-0
 uv run sams sync daily --market HK --code 00700  --start 2024-01-01 --end 2024-02-01
 
 # 除权除息/送转配：区间收益要靠它才不被跨除权日的裸价涨跌骗到
-uv run sams sync actions --market A --code 601088
+uv run sams sync actions --market A  --code 601088
+uv run sams sync actions --market HK --code 00700    # 港股的公司行为来自东财，不是 yfinance
 
 uv run sams calendar refresh --market HK --year 2026
 uv run sams calendar check   --market US --date 2026-03-09   # 是否交易日 + 时段（本地 / UTC）
@@ -50,6 +52,14 @@ uv run sams health                                             # 各表行数、
 `sync` 可重复执行：主键 + `INSERT OR REPLACE` 保证同一区间重跑后行数不变。
 两个子命令走两条独立的能力链（D38）：`daily` 只走有日线的源，`actions` 只走能给除权记录的源，
 链上被跳过的源会打印出来——「这只票没分过红」与「这条链没人能给」是两件事。
+`sams health` 的备源判据也按能力数：只有一个「仅公司行为」源的市场，日线仍然算单源。
+
+复权口径（D34–D39）：库里只存**裸价**，`close_hfq` 在读取层现算，因子来自 `corp_actions`。
+因此区间收益会拒绝出数的几种情形都在 `analysis/` 里说清原因——
+覆盖没确认过（不知道是没分红还是没查）、K 线上出现没有对应记录的除权日、
+A 股裸价跳变超过涨跌停上限（多半是漏记一次除权）、
+遇到 `kind=unknown`（实物分派、权证这类折不出每股现金或股数乘数的行为）。
+拒绝是可恢复的：补上源、补上记录，数字就出来；错数看不出来。
 
 ## 结构
 

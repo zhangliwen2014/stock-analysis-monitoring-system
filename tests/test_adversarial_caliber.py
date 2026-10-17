@@ -283,7 +283,7 @@ def test_proof_right_issue_carries_its_price(db):
     with pytest.raises(ValidationError, match="只属于配股"):
         repo.upsert(CorpAction(market="A", code="600519", ex_date=D1, kind="dividend",
                                cash_per_share=1.0, price=8.7, src="akshare"))
-    expected = {"dividend", "split", "bonus", "transfer", "rights"}
+    expected = {"dividend", "split", "bonus", "transfer", "rights", "unknown"}
     assert set(KINDS) == expected
 
 

@@ -16,6 +16,7 @@ from sams.datasource.sources import catalog, discover, kinds, known, markets_of,
 #: 本包里的适配器模块：每个都必须往注册表里放至少一个实现
 ADAPTER_MODULES = {
     "akshare_cn",
+    "akshare_hk",
     "eastmoney",
     "sina",
     "tencent",
@@ -57,6 +58,18 @@ def test_discovered_modules_all_register_an_implementation():
     assert found == ADAPTER_MODULES, "包目录里出现了没登记的模块，或 _NOT_ADAPTERS 需要更新"
     modules = {entry.module for entry in catalog().entries}
     assert found <= modules, f"这些模块没注册任何实现: {sorted(found - modules)}"
+
+
+def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
+    """D38 的「这个源能不能干这件事」由方法是否存在推出来。
+
+    再造一份「源 → 能力」的表一定会漂移，而漂移的后果不是报错：健康页会把只有
+    公司行为的源算成日线的备源，管理后台也就允许摘掉最后一个能拉价格的源。
+    """
+    entries = catalog().by_kind()
+    assert entries["akshare_hk"].capabilities == ("actions",)
+    assert entries["tencent"].capabilities == ("bars",)
+    assert entries["akshare"].capabilities == ("bars", "actions")
 
 
 def test_registering_exposes_the_implementations_own_markets():

@@ -301,7 +301,7 @@ def test_source_add_then_remove(container, capsys):
     assert cli_run_on(container, add) == 0
     assert "tx2" in capsys.readouterr().out
     assert cli_run_on(container, ["source", "list"]) == 0
-    assert "yfinance → tencent → tx2" in capsys.readouterr().out
+    assert "yfinance → tencent → akshare_hk → tx2" in capsys.readouterr().out
 
     assert cli_run_on(container, ["source", "remove", "tx2"]) == 0
     assert "连带移除路由 1 条" in capsys.readouterr().out
@@ -370,13 +370,27 @@ def test_health_shows_chains_and_flags_a_single_source_market(config_path, capsy
     """health 要说的是「这个进程会用哪条链」，一个市场的单源状态要从这一屏看出来。"""
     # 走真实入口：cli.run 会先补齐迁移，链的权威来源是库里的记录
     assert cli.run(["source", "unroute", "HK", "tencent"]) == 0
+    assert cli.run(["source", "unroute", "HK", "akshare_hk"]) == 0
     capsys.readouterr()
 
     assert cli.run(["health"]) == 0
     out = capsys.readouterr().out
     assert "[降级链]（库里的记录）" in out
     assert "akshare → eastmoney → tencent → sina" in out
-    assert "yfinance  ⚠ 单源" in out, "每个源都健康 ≠ 有备源：这里必须看得见"
+    assert "yfinance  ⚠ 日线单源" in out, "每个源都健康 ≠ 有备源：这里必须看得见"
+
+
+def test_an_actions_only_source_is_not_counted_as_a_bars_backup(config_path, capsys):
+    """akshare_hk 拉不到价格。把它当港股日线的第二个源，屏幕上就是「有两个源，正常」，
+    而 ⚠ 日线单源永远不出现——D38 分能力记账就是为了这一屏不说假话。
+    """
+    assert cli.run(["source", "unroute", "HK", "tencent"]) == 0
+    capsys.readouterr()
+
+    assert cli.run(["health"]) == 0
+    out = capsys.readouterr().out
+    assert "yfinance → akshare_hk(仅公司行为)" in out
+    assert "⚠ 日线单源" in out
 
 
 def test_health_shows_when_the_last_bar_is_and_that_prices_are_raw(container, capsys):

@@ -34,7 +34,6 @@ _NOT_ADAPTERS = frozenset(
         "calendar_providers",
         "actions",
         "akshare_actions",
-        "yfinance_actions",
     }
 )
 

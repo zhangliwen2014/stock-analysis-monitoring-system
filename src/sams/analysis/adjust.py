@@ -61,6 +61,7 @@ def group_by_ex_date(actions: pl.DataFrame) -> dict[date, dict[str, float]]:
 
 def day_factors(bars: pl.DataFrame, actions: pl.DataFrame) -> list[DayFactor]:
     """每个除权日一个因子，按日期升序。`bars` 含 `date`/`close`，顺序由本函数负责。"""
+    _refuse_unpriceable(actions)
     ordered = bars.sort("date")
     prev_closes = _prev_close_by_date(ordered)
     out: list[DayFactor] = []
@@ -124,6 +125,26 @@ def hfq_frame(bars: pl.DataFrame, actions: pl.DataFrame) -> pl.DataFrame:
         cumulative.append(running)
     adj = pl.Series("adj_factor", cumulative)
     return ordered.with_columns(adj, (pl.col("close") * adj).alias("close_hfq"))
+
+
+def _refuse_unpriceable(actions: pl.DataFrame) -> None:
+    """D39：源报了「有这么件事」但折不出数 ⇒ 整段拒绝出数，而不是当它没发生。
+
+    这是港美股唯一那道闸：D37 的涨跌停证据规则只对 A 股生效（HK/US 没有涨跌幅上限可依据），
+    所以一条被静默丢弃的实物分派在图上不会留下任何痕迹——它只会让跨那天的涨跌差几个点，
+    而几个点看起来完全像正常波动。宁可不出数。
+    """
+    if "kind" not in actions.columns:
+        return
+    blocked = actions.filter(pl.col("kind") == "unknown").sort("ex_date")
+    if blocked.is_empty():
+        return
+    first = blocked.row(0, named=True)
+    extra = f"等 {blocked.height} 条" if blocked.height > 1 else ""
+    raise NotAdjustable(
+        f"{first['ex_date']} 有一条无法折算的公司行为"
+        f"（{first.get('note') or '源未给原文'}{extra}）：推不出因子，这一段的复权涨跌不能给"
+    )
 
 
 def _prev_close_by_date(bars: pl.DataFrame) -> dict[date, float]:

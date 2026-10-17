@@ -95,6 +95,17 @@ class CorpActionRepo:
         """
         if action.kind not in KINDS:
             raise ValidationError(f"未知公司行为类型 {action.kind!r}，可选 {sorted(KINDS)}")
+        if action.kind == "unknown":
+            # 折不出数才叫 unknown；能给出数值就说明知道它是哪一种，标 unknown 是逃避校验
+            if action.cash_per_share is not None or action.ratio is not None or action.price:
+                raise ValidationError(
+                    "unknown 记录不该带数值：它的意思是「这天有件事但折算不出因子」，"
+                    "能折出数就请标明是哪一种行为"
+                )
+            if not (action.note or "").strip():
+                raise ValidationError(
+                    "unknown 必须留下源给的原文：一句空白的「有件事发生」既无法复核也无法补数"
+                )
         for name, value in (
             ("cash_per_share", action.cash_per_share),
             ("ratio", action.ratio),

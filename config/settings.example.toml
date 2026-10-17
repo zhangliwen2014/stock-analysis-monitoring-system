@@ -25,7 +25,9 @@ sources = ["akshare", "eastmoney", "tencent", "sina"]
 tz = "Asia/Hong_Kong"
 currency = "HKD"
 post_close_min = 30
-sources = ["yfinance", "tencent"]
+# akshare_hk 只报公司行为，取日线时会被跳过（D38）。写在这里是为了「配置兜底」与
+# 库里的种子给同一条链——库里一旦有路由记录，这一行就不再用到了
+sources = ["yfinance", "tencent", "akshare_hk"]
 
 [markets.US]
 tz = "America/New_York"
