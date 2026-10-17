@@ -7,6 +7,11 @@ M2 起因子由 `analysis/adjust.py` 现算，本仓库只负责「这一条记�
 
 同一 (market, code, ex_date, kind) 重复入库视为同一条记录的修正，不产生第二行：
 数据源回填改数是常态，留下两行等于让因子算两次。
+
+**但「修正」只在数值对得上时成立。** `src` 不在主键里，所以两个源对同一天同一类型给出
+两个不同的数时，覆盖写会静默丢掉一个——而丢掉的正是「一年派两次，其中一次是特别分红」
+这类同日两件事。那种情况下这里抛 `StorageError`：宁可让 `sync actions` 失败、让区间收益
+继续拒绝出数，也不出一个看起来正常的错数。同日两件事需要换主键（§18 U21），眼下先拒。
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from datetime import date
 import polars as pl
 
 from sams.core.actions import ACTION_KINDS
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
 
 #: 词汇表在 core：采集侧与仓库侧认同一套拼写（见 core/actions 的说明）
@@ -32,6 +37,22 @@ _CASH_ONLY = frozenset({"dividend"})
 _SHARE_ONLY = frozenset({"split", "bonus", "transfer", "rights"})
 #: 股数只会增加的两种；写成 <1 几乎一定是把「每股送几股」当成了乘数
 _GROWING = frozenset({"bonus", "transfer"})
+
+#: 两个源对同一条记录差多少以内算「说的是同一件事」（见模块开头的冲突规则）。
+#: 取半分：源的舍入口径差不到一分（2.10 与 2.099），而「两笔派息被当成一条」那种
+#: 错数差的是三成。定得越松，越多真冲突被静默覆盖；定得越紧，越多改数被判成冲突。
+_TOL = 0.005
+
+#: 同一条记录上会比的三个数。`src` 与 `note` 不在内：换源本身就是常态，
+#: 而 `unknown` 的两条只有原文不同，数值全空，读侧无论如何都拒绝（D39）。
+_NUMERIC_FIELDS = ("cash_per_share", "ratio", "price")
+
+
+def _agree(stored: float | None, incoming: float | None) -> bool:
+    """两个数是不是在说同一件事。一边有一边没有，永远是两件事。"""
+    if stored is None or incoming is None:
+        return stored is None and incoming is None
+    return abs(stored - incoming) <= _TOL
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -55,6 +76,63 @@ class CorpActionRepo:
 
     def upsert(self, action: CorpAction) -> None:
         self._check(action)
+        self._check_no_conflict(action, self._existing(action))
+        self._write(action)
+
+    def upsert_many(self, frame: pl.DataFrame) -> int:
+        """整批写入，返回入库行数（空帧返回 0）。
+
+        逐行走 `_check` 而不是批量 insert：D34 的字段搭配是每条记录的事实。
+        但**先看完一整批再动手**——一条冲突的记录不该把同批其余的好数据半写进库：
+        那会留下一个「这次查过、但记录不齐」的区间，而读取层只看除权记录，
+        看不出采集断在半路，也就不会有第二次机会想起它。
+        """
+        if frame.is_empty():
+            return 0
+        batch = [CorpAction(**row) for row in frame.iter_rows(named=True)]
+        for action in batch:
+            self._check(action)
+            self._check_no_conflict(action, self._existing(action))
+        for action in batch:
+            self._write(action)
+        return len(batch)
+
+    def _existing(self, action: CorpAction) -> dict | None:
+        """库里这一条（同一主键）现在长什么样；没有则 None。"""
+        rows = self.db.query(
+            """
+            SELECT cash_per_share, ratio, price, src FROM corp_actions
+            WHERE market = ? AND code = ? AND ex_date = ? AND kind = ?
+            """,
+            [action.market, action.code, action.ex_date, action.kind],
+        )
+        return rows.to_dicts()[0] if not rows.is_empty() else None
+
+    def _check_no_conflict(self, action: CorpAction, prior: dict | None) -> None:
+        """同一条记录上两个对不上的数：写谁都是凭空丢掉一件事（见模块开头）。
+
+        出错信息里点名两条记录与两个源，是因为这一步之后没有别的现场可查：
+        调用方只知道 `sync actions` 失败了，而它要决定的是信哪个数。
+        """
+        if prior is None:
+            return
+        diffs = [
+            f"{name} {prior[name]} → {getattr(action, name)}"
+            for name in _NUMERIC_FIELDS
+            if not _agree(prior[name], getattr(action, name))
+        ]
+        if not diffs:
+            return
+        raise StorageError(
+            f"{action.market}/{action.code} {action.ex_date} {action.kind} 记录冲突："
+            + "；".join(diffs)
+            + f"（库里那条来自 {prior['src']}，这次要写 {action.src}）。"
+            "主键是 (市场, 代码, 除权日, 类型)：同日同类型的两件事装不下，"
+            "覆盖写会丢掉一笔，留两条会把一笔算两次。"
+            "这次同步不写覆盖确认，这只票的区间收益在查清两个数之前继续拒绝出数。"
+        )
+
+    def _write(self, action: CorpAction) -> None:
         self.db.execute(
             """
             INSERT OR REPLACE INTO corp_actions
@@ -73,18 +151,6 @@ class CorpActionRepo:
                 action.note,
             ],
         )
-
-    def upsert_many(self, frame: pl.DataFrame) -> int:
-        """整批写入，返回入库行数（空帧返回 0）。
-
-        逐行走 `_check` 而不是批量 insert：D34 的字段搭配是每条记录的事实，
-        一条不自洽的记录不该把同批其余的好数据一起挡在库外，也不该静默进去。
-        """
-        if frame.is_empty():
-            return 0
-        for row in frame.iter_rows(named=True):
-            self.upsert(CorpAction(**row))
-        return frame.height
 
     def _check(self, action: CorpAction) -> None:
         """字段与类型是否互相自洽（D34）。

@@ -580,11 +580,19 @@ def _action(**kwargs) -> CorpAction:
     return CorpAction(**(base | kwargs))
 
 
-def test_corp_action_upsert_is_idempotent_and_last_write_wins(actions):
+def test_corp_action_upsert_is_idempotent_and_a_changed_number_is_a_conflict(actions):
+    """契约在第四轮对抗测试后改了：过去是「后写覆盖」，而覆盖会静默丢掉一笔真事。
+
+    30.0 → 30.0 是同一条记录的修正（幂等重放就该这样）；30.0 → 31.0 是两个源在吵架，
+    谁对没人知道——那就两条都不动，让覆盖确认写不下去、区间收益继续拒绝出数。
+    """
     actions.upsert(_action(cash_per_share=30.0))
-    actions.upsert(_action(cash_per_share=31.0))
+    actions.upsert(_action(cash_per_share=30.0, src="eastmoney"))
     assert actions.count() == 1
-    assert actions.list_for("A", "600519")["cash_per_share"].to_list() == [31.0]
+    assert actions.list_for("A", "600519")["src"].to_list() == ["eastmoney"]
+    with pytest.raises(StorageError, match="冲突"):
+        actions.upsert(_action(cash_per_share=31.0))
+    assert actions.list_for("A", "600519")["cash_per_share"].to_list() == [30.0]
 
 
 def test_corp_action_validation_matrix(actions):

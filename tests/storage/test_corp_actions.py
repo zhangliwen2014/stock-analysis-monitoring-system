@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import date
 
+import polars as pl
 import pytest
 
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError, ValidationError
 from sams.storage.repos.corp_actions import CorpAction, CorpActionRepo
 
 D = date(2024, 6, 14)
@@ -27,7 +28,7 @@ def _action(**kwargs) -> CorpAction:
     return CorpAction(**(base | kwargs))
 
 
-def test_upsert_is_idempotent(db, repo):
+def test_upsert_is_idempotent(repo):
     repo.upsert(_action())
     repo.upsert(_action())
     assert repo.count() == 1, "同一天同类型的第二次入库是修正，不是第二条记录"
@@ -37,6 +38,87 @@ def test_same_ex_date_different_kind_coexist(repo):
     repo.upsert(_action())
     repo.upsert(_action(kind="bonus", cash_per_share=None, ratio=1.5))
     assert repo.count() == 2, "同一天既派息又送股是真实存在的情形"
+
+
+# --- 同一主键上两个不同的数：宁可拒绝写入 ------------------------------------------
+#
+# 主键是 (market, code, ex_date, kind)，`src` 不在里面。对抗测试查出的唯一一条「三道闸
+# 全过、出门一个错数」：库里已有年度派息 2.0，备源说同日 3.0，覆盖写就只剩 3.0——
+# 区间涨跌读起来完全正常（−5.13%，实际 0.00%），守卫看不出任何异常，因为库里那条记录
+# 自洽得很。修不了主键（改主键要新迁移，且幂等重放会变成重复累加），先把静默改掉。
+
+
+def test_a_second_amount_for_the_same_day_and_kind_refuses_to_overwrite(repo):
+    repo.upsert(_action(cash_per_share=2.0))
+    with pytest.raises(StorageError, match="冲突"):
+        repo.upsert(_action(cash_per_share=3.0, src="eastmoney"))
+    assert repo.list_for("A", "600519")["cash_per_share"].to_list() == [2.0], (
+        "拒绝写入必须真的不动库：写一半再抛，库里留下的就是「谁都没确认过」的那条"
+    )
+
+
+def test_the_refusal_names_both_claims_and_says_what_to_do(repo):
+    repo.upsert(_action(cash_per_share=2.0, src="akshare"))
+    with pytest.raises(StorageError) as excinfo:
+        repo.upsert(_action(cash_per_share=3.0, src="eastmoney"))
+    text = str(excinfo.value)
+    assert "600519" in text and "2024-06-14" in text and "dividend" in text
+    assert "akshare" in text and "eastmoney" in text
+    assert "2.0" in text and "3.0" in text
+    assert "区间收益" in text, "得让敲命令的人知道接下来这只票会拒绝出数，而不是只知道失败了"
+
+
+def test_a_different_share_count_for_the_same_day_is_a_conflict_too(repo):
+    repo.upsert(_action(kind="bonus", cash_per_share=None, ratio=1.5))
+    with pytest.raises(StorageError, match="冲突"):
+        repo.upsert(_action(kind="bonus", cash_per_share=None, ratio=1.4))
+
+
+def test_a_rounding_difference_from_another_source_is_still_a_correction(repo):
+    """2.10 与 2.099 说的是同一件事。把它们判成冲突会让 `sync actions` 天天失败。"""
+    repo.upsert(_action(cash_per_share=2.10))
+    repo.upsert(_action(cash_per_share=2.099, src="eastmoney"))
+    assert repo.count() == 1
+    assert repo.list_for("A", "600519")["cash_per_share"].to_list() == [2.099]
+
+
+def test_the_same_numbers_under_another_src_replace_without_refusing(repo):
+    repo.upsert(_action(cash_per_share=2.10, src="akshare"))
+    repo.upsert(_action(cash_per_share=2.10, src="eastmoney"))
+    assert repo.count() == 1
+    assert repo.list_for("A", "600519")["src"].to_list() == ["eastmoney"]
+
+
+def test_two_unpriceable_events_on_the_same_day_collapse_without_refusing(repo):
+    """unknown 无论如何都让读取层拒绝（D39），留哪条都不影响出数：为它拒绝只是添乱。"""
+    repo.upsert(_action(kind="unknown", cash_per_share=None, note="以股代息"))
+    repo.upsert(_action(kind="unknown", cash_per_share=None, note="认股权证", src="eastmoney"))
+    assert repo.count() == 1
+
+
+def test_a_batch_with_a_conflict_writes_no_rows_at_all(repo):
+    """整批要么全进要么全不进：先写好三条再在第四条上抛，等于留下一个「查过但不齐」的区间。
+
+    那种区间最坏的地方是它看起来齐了——读取层只看除权记录，看不出这次采集断在半路。
+    """
+    repo.upsert(_action(cash_per_share=2.0))
+    frame = pl.DataFrame(
+        {
+            "market": ["A", "A"],
+            "code": ["600519", "600519"],
+            "ex_date": [date(2024, 7, 1), D],
+            "kind": ["bonus", "dividend"],
+            "cash_per_share": [None, 3.0],
+            "ratio": [1.5, None],
+            "price": [None, None],
+            "src": ["eastmoney", "eastmoney"],
+            "note": ["10送5", "10派30元(含税)"],
+        }
+    )
+    with pytest.raises(StorageError, match="冲突"):
+        repo.upsert_many(frame)
+    assert repo.count() == 1, "同批那条没有冲突的记录也不该先进库：库里还是这一条老的"
+    assert repo.list_for("A", "600519")["cash_per_share"].to_list() == [2.0]
 
 
 def test_an_unrecognized_kind_spelling_is_rejected(repo):

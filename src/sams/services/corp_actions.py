@@ -4,6 +4,10 @@
 「这段区间我查过了」——覆盖标记是读取层守卫（`analysis/returns.py`）唯一的放行依据，
 它说「截至这天，这只票的除权记录是齐的」。所以这里宁可少写一段覆盖面：
 取数失败时什么都不记，让区间收益继续拒绝，而不是记下一条没根据的确认。
+
+入库那一步同样会失败：两个源对同一天同一类型给出对不上的数时，主键装不下两条，
+仓库直接抛 `StorageError`（见 `repos/corp_actions` 模块开头）。让它冒上来——
+「这次同步没写完所以不确认」与「取数失败所以不确认」在读取层是同一种处境。
 """
 
 from __future__ import annotations
@@ -60,6 +64,9 @@ class CorpActionSyncService:
 
     def sync_actions(self, market: str, code: str, start: date, end: date) -> CorpActionSyncSummary:
         """幂等：同区间重复执行行数不变（(market, code, ex_date, kind) 主键覆盖写）。
+
+        数值差一分以内算同一条记录的修正，照旧覆盖；差得多就是冲突，整批不写、
+        确认也不写，等人来判该信哪个源。
 
         `end` 截到今天：今天之后的除权日没有任何源能替我们确认，取回来也不该写成
         「确认过的覆盖面」——那等于让未来的公告替过去的区间背书（PIT）。
