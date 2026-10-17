@@ -1,7 +1,7 @@
 # 股票分析监控系统 · 设计文档
 
 日期：2026-10-17
-状态：设计已确认，待编写实施计划
+状态：M1 已实现并自测通过（477 用例离线绿 + CLI 冒烟），本文档已同步 M1 落地的口径决定；M2–M3 待实施计划
 实施范围：**M1–M3 详细设计；M4–M5 仅定义范围与关键决策**
 
 ---
@@ -56,6 +56,12 @@
 | D19 | 币种三权分立：标的币种（存储与计算）、账户多币种现金池、报告币种（仅展示）；录入永不折算 | 一个券商账户可同时含 HKD/USD/CNY 持仓；录入时折算一次会导致汇率变动后市值错账 |
 | D20 | 盈亏拆分为 price_pnl（标的币种）与 fx_pnl（汇兑），汇总单列汇兑贡献 | 否则无法解释"持仓币种涨 5% 而账户只赚 2%"，也无法判断该怪股票还是怪汇率 |
 | D21 | 交易规则（T+1、涨跌停、时段、日历）绑定标的市场；账户只决定现金/佣金/保证金/汇总币种 | 账户与市场不是一一对应关系 |
+| D22 | 日线只存不复权价，`adjust` 进自然键；qfq 永不落库，hfq 由 `corp_actions` 现算（§5.5） | qfq 回溯改写历史 = 用 T 之后的信息算 T 的指标，违反 D9 且回测不可复现；主键事后加维度只能重建表 |
+| D23 | 成交量统一「股」（A 股源给手，适配层 ×100），成交额统一「本币元」，港美股成交额留 NULL（§5.1） | 不换算则放量/换手/成交额阈值在三个市场各差 100 倍且无处报错；臆造 `volume×close` 会让阈值看似可用实则失真 |
+| D24 | 时间、DB、总线、适配器全部经 `bootstrap.Container` 注入；「读现在」只走 `Clock` port（§3.2、§7.5） | 留一处 `datetime.now()` 直读，跨日/跨月边界的用例就变成不可复现的随机失败，下一个人只会把断言改松 |
+| D25 | 源健康为三态（正常/故障/未知并落库），`EmptyResponse` 既不成功也不失败（§7.4） | 停牌与区间无数据是市场事实，计入失败会烧掉失败预算、让健康的源显示「未恢复」；反之掩盖真取不到数 |
+| D26 | 迁移文件名 = 不重复的四位零填充序号，已应用迁移带 SHA-256 校验和，逐文件事务（§5.6） | 改一次已应用的迁移对新库生效、对老库永久不生效，而健康页显示「已是最新」——两台机器两套 schema 是静默的 |
+| D27 | `Attempt.tries` 记录实际调用次数而非配置值（§7.2） | 报告不存在的重试次数，等于让运维据此判断「源还在工作」；宁可少报 |
 
 ---
 
@@ -112,6 +118,30 @@
 3. 所有跨模块通信传递事件对象，禁止模块间直接函数回调。
 4. 采集器、通知器、分析引擎、规则模板、调度任务均为注册表；新增强制走注册，不接受在核心代码里加 `if market == ...` 分支。
 
+### 3.2 装配与依赖方向（M1 实现）
+
+M1 落地的包是 `core` ← `storage` / `datasource` ← `services` ← `cli`，加上唯一的装配根 `bootstrap.py`。
+`analysis`/`monitor`/`trading`/`scheduler`/`web` 是 M2–M5 的目标包，M1 尚未创建；`services`
+是它们在 M1 的过渡容器（accounts / watchlist / health / sync / ingest），M2 起按上表拆出去。
+
+三条把「依赖方向」从注释变成可执行约束的做法：
+
+- **`bootstrap.Container` 是唯一装配根**：`build_container(settings, db=…, bus=…, adapters=…, clock=…)`
+  构造 DB、事件总线、注册表、全部仓库与服务。业务模块**不自己连库、不自己 new 适配器、不自己读环境**——
+  否则「换存储只动一层」在第一个方便的地方就被破掉。DB 路径、限速参数、时区只从 `Settings` 来。
+- **分层守卫是测试不是文档**：`tests/test_layering.py` 用 AST 解析每个模块的 import，断言依赖方向
+  与上表一致、`core` 不 import 任何上层、凑齐三层的那一个模块只能是 `bootstrap.py`；同一套 AST 还按
+  GATED 表管第三方库的落点（`duckdb` 只在 `storage/db.py`，网络库只在 `datasource/`，`pandas` 全库禁止）。
+  这类断言唯一可靠的写法是遍历 AST，而不是 grep 字符串——「换存储只动这一层」能不能兑现，
+  取决于有没有人在方便的地方顺手 `import duckdb`。
+- **时间、总线、DB、适配器全部注入**：`Clock`（§7.5）、`EventBus`、`Database`、适配器字典。
+  默认值指向生产实现（`SystemClock`），测试传冻结实现。留一个直读 `datetime.now()` 的角落，
+  跨日/跨月边界的用例就会变成不可复现的随机失败。
+
+`build_container` 每次调用都会往传入的 bus 上再挂一个 `SystemAlarm` 日志 sink。**同一进程内复用
+同一个 bus 重复 build 会成倍告警**——CLI 是单进程一次 build，不受影响；长进程（M4 服务）必须
+build 一次并把 container 传下去，而不是每个请求 rebuild。
+
 ---
 
 ## 4. 用户、权限与管理后台
@@ -153,10 +183,20 @@
 symbols(code, market, name, list_status, lot_size, currency, exchange, sector)
   自然键: (market, code)
 
-bars_daily(code, market, date, open, high, low, close, volume, amount,
-           turnover, adj_factor)
-  自然键: (market, code, date)   幂等 upsert
-  adj_factor: 复权因子，除权除息换算依据
+bars_daily(code, market, date, adjust, open, high, low, close, volume, amount,
+           source, updated_at)
+  自然键: (market, code, date, adjust)   幂等 upsert
+  adjust: M1 只写 'raw'（不复权价）。列放进主键是刻意的：DuckDB 不能 ALTER 主键，
+          等 M2/M3 跑出指标再补复权维度只能重建表重灌，而那时"哪条序列用哪套口径算的"已无从考证
+  volume: 统一为「股」——A 股两个源给的是「手」，适配层已 ×100 换算。
+          不换算则放量倍数、换手率、成交额阈值在三个市场之间各差 100 倍且无处报错
+  amount: 统一为「本币元」；港美股源不提供成交额，留 NULL（不臆造 volume×close 的近似值）
+  turnover: 不入库。换手率 = volume / 流通股本，是读取层派生量；M1 不采流通股本，
+            留一个没有生产者的列会被下游当成可信口径（adj_factor 同此被删）
+
+corp_actions(market, code, ex_date, kind, cash_per_share, ratio, src, note)
+  自然键: (market, code, ex_date, kind)
+  除权除息事件原表，后复权序列的唯一推算依据（§5.5）
 
 quotes_snapshot(code, market, ts, price, pct_chg, volume, amount,
                 bid1, ask1, is_stale, status)
@@ -169,6 +209,10 @@ indices(index_code, market, name)
 index_constituents(index_code, code, date, weight)
 scan_results(date, strategy_id, universe_size, hits_json)
 trading_calendar(market, date, is_trading, is_half_day, sessions_json, tz)
+
+source_health(name, markets, ok, last_error, last_ok_at, consecutive_failures, updated_at)
+  落库而非驻内存：采集与 `sams health` 是两个进程，进程内的失败记录一退出就没了，
+  健康检查因此永远报「一切正常」（§7.4）
 ```
 
 **实时数据不做长期存储**：tick/快照只服务当日监控，长期只用日线。需要分钟级监控时新增 `bars_minute` 表，仓库层接口不变。
@@ -262,9 +306,15 @@ task_runs(id, job_name, market, started_at, finished_at, status,
 
 ### 5.3 写入原则
 
-- **幂等**：所有采集写入按自然键 upsert，重试不产生重复行。
+- **幂等**：所有采集写入按自然键 upsert，重试不产生重复行；重叠区间共享的日期是**替换**而非追加（`sync_daily` 连跑两遍行数不变，是 M1 的验收用例）。
 - **陈旧标记**：采集失败时保留上次数据并置 `is_stale=true`；规则引擎遇 stale 数据**跳过不评估**。
 - **归档**：`quotes_snapshot` 按日滚动清理；原始接口响应落 Parquet 保留 30 天便于回放排查。
+- **仓库层只挡「代价不对称」的两类问题**（M1 实现的 `bars` 写入校验）：
+  1. **口径混淆**——`adjust` 由仓库注入，调用方在 DataFrame 里自带 `adjust` 列直接拒绝；`date` 列必须是可解析的日期类型（普通 `DATETIME` 也拒绝，否则同一批数据在两个源之间静默变成两种口径）；`count`/`load`/`latest_date` 共用同一 `adjust` 口径，不允许一个按 raw、一个按全部。
+  2. **NaN 覆盖好数据**——`is_not_null` 挡不住 NaN，pandas 侧的「缺数据」恰恰是 NaN；存成 `close=NaN` 会覆盖上一根好 K 线并污染此后全部指标。收盘价必须有限。
+- **原样存、不清洗的部分（有意为之）**：负成交量/负成交额照单入库。那是源侧数据质量问题，属于采集与清洗的职责；在仓库层丢弃会让「源给了脏数」和「这一天没数据」在库里长得一模一样。
+- **注册视图是连接级的**：`register` 后写入失败必须 `unregister`，否则下一批数据读到上一批的残留，表现为「换个代码却拿到旧数据」。
+- **用户隔离在仓库层兜底**：常规读只按 `user_id`；跨用户读必须有显式的 `list_all()` 审计入口（§4.2）。
 
 ### 5.4 多币种模型（一个账户含多币种持仓）
 
@@ -275,6 +325,13 @@ task_runs(id, job_name, market, started_at, finished_at, status,
 | **标的币种** `symbols.currency` | 股票报价与结算币种（A股 CNY / 港股 HKD / 美股 USD / 沪港通港股 CNY 交收） | 行情、订单价、持仓成本、盈亏**存储与计算的唯一口径** |
 | **账户现金池币种** `sim_cash_balances` | 账户按币种分行的可用余额 | 判断"该账户有无钱买这只票"，必须同币种匹配 |
 | **报告币种** `sim_accounts.report_currency` | 用户选定的汇总展示币种（默认 CNY） | **只出现在展示层**，从不回写存储 |
+
+两个「市场默认币种」推不出来的例外，币种由**代码号段**决定（`core/codes.py`，M1 已实现）：
+
+- A 股 B 股：`900xxx` 沪市 USD、`200xxx`/`26x` 深市 HKD——按市场默认填 CNY 会让市值与盈亏差一个汇率，且没有任何一处报错。
+- 港股人民币双柜台：`8xxxx`（如 `80700` 腾讯-R）以 CNY 报价，同一公司的普通柜台 `00700` 是 HKD。
+
+同样按市场决定的还有 `lot_size`：A 股 100、美股 1、**港股不假设**（每只票由 `symbols.lot_size` 逐只给出，港股一手可以是 100/200/500/1000/2000 股）。用一个市场级默认值会让「可买几手」的仓位计算整批偏倍。
 
 四条硬规则：
 
@@ -292,6 +349,22 @@ fx_pnl    = 本币市值 × (今日汇率/基准汇率 - 1)     // 报告币种�
 4. **换汇是显式流水**（`fx_trades`），不是直接改余额字段——缺它多币种现金池无法与券商对账。M3 允许手工调整现金余额并写审计记录，`fx_trades` 完整实现排 M5。
 
 附带影响：交易日历、时段、T+1/T+0、涨跌停由**标的所属市场**决定（§6、§10.2）；账户只决定现金、佣金、保证金与汇总币种。同一只美股在不同券商账户的成本差异来自佣金与换汇价，而非交易规则。
+
+### 5.5 复权口径（M1 定死，不再改）
+
+- **库里只有不复权价**（`adjust='raw'`）。原始价是唯一「不因后续事件回溯改写」的数据，存了它就能重算任何口径；反过来不行。
+- **前复权永不落库**。qfq 会随每次除权回溯改写全部历史收盘价——用 T 之后的信息算 T 的指标，直接违反 D9 反未来函数；同一份 qfq 序列在两个时点取用会得到两组不同的历史收盘价，回测结果因此不可复现。需要 qfq 显示时在读取层用 `corp_actions` 现算。
+- **后复权由 `corp_actions` 推导**，同样是读取层产物：`hfq_t = raw_t × ∏(除权日 ≤ t 的换算因子)`。M1 只建表与口径，`corp_actions` 的采集器排 M3（除权除息换算在那一刻才成为可验证的功能）。
+- 价格与金额一律 DOUBLE：本系统用于分析与监控，不做账务清算，浮点误差量级远小于免费源自身的数据误差。
+
+### 5.6 迁移与 schema 校验（M1 实现）
+
+`storage/migrations/NNNN_描述.sql` 按文件名顺序执行，每条约定：
+
+- **文件名必须是四位零填充、不重复的序号前缀**（`0007_add_xxx.sql`）。不补零时 `10_` 排在 `1_` 之前（依赖就此颠倒，且只在某个特定库上才炸）；序号重复时两个文件共用一条 `schema_migrations` 记录。不合规**启动即失败**，不等跑到一半再炸。
+- **`schema_migrations.checksum` 挡下「改了已应用的迁移」**：0001 全是 `CREATE TABLE IF NOT EXISTS`，只记文件名的话，改一次 0001 对新库生效、对老库永久不生效，而 `sams health` 会显示「已是最新」。校验和不符 → 启动即失败；老库里 NULL 校验和的行不做洗白（补一个「向后兼容的重放校验」：把全部迁移在临时库上重放，比对 main schema 的表签名）。
+- **每个迁移文件一个事务**：失败的文件不记入 `schema_migrations`，库里不留半套 schema。
+- 迁移依赖的 schema 检查一律限定 `table_schema='main'`，否则别的 schema 里同名表会把它糊弄过去。
 
 ---
 
@@ -318,8 +391,24 @@ A股:  [{open:"09:30",close:"11:30"},{open:"13:00",close:"15:00"}]
 | 市场 | 权威来源 | 特殊点 |
 |---|---|---|
 | A 股 | akshare 官方交易日历 | 节假日调休会临时多放（国庆前后补班不调市），`chinese_calendar` 仅兜底 |
-| 港股 | 交易所日历 | **台风/黑暴雨临时停市无法预知**：盘中连续返回空且非时段边界 → 判定临时休市，停止轮询并记系统日志，不发用户告警 |
-| 美股 | NYSE 日历 | `zoneinfo("America/New_York")` 处理**夏令时**；含提前收市半天 |
+| 港股 | 交易所日历（`exchange_calendars` XHKG） | **台风/黑暴雨临时停市无法预知**——裁决规则见 §6.5，不能从「某个代码返回空」推断 |
+| 美股 | NYSE 日历（`exchange_calendars` XNYS） | `zoneinfo("America/New_York")` 处理**夏令时**；含提前收市半天 |
+
+### 6.5 临时休市的裁决（M1 明确的口径）
+
+原设计写「盘中连续返回空且非时段边界 → 判定临时休市」，这条**不可实现**，理由是信号本身没有区分力：
+
+- 个股停牌、代码错误、新股尚未有数据、源被限流——四者都表现为「返回空」，与休市在数据层长得一模一样。
+- 真休市时源侧通常给的是**空区间**或 HTTP 错误，而空区间在采集层的正确解释是「这一天没有 K 线」，不是「交易所关了」。
+
+可实现的裁决只用**市场级**证据，不用代码级证据：
+
+1. 日历是权威：`is_trading(m, d)=false` 就不轮询，也不因为「源给了数据」而改成交易日（源可能给非交易日的脏行）。
+2. 休市只由**市场级参照**（指数快照的交易所状态字段 / 交易所公告接口）与日历不一致时发现；M4 接入实时轮询后实施。
+3. 发现不一致 → 记 `SystemAlarm` + 写「日历待校正」，由 §6.3 的每月 1 号增量校正覆盖回库，**不**当场改 `trading_calendar`，也不给用户发告警。
+4. 代码级 `EmptyResponse` 在 M1 的语义是「无数据，非故障也非成功」（§7.4）：既不消耗失败预算，也不触发任何休市推断。
+
+M1 已完成的部分：`trading_calendar` 表 + XHKG/XNYS 生成 + `is_trading`/`sessions` 查询 + 幂等 upsert。第 2、3 条依赖盘中轮询（M4），M1 不实现、也不假装实现。
 
 ### 6.3 刷新与兜底
 
@@ -354,17 +443,45 @@ class QuoteAdapter(Protocol):
     def health(self) -> AdapterHealth: ...   # 是否限流/降级中
 ```
 
-实现：`AkshareAdapter`(A 股主源)、`EastmoneyAdapter`(A 股备源 + 资金流)、`YfinanceAdapter`(美股/港股日线)、`StooqAdapter`(美股备源)。注册表按 `market → [主源, 备源...]` 路由。
+实现（M1 范围）：`AkshareAdapter`(A 股主源)、`EastmoneyAdapter`(A 股备源)、`YfinanceAdapter`(港股/美股)。注册表按 `market → [主源, 备源...]` 路由。
+
+- `snapshots`/`funding_flow`/`financials` 属 M2–M3，M1 的 `BarAdapter` Protocol 只声明 `daily_bars(market, code, start, end)`——把未实现的成员写进 Protocol 会诱使注册图为不存在的功能返回成功。
+- **`StooqAdapter`（美股备源）M1 未实现**：本机到 stooq 的网络不通，无法自测。因此 yfinance 目前是港美股的**单源**，没有降级目标；「主源被限流时系统不瞎」这条设计意图在港美股上尚未成立，`sams health` 会诚实地显示「失败×1 · 未恢复」而不是切源成功。补 Stooq（或腾讯/新浪港美股接口）是 M2 之前的待办。
+- `EastmoneyAdapter.secid()` 负责市场前缀编号（沪 1 / 深 0 / 港 116 / 美 105）——前缀错一位会静默拿到另一只票的历史，所以解析时会**校验响应里的 `data.code` 与请求代码规范形态一致**，不一致按 `FieldDrift` 失败。同理 `normalize_bars` 的 `volume_scale`（A 股 手→股 ×100，港美股 股）在适配层完成，入库的永远是「股」。
 
 ### 7.2 多源降级与限流
 
 - 主源失败 → 自动切备源，同一批数据标记 `source` 字段便于对比质量。
 - 所有外部调用走统一限速器（默认令牌桶 5 req/s，可配），触发 429 时指数退避（1s/4s/16s，3 次上限）。
 - 连续失败或频繁限流 → admin 系统告警（监控系统必须监控自己）。
+- **`Attempt.tries` 是实际调用次数，不是配置值**：`FieldDrift` 一次就定性（重试也是同一份错误），把 `attempts_per_source=3` 抄进 `tries` 等于对调用方说不存在的事。CLI/健康页显示的「×N」由此才可信。
+- 永久性错配在**构造注册表时**就失败（市场没有任何源可服务），而不是等到第一次采集；反之「这个源从没被这个市场路由过」绝不写进 `source_health`——那会把配置错误伪装成源故障。
+- 限流器与退避一律用注入的 `Clock`（见 §7.4），测试里冻结时钟即可断言「等的正好是配置的间隔」。
 
 ### 7.3 批量策略
 
 盘中快照一次请求覆盖「所有用户自选股 ∪ 启用规则涉及标的 ∪ 被引用的指数」。用去重后的并集，多用户不放大请求量——这是市场数据共享设计带来的直接收益。
+
+### 7.4 源健康三态与系统告警（M1 实现）
+
+监控系统必须监控自己，而「自己现在怎么样」必须落库（`source_health`，见 §5.1），否则进程一退出健康检查就失忆。三态：
+
+| 状态 | `ok` | `consecutive_failures` | 含义 |
+|---|---|---|---|
+| 正常 | `True` | 0 | 本次取到数据 |
+| 故障 | `False` | +1 | 网络/限流/字段漂移等**源侧**失败 |
+| 未知 | `NULL` | 0 | 从没被调用过；或整批 `EmptyResponse`（无数据） |
+
+- **`EmptyResponse` 既不算成功也不算故障**：停牌、区间无数据是市场事实，不是源坏了。把它计入失败会烧掉失败预算、让一个健康的源显示成「未恢复」；把它算成成功又会掩盖真的取不到数。二者都不取，`ok=NULL`、失败计数归零、不发告警。
+- 状态从二态改三态需要迁移（0005）：`ok BOOLEAN NOT NULL` 存不下「未知」，Python 侧的解码分支会永远走不到，而下一个人真去落这个值时撞的是 `ConstraintException`。DuckDB 不能 ALTER 掉约束，按 0003 的方式重建表。
+- **`SystemAlarm` 每次故障连击只发一次**（`consecutive_failures` 从 0 变 1 的那一刻），恢复后再失败才算新一轮。每失败一个代码发一条 = 一批停牌股刷屏。告警由 `bootstrap` 的日志 sink 消费（`logging.error`），业务模块不直接写日志——spec §12 的「core 不发通知」在系统域同样成立。
+- 告警粒度是**源**，不是「源×市场」（yfinance 港美股共用一条）。当前每市场单源，二者等价；M4 港美股有了备源、需要按市场报告降级时再拆。
+
+### 7.5 Clock port（时间读取的唯一入口）
+
+`core/clock.py` 提供 `Clock`（`now()` / `today(tz)` / `sleep(s)`），`SystemClock` 为生产实现，测试注入 `FrozenClock`。
+
+**所有**「读现在」都必须走注入的 clock：会话签发与过期（`storage/repos/sessions.py` 的 `verify` 同时比 `expires_at` 与 `created_at`，用 SQL `now()` 会让冻结时钟测不动）、吊销 `revoked_at`、告警 `ts`、限速器等待、退避计时、`source_health.last_ok_at`。留一处 `datetime.now()` 直读，测试就会在跨日/跨月边界随机失败——而那种失败复现不了，下一个人只会把断言改松。M2 的规则冷却与 M4 的调度时刻同样必须接 clock。
 
 ---
 
@@ -488,7 +605,7 @@ MA(5/10/20/60/120/250)、EMA、MACD、RSI(6/14)、BOLL(20,2)、KDJ、ATR(14)、O
 - 账户 `margin_enabled=true`：追加维持担保比例提示（规则本身 M5）
 - 金额型阈值与盈亏额一律带币种标注（标的币种 + 报告币种折算值）
 
-**除权除息**：`bars_daily.adj_factor` 驱动成本价与止损价换算，避免每次除权误报"跌破止损"——列为 M3 强制验收用例。
+**除权除息**：`corp_actions`（不是 `bars_daily.adj_factor`——该列已删，见 §5.5）驱动成本价与止损价换算，避免每次除权误报"跌破止损"——列为 M3 强制验收用例。换算后的序列在读取层现算，库里始终只有 raw。
 
 ### 10.3 M3 内置模板清单（约 40 个，只用日线/快照即可算）
 
@@ -574,6 +691,9 @@ class Notifier(Protocol):
 | 通知器 | mock 发送 | 重试 3 次、渠道降级、脱敏、失败不影响引擎 |
 | Web/admin | 冒烟 | 登录、越权访问被拒、admin 只读页可访问 |
 | 回测(M5) | 小样本手算对齐 | 胜率/盈亏比统计一致 |
+| **分层与系统边界** | AST 扫 import（`tests/test_layering.py`） | 依赖方向与 §3.1 表一致；`core` 不 import 上层；凑齐三层的那一个模块只能是 `bootstrap.py`；第三方库落点受管——`duckdb` 只在 `storage/db.py`、`requests`/`akshare`/`yfinance`/`exchange_calendars` 只在 `datasource/`、`bcrypt` 只在 `storage/repos/users.py`、`pandas` 全库禁止 |
+| **时间相关不变式** | 冻结时钟（`core/clock.py` 端口） | 会话在跨日/跨月边界不过期、`revoked_at` 取注入时刻、告警 `ts` 跟随 clock、限速等的正好是配置间隔。**禁止用 `datetime.now()` 直读**——否则这类用例会在真实日历上随机失败 |
+| **对抗契约** | 四份 `tests/test_adversarial_*.py`（storage / datasource / services / caliber） | 每轮评审与测试后把「这里有坑」改写成「这里必须是这个行为」；断言只描述已成立的契约，不留 red-xfail 的漏洞存档 |
 
 **不做 E2E 全链路自动化**（依赖真实行情源，不稳定且慢），改为每期结束人工走一遍验收清单。
 
@@ -595,6 +715,8 @@ class Notifier(Protocol):
 core（配置/事件总线/交易日历/类型）、storage（全部表 + 仓库层 + 用户隔离）、datasource（A 股主备源 + 美股港股日线）、cli（`sync`/`calendar check`/`health`）、users+权限+admin 后台骨架。
 
 **验收**：`python -m cli sync --market A --code 600519` 拉取入库；重复执行无重复行；A 股全年日历与交易所一致；用户 B 查不到用户 A 的自选股；日历 fixture 单测全绿。
+
+**M1 验收状态（2026-10-17）**：命令名为 `sams sync --market A --code 600519 --start … --end …`（`python -m cli` 已改为 console script `sams`）。重复执行无重复行、用户隔离、日历单测（XHKG/XNYS + fixture）、迁移/校验和/健康三态——**均离线全绿**（`uv run pytest -q` 477 passed）。**未验证项**：真实网络下 US/HK 同步（本机到三个源全部不通，见 U10），系统侧行为已在冒烟中确认为诚实报错（`失败×1 · 未恢复`，退出码 1），不是静默成功。
 
 ### M2 分析与观点（详设 §8 §9）
 
@@ -670,7 +792,7 @@ DSA 的本质是**每天跑一次的 LLM 自选股报告生成器**（定时触�
 | 免费数据源限流或字段变更（akshare 频繁调整） | 多源降级 + 契约测试锁定字段 + 原始响应留 Parquet 便于回放；数据质量页可见 |
 | 告警噪音导致用户关掉通知 | 过滤条件 + 节流 + 严重级别分级 + 忽略率统计反推关停建议 |
 | 胜率数字被误当承诺 | 样本数强制展示、<30 标"样本过少"、不参与排序推荐 |
-| 港股临时停市无法预知 | §6.2 的启发式判定 + 静默 |
+| 港股临时停市无法预知 | §6.5 的日历裁决口径（只用市场级证据，不从代码级空响应推断）+ 静默；发现不一致走 `SystemAlarm` |
 | DuckDB 单写入者限制未来拆分 | 读写全收口 `storage`；A→B 时换库只动一层（D5） |
 | 范围偏大导致一期做不完 | M1–M3 为最小可用闭环；先跑通再排 M4/M5 |
 | M0 对照期被跳过 | 规则模板将按想象而非真实使用实现，返工概率高；若跳过 M0，M3 模板数上限锁定为 15 个 |
@@ -680,3 +802,23 @@ DSA 的本质是**每天跑一次的 LLM 自选股报告生成器**（定时触�
 ## 17. 免责声明
 
 所有估值区间、赔率、胜率、信号与提醒均为**基于历史统计的规则化参考，不构成投资建议**。系统不接入实盘，不代用户做任何交易决策。
+
+---
+
+## 18. M1 未决口径登记表（有意不修，留待复核）
+
+对抗测试与两轮架构/交易专家评审后，明确**不改**而记录在案的项。每条都是「知道它在这里、知道为什么先不动」，不是遗漏。
+
+| # | 现状 | 为什么不修 | 何时必须处理 |
+|---|---|---|---|
+| U1 | 负成交量/负成交额原样入库 | 丢弃会让「源给脏数」与「这天没数据」在库里同形；清洗是采集层职责 | M2 数据质量页 |
+| U2 | 停牌与日历缺口不交叉核对 | 需要 market-wide 参照（§6.5 第 2 条），M1 无盘中轮询 | M4 |
+| U3 | `SystemAlarm` 粒度是**源**，不是源×市场 | 当前每市场单源，二者等价；提前拆表是为不存在的需求设计 | 港美股出现备源时（M2 前） |
+| U4 | `corp_actions.list_for()` 不传 `until` 会返回未来除权日 | 表尚无生产者；现在加过滤等于给未定的口径下结论 | M3 采集器落地时（同 PR） |
+| U5 | 港美股只有 yfinance 单源，无降级目标 | 本机到 stooq 网络不通，写了也无法自测 | 网络可达后立即补，或换腾讯/新浪接口 |
+| U6 | `SAMS_SECRET_KEY` 必填但 M1 没有消费者 | 通道 Fernet 加密在 M2；先把必填做出来，避免 M2 上线时静默回退到默认密钥 | M2（消费者到位） |
+| U7 | `quotes_snapshot.is_stale` 与 `task_runs` 有表无写入方 | §5.3 的陈旧标记服务盘中轮询，M1 只有盘后日线 | M4 |
+| U8 | 用户域留在 DuckDB、快照留在库里 | DuckDB 单写入者约束；但 M1 是单进程 CLI，读写串行，不构成实际阻塞 | M4 起服务化时评估用户域→SQLite、快照→Parquet |
+| U9 | 采集不带 `captured_at`/`ingest_run_id`，无法回放「某次运行的视角」 | 归档为 Parquet + 运行号是运维设施，M1 加它会稀释「幂等 upsert」这条主线验收 | M4 运维工具 |
+| U10 | live 用例（`-m live`）在本机全部网络失败，M1 验收项「真实网络同步 US/HK」**未验证** | 不是代码问题；`sams health` 已能诚实显示「失败×1 · 未恢复」 | 网络可达的环境跑一次 `pytest -m live` |
+| U11 | 单列只能带一个时区（Polars 限制）：`tz` 以字符串存、按需转换 | 反压不过库设计；偏移量在 core 侧集中换算 | 不处理 |

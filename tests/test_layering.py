@@ -47,9 +47,19 @@ def _resolved(name: str, level: int, module_parts: tuple[str, ...]) -> str:
 
 def imported_layers(path: Path) -> set[str]:
     """该模块 import 到的 sams 顶层子包集合。"""
+    return {seg[1] for seg in _imports(path) if len(seg) > 1 and seg[0] == "sams"}
+
+
+def imported_third_party(path: Path) -> set[str]:
+    """该模块 import 到的第三方包根名（`import a.b` 取 `a`）。"""
+    return {seg[0] for seg in _imports(path) if seg[0] != "sams"}
+
+
+def _imports(path: Path) -> list[tuple[str, ...]]:
+    """所有 import 的 dotted 段序列，相对导入先还原成绝对。"""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     parts = path.relative_to(ROOT).with_suffix("").parts
-    found = set()
+    found: list[tuple[str, ...]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names = [(alias.name, 0) for alias in node.names]
@@ -58,10 +68,45 @@ def imported_layers(path: Path) -> set[str]:
         else:
             continue
         for name, level in names:
-            segments = _resolved(name, level, parts).split(".")
-            if len(segments) > 1 and segments[0] == "sams":
-                found.add(segments[1])
+            found.append(tuple(_resolved(name, level, parts).split(".")))
     return found
+
+
+#: 第三方库的落点。「换存储只动一层」（spec §3.1 约束 2）能不能成立，取决于
+#: duckdb/requests 有没有在方便的地方被顺手 import——所以这条也由机器看着。
+#: 值是按前缀匹配的相对路径（`storage/db.py` 精确到文件，`datasource` 放行整层）。
+GATED: dict[str, tuple[str, ...]] = {
+    "duckdb": ("storage/db.py",),
+    "bcrypt": ("storage/repos/users.py",),
+    "requests": ("datasource",),
+    "akshare": ("datasource",),
+    "yfinance": ("datasource",),
+    "exchange_calendars": ("datasource",),
+    # M1 没有任何模块需要 pandas：跨层传 DataFrame 一律 Polars（D13），
+    # 边界处转 pandas 是 M5 与 backtrader 对接时才开的小口
+    "pandas": (),
+    # Fernet 属 M2 的通道加密，落点届时加进 storage
+    "cryptography": (),
+}
+
+
+def _allowed_here(rel: str, prefix: str) -> bool:
+    """`storage/db.py` 精确到文件，`datasource` 放行整层（含子包）。"""
+    return rel == prefix or rel.startswith(prefix + "/")
+
+
+@pytest.mark.parametrize(
+    "path", sorted(SRC.rglob("*.py")), ids=lambda p: str(p.relative_to(SRC))
+)
+def test_third_party_imports_are_gated(path: Path):
+    rel = str(path.relative_to(SRC))
+    for name in imported_third_party(path):
+        allowed = GATED.get(name)
+        if allowed is None:
+            continue  # 非受管库（polars 等）不受本用例约束
+        assert any(_allowed_here(rel, prefix) for prefix in allowed), (
+            f"{rel} import 了 {name}，但它只允许出现在 {list(allowed) or '任何地方都不许'}"
+        )
 
 
 def _layer(path: Path) -> str:

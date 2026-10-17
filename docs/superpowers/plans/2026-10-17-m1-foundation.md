@@ -33,13 +33,19 @@ src/sams/core/config.py               Settings / MarketCfg + 环境变量覆盖
 src/sams/core/errors.py               ValidationError, DatasourceError, RateLimited, EmptyResponse, FieldDrift
 src/sams/core/events.py               Event 子类 + EventBus（同步、异常隔离）
 src/sams/core/timeutil.py             交易日历合成与时段判定、盘后触发点
+src/sams/core/clock.py                Clock 端口 + SystemClock（所有「读现在」的唯一入口）
+src/sams/core/codes.py                规范代码 / 按号段定币种 / 按市场定每手股数（核心域规则）
 src/sams/core/calendar.py             端口：CalendarProvider / CalendarStore（不 import 任何下层）
 src/sams/core/sources.py              SourceRecord + SourceHealthStore / SourceHealthView 端口
-src/sams/storage/db.py                Database 包装（open/execute/register/table_names）
+src/sams/storage/db.py                Database 包装（open/execute/register/unregister/table_names）
 src/sams/storage/migrations/0001_init.sql       spec §5 全部表 DDL
 src/sams/storage/migrations/0002_source_health.sql  源健康按源覆盖式落库（跨进程可见）
-src/sams/storage/migrate.py           schema_migrations 驱动，幂等
-src/sams/storage/repos/{users,sessions,symbols,bars,calendar,watchlists,source_health}.py
+src/sams/storage/migrations/0003_bar_semantics.sql  adjust 进主键、只存 raw、corp_actions 建表
+src/sams/storage/migrations/0004_migration_checksum.sql  已应用迁移的内容校验和
+src/sams/storage/migrations/0005_source_health_tristate.sql  ok 去 NOT NULL（三态）
+src/sams/storage/migrations/0006_drop_ownerless_turnover.sql  删无生产者的列
+src/sams/storage/migrate.py           schema_migrations 驱动，逐文件事务 + 向后兼容重放校验
+src/sams/storage/repos/{users,sessions,symbols,bars,calendar,watchlists,source_health,corp_actions}.py
 src/sams/datasource/base.py           BarAdapter 协议、标准列常量、normalize_bars、code_in_market
 src/sams/datasource/ratelimit.py      TokenBucket + backoff_sleep（注入时钟）
 src/sams/datasource/calendar_providers.py  CnSinaProvider(akshare)、XcalProvider(exchange_calendars)
@@ -48,7 +54,9 @@ src/sams/datasource/registry.py       市场→源列表，降级重试与源健
 src/sams/services/{calendar,sync,health,accounts}.py  用例编排（日历补齐、采集入库、自检、账号）
 src/sams/bootstrap.py                 组装根：唯一同时认识所有实现的地方
 src/sams/cli/{__init__,common,db,user,sync,calendar,health}.py  命令分发与展示
-tests/                                镜像 src 结构；support.py 放替身与样本；test_layering.py 分层守卫
+tests/                                镜像 src 结构；support.py 放替身与样本（含 FrozenClock）；
+                                      test_layering.py 分层守卫；
+                                      test_adversarial_{storage,datasource,services,caliber}.py 四份契约
 ```
 
 ## 任务
@@ -126,3 +134,41 @@ CLI 实跑（独立临时库，不碰开发库）：
 ### 验收清单里还欠一条
 
 第 3 项（US/HK 日线入库且 `currency` 正确）没跑通：Yahoo Finance 对当前出口持续限流，拿不到真实日线。失败链路与健康上报已按上面的真实 429 验证过，入库与币种字段由单测覆盖（`services/test_sync.py`）。等网络通畅时补一次 `sams sync --market US/HK` 即可结案。
+
+---
+
+## 追加：交易专家评审 + 四路对抗测试后的收敛（2026-10-17 晚）
+
+流程按用户要求走完：自测 → 4 个测试 agent 并行对抗测试（storage / datasource / services / 口径）→ 修复并收敛用例 → 交易专家做使用向复核。
+
+### 改了什么（按提交）
+
+| 提交 | 内容 |
+|---|---|
+| `74c881c` | **行情口径落库**：`adjust` 成为 `bars_daily` 主键维度、只存 raw、删 `adj_factor`、`corp_actions` 独立建表（spec §5.5 / D22） |
+| `26e734a` | 迁移记录内容校验和，已应用的迁移被改动时拒绝继续（§5.6 / D26）；后续补文件名规范：四位零填充 + 序号不得重复，不合规**启动即失败** |
+| `d99a939` | **Clock 端口**：会话签发/过期/`revoked_at`、告警 `ts`、限速等待全部改走注入时钟；`source_health.ok` 引入「未调用」态（§7.5 / D24） |
+| `eafed74` | 成交量在适配层归一为「股」（A 股 手×100），港美股保持「股」；跨阈值失败发 `SystemAlarm`（D23） |
+| `9bb67b6` | 组装根接线 clock / 告警日志出口 / `corp_actions` 仓储 |
+| `a3ab83a` | **仓库层把承诺变成强制**：`StorageError` 统一写失败异常、迁移逐文件事务、视图写入失败必 `unregister`、`date` 列类型校验（含裸 DATETIME 拒绝）、`count`/`load`/`latest_date` 共用一个 `adjust` 口径、拒绝调用方自带 `adjust` 列 |
+| `034487c` | **代码规范形态入核心层**（`core/codes.py`：币种按号段、别名归一后才入库）、`EmptyResponse` 既非成功也非故障、东财响应代码与请求代码不一致按漂移失败、可选列整列缺失要 warn、`Attempt.tries` 记实际调用次数（§7.2 / D25 / D27） |
+| `828cbf8` | CLI：`--password ""` 不再被当成没传、显式 `--config` 不再被环境变量静默改写 |
+| `ee2bbd1` | 四份对抗测试从「漏洞存档」收敛为**契约**：断言的不再是「这里有坑」，而是「这里必须是这个行为」 |
+
+### 有意不修的东西写进了 spec §18
+
+负成交量原样入库、停牌 vs 日历缺口不交叉核对（§6.5 给了可实现的替代口径）、告警粒度暂为「源」而非「源×市场」、`list_for()` 不带 `until` 会返回未来除权日、`SAMS_SECRET_KEY` 必填但 M1 无消费者、港美股单源无降级目标——spec §18 的 U1–U11 每条各自记了「为什么不修」和「何时必须处理」，不留在口头。
+
+分层守卫顺手加了一条：`tests/test_layering.py::test_third_party_imports_are_gated` 按 AST 检查第三方库的落点——`duckdb` 只在 `storage/db.py`、`requests`/`akshare`/`yfinance`/`exchange_calendars` 只在 `datasource/`、`bcrypt` 只在 `storage/repos/users.py`、`pandas` 全库禁止。「换存储只动一层」这句话能不能兑现，取决于有没有人在方便的地方顺手 import 了 duckdb。
+
+### 复跑
+
+```
+uv run pytest -q        477 passed, 1 deselected（live）
+uv run ruff check .     All checks passed
+```
+
+CLI 冒烟（全新临时库 + `SAMS_SECRET_KEY`，跑完即删）：`db migrate`（6 个迁移，32 张表）→ `user add` / `login` / `user passwd`（改密吊销旧会话 1 个）→ 错密码登录拒绝且 exit 1 → `sync --market HK --code 00700` 真实 429 → 退避 2 次 → `源 yfinance 连续失败 1 次` 只发一条告警 → `错误: 所有源均失败`，exit 1 → `health` 在另一进程显示 `失败×1 · 未恢复`，其余两源 `未知（未调用）`。全程无 traceback，失败信息与成功信息同样诚实。
+
+第 3 项验收仍欠（同上一轮：网络，不是代码）。
+
