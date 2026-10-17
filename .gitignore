@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+data/
+*.duckdb
+*.parquet
+logs/
+.pytest_cache/
+.ruff_cache/
+.qoder/settings.local.json
