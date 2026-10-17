@@ -99,9 +99,10 @@ def test_editing_an_applied_migration_refuses_to_run(tmp_path, db):
     而 health 会说「已是最新」——两台机器两套 schema 就是这么来的。"""
     migrations = tmp_path / "migrations"
     migrations.mkdir()
-    source = next(p for p in discover() if p.name == "0001_init.sql")
+    # 整套文件：库里记了 0001..0006，目录只给 0001 会先撞上「文件缺失」那条检查
+    for path in discover():
+        (migrations / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     target = migrations / "0001_init.sql"
-    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
     apply_migrations(db, migrations)
 
     target.write_text(

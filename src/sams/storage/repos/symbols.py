@@ -18,7 +18,9 @@ COLUMNS = (
     "lot_size",
     "list_status",
 )
-_DEFAULTS = {"list_status": "L", "lot_size": 1}
+#: list_status 缺省按「在市」；lot_size 没有默认值——港股逐票规定每手股数，
+#: 填 1 不是「不知道」而是「知道错了」，M2 的手数换算会差一个数量级。
+_DEFAULTS = {"list_status": "L"}
 
 
 def _prepare(df: pl.DataFrame) -> pl.DataFrame:
@@ -32,10 +34,7 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
             out = out.with_columns(pl.lit(_DEFAULTS.get(col), dtype=dtype).alias(col))
     # 同一批里有人给了 list_status、有人没给时，缺的那个是 null 而不是默认值：
     # list_market 按 'L' 过滤，null 行会静默消失，所以在这里补平
-    out = out.with_columns(
-        pl.col("list_status").fill_null(_DEFAULTS["list_status"]),
-        pl.col("lot_size").fill_null(_DEFAULTS["lot_size"]),
-    )
+    out = out.with_columns(pl.col("list_status").fill_null(_DEFAULTS["list_status"]))
     return out.select(list(COLUMNS)).unique(subset=["market", "code"], keep="last")
 
 
@@ -46,17 +45,27 @@ class SymbolRepo:
     def upsert(self, df: pl.DataFrame) -> int:
         if df.is_empty():
             return 0
-        prepared = _prepare(df)
+        try:
+            prepared = _prepare(df)
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 别让调用方去认 polars 异常
+            raise StorageError(f"symbols 写入数据不合法: {exc}") from exc
         self.db.register("incoming_symbols", prepared)
-        self.db.execute(
-            """
-            INSERT OR REPLACE INTO symbols
-                (market, code, name, currency, exchange, sector, lot_size, list_status)
-            SELECT market, code, name, currency, exchange, sector, lot_size, list_status
-            FROM incoming_symbols
-            """
-        )
-        self.db.unregister("incoming_symbols")
+        try:
+            self.db.execute(
+                """
+                INSERT OR REPLACE INTO symbols
+                    (market, code, name, currency, exchange, sector, lot_size,
+                     list_status, updated_at)
+                SELECT market, code, name, currency, exchange, sector, lot_size,
+                       list_status, now()
+                FROM incoming_symbols
+                """
+            )
+        finally:
+            # 不放进 finally 的话，写失败的批次会把视图留在连接上，直到下次同名注册
+            self.db.unregister("incoming_symbols")
         return prepared.height
 
     def get(self, market: str, code: str) -> dict | None:

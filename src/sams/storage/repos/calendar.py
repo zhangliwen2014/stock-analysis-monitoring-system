@@ -45,15 +45,20 @@ class CalendarRepo:
             }
         )
         self.db.register("incoming_calendar", frame)
-        self.db.execute(
-            """
-            INSERT OR REPLACE INTO trading_calendar
-                (market, date, is_trading, is_half_day, tz, sessions_json, source, refreshed_at)
-            SELECT market, date, is_trading, is_half_day, tz, sessions_json, source, now()
-            FROM incoming_calendar
-            """
-        )
-        self.db.unregister("incoming_calendar")
+        try:
+            self.db.execute(
+                """
+                INSERT OR REPLACE INTO trading_calendar
+                    (market, date, is_trading, is_half_day, tz, sessions_json,
+                     source, refreshed_at)
+                SELECT market, date, is_trading, is_half_day, tz, sessions_json,
+                       source, now()
+                FROM incoming_calendar
+                """
+            )
+        finally:
+            # 写失败也要注销：挂在连接上的视图会被下一批读到
+            self.db.unregister("incoming_calendar")
         return frame.height
 
     def get(self, market: str, day: date) -> CalendarDay | None:

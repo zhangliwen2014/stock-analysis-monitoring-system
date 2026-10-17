@@ -85,7 +85,8 @@ def test_deduplicates_within_one_batch(bars, bars_frame):
 def test_symbol_upsert_fills_defaults(symbols):
     symbols.upsert(pl.DataFrame([{"market": "A", "code": "600519", "currency": "CNY"}]))
     row = symbols.get("A", "600519")
-    assert row["list_status"] == "L" and row["lot_size"] == 1
+    # lot_size 没有默认值：调用方没给就是「不知道」，填 1 会让 M2 的手数换算差一个数量级
+    assert row["list_status"] == "L" and row["lot_size"] is None
     assert symbols.upsert(pl.DataFrame([{"market": "A", "code": "600519", "currency": "CNY"}])) == 1
     assert symbols.get("A", "missing") is None
 

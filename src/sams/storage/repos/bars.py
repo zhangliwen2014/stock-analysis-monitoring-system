@@ -3,6 +3,10 @@
 幂等靠 (market, code, date, adjust) 主键 + INSERT OR REPLACE，因此采集重试安全（spec §5.3）。
 读取一律带 `adjust = 'raw'`：库里目前只有一种口径，但把口径写进查询而不是靠约定，
 是为了让 M2 引入后复权序列时不可能悄悄读到混着两种价的同一根 K 线。
+
+仓库层只挡住两类代价不对称的问题：口径混淆，以及 NaN 覆盖上一根好 K 线。
+负成交量/负成交额原样存——那是源侧数据质量问题，属于采集与清洗的职责，
+在这里丢弃会让「源给了脏数」和「这一天没数据」在库里长得一样。
 """
 
 from __future__ import annotations
@@ -31,33 +35,57 @@ COLUMNS = (
     "close",
     "volume",
     "amount",
-    "turnover",
     "source",
 )
+
+#: 除 close 之外的数值列：出现 NaN/Inf 时置空而不是丢整行——缺成交量不该陪葬一根有效 K 线
+_OPTIONAL_NUMERIC = ("open", "high", "low", "volume", "amount")
 
 
 def _prepare(df: pl.DataFrame) -> pl.DataFrame:
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
         raise StorageError(f"bars_daily 缺少必需列: {missing}")
+    if "adjust" in df.columns:
+        raise StorageError(
+            "bars_daily 的口径由仓库层固定为 raw；自带 adjust 列的推导序列若在这里入库，"
+            "会被静默改名成 raw 并覆盖真正的不复权 K 线（后复权请在读取层由 corp_actions 现算）"
+        )
+    if df.schema["date"] != pl.Date:
+        # cast(pl.Date) 会把带时区的 datetime 一律取 UTC 日历日：A 股 00:30+08:00 存成前一天
+        raise StorageError(
+            f"bars_daily.date 必须是 pl.Date（交易日），收到 {df.schema['date']}；"
+            "带时刻请先按该市场时区取 date"
+        )
     out = df
     for col in COLUMNS:
         if col not in out.columns:
             dtype = pl.Date if col == "date" else pl.Float64
             out = out.with_columns(pl.lit(None, dtype=dtype).alias(col))
-    out = out.select(list(COLUMNS))
-    out = out.with_columns(
+    out = out.select(list(COLUMNS)).with_columns(
         pl.col("market").cast(pl.Utf8),
         pl.col("code").cast(pl.Utf8),
-        pl.col("date").cast(pl.Date),
         pl.col("source").cast(pl.Utf8),
+        *[pl.col(c).cast(pl.Float64) for c in ("close", *_OPTIONAL_NUMERIC)],
     )
     before = out.height
-    out = out.filter(pl.col("close").is_not_null() & pl.col("date").is_not_null())
+    # is_not_null 挡不住 NaN：pandas 侧的「缺数据」正是 NaN，它会通过非空校验并覆盖上一根好 K 线
+    out = out.filter(pl.col("close").is_finite() & pl.col("date").is_not_null())
     dropped = before - out.height
     if dropped:
         # 缺收盘价的行不能存成"收盘=0"，但也不静默消失：记录后再丢弃
-        logger.warning("bars_daily 丢弃 %d 行（缺收盘价或日期）", dropped)
+        logger.warning("bars_daily 丢弃 %d 行（收盘价缺失或非法）", dropped)
+    bad = out.select(
+        pl.sum_horizontal(
+            *[~pl.col(c).is_finite() & pl.col(c).is_not_null() for c in _OPTIONAL_NUMERIC]
+        ).sum()
+    ).item()
+    if bad:
+        logger.warning("bars_daily 有 %d 个非有限数值（NaN/Inf）已置空", bad)
+    out = out.with_columns(
+        pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c)
+        for c in _OPTIONAL_NUMERIC
+    )
     return out.unique(subset=["market", "code", "date"], keep="last").sort(
         ["market", "code", "date"]
     )
@@ -68,10 +96,18 @@ class BarRepo:
         self.db = db
 
     def upsert(self, df: pl.DataFrame) -> int:
-        """写入并返回受影响行数（不含被丢弃的脏行）。"""
+        """写入并返回受影响行数（不含被丢弃的脏行）。
+
+        同键后写覆盖先写：数据源回填改数是常态，留两行等于让同一根 K 线有两个收盘价。
+        """
         if df.is_empty():
             return 0
-        prepared = _prepare(df)
+        try:
+            prepared = _prepare(df)
+        except StorageError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 脏列型别让调用方去认 polars 异常
+            raise StorageError(f"bars_daily 写入数据不合法: {exc}") from exc
         if prepared.is_empty():
             return 0
         # 名字唯一 + finally 注销：同名视图会被后一批覆盖，异常路径下残留会喂错下一批
@@ -82,9 +118,9 @@ class BarRepo:
                 f"""
                 INSERT OR REPLACE INTO bars_daily
                     (market, code, date, open, high, low, close, volume, amount,
-                     turnover, source)
+                     source, updated_at)
                 SELECT market, code, date, open, high, low, close, volume, amount,
-                       turnover, source
+                       source, now()
                 FROM {view}
                 """
             )
@@ -123,8 +159,9 @@ class BarRepo:
         return self.db.query(" ".join(sql) + " ORDER BY code, date", params)
 
     def count(self, market: str | None = None, code: str | None = None) -> int:
-        sql = "SELECT count(*) FROM bars_daily WHERE 1=1"
-        params: list = []
+        # 与 load/latest_date 同一个口径过滤，否则行数会算进库里另一套复权序列
+        sql = "SELECT count(*) FROM bars_daily WHERE adjust = ?"
+        params: list = [ADJUST]
         if market:
             sql += " AND market = ?"
             params.append(market)

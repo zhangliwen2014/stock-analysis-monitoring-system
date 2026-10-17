@@ -10,6 +10,7 @@ M1 只提供读写与幂等保证，推导因子是 M2 的事，但表结构与�
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date
 
@@ -43,6 +44,15 @@ class CorpActionRepo:
             raise ValidationError(f"未知公司行为类型 {action.kind!r}，可选 {sorted(KINDS)}")
         if action.cash_per_share is None and action.ratio is None:
             raise ValidationError("公司行为必须给出现金或比例，否则复权因子无从计算")
+        # NaN 也算「给了」吗？不算——0 与负的派息/比例同样无从推导因子，却能一路乘进后复权序列
+        for name, value in (
+            ("cash_per_share", action.cash_per_share),
+            ("ratio", action.ratio),
+        ):
+            if value is None:
+                continue
+            if not math.isfinite(value) or value < 0 or (name == "ratio" and value == 0):
+                raise ValidationError(f"{name}={value} 非法：必须是非负的有限数（ratio 不能为 0）")
         self.db.execute(
             """
             INSERT OR REPLACE INTO corp_actions

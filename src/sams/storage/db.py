@@ -34,10 +34,25 @@ class Database:
             raise StorageError(f"无法打开数据库 {target}: {exc}") from exc
 
     def execute(self, sql: str, params: list[Any] | None = None) -> None:
-        self.conn.execute(sql, params or [])
+        self._run(sql, params)
+
+    def _run(self, sql: str, params: list[Any] | None) -> Any:
+        """唯一的 DuckDB ↔ StorageError 转换点。
+
+        services 层按 `except StorageError` 兜仓库故障；漏出原始 duckdb 异常的话，
+        约束冲突会一路冒到 CLI，运维看到的是一坨栈而不是「哪张表哪条约束」。
+        """
+        try:
+            return self.conn.execute(sql, params or [])
+        except duckdb.Error as exc:
+            raise StorageError(f"SQL 执行失败: {exc}") from exc
 
     def query(self, sql: str, params: list[Any] | None = None) -> pl.DataFrame:
-        return self.conn.execute(sql, params or []).pl()
+        return self._run(sql, params).pl()
+
+    def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
+        row = self._run(sql, params).fetchone()
+        return row[0] if row else None
 
     def register(self, name: str, df: pl.DataFrame) -> None:
         self.conn.register(name, df.to_arrow())
@@ -45,10 +60,6 @@ class Database:
     def unregister(self, name: str) -> None:
         """注册视图是连接级的、会一直挂着：不注销的话，下一批数据可能读到上一批的残留。"""
         self.conn.unregister(name)
-
-    def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
-        row = self.conn.execute(sql, params or []).fetchone()
-        return row[0] if row else None
 
     def table_names(self) -> list[str]:
         rows = self.query(
