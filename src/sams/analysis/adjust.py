@@ -12,16 +12,31 @@
 
 拆股、送股、转增、配股在同一个式子里退化成同一件事，所以四种行为不必各写一套算法。
 `ratio = 1`（只有派息）时它化成 (P − D)/P；`cash = 0`（只有拆股）时化成 1/ratio。
+
+两个入口，只有一个能出数：`hfq_frame` 是裸算原语（单测因子算术用它），`adjusted_series`
+会先过 `analysis/guard.py` 的三道闸。**下游一律走 `adjusted_series`**——覆盖与未标记跳变的
+判定不在原语里，绕过它就等于把 U12 那个错数重新请回来。
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 
 import polars as pl
 
+from sams.analysis.guard import (
+    ConfirmedSpan,
+    reject_unmarked_jumps,
+    require_coverage,
+    require_real_closes,
+)
 from sams.core.errors import NotAdjustable
+
+#: 后复权要乘哪几档价格。KDJ/ATR/BOLL/重采样都要用 high/low，只给收盘价等于逼每个
+#: 指标自己再乘一遍——而「自己再乘一遍」最常见的错法是直接把裸 high 喂进去
+PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
 
 
 @dataclass(frozen=True)
@@ -107,24 +122,110 @@ def day_factors(bars: pl.DataFrame, actions: pl.DataFrame) -> list[DayFactor]:
     return out
 
 
-def hfq_frame(bars: pl.DataFrame, actions: pl.DataFrame) -> pl.DataFrame:
-    """加两列：`adj_factor`（截至当日的累乘）与 `close_hfq`。
+def hfq_frame(
+    bars: pl.DataFrame,
+    actions: pl.DataFrame,
+    *,
+    factors: list[DayFactor] | None = None,
+    price_columns: Sequence[str] = PRICE_COLUMNS,
+) -> pl.DataFrame:
+    """给 K 线帧加上 `adj_factor` 与每档价格的 `_hfq` 列。**这是裸算原语，不过闸。**
 
     累乘口径是「除权日 ≤ t」，所以除权**当天**的 K 线已经带上当天的因子——
     当天的价格本来就是除权后的，不加会在当天留下一个假跳水。
+
+    不要拿它直接出数：它不检查覆盖（D36）、不听未标记跳变的证据（D37）、也不要
+    `listed_on`。那些判定在 `analysis/guard.py`，唯一的放行入口是 `adjusted_series`。
+    留这个函数公开只为了单测因子算术本身，以及让 `adjusted_series` 复用它。
     """
     ordered = bars.sort("date")
-    factors = day_factors(ordered, actions)
+    running_factors = day_factors(ordered, actions) if factors is None else factors
     cumulative: list[float] = []
     running = 1.0
     cursor = 0
     for day in ordered["date"].to_list():
-        while cursor < len(factors) and factors[cursor].ex_date <= day:
-            running *= factors[cursor].factor
+        while cursor < len(running_factors) and running_factors[cursor].ex_date <= day:
+            running *= running_factors[cursor].factor
             cursor += 1
         cumulative.append(running)
     adj = pl.Series("adj_factor", cumulative)
-    return ordered.with_columns(adj, (pl.col("close") * adj).alias("close_hfq"))
+    # 每一档价格都乘：只给 close_hfq 等于逼每个指标自己再乘一遍，而最容易的错法是
+    # 把裸 high/low 直接喂进 ATR、BOLL、KDJ——那些数看起来完全正常
+    columns = [c for c in price_columns if c in ordered.columns]
+    hfq = [(pl.col(c) * adj).alias(f"{c}_hfq") for c in columns]
+    return ordered.with_columns(adj, *hfq)
+
+
+def actions_in_span(
+    actions: pl.DataFrame, first: date, last: date, *, until: date | None = None
+) -> pl.DataFrame:
+    """只留下落在首尾两根 K 线**之间**（首根当日除外）的除权日。
+
+    区间涨跌取的是首尾之比：首根之前的因子对两端是同一个常数，约掉了；末根之后的
+    因子两根都不沾。留着它们不但没有影响，还会让 `day_factors` 去要那些日子的
+    前一根 K 线——于是「算一周的涨跌」得把上市以来的 K 线全取出来，取不到就报
+    「库里没有前一根 K 线」，而未来那几天根本还没行情。
+
+    `until` 是 PIT 那把锁：除权日晚于它的记录还没发生，不能进今天看到的序列
+    （仓库层 `list_for(until=…)` 是同一条口径的第二道保险）。
+    """
+    if actions.is_empty():
+        return actions
+    out = actions.filter((pl.col("ex_date") > first) & (pl.col("ex_date") <= last))
+    if until is not None:
+        out = out.filter(pl.col("ex_date") <= until)
+    return out
+
+
+@dataclass(frozen=True)
+class AdjustedSeries:
+    """一份过了闸的复权序列，带上「谁确认的」与「哪些天动了」。
+
+    `covered_by` 与 `factors` 不是装饰：快照要写下是谁替这段历史背书，交易员要能问
+    「这几天里哪几天除权」。少了它们，调用方只能自己再去查一遍，而自己查的那一遍
+    通常就是绕过守卫的那一遍。
+    """
+
+    frame: pl.DataFrame
+    covered_by: str | None
+    factors: tuple[DayFactor, ...]
+
+    @property
+    def ex_dates(self) -> int:
+        return len(self.factors)
+
+
+def adjusted_series(
+    market: str,
+    code: str,
+    bars: pl.DataFrame,
+    actions: pl.DataFrame,
+    *,
+    coverage: Sequence[ConfirmedSpan] = (),
+    today: date | None = None,
+    listed_on: date | None = None,
+    price_columns: Sequence[str] = PRICE_COLUMNS,
+) -> AdjustedSeries:
+    """唯一的复权出数入口：过闸（D36/D37/D39）后再给 hfq 列。
+
+    两道口径要记住：
+
+    * **因子只吃落在 `bars` 首尾之间的除权日**。对区间涨跌这是约掉的常数，对
+      **绝对**后复权价不是：想要一条不漏乘的绝对 hfq 曲线，`bars` 必须取到上市首日。
+      M2-B 的指标引擎要么全量取，要么只比形状。
+    * `today` 同时用作 PIT 上界与覆盖新鲜度——传了它，晚于它的除权日不进因子。
+    """
+    ordered = require_real_closes(market, code, bars)
+    first, last = ordered["date"].to_list()[0], ordered["date"].to_list()[-1]
+    inside = actions_in_span(actions, first, last, until=today)
+    factors = day_factors(ordered, inside)
+    reject_unmarked_jumps(market, code, ordered, factors, listed_on=listed_on)
+    covered_by = require_coverage(market, code, first, last, coverage, today=today)
+    return AdjustedSeries(
+        frame=hfq_frame(ordered, inside, factors=factors, price_columns=price_columns),
+        covered_by=covered_by,
+        factors=tuple(factors),
+    )
 
 
 def _refuse_unpriceable(actions: pl.DataFrame) -> None:

@@ -195,10 +195,9 @@ class AkshareHkAdapter:
             expanded = expand_payout(_to_polars(self._payout_fetch(symbol)))
             if expanded.is_empty():
                 return empty_actions()
-            windowed = expanded.filter((pl.col("ex_date") >= start) & (pl.col("ex_date") <= end))
-            if windowed.is_empty():
-                return empty_actions()
-            actions = normalize_actions(windowed, market=market, code=code, source=self.name)
+            # 全历史源不按窗口切片：切掉的那些行是源已经给到的事实，而服务层照样会写
+            # 「确认至今天的全历史覆盖」——库与覆盖标记说反话时，守卫就会放行裸价
+            actions = normalize_actions(expanded, market=market, code=code, source=self.name)
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001

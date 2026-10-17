@@ -39,6 +39,10 @@ class CorpActionAdapter(Protocol):
 
         「这个区间没有除权」返回空帧而不是抛 `EmptyResponse`（见 `empty_actions`）；
         只有源真的答不上来（改版、限流）才抛异常。
+
+        `corp_actions_full_history` 为真的源**不受 `start/end` 约束**：它的接口本来就一次
+        给全史，切掉窗口外的行等于让库里少几行事实，而服务层照样会写「全历史，确认至今
+        天」——库与覆盖标记说反话时，守卫就对老日子放行了裸价。按区间拉的源必须切。
         """
         ...
 
@@ -92,6 +96,11 @@ def normalize_actions(
         常态噪声（预案未定、不分红的报告期），不是改版。
       * `kind = unknown` 允许三个数值全空：它记的是「这天确实有件事，但我折不出数」（D39），
         读取层见到它就拒绝，而不是把它当成没发生过。
+      * 同一 (除权日, 类型) 的多行 ⇒ **相加合成一行**（`merge_same_day`）。库的主键就是
+        (market, code, ex_date, kind)，同日同类第二行无处可存，吞掉它就是少乘一截因子。
+
+    空输入不要送到这里来：`EmptyResponse` 在路由里的意思是「这个源没答上」，而「答了、
+    这区间没有」必须用 `empty_actions()` 表达（D36 的覆盖标记只认后者）。
     """
     column_map = dict(column_map or {c: c for c in ACTION_COLUMNS})
     absent = [column_map[k] for k in ("ex_date", "kind") if column_map.get(k) not in raw.columns]
@@ -161,13 +170,67 @@ def normalize_actions(
     if out.is_empty():
         raise EmptyResponse(source, f"{market} {code} 区间内没有可推导的公司行为")
 
-    return (
+    return merge_same_day(
         out.with_columns(
             pl.lit(canonical_code(market, code)).alias("code"),
             pl.lit(market).alias("market"),
             pl.lit(source).alias("src"),
         )
         .select(ACTION_COLUMNS)
-        .unique(subset=["ex_date", "kind"], keep="last")
-        .sort(["ex_date", "kind"])
+        # 完全一样的重复行是同一份方案的重复披露，不是两件事
+        .unique()
+    ).sort(["ex_date", "kind"])
+
+
+def merge_same_day(frame: pl.DataFrame) -> pl.DataFrame:
+    """同一 (除权日, 类型) 的多行合成一行：现金相加、新增股数相加、配股价按新增股数加权。
+
+    为什么是相加而不是「留最新一条」：`corp_actions` 的主键是 (market, code, ex_date, kind)，
+    同日同类的第二行在库里根本没有容身之处——年度分红与特别分红同日除权是真实存在的
+    事件，吞掉一条就是因子少乘一截，而价格序列照样单调、图上看不出任何异常。合成口径与
+    推导端逐字一致（`analysis.adjust.group_by_ex_date` 对同一天的多条行为就是相加），
+    所以「这里一行、那里两行」不会改变算出来的因子。
+
+    `price` 取加权平均而不是任意一条：推导端算的是 `price × (ratio − 1)`，把两笔配股合成
+    一笔时只有按新增股数加权才能保住那个乘积的总和。
+    """
+    merged: dict[tuple[object, object], dict[str, object]] = {}
+    for row in frame.iter_rows(named=True):
+        key = (row["ex_date"], row["kind"])
+        left = merged.get(key)
+        if left is None:
+            merged[key] = dict(row)
+            continue
+        _accumulate(left, row)
+    rows = list(merged.values())
+    if len(rows) == frame.height:
+        return frame
+    schema = {column: frame.schema[column] for column in ACTION_COLUMNS}
+    return pl.DataFrame(rows, schema=schema).select(ACTION_COLUMNS)
+
+
+def _accumulate(left: dict[str, object], row: dict[str, object]) -> None:
+    """把 `row` 这一笔并进已经存在的 `left`。"""
+
+    def number(value: object) -> float:
+        return 0.0 if value is None else float(value)  # type: ignore[arg-type]
+
+    def added_shares(value: object) -> float:
+        # `ratio` 为空是「这一笔不动股数」，不是乘数 1.0 更不是 −1 回收
+        return number(value) - 1 if value is not None else 0.0
+
+    cash = number(left["cash_per_share"]) + number(row["cash_per_share"])
+    extra = added_shares(left["ratio"]) + added_shares(row["ratio"])
+    # 配股付的钱 = 每股新股的价钱 × 新股数；缩股不付钱，所以只数正向的那部分
+    paid = (
+        number(left["price"]) * max(added_shares(left["ratio"]), 0.0)
+        + number(row["price"]) * max(added_shares(row["ratio"]), 0.0)
     )
+    left["cash_per_share"] = cash if cash else None
+    left["ratio"] = 1.0 + extra if extra else None
+    if extra:
+        left["price"] = paid / extra
+    elif left["price"] is None:
+        left["price"] = row["price"]
+    notes = [n for n in (left.get("note"), row.get("note")) if n]
+    left["note"] = "；".join(dict.fromkeys(notes)) if notes else None

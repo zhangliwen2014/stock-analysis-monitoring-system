@@ -129,11 +129,16 @@ def test_a_symbol_that_never_paid_out_answers_empty_not_failed():
     assert out.columns[0] == "market"
 
 
-def test_window_without_events_is_also_an_empty_answer():
+def test_a_dividend_outside_the_window_still_comes_back():
+    """Yahoo 的 `Ticker.actions` 一次给全史，所以窗口外那笔也得入库。
+
+    留着窗口切片，覆盖标记就会承诺「全历史确认到今天」而库里缺行：守卫放行老日子，
+    老日子的区间涨跌退回裸价。
+    """
     out = adapter(date(2020, 1, 1), **{"Dividends": [1.0]}).corp_actions(
         "US", "AAPL", date(2024, 1, 1), date(2024, 2, 1)
     )
-    assert out.is_empty()
+    assert out["ex_date"].to_list() == [date(2020, 1, 1)]
 
 
 def test_adapter_declares_both_capabilities():
@@ -150,7 +155,11 @@ def test_live_apple_dividends_are_dated_inside_the_requested_window():
     它对错位不敏感。
     """
     out = YfinanceAdapter().corp_actions("US", "AAPL", date(2024, 1, 1), date(2024, 12, 31))
-    assert out.height >= 4, "苹果按季派息，一年至少四笔"
-    assert set(out["kind"].to_list()) == {"dividend"}
-    assert all(date(2024, 1, 1) <= d <= date(2024, 12, 31) for d in out["ex_date"].to_list())
     assert out.filter(pl.col("cash_per_share") <= 0).is_empty()
+    # 全历史源不切窗口：问的是 2024，答的是上市以来的全部记录（苹果 2005/2014 的拆股也在里面）
+    assert out.height > 100, f"期望全历史上百笔，实际 {out.height} 笔"
+    in_window = out.filter(
+        (pl.col("ex_date") >= date(2024, 1, 1)) & (pl.col("ex_date") <= date(2024, 12, 31))
+    )
+    assert in_window.height >= 4, "苹果按季派息，一年至少四笔"
+    assert set(in_window["kind"].to_list()) == {"dividend"}

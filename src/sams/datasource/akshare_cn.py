@@ -98,20 +98,23 @@ class AkshareAdapter:
         self._fhps_fetch = fhps_fetch
 
     def corp_actions(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
-        """A 股分红送配。一次拉全史再按除权日切区间：源没有日期参数，切片只能在本地做。"""
+        """A 股分红送配。源没有日期参数，一次给全史——那就把全史都交回去，**不按窗口切**。
+
+        窗口切片看着只是少存几行，实际是让库与覆盖标记说反话：服务层会写下
+        「全历史，确认至今天」，而库里缺着窗口外那些真的除权日。守卫照着覆盖标记放行，
+        老日子的区间涨跌就变成裸价——正是 U12 那个 −3.81%。
+        """
         if market not in self.markets:
             raise ValueError(f"{self.name} 不支持市场 {market}")
         symbol = code_in_market(market, code)
         try:
             raw = _as_polars(self._fhps_fetch(symbol))
+            if raw.is_empty():
+                return empty_actions()
             expanded = expand_fhps(raw)
             if expanded.is_empty():
                 return empty_actions()
-            # 源没有日期参数：全史取回来在本地按除权日切。切完为空同样是「查过，这区间没有」
-            windowed = expanded.filter((pl.col("ex_date") >= start) & (pl.col("ex_date") <= end))
-            if windowed.is_empty():
-                return empty_actions()
-            actions = normalize_actions(windowed, market=market, code=code, source=self.name)
+            actions = normalize_actions(expanded, market=market, code=code, source=self.name)
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001 — 边界处统一归类，见 classify_error

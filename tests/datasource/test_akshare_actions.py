@@ -185,7 +185,7 @@ def stub(payload: pl.DataFrame):
     return fetch
 
 
-def test_adapter_filters_the_full_history_to_the_requested_window():
+def test_adapter_tags_the_answer_with_the_source_that_gave_it():
     adapter = AkshareAdapter(fhps_fetch=stub(one()))
     out = adapter.corp_actions("A", "601088", date(2024, 1, 1), date(2024, 12, 31))
     assert out["cash_per_share"].to_list() == [2.26]
@@ -193,11 +193,40 @@ def test_adapter_filters_the_full_history_to_the_requested_window():
     assert out["note"].to_list() == ["报告期 2023-12-31；10派22.60元(含税,扣税后20.34元)"]
 
 
-def test_adapter_window_without_any_ex_date_is_a_successful_empty_result():
-    """二十年分红三次的股票同步一个没有除权的月份：这是「查过，这区间没有」，不是故障。"""
-    adapter = AkshareAdapter(fhps_fetch=stub(one()))
-    out = adapter.corp_actions("A", "601088", date(2025, 1, 1), date(2025, 6, 30))
-    assert out.is_empty() and out.columns[-1] == "note"
+def multi(ex_dates: list[date], cash_per_ten: list[float]) -> pl.DataFrame:
+    """跨多年的分红明细：用来验证全历史源**不**按窗口切片。"""
+    return pl.DataFrame(
+        {
+            "方案进度": ["实施分配"] * len(ex_dates),
+            "除权除息日": ex_dates,
+            "现金分红-现金分红比例": cash_per_ten,
+            "现金分红-现金分红比例描述": [f"10派{v:.2f}元" for v in cash_per_ten],
+            "送转股份-送转总比例": [None] * len(ex_dates),
+        }
+    )
+
+
+def test_a_full_history_source_answers_the_whole_history_not_the_requested_window():
+    """接口一次给全史，就不能只交回窗口那几条。
+
+    服务层按 `corp_actions_full_history` 写下「确认至今天」的覆盖标记，守卫照着它放行
+    任意老日子；库里却缺着窗口外那些真的除权日 —— 库与承诺说反话时，2015 年的区间涨跌
+    就变成裸价。切片省下的几行行数是 U12 那个错数的价钱。
+    """
+    payload = multi([date(2015, 7, 8), date(2024, 7, 8)], [8.0, 22.6])
+    out = AkshareAdapter(fhps_fetch=stub(payload)).corp_actions(
+        "A", "601088", date(2024, 1, 1), date(2024, 3, 1)
+    )
+    assert out["ex_date"].to_list() == [date(2015, 7, 8), date(2024, 7, 8)]
+    assert out["cash_per_share"].to_list() == [0.8, 2.26]
+
+
+def test_a_stock_that_never_paid_out_answers_empty_not_failed():
+    """一次都没有过分红是一家真实存在的公司的正常状态：空帧，让覆盖标记写得下去（D36）。"""
+    out = AkshareAdapter(fhps_fetch=stub(pl.DataFrame())).corp_actions(
+        "A", "601088", date(2025, 1, 1), date(2025, 6, 30)
+    )
+    assert out.is_empty() and "cash_per_share" in out.columns
 
 
 def test_adapter_passes_the_canonical_symbol_and_never_the_users_input():

@@ -63,7 +63,7 @@ def run_actions(container: Container, args: argparse.Namespace) -> int:
         line = (
             f"{code:<10} 源={summary.source} 取回={summary.fetched} 入库={summary.written} "
             f"确认至={summary.covered_to}"
-            f"{'（全历史）' if summary.full_history else ''}"
+            f"{'（全历史：取回与入库不受请求窗口约束）' if summary.full_history else ''}"
         )
         if summary.clamped_to is not None:
             line += f" [请求终点在未来，按今天截断至 {summary.clamped_to}]"

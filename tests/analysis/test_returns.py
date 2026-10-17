@@ -12,7 +12,8 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
-from sams.analysis.returns import IntervalReturn, interval_return, is_covered
+from sams.analysis.guard import is_covered
+from sams.analysis.returns import IntervalReturn, interval_return
 from sams.core.errors import NotAdjustable
 
 START = date(2024, 7, 1)
@@ -115,10 +116,31 @@ def test_a_limit_down_move_is_not_refused():
     assert get(bars=frame(closes)).adjusted == pytest.approx(-0.10, abs=1e-9)
 
 
-def test_new_listing_jumps_are_not_treated_as_evidence():
-    """上市初期的无限制波动与除权在价格上长得一样，按位置跳过而不是按名字猜。"""
+def test_new_listing_jumps_are_exempted_only_when_the_caller_says_when():
+    """上市初期的无限制波动与除权在价格上长得一样，按「距上市第几根」跳过。
+
+    豁免必须挂在 `listed_on` 上而不是「请求窗口的第几根」上：后者等于让调用方用一次
+    窄窗口取数就买到一张免检票——那只 2007 年上市的票并没有上市首日。
+    """
     closes = [10.0, 30.0, 45.0, 60.0, 75.0, 90.0, 85.0, 80.0, 82.0, 83.0, 84.0]
-    assert get(bars=frame(closes)).raw == pytest.approx(84 / 10 - 1)
+    assert get(bars=frame(closes), listed_on=START).raw == pytest.approx(84 / 10 - 1)
+    # 同一段行情，不告诉守卫上市日，就不给豁免
+    with pytest.raises(NotAdjustable, match="未记录的公司行为"):
+        get(bars=frame(closes))
+
+
+def test_a_window_starting_much_later_still_exempts_only_the_listing_bars():
+    """给了上市日之后，豁免跟着「距上市第几根」走：老日子的不可能跳变一个都跑不掉。"""
+    days = [START + timedelta(days=i) for i in range(120)]
+    closes = [10.0] * 119 + [7.0]
+    with pytest.raises(NotAdjustable, match="未记录的公司行为"):
+        get(
+            bars=frame(closes, days),
+            listed_on=START,
+            start=days[115],
+            end=days[119],
+            coverage=covered(end=days[119]),
+        )
 
 
 def test_markets_without_price_limits_rely_on_coverage_only():

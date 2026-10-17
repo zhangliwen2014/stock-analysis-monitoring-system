@@ -25,7 +25,7 @@ ALLOWED: dict[str, set[str]] = {
     "storage": {"core"},
     "datasource": {"core"},
     "services": {"core", "storage", "datasource"},
-    "analysis": {"core", "storage", "services"},
+    "analysis": {"core", "storage"},
     "monitor": {"core", "storage", "datasource", "services", "analysis"},
     "trading": {"core", "storage", "services", "analysis"},
     "cli": {"core", "services"},

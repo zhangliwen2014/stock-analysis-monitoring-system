@@ -114,7 +114,10 @@ def test_everything_dropped_is_empty_response():
         get(pl.DataFrame({"ex_date": [None], "kind": [None], "cash_per_share": [1.0]}))
 
 
-def test_same_ex_date_and_kind_keeps_the_last_row():
+def test_same_ex_date_and_kind_are_added_not_dropped():
+    """同日同类两笔 ⇒ 现金相加。库的主键是 (market, code, ex_date, kind)，
+    「留最后一条」等于第二笔从没发生过：年度分红与特别分红同日除权是真实事件，
+    少一笔就是因子少乘一截，而价格序列照样单调、图上看不出异常。"""
     frame = pl.DataFrame(
         {
             "ex_date": [date(2024, 7, 8), date(2024, 7, 8)],
@@ -123,7 +126,41 @@ def test_same_ex_date_and_kind_keeps_the_last_row():
         }
     )
     out = get(frame)
-    assert out.height == 1 and out["cash_per_share"].to_list() == [2.30], "源回填改数取后一条"
+    assert out.height == 1
+    assert out["cash_per_share"].to_list() == [pytest.approx(4.56)]
+
+
+def test_an_exact_repeat_row_is_not_double_counted():
+    """两份一模一样的是同一条记录的重复披露，不是两笔事件：先按整行去重再相加。"""
+    frame = pl.DataFrame(
+        {
+            "ex_date": [date(2024, 7, 8), date(2024, 7, 8)],
+            "kind": ["dividend", "dividend"],
+            "cash_per_share": [2.26, 2.26],
+            "note": ["10派2.26元", "10派2.26元"],
+        }
+    )
+    out = get(frame)
+    assert out["cash_per_share"].to_list() == [pytest.approx(2.26)]
+
+
+def test_two_rights_rows_keep_the_total_cash_they_cost():
+    """配股价按新增股数加权合成：推导端算的是 `price × (ratio − 1)`，
+    只有加权才保住两笔的应付总额，随便取一条会把它改小。"""
+    frame = pl.DataFrame(
+        {
+            "ex_date": [date(2024, 7, 8), date(2024, 7, 8)],
+            "kind": ["rights", "rights"],
+            "cash_per_share": [None, None],
+            "ratio": [1.2, 1.3],
+            "price": [8.0, 4.0],
+        }
+    )
+    out = get(frame)
+    row = out.row(0, named=True)
+    assert row["ratio"] == pytest.approx(1.5)
+    # (8×0.2 + 4×0.3) / 0.5 = 5.6 ⇒ 5.6 × 0.5 = 2.8 = 1.6 + 1.2，与两笔原样相加一致
+    assert row["price"] * (row["ratio"] - 1) == pytest.approx(8.0 * 0.2 + 4.0 * 0.3)
 
 
 def test_nan_becomes_null_instead_of_poisoning_the_factor():

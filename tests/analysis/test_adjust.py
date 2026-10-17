@@ -6,12 +6,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 
 import polars as pl
 import pytest
 
-from sams.analysis.adjust import day_factors, group_by_ex_date, hfq_frame
+from sams.analysis.adjust import (
+    adjusted_series,
+    day_factors,
+    group_by_ex_date,
+    hfq_frame,
+)
 from sams.core.errors import NotAdjustable
 
 D0 = date(2024, 7, 5)  # 除权前一天（周五）
@@ -161,3 +167,78 @@ def test_a_known_kind_still_derives_a_factor():
     """拒绝只认 unknown：其余类型照常推导，别把整条链一起挡死。"""
     frame = hfq_frame(bars(100.0, 99.0), actions((D1, "dividend", 1.0, None, None)))
     assert frame["adj_factor"].to_list() == pytest.approx([1.0, 100.0 / 99.0])
+
+
+# --- adjusted_series：唯一能出数的那个入口 -------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Span:
+    covered_from: date
+    covered_to: date
+    full_history: bool = True
+    src: str = "akshare"
+
+
+CONFIRMED = [Span(covered_from=D0, covered_to=D3)]
+
+
+def test_the_guarded_entry_refuses_where_the_bare_primitive_would_answer():
+    """同一份输入，`hfq_frame` 给得出数，`adjusted_series` 必须拒绝。
+
+    这条用例锁的是「安全路径是默认路径」：M2-B 的指标引擎要的是一条序列，它会挑最顺手的
+    那个函数。守卫要是只装在 `interval_return` 里，U12 那个错数就换个名字从指标这条路出门。
+    """
+    frame = bars(100.0, 99.0)
+    assert hfq_frame(frame, actions())["close_hfq"].to_list() == [100.0, 99.0]
+    with pytest.raises(NotAdjustable, match="覆盖确认"):
+        adjusted_series("A", "600000", frame, actions(), coverage=[])
+
+
+def test_every_price_column_carries_the_factor_not_just_the_close():
+    """ATR/BOLL/KDJ/周月重采样都吃 high/low。只给收盘价等于请每个指标自己再乘一遍，
+    而最顺手的错法是把裸 high 直接喂进去——那些数看起来完全正常。"""
+    frame = pl.DataFrame(
+        {
+            "date": [D0, D1],
+            "open": [101.0, 99.5],
+            "high": [102.0, 100.0],
+            "low": [100.0, 98.5],
+            "close": [100.0, 99.0],
+        }
+    )
+    series = adjusted_series(
+        "A", "600000", frame, actions((D1, "dividend", 1.0, None, None)), coverage=CONFIRMED
+    )
+    factor = 100.0 / 99.0
+    for column in ("open", "high", "low", "close"):
+        assert series.frame[f"{column}_hfq"][1] == pytest.approx(frame[column][1] * factor)
+    assert series.ex_dates == 1
+    assert series.covered_by == "akshare"
+
+
+def test_a_missing_close_is_refused_with_a_reason_instead_of_a_traceback():
+    """缺数要说不出口。`None / 100.0` 那种 TypeError 不是拒绝，是崩。"""
+    frame = pl.DataFrame({"date": [D0, D1], "close": [100.0, None]})
+    with pytest.raises(NotAdjustable, match="缺收盘价"):
+        adjusted_series("A", "600000", frame, actions(), coverage=CONFIRMED)
+
+
+def test_a_recorded_split_is_not_refused_as_an_unmarked_one():
+    """10 送 10 的 −50% 跳变是 D37 最想保住的情形，不是它该拒绝的证据。
+
+    守卫按价格对账：真实收盘落在参考价 ±涨跌幅 之内就算被这天的记录解释了。把它拒掉
+    等于守卫把自己存在的理由否定掉——高送转的 A 票从此没有一条区间涨跌能出数。
+    """
+    frame = pl.DataFrame({"date": [D0, D1], "close": [100.0, 50.0]})
+    series = adjusted_series(
+        "A", "600000", frame, actions((D1, "bonus", None, 2.0, None)), coverage=CONFIRMED
+    )
+    assert series.frame["close_hfq"].to_list() == pytest.approx([100.0, 100.0])
+
+
+def test_an_unrecorded_split_sized_move_still_gets_refused():
+    """同一段行情，库里没有那天的记录，豁免就不成立——否则上面那条等于关掉守卫。"""
+    frame = pl.DataFrame({"date": [D0, D1], "close": [100.0, 50.0]})
+    with pytest.raises(NotAdjustable, match="未记录的公司行为"):
+        adjusted_series("A", "600000", frame, actions(), coverage=CONFIRMED)

@@ -223,10 +223,9 @@ class YfinanceAdapter:
                 # 一只从不派息的票是真实存在的状态，不是故障：给它一次成功的空答复，
                 # 覆盖标记（D36）才写得下去
                 return empty_actions()
-            windowed = expanded.filter((pl.col("ex_date") >= start) & (pl.col("ex_date") <= end))
-            if windowed.is_empty():
-                return empty_actions()
-            return normalize_actions(windowed, market=market, code=code, source=self.name)
+            # 全历史源不按窗口切片：窗口外的派息已经拿到手了，丢掉它就是让库与
+            # 「确认至今天的全历史覆盖」那条记录说反话
+            return normalize_actions(expanded, market=market, code=code, source=self.name)
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001

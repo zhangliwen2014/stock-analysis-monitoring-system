@@ -169,24 +169,18 @@ def test_the_adapter_adds_market_canonical_code_and_src():
     ], "键不归一，同一天的分红会为一只票写出两个主键，自选清单只认其中一个"
 
 
-def test_the_window_is_the_request_window():
+def test_a_full_history_source_is_not_sliced_to_the_window():
+    """接口给全史 ⇒ 交回全史。窗口只决定这次「问的是哪段」，不决定库里存几行。
+
+    切掉窗口外的行，服务层却照样写「全历史，确认至今天」，守卫照着它放行 2015 年的
+    区间——而那笔 2015 年的除息从没入库，区间涨跌就成了裸价。少存几行省下的空间，
+    买回来的是 U12 那个看起来正常的错数。
+    """
     out = hk_adapter(
         "每股派港币0.1元", "每股派港币0.2元", ex_dates=[date(2023, 5, 17), EX]
     ).corp_actions("HK", "00700", date(2024, 1, 1), date(2024, 12, 31))
-    assert out["ex_date"].to_list() == [EX], "接口给全史，窗口是这一层切的"
-
-
-def test_a_quiet_window_is_an_empty_answer_not_a_failure():
-    """「这段区间没除权」必须是带 schema 的空帧，不是 EmptyResponse（D36）。
-
-    EmptyResponse 在路由里既不算成功也不算故障，覆盖标记就写不下去——于是「查过、没有」
-    与「从没查过」又混回一团，而区间收益的守卫会一路拒绝出数。
-    """
-    out = hk_adapter("每股派港币0.1元").corp_actions(
-        "HK", "00700", date(2023, 1, 1), date(2023, 12, 31)
-    )
-    assert out.is_empty()
-    assert "cash_per_share" in out.columns and "note" in out.columns
+    assert out["ex_date"].to_list() == [date(2023, 5, 17), EX]
+    assert out["cash_per_share"].to_list() == [0.1, 0.2]
 
 
 def test_a_stock_that_never_paid_out_also_answers_empty():

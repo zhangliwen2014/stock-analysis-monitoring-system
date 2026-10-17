@@ -75,12 +75,17 @@ class CorpActionSyncService:
         result = self.registry.fetch_actions(market, code, start, until)
         written = self.actions.upsert_many(result.frame)
         # 全历史源的答复是「截至今天，这只票的除权记录就这些」，与请求窗口多窄无关；
-        # 按区间拉的源只能确认它被拉的那一段
+        # 按区间拉的源只能确认它被拉的那一段。
+        # `covered_from` 记的是这次实际落库的最早除权日：一个从没分过红的票，
+        # 「全历史」的起点就是请求窗口的起点，编一个 1990 出来是把猜测写成事实
         covered_to = today if result.full_history else until
+        covered_from = start
+        if result.full_history and not result.frame.is_empty():
+            covered_from = min(result.frame["ex_date"].to_list())
         self.coverage.record(
             market,
             code,
-            covered_from=start,
+            covered_from=covered_from,
             covered_to=covered_to,
             full_history=result.full_history,
             src=result.source,
@@ -103,7 +108,7 @@ class CorpActionSyncService:
             degraded=result.degraded,
             skipped=result.skipped,
             attempts=result.attempts,
-            covered_from=start,
+            covered_from=covered_from,
             covered_to=covered_to,
             full_history=result.full_history,
             clamped_to=clamped,
