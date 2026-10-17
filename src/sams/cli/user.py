@@ -43,7 +43,11 @@ def add_to(subparsers) -> None:
 
 
 def _password(args: argparse.Namespace) -> str:
-    return args.password or ask_password()
+    # 只认「没给这个参数」：`--password ""` 是想用空口令，应交给口令强度校验，
+    # 而不是被当成没传、转身去问终端要（无人值守时那里直接 EOFError 炸栈）
+    if args.password is None:
+        return ask_password()
+    return args.password
 
 
 def add(container: Container, args: argparse.Namespace) -> int:

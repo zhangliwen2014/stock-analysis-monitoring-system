@@ -51,7 +51,9 @@ class Settings:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> Settings:
-        cfg_path = Path(os.environ.get("SAMS_CONFIG") or path or DEFAULT_CONFIG_PATH)
+        # 显式传参 > SAMS_CONFIG > 默认路径：命令行上指定的文件必须赢过环境变量，
+        # 否则「我用 --config 指了另一个库」会静默操作环境变量里那个库
+        cfg_path = Path(path or os.environ.get("SAMS_CONFIG") or DEFAULT_CONFIG_PATH)
         if not cfg_path.exists():
             raise ValidationError(
                 f"配置文件不存在: {cfg_path}；请先 cp {EXAMPLE_CONFIG_PATH} {cfg_path}"
