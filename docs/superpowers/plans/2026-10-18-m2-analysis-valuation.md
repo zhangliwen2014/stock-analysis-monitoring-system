@@ -225,6 +225,32 @@ verdict 是「**谨慎用**」：9 个真实区间的对账全部对齐，数字
 `--market HK --code 00700 --start 2022-12-01 --end 2023-03-01` ⇒ 拒绝（2023-01-05 那条实物分派
 `kind=unknown`，D39）；`sh601088` 与 `601088` 给同一个数。离线 `uv run pytest -q` 905 passed / 8 deselected。
 
+**A-7 第四轮：三道闸再各走一遍（对抗测试 agent + 架构师评审 agent + 交易员 agent）** ✅（提交 `85c2d6e`、`b7bfe0e`）
+
+三个 agent 这一轮查出的都不是「算错了」，而是**守卫能在某些敲法下静默不生效**——最难发现的那一类。
+全部先写复现用例再修：
+
+| # | 症状（能复现的那句） | 处置 |
+|---|---|---|
+| 1 | 对抗：降级到备源、而备源对同一 `(ex_date, kind)` 给了另一个数（2.10 → 3.00），后写覆盖先写，覆盖确认照旧写 ⇒ 放行一个看起来正常的错数 | `repos/corp_actions` 写侧冲突判定：相差 ≤0.005 视为同一条记录的修正（照旧覆盖），差得多 ⇒ `StorageError` 并把两个数与两个源都点名；**整批先校验后写**，一条冲突不陪其余数据进半截库。同日两件事要真正支持得换主键 ⇒ **U21** |
+| 2 | 架构师：`is_covered(..., today=None)` 那个默认值等于「忘了传时钟也能出数」，而且出来的数与新鲜确认过的一模一样 | `guard.is_covered` / `require_coverage` / `adjusted_series` / `interval_return` 的 `today`、`coverage` 全部去掉默认值；`test_the_clock_and_the_confirmation_cannot_be_forgotten` 把「没有默认值」这件事本身钉住（否则下次有人「顺手加个默认」就抹掉了） |
+| 3 | 架构师：`ALLOWED["analysis"]` 含 `storage`，等于允许守卫自己去库里看一眼 | 收紧为 `analysis: {core}`。三份事实全是参数：「能 import storage」与「会顺手查一眼库」只差一个习惯，而后者让守卫变成装饰 |
+| 4 | 架构师：`hfq_frame` 是不过闸的裸原语，只靠 docstring 写「请勿出数」 | `tests/test_layering.py::SOLE_CONSUMER` 机器校验它只有 `analysis/adjust.py` 一个消费者，别处出现即失败 |
+| 5 | 交易员：`--market a` 让 `daily_price_limit` 返回 None ⇒ D37 那道闸静默关掉，同时三个仓库各查一张空表 | `core.codes.canonical_market()` 上收到**服务边界**：`AnalysisService.interval_return`、`CorpActionSyncService.sync_actions`、`SyncService.sync_daily` 在入口归一（否则覆盖确认按 `a` 写进去，「同步成功」与「读数继续拒绝」同时成立）。空市场名 ⇒ `ValidationError`，CLI 打「错误:」并退 1 |
+| 6 | 交易员：「在 X~Y 不足两根 K 线」把三种情况说成一种，而下一步该敲的命令完全不同 | `services/analysis.py::_why_no_bars` 分诊：主档没这个代码（多半写错）/ 主档有、全库 0 根（还没采集）/ 全库 N 根、这段 0 根（并报最新到哪天） |
+| 7 | 交易员：锚点挪了却断言「（周末、长假、停牌）」——那是无依据的猜测，且恰好把最危险的一种缺口（开市日没采到）说成常态 | `CalendarService.known_status()`：只读库、绝不顺手打来源，日历没铺到就回答 None。CLI 按 开市/休市/未知 分类措辞，并引入**退出码 3** =「数给了，但不是请求那个区间的数」；`0` 现在只表示「请求的那段」 |
+| 8 | 交易员：`+2.44% vs +2.44%，采信复权`——两个数在两位小数下长成同一个字符串，那行输出没有信息量，而被舍掉的那一位正是差别 | 复权与裸价在两位小数下相同且确实不同时，补一行四位小数 |
+| 9 | 交易员：`ex_dates=0` 就打印「区间内没有除权日」，而起点那根本身可能就是除权日（效果已在起点价里，因此不进因子） | `IntervalReturn.start_is_ex_date`（`analysis/returns.py`），文案分三支；顺带纠正「两个数相等是巧合」那句——首尾之间没因子时它们是**必然**相等 |
+| 10 | 交易员：`--start 2024-7-1` 吐一段栈 | `cli/common.iso_date()` 把 `fromisoformat` 的 `ValueError` 换成 `ValidationError` 并带上正确示例；同一条规则让 `canonical_code` 的空代码也不再是裸 `ValueError` |
+
+**第四轮之后新增的债**：见 spec §18 **U21**（同日两件事的真除权需要换主键；现在宁可拒绝也不合并）。
+
+实测验收（本机真实网络，`601088` 2024-07）：`--market a` 与 `--market A` 给同一个数；
+`--start 2024-07-01 --end 2024-07-20` 在日历没铺到 2024 年时答「5 天无法判断」并以 3 结尾，
+`sams calendar refresh --market A --year 2024`（242 个交易日）之后同一句改成
+「4 个开市日没有 K 线（07-16/17/18 等）＋1 天休市」，仍然 3；`--code 000001` ⇒ 「主档里也没有这个代码」；
+`--start 2024-09-01` ⇒ 「全库有 11 根，最新到 2024-07-15」。离线 `uv run pytest -q` 1000 passed / 8 deselected。
+
 ### B 块：指标引擎（§8.2）
 
 - [ ] `indicators.py` 全部为纯函数（输入 `pl.DataFrame`，输出带新列的帧），入口拒绝未复权序列
