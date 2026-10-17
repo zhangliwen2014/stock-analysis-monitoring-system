@@ -1,0 +1,48 @@
+[project]
+name = "sams"
+version = "0.1.0"
+description = "多市场股票分析、监控与模拟交易系统"
+readme = "README.md"
+authors = [
+    { name = "zhangliwen2014", email = "zhangliwen@163.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "akshare>=1.19.1",
+    "bcrypt>=5.0.0",
+    "cryptography>=50.0.2",
+    "duckdb>=1.5.6",
+    "exchange-calendars>=4.13.2",
+    "polars>=2.0.0",
+    "pyarrow>=26.0.0",
+    "requests>=2.34.2",
+    "yfinance>=1.7.0",
+]
+
+[project.scripts]
+sams = "sams.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live'"
+testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+    "live: 需要真实网络的用例（默认不执行，用 -m live 单独跑）",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
