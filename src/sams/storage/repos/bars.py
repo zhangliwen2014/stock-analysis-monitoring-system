@@ -4,9 +4,10 @@
 读取一律带 `adjust = 'raw'`：库里目前只有一种口径，但把口径写进查询而不是靠约定，
 是为了让 M2 引入后复权序列时不可能悄悄读到混着两种价的同一根 K 线。
 
-仓库层只挡住两类代价不对称的问题：口径混淆，以及 NaN 覆盖上一根好 K 线。
+仓库层挡掉的是「存进去就会被当成真数用」的那几类：口径混淆、NaN 覆盖上一根好 K 线、
+收盘价为 0（区间跌幅立刻变 −100%）、非正的开高低与 high<low 的不自洽极值（置空，不陪葬整行）。
 负成交量/负成交额原样存——那是源侧数据质量问题，属于采集与清洗的职责，
-在这里丢弃会让「源给了脏数」和「这一天没数据」在库里长得一样。
+在这里丢弃会让「源给了脏数」和「这一天没数据」在库里长得一样；它由 `sams health` 如实报出来。
 """
 
 from __future__ import annotations
@@ -69,12 +70,16 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
         *[pl.col(c).cast(pl.Float64) for c in ("close", *_OPTIONAL_NUMERIC)],
     )
     before = out.height
-    # is_not_null 挡不住 NaN：pandas 侧的「缺数据」正是 NaN，它会通过非空校验并覆盖上一根好 K 线
-    out = out.filter(pl.col("close").is_finite() & pl.col("date").is_not_null())
+    # is_not_null 挡不住 NaN：pandas 侧的「缺数据」正是 NaN，它会通过非空校验并覆盖上一根好 K 线。
+    # close <= 0 同一条道：0 是「今天没成交」写进了收盘列，会让区间跌幅变成 −100%，
+    # 对上层来说和真正的暴跌长得一模一样——止损规则会被一根脏 K 线打死。
+    out = out.filter(
+        pl.col("close").is_finite() & (pl.col("close") > 0) & pl.col("date").is_not_null()
+    )
     dropped = before - out.height
     if dropped:
-        # 缺收盘价的行不能存成"收盘=0"，但也不静默消失：记录后再丢弃
-        logger.warning("bars_daily 丢弃 %d 行（收盘价缺失或非法）", dropped)
+        # 缺收盘价（或收盘价为 0）的行不能存，但也不静默消失：记录后再丢弃
+        logger.warning("bars_daily 丢弃 %d 行（收盘价缺失或非正）", dropped)
     bad = out.select(
         pl.sum_horizontal(
             *[~pl.col(c).is_finite() & pl.col(c).is_not_null() for c in _OPTIONAL_NUMERIC]
@@ -85,6 +90,23 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
     out = out.with_columns(
         pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c)
         for c in _OPTIONAL_NUMERIC
+    )
+    # 非正的开高低不是价格而是「这个字段没数据」：置空，让 M2 的振幅/形态规则显式看到缺失
+    out = out.with_columns(
+        pl.when(pl.col(c) > 0).then(pl.col(c)).otherwise(None).alias(c)
+        for c in ("open", "high", "low")
+    )
+    # high/low 必须把 close 包住：源写反了极值，这两个值就同时不可信，两头都置空
+    inverted = (
+        (pl.col("high") < pl.col("low"))
+        | (pl.col("high") < pl.col("close"))
+        | (pl.col("low") > pl.col("close"))
+    )
+    broken = out.filter(inverted).height
+    if broken:
+        logger.warning("bars_daily 有 %d 行 OHLC 不自洽（high/low 已置空）", broken)
+    out = out.with_columns(
+        pl.when(inverted).then(None).otherwise(pl.col(c)).alias(c) for c in ("high", "low")
     )
     return out.unique(subset=["market", "code", "date"], keep="last").sort(
         ["market", "code", "date"]

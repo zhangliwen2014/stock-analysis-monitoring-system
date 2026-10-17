@@ -1,6 +1,6 @@
 # M1 地基实施计划
 
-**Goal:** 交付可运行地基——配置、事件总线、分市场交易日历、DuckDB 存储与仓库层（用户数据硬隔离）、A 股主备源与港美股日线采集、CLI 运维入口。
+**Goal:** 交付可运行地基——配置、事件总线、分市场交易日历、DuckDB 存储与仓库层（用户数据硬隔离）、可插拔的三市场主备数据源与降级链、CLI 运维入口（`sync`/`calendar`/`health`/`source`）。
 
 **Architecture:** 分层单体。`core` 无内部依赖；`storage` 是唯一读写入口；`datasource` 只做「外部接口 → 标准列集」规范化并按市场路由降级；`cli` 把三者串起来。跨模块通信走进程内事件总线，为 A→B 拆分保留边界。
 
@@ -44,16 +44,18 @@ src/sams/storage/migrations/0003_bar_semantics.sql  adjust 进主键、只存 ra
 src/sams/storage/migrations/0004_migration_checksum.sql  已应用迁移的内容校验和
 src/sams/storage/migrations/0005_source_health_tristate.sql  ok 去 NOT NULL（三态）
 src/sams/storage/migrations/0006_drop_ownerless_turnover.sql  删无生产者的列
+src/sams/storage/migrations/0007_data_sources.sql  data_sources + data_source_routes（含现有降级链播种）
 src/sams/storage/migrate.py           schema_migrations 驱动，逐文件事务 + 向后兼容重放校验
 src/sams/storage/repos/{users,sessions,symbols,bars,calendar,watchlists,source_health,corp_actions}.py
 src/sams/datasource/base.py           BarAdapter 协议、标准列常量、normalize_bars、code_in_market
 src/sams/datasource/ratelimit.py      TokenBucket + backoff_sleep（注入时钟）
 src/sams/datasource/calendar_providers.py  CnSinaProvider(akshare)、XcalProvider(exchange_calendars)
-src/sams/datasource/{akshare_cn,eastmoney,yfinance_us}.py   三个源的适配器
-src/sams/datasource/registry.py       市场→源列表，降级重试与源健康
-src/sams/services/{calendar,sync,health,accounts}.py  用例编排（日历补齐、采集入库、自检、账号）
+src/sams/datasource/sources.py        @source 注册表 + pkgutil 自动发现（可插拔的代码层）
+src/sams/datasource/{akshare_cn,eastmoney,yfinance_us,tencent}.py   四个源的适配器（腾讯 gtimg 三市场通吃的备源）
+src/sams/datasource/registry.py       市场→源列表（库内路由优先，配置兜底），降级重试与源健康
+src/sams/services/{calendar,sync,health,accounts,source_admin}.py  用例编排（日历补齐、采集入库、自检、账号、源维护）
 src/sams/bootstrap.py                 组装根：唯一同时认识所有实现的地方
-src/sams/cli/{__init__,common,db,user,sync,calendar,health}.py  命令分发与展示
+src/sams/cli/{__init__,common,db,user,sync,calendar,health,source}.py  命令分发与展示
 tests/                                镜像 src 结构；support.py 放替身与样本（含 FrozenClock）；
                                       test_layering.py 分层守卫；
                                       test_adversarial_{storage,datasource,services,caliber}.py 四份契约
@@ -84,7 +86,7 @@ tests/                                镜像 src 结构；support.py 放替身�
 
 1. `uv run sams db migrate` 建库；重跑不重复应用迁移。
 2. `uv run sams sync --market A --code 600519 --start 2024-01-01 --end 2024-02-01` 成功入库；**连续执行两次行数完全一致**。
-3. `uv run sams sync --market US --code AAPL ...`、`--market HK --code 00700 ...` 入库且 `currency` 正确（USD/HKD）。
+3. `uv run sams sync --market US --code AAPL ...`、`--market HK --code 00700 ...` 入库且 `currency` 正确（USD/HKD）。**已验证**：三个市场均在主源失败后降级到腾讯 gtimg 入库（28/33/33 行，见 spec §18 U10）。
 4. `uv run sams calendar check --market A --date 2026-10-01` → 休市；`--market US --date 2026-03-09` → 开盘且 UTC 时刻体现夏令时。
 5. `uv run sams user add` + `login`；用户 B 查询不到用户 A 的自选股。
 6. `uv run pytest -q` 全绿；`uv run ruff check .` 干净。
@@ -131,9 +133,11 @@ CLI 实跑（独立临时库，不碰开发库）：
 
 修掉的一个显示 bug：`calendar check` 的 UTC 一栏直接复用本地时间格式化，没做 `astimezone(UTC)`；现已按港股半天 09:30→01:30 的断言锁住。
 
-### 验收清单里还欠一条
+### 验收清单里当时欠的一条（现已补上）
 
-第 3 项（US/HK 日线入库且 `currency` 正确）没跑通：Yahoo Finance 对当前出口持续限流，拿不到真实日线。失败链路与健康上报已按上面的真实 429 验证过，入库与币种字段由单测覆盖（`services/test_sync.py`）。等网络通畅时补一次 `sams sync --market US/HK` 即可结案。
+第 3 项（US/HK 日线入库且 `currency` 正确）当时没跑通：Yahoo Finance 对当前出口持续限流，拿不到真实日线。失败链路与健康上报已按上面的真实 429 验证过，入库与币种字段由单测覆盖（`services/test_sync.py`）。
+
+后续在同一台机器上跑通了：三个市场的主源都失败过一轮，降级到腾讯 gtimg 取数成功，重复同步行数不变（spec §18 U10）。这条到此结案。
 
 ---
 
@@ -172,3 +176,31 @@ CLI 冒烟（全新临时库 + `SAMS_SECRET_KEY`，跑完即删）：`db migrate
 
 第 3 项验收仍欠（同上一轮：网络，不是代码）。
 
+## 追加：数据源可插拔层 + 备份链（迁移 0007）
+
+用户要求：「数据源需要有备份，出现问题使用备份的数据（1个或多个）……可以通过管理后台加入、维护这些数据源」「数据源的设计应该为可拔插、便于扩展」。Web 后台在 M4，但维护数据源这件事不必等它——命令行与将来的界面调的是同一个 `services.SourceAdminService`。
+
+**两层可插拔**（spec D28）：
+
+* 代码层：`datasource/sources.py` 的 `@source(kind)` 装饰器 + pkgutil 自动发现。新增实现 = 在 `datasource/` 下加一个文件、贴一个装饰器，无需改注册表、无需改 bootstrap。
+* 配置层：`data_sources`（name/kind/options_json/enabled/note）与 `data_source_routes`（market/name/priority）。0007 迁移建表并按 §7.1 的现有链播种；表缺失时**读静默、写报错**，`sams db migrate` 之前老库照常跑。配置文件 `[markets.*].sources` 只在表为空时兜底，一旦有记录，库里说的就是生效链。
+
+**安全边界**：`kind` 只接受注册表里出现过的名字，不接受 import 路径或模块名——否则「加数据源」这条命令本身就成了任意代码执行入口（管理后台迟早要暴露它）。
+
+**CLI**：`sams source list/kinds/add/update/enable/disable/remove/route/unroute/move/probe`。校验全部在 service 层（未注册实现、不支持的市场、把某市场弄成零源都拒绝），CLI 只做参数形状转换。`probe` 绕开降级链单打一个源，取数失败也返回 0——试跑是诊断，脚本要能接着问下一个源。
+
+**目录变化**：`datasource/akshare.py` → `akshare_cn.py`（与 shadow stdlib `akshare` 包名冲突的历史包袱清掉）；新增 `tencent.py`（gtimg，三市场通吃的备源）。`tests/datasource/` 下按源补契约测试，全部离线喂录制 payload。
+
+## 追加：专家使用向复核后的修复（2026-10-17 深夜）
+
+按「找股票交易专家 agent 测试使用」的口径复核，产出 14 条发现。已修（各带守护测试，spec 记为 D29–D33）：
+
+* **回写身份校验**（D29）：每个适配器确认响应里回写的代码/符号就是请求的那只。`akshare_cn.require_echoed_code`、`tencent.parse_tencent_daily(..., symbol=)` 不符即 `FieldDrift` 整批丢弃——换错票不会露出破绽，`000001` 的曲线挂到 `600519` 名下只会「看起来跌得很惨」，而它已是库里的事实。
+* **最小写入守护**（D30）：非正/非有限收盘价丢弃并计数告警；非正 open/high/low 置空；OHLC 不自洽时 high/low 同时置空。**负成交量故意保留**——它是来源给的事实，由 `sams health` 露头，不在写入侧被静默洗掉。
+* **代码归一唯一入口**（D31）：`HK00700`/`HK.00700`/`00700.HK`/`700` 都收敛成 `00700`；人民币柜台按数值区间 80000–89999 判，不按前缀（`08xxx` 是港股通外的创业板，仍是 HKD）。自选股仓库在入口调用 `canonical_code`，不指望调用方先归一。
+* **日历覆盖判定**（D32）：「覆盖」按首末日期跨度判而非行数（缺 12 月不算铺满）；已覆盖年份的缺失日第一次就回答休市；补齐后重新走同一条判定，避免 `sams calendar check` 先打印交易再打印休市；一个进程对一个年份最多问来源一次，显式 `refresh` 才算新机会。
+* **健康报告数据事实**（D33）：按市场打印行数/只数/最新日期、成交额缺失比例、负成交量行数、`corp_actions` 为空时的裸价提醒。行数说明不了「能不能用」——「成交额只有 0% 的行有值，依赖它的规则不会触发」这种话只有这一屏会说。
+
+判为「记录而非修复」的（进 spec §18）：U12 裸价 + 无除权标记 ⇒ 跨除权日区间涨跌幅会算错（601088 实测 −3.81% vs 复权 +1.26%）；U13 换手率/流通股本被丢弃 ⇒ §10.3 换手率类模板 M3 不可启用；U14 腾讯第 7 个元素故意不取；U15 `EmptyResponse` 的原因未持久化。
+
+**验证**：`uv run ruff check .` 全绿；`uv run pytest -q` 670 passed / 4 deselected（本轮新增 54 个用例）。真实网络三市场降级到腾讯并幂等重跑，见 spec §18 U10。

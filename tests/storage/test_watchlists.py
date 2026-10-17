@@ -80,3 +80,21 @@ def test_per_user_cap(repo):
     with pytest.raises(ValidationError, match="上限"):
         repo.add(A_ID, "A", "over-cap")
     assert repo.count(A_ID) == MAX_ITEMS_PER_USER, "超限的写入不能污染计数"
+
+
+def test_codes_are_canonicalised_on_the_way_in(repo):
+    """清单里的键必须和 bars 里的键同一个形态，否则那一行永远读不到行情且不报错。
+
+    用户在界面上写 `700`、`HK.00700`、`00700.HK` 都是同一只票；采集侧入库的是 `00700`。
+    """
+    repo.add(A_ID, "HK", "700")
+    assert [i.code for i in repo.list(A_ID)] == ["00700"]
+    assert repo.contains(A_ID, "HK", "HK.00700")
+    repo.add(A_ID, "HK", "HK00700")
+    assert repo.count(A_ID) == 1, "同一只票的两种写法不该占两行"
+    assert repo.remove(A_ID, "HK", "00700.HK") is True
+
+
+def test_the_exchange_suffix_is_not_part_of_the_key(repo):
+    repo.add(A_ID, "A", "601088.SH")
+    assert [i.code for i in repo.list(A_ID)] == ["601088"]

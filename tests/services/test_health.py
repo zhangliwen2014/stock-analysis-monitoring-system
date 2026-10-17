@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
+import polars as pl
 import pytest
 from support import StubAdapter, sample_bars
 
@@ -47,10 +48,16 @@ def test_counts_reflect_written_rows(db, settings):
 
 
 def test_calendar_coverage_lists_covered_years_only(db, settings):
-    day = CalendarDay(
-        "A", D, True, False, "Asia/Shanghai", (SessionWindow("am", "09:30", "11:30"),)
-    )
-    CalendarRepo(db).save([day], source="fake")
+    # 一年「已覆盖」= 首尾都铺到（见 CalendarRepo.year_covered），只写一天不算
+    days = [
+        CalendarDay(
+            "A", D, True, False, "Asia/Shanghai", (SessionWindow("am", "09:30", "11:30"),)
+        ),
+        CalendarDay("A", date(2024, 12, 30), True, False, "Asia/Shanghai", ()),
+        # 上半年有、下半年没有：来源给半截时这一年必须报未覆盖，否则 Jul~Dec 静默停摆
+        CalendarDay("US", date(2024, 4, 1), True, False, "America/New_York", ()),
+    ]
+    CalendarRepo(db).save(days, source="fake")
     report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
     assert report.calendar_years["A"] == [D.year]
     assert report.calendar_years["US"] == []
@@ -106,7 +113,7 @@ def test_calendar_window_is_taken_from_the_injected_clock(db, settings):
     asked: list[int] = []
 
     class RecordingStore:
-        def year_covered(self, market: str, year: int) -> bool:
+        def year_covered(self, market: str, year: int, *, through=None) -> bool:
             asked.append(year)
             return False
 
@@ -120,3 +127,51 @@ def test_calendar_window_is_taken_from_the_injected_clock(db, settings):
     )
     assert service.report().calendar_years["A"] == []
     assert asked == [2029, 2030, 2031] * len(settings.markets)
+
+
+# ---------------------------------------------------------------- 日线事实
+
+
+def test_report_carries_freshness_and_coverage_per_market(db, settings):
+    """行数说明不了「能不能用」：最后一天是哪天、成交额有没有值才是。
+
+    `bars_daily = 30000` 可能是 300 只票十年，也可能是三天前停更的三只。
+    """
+    BarRepo(db).upsert(sample_bars("A", "600519"))
+    no_amount = sample_bars("HK", "00700").with_columns(
+        pl.lit(None, dtype=pl.Float64).alias("amount")
+    )
+    BarRepo(db).upsert(no_amount)
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+    data = report.market_data
+    assert data["A"].rows == 2 and data["A"].codes == 1
+    assert data["A"].latest == date(2024, 1, 3)
+    assert data["A"].with_amount == 2 and data["A"].amount_missing == 0
+    # 只有 tencent/sina 在服务时成交额整段为空：不是错误，但依赖它的规则永不触发
+    assert data["HK"].amount_missing == 2
+
+
+def test_negative_volume_is_counted_as_a_quality_fact(db, settings):
+    """负量原样入库是决定，但它必须在这里露头，否则量比类指标会算出 62 倍。"""
+    frame = sample_bars().with_columns(
+        pl.when(pl.col("date") == D).then(-5.0).otherwise(pl.col("volume")).alias("volume")
+    )
+    BarRepo(db).upsert(frame)
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+    data = report.market_data
+    assert data["A"].negative_volume == 1
+
+
+def test_a_market_without_bars_has_no_data_row(db, settings):
+    """还没采集过 ≠ 数据坏了：报告里根本没有这一项，由 CLI 说「尚未采集」。"""
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+    assert report.market_data == {}
+    assert report.tables["corp_actions"] == 0, "裸价表空着是跨除权日涨跌不可用的前提事实"
+
+
+def test_the_bar_lag_survives_a_later_write(db, settings):
+    BarRepo(db).upsert(sample_bars())
+    health = service(db, settings, StubAdapter("akshare", ["A"], sample_bars()))
+    assert health.report().market_data["A"].latest == date(2024, 1, 3)
+    BarRepo(db).upsert(sample_bars(start=date(2024, 4, 1)))
+    assert health.report().market_data["A"].latest == date(2024, 4, 2)

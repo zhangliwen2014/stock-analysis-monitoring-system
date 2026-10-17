@@ -20,6 +20,7 @@ from sams.datasource.base import (
     code_in_market,
     normalize_bars,
 )
+from sams.datasource.sources import source
 
 KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 #: 接口按 fields2 的顺序逗号分隔返回，顺序即语义，改动会静默错位
@@ -131,3 +132,6 @@ class EastmoneyAdapter:
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
 
+
+
+source("eastmoney", note="东方财富 A 股 kline")(EastmoneyAdapter)

@@ -8,6 +8,8 @@ from support import FrozenClock, StubAdapter, sample_bars
 
 from sams.bootstrap import attach_log_sink, build_container
 from sams.core.events import EventBus, SystemAlarm
+from sams.storage.db import Database
+from sams.storage.migrate import apply_migrations
 
 
 def stub_adapters() -> dict:
@@ -53,3 +55,106 @@ def test_log_sink_does_not_swallow_other_subscribers():
     bus.subscribe(SystemAlarm, seen.append)
     result = bus.publish(SystemAlarm(component="x", message="y"))
     assert result.ok and len(seen) == 1
+
+
+# ---------- 数据源链的来源：库里有记录就不看配置文件 ----------
+
+
+@pytest.fixture
+def migrated(settings):
+    """建好并关闭：下面的用例各自重新打开这个文件库，模拟「两条命令两次进程」。"""
+    database = Database.open(settings.db_path)
+    apply_migrations(database)
+    database.close()
+    return settings
+
+
+def test_registry_chain_comes_from_the_database(migrated):
+    built = build_container(migrated)
+    try:
+        assert built.registry.market_sources == {
+            "A": ("akshare", "eastmoney", "tencent", "sina"),
+            "HK": ("yfinance", "tencent"),
+            "US": ("yfinance", "tencent"),
+        }
+    finally:
+        built.close()
+
+
+def test_disabling_a_source_takes_it_out_of_the_next_container(migrated):
+    """管理后台改完不必重启：下一次装配读到的就是新链（M1 的可维护性承诺）。"""
+    first = build_container(migrated)
+    try:
+        first.source_admin.set_enabled("akshare", False)
+    finally:
+        first.close()
+
+    second = build_container(migrated)
+    try:
+        assert second.registry.market_sources["A"] == ("eastmoney", "tencent", "sina")
+        assert "akshare" not in second.registry.adapters, "停用源连适配器都不该建"
+    finally:
+        second.close()
+
+
+def test_two_rows_can_share_one_implementation(migrated):
+    """可插拔的用意：同一实现的第二个实例（不同超时、不同用途）是配置能表达的事。"""
+    first = build_container(migrated)
+    try:
+        first.source_admin.add("tencent_fast", "tencent", ["A"], options={"timeout": 3})
+    finally:
+        first.close()
+
+    built = build_container(migrated)
+    try:
+        assert built.registry.market_sources["A"][-1] == "tencent_fast"
+        assert built.registry.adapters["tencent_fast"] is not built.registry.adapters["tencent"]
+    finally:
+        built.close()
+
+
+def test_options_reach_the_adapter_constructor(migrated):
+    """库里存的参数必须真的传进构造函数：静默忽略等于「我以为改了超时，其实没有」。"""
+    built = build_container(migrated)
+    try:
+        built.source_admin.add("sina_short", "sina", ["A"], options={"timeout": 2})
+    finally:
+        built.close()
+    built = build_container(migrated)
+    try:
+        assert built.registry.adapters["sina_short"]._timeout == 2
+    finally:
+        built.close()
+
+
+def test_settings_are_the_fallback_when_the_table_is_empty(migrated):
+    """老库（没跑过 0007）也要能装配：这时配置文件说话。"""
+    built = build_container(migrated)
+    try:
+        built.db.execute("DELETE FROM data_source_routes")
+        built.db.execute("DELETE FROM data_sources")
+    finally:
+        built.close()
+
+    second = build_container(migrated)
+    try:
+        assert second.registry.market_sources["A"] == ("akshare", "eastmoney")
+    finally:
+        second.close()
+
+
+def test_a_market_left_without_sources_warns_instead_of_crashing(migrated, caplog):
+    """账号管理、健康检查都不该因为「某个市场暂时没源」就跑不起来，但必须说出来。"""
+    built = build_container(migrated)
+    try:
+        built.db.execute("DELETE FROM data_source_routes WHERE market = 'HK'")
+    finally:
+        built.close()
+
+    with caplog.at_level(logging.WARNING, logger="sams.bootstrap"):
+        second = build_container(migrated)
+    try:
+        assert "HK" in caplog.text
+        assert "HK" not in second.registry.market_sources
+    finally:
+        second.close()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
+import polars as pl
 import pytest
 from support import StubAdapter, sample_bars
 
@@ -225,3 +226,147 @@ def test_unknown_config_file_is_reported_not_traced(tmp_path, monkeypatch, capsy
     monkeypatch.setenv("SAMS_CONFIG", str(tmp_path / "missing.toml"))
     assert cli.run(["health"]) == 1
     assert "配置文件不存在" in capsys.readouterr().err
+
+
+# ---------- `sams source ...`：M1 的数据源管理后台 ----------
+
+
+def test_source_list_shows_the_seeded_chains(container, capsys):
+    assert cli_run_on(container, ["source", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "akshare → eastmoney → tencent → sina" in out
+    assert "yfinance → tencent" in out, "验收：港美股有备源，且从 list 就能看出来"
+
+
+def test_source_list_falls_back_to_the_config_when_the_table_is_empty(container, capsys):
+    container.db.execute("DELETE FROM data_source_routes")
+    container.db.execute("DELETE FROM data_sources")
+    assert cli_run_on(container, ["source", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "按配置文件" in out and "db migrate" in out
+    assert "akshare → eastmoney" in out, "空表时要说清真正生效的是哪条链"
+
+
+def test_source_kinds_lists_the_pluggable_implementations(container, capsys):
+    assert cli_run_on(container, ["source", "kinds"]) == 0
+    out = capsys.readouterr().out
+    assert "tencent" in out and "sina" in out
+    assert "参数 ['timeout']" in out, "可配参数要写在界面上，不然只能靠试"
+    assert "来自 tencent.py" in out
+
+
+def test_source_add_then_remove(container, capsys):
+    add = ["source", "add", "tx2", "--kind", "tencent", "--markets", "HK"]
+    assert cli_run_on(container, add) == 0
+    assert "tx2" in capsys.readouterr().out
+    assert cli_run_on(container, ["source", "list"]) == 0
+    assert "yfinance → tencent → tx2" in capsys.readouterr().out
+
+    assert cli_run_on(container, ["source", "remove", "tx2"]) == 0
+    assert "连带移除路由 1 条" in capsys.readouterr().out
+
+
+def test_source_options_keep_their_type(container, capsys):
+    add = ["source", "add", "sx", "--kind", "sina", "--markets", "A", "--opt", "timeout=7"]
+    assert cli_run_on(container, add) == 0
+    capsys.readouterr()
+    assert cli_run_on(container, ["source", "list"]) == 0
+    # 存成 "7" 会一路带到构造函数里：换成布尔参数时就不只是「侥幸能跑」的问题了
+    assert "参数 {'timeout': 7}" in capsys.readouterr().out
+
+
+def test_bad_add_is_reported_as_a_message_not_a_trace(config_path, capsys):
+    assert cli.run(["source", "add", "evil", "--kind", "os.system", "--markets", "A"]) == 1
+    assert "未注册" in capsys.readouterr().err
+    capsys.readouterr()
+    assert cli.run(["source", "add", "sx", "--kind", "sina", "--markets", "US"]) == 1
+    assert "不支持市场" in capsys.readouterr().err
+
+
+def test_disabling_the_last_source_of_a_market_is_refused(config_path, capsys):
+    """这条命令的失败是它存在的理由：撤掉唯一的源在当下毫无症状，
+    症状要到下一次采集才出现——那时已经没人知道是谁干的。
+    """
+    assert cli.run(["source", "move", "HK", "yfinance"]) == 0
+    capsys.readouterr()
+    assert cli.run(["source", "disable", "yfinance"]) == 1
+    assert "完全取不到数" in capsys.readouterr().err
+    assert cli.run(["source", "add", "tx9", "--kind", "tencent", "--markets", "HK"]) == 0
+    capsys.readouterr()
+    assert cli.run(["source", "disable", "yfinance"]) == 0
+    assert "已停用 yfinance" in capsys.readouterr().out
+
+
+def test_source_enable_puts_it_back_at_the_same_priority(config_path, capsys):
+    cli.run(["source", "disable", "tencent"])
+    capsys.readouterr()
+    assert cli.run(["source", "enable", "tencent"]) == 0
+    assert "yfinance → tencent" in capsys.readouterr().out
+
+
+def test_probe_prints_the_failure_instead_of_raising(container, monkeypatch, capsys):
+    from sams.datasource.sina import SinaAdapter
+
+    monkeypatch.setattr(
+        "sams.services.sources.build", lambda kind, options=None: SinaAdapter(get=_FakeSina())
+    )
+    assert cli_run_on(container, ["source", "probe", "sina", "--market", "A", "--code", "600519",
+                                  "--start", "2024-01-02", "--end", "2024-01-05"]) == 0
+    out = capsys.readouterr().out
+    assert "OK 取到 2 根" in out, "试跑命令的退出码不该是网络状况的函数"
+
+
+class _FakeSina:
+    def __call__(self, url, params, *, timeout=15):
+        return [
+            {"day": f"2024-01-0{d}", "open": "1", "high": "2", "low": "0.5", "close": "1.5",
+             "volume": "1000"}
+            for d in (2, 3)
+        ]
+
+
+def test_health_shows_chains_and_flags_a_single_source_market(config_path, capsys):
+    """health 要说的是「这个进程会用哪条链」，一个市场的单源状态要从这一屏看出来。"""
+    # 走真实入口：cli.run 会先补齐迁移，链的权威来源是库里的记录
+    assert cli.run(["source", "unroute", "HK", "tencent"]) == 0
+    capsys.readouterr()
+
+    assert cli.run(["health"]) == 0
+    out = capsys.readouterr().out
+    assert "[降级链]（库里的记录）" in out
+    assert "akshare → eastmoney → tencent → sina" in out
+    assert "yfinance  ⚠ 单源" in out, "每个源都健康 ≠ 有备源：这里必须看得见"
+
+
+def test_health_shows_when_the_last_bar_is_and_that_prices_are_raw(container, capsys):
+    """行数说明不了能不能用：最后一天是哪天、是不是裸价，只有这一屏会说。"""
+    assert cli_run_on(container, sync_argv()) == 0
+    capsys.readouterr()
+
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "[数据]" in out
+    assert "最新 2024-01-03" in out
+    # 库里没有公司行为时跨除权日的区间涨跌是错的（专家复核 #1），必须在这里露头
+    assert "corp_actions 0 行" in out and "裸价" in out
+
+
+def test_health_names_a_field_the_serving_sources_do_not_provide(container, capsys):
+    """只有腾讯/新浪在服务时成交额整段为空——不是错误，但依赖它的规则永不触发。"""
+    container.bars.upsert(
+        sample_bars("HK", "00700").with_columns(pl.lit(None, dtype=pl.Float64).alias("amount"))
+    )
+    assert cli_run_on(container, ["health"]) == 0
+    assert "成交额只有 0% 的行有值" in capsys.readouterr().out
+
+
+def test_health_shows_negative_volume_rows(container, capsys):
+    """负量原样入库是决定，量比会算出 62 倍是后果——中间这一环不能缺。"""
+    container.bars.upsert(sample_bars().with_columns(pl.lit(-5.0).alias("volume")))
+    assert cli_run_on(container, ["health"]) == 0
+    assert "行成交量为负" in capsys.readouterr().out
+
+
+def test_health_says_a_market_has_no_bars_yet(container, capsys):
+    assert cli_run_on(container, ["health"]) == 0
+    assert "（无日线，还没采集过）" in capsys.readouterr().out

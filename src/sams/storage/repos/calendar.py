@@ -10,13 +10,22 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import polars as pl
 
 from sams.core.errors import StorageError
 from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.storage.db import Database
+
+#: 判断「整年被铺满」时首尾各允许的空白天数：元旦、春节、圣诞本身就没有行
+_COVER_SLACK_DAYS = 14
+
+
+def _as_date(value) -> date:
+    """DuckDB 的 min/max(date) 在部分版本下返回 datetime。"""
+    return value.date() if isinstance(value, datetime) else value
+
 
 
 class CalendarRepo:
@@ -84,14 +93,35 @@ class CalendarRepo:
             windows=windows,
         )
 
-    def year_covered(self, market: str, year: int) -> bool:
-        return (
-            self.db.scalar(
-                "SELECT count(*) FROM trading_calendar WHERE market = ? AND year(date) = ?",
-                [market, year],
-            )
-            or 0
-        ) > 0
+    def year_covered(self, market: str, year: int, *, through: date | None = None) -> bool:
+        """该年是否被**完整**刷新过：行必须同时铺到年初与年末。
+
+        `count(*) > 0` 挡不住半截。来源只回了上半年时，下半年在库里一行都没有，
+        而本模块的判定规则是「已覆盖 + 无行 = 休市」——于是 Jul~Dec 每一天都被
+        判成休市，监控静默停摆半年，正是文件头写明的最坏失效。
+        两端各留 `_COVER_SLACK_DAYS` 天余量：元旦/圣诞/春节本身休市，首尾那几天没行。
+
+        `through` 是「数据最多到这里」的上界（通常是今天）。今年还没过完，
+        要求年末有行会永远判为未覆盖；但下界不早于 1 月底，否则一月初的
+        一次残缺刷新就能把整年判成已覆盖。
+        """
+        end = date(year, 12, 31)
+        if through is not None and through.year == year:
+            end = max(through, date(year, 1, 31))
+        row = self.db.query(
+            """
+            SELECT min(date) AS first_day, max(date) AS last_day, count(*) AS rows
+            FROM trading_calendar WHERE market = ? AND year(date) = ?
+            """,
+            [market, year],
+        ).to_dicts()[0]
+        if not row["rows"]:
+            return False
+        first = _as_date(row["first_day"])
+        last = _as_date(row["last_day"])
+        return first <= date(year, 1, 1) + timedelta(days=_COVER_SLACK_DAYS) and (
+            last >= end - timedelta(days=_COVER_SLACK_DAYS)
+        )
 
     def trading_days(self, market: str, year: int) -> int:
         return int(

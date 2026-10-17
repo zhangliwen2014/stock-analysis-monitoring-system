@@ -20,20 +20,22 @@ from sams.core.config import Settings
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited, TransientError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.sources import SourceHealthStore, SourceRecord
-from sams.datasource.akshare_cn import AkshareAdapter
 from sams.datasource.base import BarAdapter
-from sams.datasource.eastmoney import EastmoneyAdapter
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
-from sams.datasource.yfinance_us import YfinanceAdapter
+from sams.datasource.sources import build as build_adapter
+from sams.datasource.sources import known
 
 logger = logging.getLogger("sams.datasource.registry")
 
-#: 源名 → 构造器。配置里的 sources 用名字引用，加源只改这张表
-SOURCE_BUILDERS: dict[str, Callable[[], BarAdapter]] = {
-    "akshare": AkshareAdapter,
-    "eastmoney": EastmoneyAdapter,
-    "yfinance": YfinanceAdapter,
-}
+
+def default_adapters() -> dict[str, BarAdapter]:
+    """把所有已注册实现都建出来，键名 = 实现名。
+
+    这里不再维护「源名 → 构造器」的硬编码表：实现自己在模块里 `@source` 注册，
+    加一个源不用碰本文件。「配置里没提到但已注册」的实现多建出来无害——
+    构造适配器不发网络请求，而漏建会让配置写错名字时报「未注册」这种误导性的话。
+    """
+    return {kind: build_adapter(kind) for kind in known()}
 
 #: 值得原地退避重试的错误。FieldDrift 不在其中——改版重试不会变好，只会白等 21 秒
 RETRYABLE: tuple[type[BaseException], ...] = (RateLimited, TransientError, OSError, TimeoutError)
@@ -109,8 +111,18 @@ class AdapterRegistry:
     alarm_after_failures: int = 3
 
     def __post_init__(self) -> None:
+        # 反查「这个源名被路由到哪些市场」：健康页要说的是「我把它用在哪些市场」，
+        # 而不是「这个实现理论上能吃几个市场」——腾讯支持三市场，但可能只被排进 A 股链
+        routed: dict[str, set[str]] = {}
+        for market, sources in self.market_sources.items():
+            for name in sources:
+                routed.setdefault(name, set()).add(market)
         for name, adapter in self.adapters.items():
-            self.records[name] = SourceRecord(name=name, markets=tuple(sorted(adapter.markets)))
+            markets = routed.get(name, set()) & set(adapter.markets)
+            self.records[name] = SourceRecord(
+                name=name,
+                markets=tuple(sorted(markets or adapter.markets)),
+            )
         for market, sources in self.market_sources.items():
             unknown = [s for s in sources if s not in self.adapters]
             if unknown:
@@ -145,13 +157,21 @@ class AdapterRegistry:
         bus: EventBus | None = None,
         clock: Clock = SYSTEM_CLOCK,
         sleep: Callable[[float], None] = time.sleep,
+        market_sources: dict[str, tuple[str, ...]] | None = None,
     ) -> AdapterRegistry:
-        built = adapters if adapters is not None else {
-            name: builder() for name, builder in SOURCE_BUILDERS.items()
-        }
+        """`market_sources` 给了就用它，不再从 settings 推。
+
+        数据源链现在是库里的记录（`data_source_routes`），管理后台改完不必重启；
+        settings 里的 `[markets.*].sources` 退化成「库里一条记录都没有时」的兜底。
+        """
+        built = adapters if adapters is not None else default_adapters()
         return cls(
             adapters=built,
-            market_sources={m: cfg.sources for m, cfg in settings.markets.items()},
+            market_sources=(
+                market_sources
+                if market_sources is not None
+                else {m: cfg.sources for m, cfg in settings.markets.items()}
+            ),
             # 桶跟着注入时钟与 sleep 走：否则「429 之后退避多久」只能靠真等来测
             bucket=bucket
             if bucket is not None

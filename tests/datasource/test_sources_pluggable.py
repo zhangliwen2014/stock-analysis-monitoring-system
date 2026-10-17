@@ -1,0 +1,118 @@
+"""可插拔注册表：加一个源到底要不要改别的文件。
+
+这个文件测的是「承诺」本身：实现自己声明能服务哪些市场、名字必须先在表里存在才能落库、
+参数只能传实现真的接受的。三条都关系到管理后台能不能被信任——
+界面上写的 `kind` 和 options 最终会变成构造函数的参数。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from sams.core.errors import DatasourceError
+from sams.datasource import sources
+from sams.datasource.sources import catalog, discover, kinds, known, markets_of, source
+
+#: 本包里的适配器模块：每个都必须往注册表里放至少一个实现
+ADAPTER_MODULES = {
+    "akshare_cn",
+    "eastmoney",
+    "sina",
+    "tencent",
+    "yfinance_us",
+}
+
+
+@pytest.fixture(autouse=True)
+def _restore_registry():
+    """用例可以注册临时实现，但不能把它留给下一个用例。"""
+    snapshot = dict(sources._REGISTRY)
+    yield
+    sources._REGISTRY.clear()
+    sources._REGISTRY.update(snapshot)
+
+
+class Dummy:
+    name = "dummy"
+    markets = frozenset({"A", "HK"})
+
+    def __init__(self, *, timeout: int = 15) -> None:
+        self.timeout = timeout
+
+    def daily_bars(self, market, code, start, end):  # pragma: no cover - 从未被调用
+        raise AssertionError("注册表不该调用适配器")
+
+
+def register_dummy(**kwargs) -> str:
+    kind = "dummy_for_test"
+    source(kind=kind, **kwargs)(Dummy)
+    return kind
+
+
+def test_discovered_modules_all_register_an_implementation():
+    """新文件放进包里却忘了 `@source`，症状是「这个源看起来不存在」——
+    排查的人会一路去查网络。让它在测试里当场红。
+    """
+    found = set(discover())
+    assert found == ADAPTER_MODULES, "包目录里出现了没登记的模块，或 _NOT_ADAPTERS 需要更新"
+    modules = {entry.module for entry in catalog().entries}
+    assert found <= modules, f"这些模块没注册任何实现: {sorted(found - modules)}"
+
+
+def test_registering_exposes_the_implementations_own_markets():
+    kind = register_dummy(options=("timeout",))
+    assert markets_of(kind) == frozenset({"A", "HK"})
+    assert kind in kinds() and kind in known()
+
+
+def test_build_passes_only_the_declared_options_to_the_constructor():
+    kind = register_dummy(options=("timeout",))
+    assert sources.build(kind, {"timeout": 3}).timeout == 3
+    assert sources.build(kind).timeout == 15
+
+
+def test_unknown_kind_is_refused_with_the_valid_list():
+    with pytest.raises(DatasourceError, match="未注册"):
+        sources.build("no-such-source")
+
+
+def test_undeclared_option_is_refused_at_build():
+    kind = register_dummy()
+    # 管理后台里写 `base_url` 这种参数，必须在装配时炸，而不是静默忽略：
+    # 静默忽略等于「我以为换了地址，其实一直在打原接口」
+    with pytest.raises(DatasourceError, match="不接受参数"):
+        sources.build(kind, {"base_url": "https://evil.example"})
+
+
+def test_declaring_an_option_the_constructor_does_not_take_is_a_registration_error():
+    with pytest.raises(DatasourceError, match="不接受参数"):
+        register_dummy(options=("page_size",))
+
+
+def test_a_class_that_does_not_declare_markets_cannot_be_registered():
+    class NoMarkets:
+        name = "no-markets"
+
+    with pytest.raises(DatasourceError, match="未声明 markets"):
+        source("no_markets")(NoMarkets)
+
+
+def test_supporting_lists_only_what_can_serve_the_market():
+    register_dummy(options=("timeout",))
+    assert "tencent" in catalog().supporting("HK")
+    assert "sina" not in catalog().supporting("HK")
+    assert catalog().supporting("A") == tuple(sorted(catalog().supporting("A")))
+
+
+def test_default_adapters_builds_every_registered_implementation():
+    """采集路由的默认适配器集合来自注册表，不再是一份硬编码清单：
+    清单会漏，漏掉的源在配置里看起来像「写错了名字」。
+    """
+    from sams.datasource.registry import default_adapters
+
+    assert set(default_adapters()) == set(known())
+
+
+def test_catalog_entries_carry_a_note_for_the_admin_surface():
+    """加源界面要说得出「这个源是干嘛的」，否则运维只能靠猜名字。"""
+    assert all(entry.note for entry in catalog().entries)

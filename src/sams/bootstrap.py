@@ -17,15 +17,18 @@ from sams.core.events import EventBus, SystemAlarm
 from sams.datasource.base import BarAdapter
 from sams.datasource.calendar_providers import default_providers
 from sams.datasource.registry import AdapterRegistry
+from sams.datasource.sources import build as build_source
 from sams.services.accounts import AccountService
 from sams.services.calendar import CalendarService
 from sams.services.health import HealthService
+from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
 from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
+from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -63,11 +66,13 @@ class Container:
     watchlists: WatchlistRepo
     calendar_store: CalendarRepo
     source_health: SourceHealthRepo
+    data_sources: DataSourceRepo
     registry: AdapterRegistry
     accounts: AccountService
     calendar: CalendarService
     sync: SyncService
     health: HealthService
+    source_admin: SourceAdminService
 
     def close(self) -> None:
         self.db.close()
@@ -81,6 +86,45 @@ class Container:
 
     def applied_migrations(self) -> set[str]:
         return applied(self.db)
+
+
+def _registry(
+    cfg: Settings,
+    data_sources: DataSourceRepo,
+    source_health: SourceHealthRepo,
+    event_bus: EventBus,
+    clock: Clock,
+    adapters: dict[str, BarAdapter] | None,
+) -> AdapterRegistry:
+    """数据源链的来源：库里有记录就按库里的，没有才退回配置文件。
+
+    显式传 `adapters` 是测试与特殊场景的后门，传了就整个绕过库——
+    否则单测要在 DuckDB 里播种子数据才能构造容器，而「装配」这件事本身就该可替换。
+    """
+    if adapters is not None:
+        return AdapterRegistry.from_settings(
+            cfg, adapters=adapters, store=source_health, bus=event_bus, clock=clock
+        )
+    rows = data_sources.list()
+    if not rows:
+        return AdapterRegistry.from_settings(
+            cfg, store=source_health, bus=event_bus, clock=clock
+        )
+    built = {row.name: build_source(row.kind, row.options) for row in rows if row.enabled}
+    chains = data_sources.chains()
+    dark = sorted(set(cfg.markets) - set(chains))
+    if dark:
+        # 不抛错：健康检查与账号管理不该因为「某个市场暂时没源」就整个跑不起来。
+        # 但必须说出来——配置被删空的正常症状是「下次采集才知道」
+        logger.warning("市场 %s 在库里没有任何启用的数据源，采集会直接失败", dark)
+    return AdapterRegistry.from_settings(
+        cfg,
+        adapters=built,
+        market_sources=chains,
+        store=source_health,
+        bus=event_bus,
+        clock=clock,
+    )
 
 
 def build_container(
@@ -104,12 +148,11 @@ def build_container(
     sessions = SessionRepo(database, clock)
     corp_actions = CorpActionRepo(database)
     source_health = SourceHealthRepo(database)
+    data_sources = DataSourceRepo(database)
 
-    registry = AdapterRegistry.from_settings(
-        cfg, adapters=adapters, store=source_health, bus=event_bus, clock=clock
-    )
+    registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
     providers = providers if providers is not None else default_providers()
-    calendar = CalendarService(calendar_store, providers, bus=event_bus)
+    calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
 
     return Container(
         settings=cfg,
@@ -124,6 +167,8 @@ def build_container(
         watchlists=WatchlistRepo(database),
         calendar_store=calendar_store,
         source_health=source_health,
+        data_sources=data_sources,
+        source_admin=SourceAdminService(data_sources, cfg),
         registry=registry,
         accounts=AccountService(users, sessions),
         calendar=calendar,

@@ -32,7 +32,7 @@ class FakeStore:
         self.gets.append(day)
         return self.rows.get(day)
 
-    def year_covered(self, market, year):
+    def year_covered(self, market, year, *, through=None):
         return year in self.covered
 
 
@@ -185,3 +185,50 @@ def test_sessions_can_opt_into_extended_hours():
     )
     assert [s.name for s in regular] == ["regular"]
     assert [s.name for s in with_pre] == ["pre", "regular"]
+
+
+def test_a_holiday_is_answered_closed_on_the_first_lookup_not_the_second():
+    """补齐之后要重新走「已覆盖 + 无行 = 休市」那条判定。
+
+    漏掉这一步的话同一个周末第一次问回答「交易日」（保守降级）、第二次回答「休市」，
+    `sams calendar check` 会先打印交易日再打印休市。
+    """
+    provider = FakeProvider(days=[trading_day(date(2026, 3, 9))])
+    svc = service(provider, FakeStore())
+    assert svc.day("HK", date(2026, 3, 10)).is_trading is False
+    assert svc.day("HK", date(2026, 3, 10)).is_trading is False
+
+
+class HalfYearStore(FakeStore):
+    """来源只给上半年时，真实仓库不会把这一年算成已覆盖。"""
+
+    def save(self, days, *, source):
+        written = super().save(days, source=source)
+        self.covered.discard(days[0].day.year)
+        return written
+
+
+def test_a_partial_year_is_asked_once_and_answered_conservatively():
+    """未覆盖 → 保守按交易日，但一个年份最多问来源一次。
+
+    `next_trading_day` 会连着问 30 天，每次问都补齐等于打来源 30 次同一件事。
+    """
+    provider = FakeProvider(days=[trading_day(date(2026, 3, 9))])
+    svc = service(provider, HalfYearStore())
+    assert svc.day("HK", date(2026, 3, 10)).is_trading is True, "方向必须是宁可空转"
+    assert svc.day("HK", date(2026, 3, 11)).is_trading is True
+    assert provider.calls == 1
+
+
+def test_an_explicit_refresh_is_a_new_chance_at_the_provider():
+    """显式刷新（`sams calendar refresh`）作废「本进程问过了」的登记。"""
+    provider = FakeProvider(days=[trading_day(date(2026, 3, 9))])
+    svc = service(provider, HalfYearStore())
+    svc.day("HK", date(2026, 3, 10))
+    assert provider.calls == 1, "第一个未覆盖的日期问了一次，之后的日期不该再问"
+    svc.day("HK", date(2026, 3, 11))
+    assert provider.calls == 1
+    svc.refresh("HK", 2026)
+    svc.day("HK", date(2026, 3, 12))
+    # 显式刷新自己打了一次来源，又让下一个日期有权再问一次
+    assert provider.calls == 3

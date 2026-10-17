@@ -18,6 +18,7 @@ from sams.datasource.base import (
     normalize_bars,
     parses_as_date,
 )
+from sams.datasource.sources import source
 
 #: 标准列 → 源列（yfinance 首字母大写）。
 #: 这里刻意不映射 amount：`Ticker.history()` 不提供成交额，写个假列名只会让
@@ -105,3 +106,6 @@ class YfinanceAdapter:
             raise  # 已经是本域异常，别二次归类
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
+
+
+source("yfinance", note="yfinance 港美股日线（Yahoo）")(YfinanceAdapter)

@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sams.core.calendar import CalendarProvider, CalendarStore
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import CalendarSourceError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.timeutil import (
@@ -36,13 +37,15 @@ class CalendarService:
         providers: dict[str, CalendarProvider],
         *,
         bus: EventBus | None = None,
+        clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         if not providers:
             raise CalendarSourceError("未配置任何日历来源")
         self.store = store
         self.providers = providers
         self.bus = bus
-        self._refresh_failures: set[tuple[str, int]] = set()
+        self.clock = clock
+        self._refresh_attempts: set[tuple[str, int]] = set()
         # 盘中循环每 10 秒就要问「今天是不是交易日」，不做缓存等于每 10 秒一次 SQL 往返
         self._day_cache: dict[tuple[str, date], CalendarDay] = {}
         self._cache_cap = 4096
@@ -72,7 +75,8 @@ class CalendarService:
     def _invalidate(self, market: str, year: int) -> None:
         for key in [k for k in self._day_cache if k[0] == market and k[1].year == year]:
             self._day_cache.pop(key, None)
-        self._refresh_failures.discard((market, year))
+        # 显式刷新（`sams calendar refresh`）是一次新的好意，本进程的「别再问」登记要作废
+        self._refresh_attempts.discard((market, year))
 
     def day(self, market: str, day: date) -> CalendarDay:
         """取当日日历。库中没有且该年未覆盖 → 补齐 → 再取；仍失败 → 保守降级。"""
@@ -88,29 +92,45 @@ class CalendarService:
         stored = self.store.get(market, day)
         if stored is not None:
             return stored
-        if self.store.year_covered(market, day.year):
+        if self.store.year_covered(market, day.year, through=self._today()):
             # 年份已覆盖却没有这一天 = 确定休市，不该再问来源
-            provider = self.provider(market)
-            return CalendarDay(
-                market=market,
-                day=day,
-                is_trading=False,
-                is_half_day=False,
-                tz=provider.tz,
-                windows=(),
-            )
-        if (market, day.year) not in self._refresh_failures:
+            return self._closed_day(market, day)
+        if (market, day.year) not in self._refresh_attempts:
+            # 一个年份最多问来源一次：next_trading_day 会连着问 30 天，
+            # 每次都触发补齐等于对日历来源重复打同一件事
+            self._refresh_attempts.add((market, day.year))
             try:
                 self.refresh(market, day.year)
             except CalendarSourceError as exc:
-                self._refresh_failures.add((market, day.year))
                 logger.error("日历补齐失败，降级为保守假设: %s", exc)
                 self._alarm(f"{market} {day.year} 年日历来源不可用: {exc}")
             else:
                 loaded = self.store.get(market, day)
                 if loaded is not None:
                     return loaded
+                if self.store.year_covered(market, day.year, through=self._today()):
+                    # 补齐后必须重新走这条判定：否则同一个周末第一次问回答「交易日」、
+                    # 第二次回答「休市」，`sams calendar check` 会先打印交易再打印休市
+                    return self._closed_day(market, day)
+                logger.warning("%s %d 年补齐后仍未铺满：来源给的是半截日历", market, day.year)
+                # refresh 会作废这条登记（那是给显式刷新留的），而「问过了还是半截」必须记住，
+                # 否则 next_trading_day 连着问 30 天就会打 30 次同一个来源
+                self._refresh_attempts.add((market, day.year))
         return self._conservative_day(market, day)
+
+    def _today(self) -> date:
+        return self.clock.today()
+
+    def _closed_day(self, market: str, day: date) -> CalendarDay:
+        provider = self.provider(market)
+        return CalendarDay(
+            market=market,
+            day=day,
+            is_trading=False,
+            is_half_day=False,
+            tz=provider.tz,
+            windows=(),
+        )
 
     def _conservative_day(self, market: str, day: date) -> CalendarDay:
         provider = self.provider(market)

@@ -11,13 +11,14 @@ from datetime import date
 
 import polars as pl
 
-from sams.core.errors import DatasourceError, EmptyResponse
+from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift
 from sams.datasource.base import (
     LOTS_TO_SHARES,
     classify_error,
     code_in_market,
     normalize_bars,
 )
+from sams.datasource.sources import source
 
 COLUMN_MAP = {
     "date": "日期",
@@ -28,6 +29,22 @@ COLUMN_MAP = {
     "volume": "成交量",
     "amount": "成交额",
 }
+
+#: akshare 把请求的代码回写在每一行里，拿它确认取到的确实是那只票
+ECHO_COLUMN = "股票代码"
+
+
+def require_echoed_code(frame: pl.DataFrame, *, code: str) -> None:
+    """回写的代码与请求不一致 → 整批都不能要。
+
+    换错票不会露出破绽：`000001` 的曲线挂到 `600519` 名下，看起来只是一只跌得很难看的
+    茅台，而它已经是库里的事实，事后无从查出。响应里没有这一列时不拒绝——没证据不等于矛盾。
+    """
+    if ECHO_COLUMN not in frame.columns:
+        return
+    echoed = {str(value) for value in frame[ECHO_COLUMN].unique().to_list()}
+    if echoed != {code}:
+        raise FieldDrift("akshare", f"响应回写的代码是 {sorted(echoed)}，请求的是 {code}")
 
 
 def akshare_fetch(symbol: str, start: date, end: date) -> pl.DataFrame:
@@ -61,6 +78,7 @@ class AkshareAdapter:
             raw = _as_polars(self._fetch(symbol, start, end))
             if raw.is_empty():
                 raise EmptyResponse(self.name, f"{market} {code} 区间无数据")
+            require_echoed_code(raw, code=symbol)
             bars = normalize_bars(
                 raw,
                 market=market,
@@ -81,3 +99,7 @@ def _as_polars(frame) -> pl.DataFrame:
     if isinstance(frame, pl.DataFrame):
         return frame
     return pl.from_pandas(frame)
+
+
+# 注册进 datasource.sources：加源只改自己这一行，不动 registry / bootstrap / CLI
+source("akshare", note="akshare A 股主源（封装东财/新浪）")(AkshareAdapter)

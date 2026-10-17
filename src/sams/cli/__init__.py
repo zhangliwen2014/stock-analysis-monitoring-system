@@ -11,11 +11,11 @@ import argparse
 import sys
 
 from sams.bootstrap import build_container
-from sams.cli import calendar, db, health, sync, user
+from sams.cli import calendar, db, health, source, sync, user
 from sams.core.config import Settings
 from sams.core.errors import SamsError
 
-COMMAND_MODULES = (db, user, sync, calendar, health)
+COMMAND_MODULES = (db, user, sync, calendar, health, source)
 
 
 def build_parser() -> argparse.ArgumentParser:

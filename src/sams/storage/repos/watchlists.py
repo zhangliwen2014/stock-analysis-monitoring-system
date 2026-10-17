@@ -9,10 +9,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from sams.core.codes import canonical_code
 from sams.core.errors import ValidationError
 from sams.storage.db import Database
 
 MAX_ITEMS_PER_USER = 500
+
+
+def _norm(market: str, code: str) -> tuple[str, str]:
+    """清单里的代码必须和 bars 里的代码同一个形态。
+
+    不归一时 `700` 落库成功、永远查不到 00700 的数据，而且不报错——用户看到的是
+    「这个自选股没有行情」，实际是键写错了。仓库层兜底，不指望调用方先归一。
+    """
+    if not market or not code:
+        raise ValidationError("market 与 code 不能为空")
+    try:
+        return market, canonical_code(market, code)
+    except ValueError as exc:
+        # CLI 只把 SamsError 当「用户输入错了」，ValueError 会炸出栈回溯
+        raise ValidationError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -36,8 +52,7 @@ class WatchlistRepo:
 
     def add(self, user_id: str, market: str, code: str, *, note: str | None = None) -> None:
         user_id = _require_user(user_id)
-        if not market or not code:
-            raise ValidationError("market 与 code 不能为空")
+        market, code = _norm(market, code)
         if self.count(user_id) >= MAX_ITEMS_PER_USER and not self.contains(user_id, market, code):
             raise ValidationError(f"自选股数量上限 {MAX_ITEMS_PER_USER}")
         self.db.execute(
@@ -46,6 +61,7 @@ class WatchlistRepo:
         )
 
     def remove(self, user_id: str, market: str, code: str) -> bool:
+        market, code = _norm(market, code)
         before = self.count(user_id)
         self.db.execute(
             "DELETE FROM watchlists WHERE user_id = ? AND market = ? AND code = ?",
@@ -54,6 +70,7 @@ class WatchlistRepo:
         return self.count(user_id) < before
 
     def contains(self, user_id: str, market: str, code: str) -> bool:
+        market, code = _norm(market, code)
         return (
             self.db.scalar(
                 "SELECT count(*) FROM watchlists WHERE user_id = ? AND market = ? AND code = ?",

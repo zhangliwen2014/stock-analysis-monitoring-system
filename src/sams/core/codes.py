@@ -13,7 +13,8 @@ def canonical_code(market: str, code: str) -> str:
     if not cleaned:
         raise ValueError("code 不能为空")
     if market == "HK":
-        digits = cleaned.removeprefix("HK").removesuffix(".HK")
+        # HK00700 / HK.00700 / 00700.HK / 700 是同一只票，落库必须只有 00700 一种写法
+        digits = cleaned.removeprefix("HK").removesuffix(".HK").removeprefix(".").strip()
         return f"{int(digits):05d}" if digits.isdigit() else cleaned
     # A 股/美股的交易所后缀是数据源要的形态，不是本系统的键
     return cleaned.removesuffix(".SH").removesuffix(".SS").removesuffix(".SZ")
@@ -31,8 +32,11 @@ def currency_override(market: str, code: str) -> str | None:
             return "USD"  # 沪市 B 股
         if code.startswith("200"):
             return "HKD"  # 深市 B 股
-    if market == "HK" and code.startswith("80"):
-        return "CNY"  # 人民币双柜台（08xxx 是港股通外的创业板，仍是 HKD）
+    if market == "HK" and code.isdigit() and 80000 <= int(code) <= 89999:
+        # 人民币双柜台占用整个 8xxxx 段（80700 腾讯、83690 小米、89988 阿里……），
+        # 用 startswith("80") 会漏掉 8 万以后的那些：同一公司的两条曲线被当成两种币，
+        # 永久显示一个不存在的「折价」。08xxx 是港股通外的创业板，仍是 HKD。
+        return "CNY"
     return None
 
 

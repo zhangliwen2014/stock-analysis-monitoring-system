@@ -189,3 +189,32 @@ def test_yfinance_volume_is_already_shares():
     """美股不需要换算：把两处口径都写死，才有人会发现哪天源变了。"""
     out = normalize_history(pandas_history(), market="US", code="AAPL")
     assert out["volume"].to_list() == [30000.0, 28000.0]
+
+
+def test_an_echoed_code_that_differs_means_a_different_stock():
+    """akshare 把请求的代码回写在每一行里，不一致就是取到了别的票。
+
+    000001 的曲线挂到 600519 名下不会露出破绽，看起来只是一只跌得很难看的茅台。
+    """
+    frame = RECORDED_CN.with_columns(pl.lit("000001").alias("股票代码"))
+    adapter = AkshareAdapter(fetch=lambda *a: frame)
+    with pytest.raises(FieldDrift, match="响应回写的代码"):
+        adapter.daily_bars("A", "600519", date(2024, 1, 2), date(2024, 1, 3))
+
+
+def test_a_mixed_echo_column_is_refused_whole():
+    frame = RECORDED_CN.with_columns(pl.Series(["600519", "000001"]).alias("股票代码"))
+    adapter = AkshareAdapter(fetch=lambda *a: frame)
+    with pytest.raises(FieldDrift, match="响应回写的代码"):
+        adapter.daily_bars("A", "600519", date(2024, 1, 2), date(2024, 1, 3))
+
+
+def test_a_matching_echo_passes_and_a_frame_without_one_is_not_accused():
+    """没有回写列不构成拒绝理由：老版本 akshare 不给这一列，那样会砍掉一个可用的源。"""
+    ok = RECORDED_CN.with_columns(pl.lit("600519").alias("股票代码"))
+    assert AkshareAdapter(fetch=lambda *a: ok).daily_bars(
+        "A", "600519", date(2024, 1, 2), date(2024, 1, 3)
+    ).height == 2
+    assert AkshareAdapter(fetch=lambda *a: RECORDED_CN).daily_bars(
+        "A", "600519", date(2024, 1, 2), date(2024, 1, 3)
+    ).height == 2

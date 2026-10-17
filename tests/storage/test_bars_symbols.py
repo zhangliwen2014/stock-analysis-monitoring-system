@@ -4,6 +4,7 @@ from datetime import date
 
 import polars as pl
 import pytest
+import support
 
 from sams.core.errors import StorageError
 from sams.storage.repos.bars import BarRepo
@@ -134,3 +135,75 @@ def test_adjust_is_part_of_the_primary_key(bars, db, bars_frame):
     loaded = bars.load("A", ["600519"])
     assert loaded.height == 3, "读取默认只回不复权口径，混着两种价的序列会算错指标"
     assert set(loaded["adjust"].to_list()) == {"raw"}
+
+
+# ---------------------------------------------------------------- 脏值守卫
+
+
+def zero_close_frame(close=0.0) -> pl.DataFrame:
+    frame = support.bars_frame()
+    return frame.with_columns(
+        pl.when(pl.col("date") == D2).then(float(close)).otherwise(pl.col("close")).alias("close")
+    )
+
+
+def test_a_zero_close_row_is_dropped_not_stored(bars, db):
+    """收盘 0 会被存成「今天收盘 0 元」：区间跌幅立刻 −100%，止损规则据此打死一只好票。"""
+    assert bars.upsert(zero_close_frame()) == 2
+    assert db.scalar("SELECT count(*) FROM bars_daily") == 2
+    assert bars.load("A", ["600519"])["date"].to_list() == [D1, D3]
+
+
+def test_a_negative_close_row_is_dropped_too(bars):
+    assert bars.upsert(zero_close_frame(-3.0)) == 2
+
+
+def test_a_dropped_row_is_logged_not_silent(bars, caplog):
+    """丢弃必须留痕：否则「源给了脏数」和「这一天没数据」在库里长得一样。"""
+    with caplog.at_level("WARNING"):
+        bars.upsert(zero_close_frame())
+    assert "收盘价缺失或非正" in caplog.text
+
+
+def test_non_positive_open_high_low_become_null_not_fake_prices(bars):
+    """非正的开高低是「这个字段没数据」，置空后 M2 的形态规则看得见缺失。"""
+    frame = support.bars_frame().with_columns(
+        pl.when(pl.col("date") == D1).then(0.0).otherwise(pl.col("open")).alias("open")
+    )
+    bars.upsert(frame)
+    loaded = bars.load("A", ["600519"]).sort("date")
+    assert loaded["open"].to_list()[0] is None
+    assert loaded["close"].to_list() == [1.2, 2.2, 3.2], "开盘价坏了不该陪葬整根 K 线"
+
+
+def test_inverted_extremes_are_nulled_on_both_ends(bars):
+    """high < low 说明极值被写反了；high 低于 close 同样不可信（突破类规则会误报）。"""
+    frame = pl.DataFrame(
+        {
+            "market": ["A", "A"],
+            "code": ["600519", "600519"],
+            "date": [D1, D2],
+            "open": [10.0, 10.0],
+            "high": [9.0, 9.5],  # 第一行 high<low，第二行 high 连收盘都包不住
+            "low": [11.0, 8.0],
+            "close": [10.0, 10.0],
+            "volume": [100.0, 100.0],
+            "amount": [1000.0, 1000.0],
+            "source": ["akshare", "akshare"],
+        }
+    )
+    bars.upsert(frame)
+    loaded = bars.load("A", ["600519"]).sort("date")
+    assert loaded["high"].to_list() == [None, None]
+    assert loaded["low"].to_list() == [None, None]
+    assert loaded["close"].to_list() == [10.0, 10.0]
+
+
+def test_negative_volume_is_still_stored_as_a_fact(bars):
+    """负量原样存是决定（见模块文件头）：丢弃会把它伪装成「这天没数据」。
+
+    它由 `sams health` 的「N 行成交量为负」露头，所以这条测试锁的是「别改成丢弃」。
+    """
+    frame = support.bars_frame().with_columns(pl.lit(-5.0).alias("volume"))
+    assert bars.upsert(frame) == 3
+    assert bars.load("A", ["600519"])["volume"].unique().to_list() == [-5.0]

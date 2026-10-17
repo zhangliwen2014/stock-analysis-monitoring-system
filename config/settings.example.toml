@@ -11,24 +11,27 @@ polling_interval_s = 10      # 盘中轮询间隔
 cooldown_min = 30            # 同一规则命中后的冷却
 
 # sources 是降级顺序：前一个失败才用后一个。
+# 这里的值只在**库里 data_sources 表为空**时生效（没跑过 0007 迁移的老库）。
+# 跑过迁移之后，真正的链存在库里，由 `sams source add/enable/disable/move` 或管理后台维护，
+# 改这里不会有任何效果——两处都能配是新的错账来源，所以库里有权，配置只做兜底。
 # post_close_min 是盘后任务的延迟分钟数，美股给大些让任务落到工作日上午。
 [markets.A]
 tz = "Asia/Shanghai"
 currency = "CNY"
 post_close_min = 30
-sources = ["akshare", "eastmoney"]
+sources = ["akshare", "eastmoney", "tencent", "sina"]
 
 [markets.HK]
 tz = "Asia/Hong_Kong"
 currency = "HKD"
 post_close_min = 30
-sources = ["yfinance"]
+sources = ["yfinance", "tencent"]
 
 [markets.US]
 tz = "America/New_York"
 currency = "USD"
 post_close_min = 60
-sources = ["yfinance"]
+sources = ["yfinance", "tencent"]
 # 盘前/盘后默认不参与轮询，规则需要时才显式启用（spec §6.1）
 [markets.US.extended.pre]
 open = "04:00"

@@ -77,6 +77,22 @@ def code_in_market(market: str, code: str) -> str:
     return canonical
 
 
+#: 沪市号段首位；其余（0/1/2/3 开头）归深市。B 股 900 在沪、200 在深，这条已经分对
+_SH_FIRST = "569"
+
+
+def a_share_symbol(code: str) -> str:
+    """A 股代码 → 带交易所前缀的 symbol（`sh600519` / `sz000001`）。
+
+    新浪与腾讯都要这个形态，规则放公共件里：放在任一个适配器里，另一个就得反向 import
+    它——同层横串正是分层守卫要挡的东西。
+    """
+    symbol = canonical_code("A", code)
+    if not symbol.isdigit() or len(symbol) != 6:
+        raise ValueError(f"A 股代码应为 6 位数字，收到 {code!r}")
+    return f"{'sh' if symbol[0] in _SH_FIRST else 'sz'}{symbol}"
+
+
 class BarAdapter(Protocol):
     """数据源适配器契约。健康状态不在这里：由 registry 在路由时统一记录，
     因为只有它看得见「这次失败有没有被备源救回来」。"""
