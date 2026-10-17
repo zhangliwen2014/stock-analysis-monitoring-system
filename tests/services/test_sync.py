@@ -71,6 +71,20 @@ def test_sync_writes_bars_and_creates_symbol(db, settings):
     assert row["currency"] == "USD" and row["list_status"] == "L"
 
 
+def test_a_lowercase_market_lands_on_the_canonical_key(db, settings):
+    """`--market us` 会在主档造一个 `us` 的行，而 K 线按源给的 `US` 入库。
+
+    同一只票从此有两个键：主档查不到它的币种，`sams health` 数不到它的 K 线。
+    """
+    svc, registry, bars, symbols = make_service(db, settings, ok_result())
+    summary = svc.sync_daily("us", "AAPL", D1, D2)
+    assert registry.calls == [("US", "AAPL", D1, D2)]
+    assert summary.market == "US"
+    assert bars.count("US", "AAPL") == 2
+    assert symbols.get("US", "AAPL")["currency"] == "USD"
+    assert symbols.get("us", "AAPL") is None
+
+
 def test_rerun_is_idempotent(db, settings):
     svc, _, bars, _ = make_service(db, settings, ok_result())
     svc.sync_daily("US", "AAPL", D1, D2)

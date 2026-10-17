@@ -184,6 +184,6 @@ def build_container(
         corp_action_sync=CorpActionSyncService(
             registry, corp_actions, corp_actions_coverage, clock=clock
         ),
-        analysis=AnalysisService(bars, corp_actions, corp_actions_coverage, clock=clock),
+        analysis=AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.codes import canonical_code
+from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import DatasourceError
 from sams.datasource.registry import AdapterRegistry, Attempt
 from sams.storage.repos.corp_actions import CorpActionRepo
@@ -70,7 +70,11 @@ class CorpActionSyncService:
 
         `end` 截到今天：今天之后的除权日没有任何源能替我们确认，取回来也不该写成
         「确认过的覆盖面」——那等于让未来的公告替过去的区间背书（PIT）。
+
+        市场名与代码一起在入口归一：覆盖确认的主键含市场，写成 `a` 的那一行
+        读取层永远查不到，于是「同步成功了」与「区间收益继续拒绝」同时成立。
         """
+        market = canonical_market(market)
         code = canonical_code(market, code)
         today = self.clock.today()
         until = min(end, today)

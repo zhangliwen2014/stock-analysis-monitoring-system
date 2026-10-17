@@ -101,6 +101,20 @@ def test_alias_code_lands_on_the_canonical_key(db):
     assert coverage.get("A", "601088", src="akshare") is not None
 
 
+def test_a_lowercase_market_lands_on_the_canonical_key(db):
+    """确认表的主键含市场：写成 `a` 的那一行，读取层按 `A` 永远查不到。
+
+    于是「同步报告说成功」与「区间收益继续拒绝出数」会同时成立——最难查的那种。
+    """
+    service, registry, actions, coverage = make_service(db, ok_result())
+    summary = service.sync_actions("a", "601088", D1, D2)
+    assert registry.calls[0][0] == "A"
+    assert summary.market == "A"
+    assert actions.list_for("A", "601088").height == 1
+    assert coverage.get("A", "601088", src="akshare") is not None
+    assert coverage.count() == 1, "不该在 `a` 这个键形态下再留一行"
+
+
 def test_an_empty_answer_still_records_coverage(db):
     """「查过且没有」必须与「没查过」分开（D36）：空结果也是这次同步的产物。"""
     service, _, actions, coverage = make_service(db, ok_result(frame=empty_actions()))

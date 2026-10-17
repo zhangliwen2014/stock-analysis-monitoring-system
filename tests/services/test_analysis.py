@@ -16,11 +16,12 @@ import polars as pl
 import pytest
 from support import FrozenClock
 
-from sams.core.errors import NotAdjustable
+from sams.core.errors import NotAdjustable, ValidationError
 from sams.services.analysis import AnalysisService
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
+from sams.storage.repos.symbols import SymbolRepo
 
 TODAY = date(2024, 7, 20)
 START = date(2024, 7, 1)
@@ -67,13 +68,18 @@ class SpyActionsRepo:
     少传 `until` 不会让任何一个算数的用例失败——`actions_in_span` 那道保险会把
     窗口外的日期拦下来——它只会在「未来的除权已经进了库」那种票上悄悄多乘一次。
     所以这条口径要单独钉住，而不是靠组合别的数据间接暴露。
+
+    `markets` 记的是同一件事的另一半：库里的主键只有一个形态的市场名，传进去一个
+    小写的，查出来的就是空表——而空表在这条路径上长得和「这只票没分过红」一模一样。
     """
 
     def __init__(self, inner: CorpActionRepo) -> None:
         self.inner = inner
         self.untils: list[date | None] = []
+        self.markets: list[str] = []
 
     def list_for(self, market: str, code: str, *, until: date | None = None) -> pl.DataFrame:
+        self.markets.append(market)
         self.untils.append(until)
         return self.inner.list_for(market, code, until=until)
 
@@ -90,6 +96,7 @@ def make_service(db, *, today: date = TODAY, actions: CorpActionRepo | None = No
         BarRepo(db),
         actions,
         coverage,
+        SymbolRepo(db),
         clock=FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC)),
     )
     return service, actions, coverage
@@ -132,6 +139,26 @@ def test_actions_are_read_as_of_today_not_as_of_the_whole_table(db):
     assert spy.untils == [TODAY]
 
 
+def test_a_lowercase_market_reads_the_same_stock(db):
+    """`--market a` 不是排版问题：D37 只认 `"A"`，小写等于把那道闸静默关掉。
+
+    归一放在服务边界，仓库收到的永远是库里那个键形态——否则三个仓库查出来的是三张
+    空表，而空表在报告上写出来是「这只票这段时间没行情」。
+    """
+    spy = SpyActionsRepo(CorpActionRepo(db))
+    service = seeded(db, actions=spy)
+    lower = service.interval_return("a", CODE, START, END)
+    assert spy.markets == ["A"]
+    assert lower.market == "A"
+    assert lower == service.interval_return("A", CODE, START, END)
+
+
+def test_an_empty_market_is_refused_instead_of_reading_nothing(db):
+    service = seeded(db)
+    with pytest.raises(ValidationError, match="market 不能为空"):
+        service.interval_return("   ", CODE, START, END)
+
+
 def test_a_code_whose_ex_rights_were_never_confirmed_is_refused(db):
     """0 行除权记录不等于没分过红：不许悄悄退回裸价给数（D36）。"""
     service, _, _ = make_service(db)
@@ -139,10 +166,31 @@ def test_a_code_whose_ex_rights_were_never_confirmed_is_refused(db):
         service.interval_return("A", CODE, START, END)
 
 
-def test_a_code_with_no_bars_at_all_is_refused(db):
+def test_a_code_the_database_has_never_seen_says_the_code_is_unknown(db):
+    """「不足两根」有三条来路，下一步该敲的命令完全不同：先说清是哪一条。"""
     service, _, _ = make_service(db)
-    with pytest.raises(NotAdjustable, match="不足两根"):
+    with pytest.raises(NotAdjustable, match="主档里也没有这个代码"):
         service.interval_return("A", "000001", START, END)
+
+
+def test_a_registered_code_with_no_bars_says_it_has_never_been_collected(db):
+    """主档有它、库里 0 根：那是没采集，不是代码写错，更不是「这段时间没行情」。"""
+    SymbolRepo(db).upsert(
+        pl.DataFrame(
+            [{"market": "A", "code": "000001", "name": "平安银行", "currency": "CNY"}]
+        )
+    )
+    service, _, _ = make_service(db)
+    with pytest.raises(NotAdjustable, match="还没采集过") as exc:
+        service.interval_return("A", "000001", START, END)
+    assert "平安银行" in str(exc.value)
+
+
+def test_a_window_outside_the_collected_range_says_where_the_bars_are(db):
+    service = seeded(db)
+    with pytest.raises(NotAdjustable, match="只有 0 根") as exc:
+        service.interval_return("A", CODE, date(2024, 8, 1), date(2024, 8, 30))
+    assert "最新到 2024-07-11" in str(exc.value)
 
 
 def test_an_alias_reads_the_same_stock(db):

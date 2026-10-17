@@ -30,10 +30,14 @@ class IntervalReturn:
     end: date
     raw: float
     adjusted: float
-    #: 区间内参与计算的除权日个数。0 时 raw 与 adjusted 必然相等——这是可以直说的巧合，
-    #: 而不是「复权没影响结果」
+    #: 区间内参与计算的除权日个数。0 时 raw 与 adjusted 必然相等——这不是「复权没影响结果」，
+    #: 而是这一段压根没乘过因子；这段时间到底有没有发生除权，看 `start_is_ex_date`
     ex_dates: int
-    covered_by: str | None
+    #: 首根那根本身就是除权日：它的效果已经在起点价里，所以不进 `ex_dates`，
+    #: 但「这段时间没有公司行为」那句话从此不能说
+    start_is_ex_date: bool
+    #: 放行这段区间的覆盖确认出自哪个源。过闸的数一定有人背书，所以这里不可能是 None
+    covered_by: str
 
     @property
     def differs(self) -> bool:
@@ -48,8 +52,8 @@ def interval_return(
     code: str,
     start: date,
     end: date,
-    coverage: Sequence[ConfirmedSpan] = (),
-    today: date | None = None,
+    coverage: Sequence[ConfirmedSpan],
+    today: date,
     listed_on: date | None = None,
 ) -> IntervalReturn:
     """[start, end] 的区间涨跌。拒绝时抛 `NotAdjustable` 并带上原因。
@@ -58,6 +62,9 @@ def interval_return(
     落在这两根之间的记录（更早的因子对两端是同一个常数，见 `adjust.actions_in_span`）。
     `listed_on` 是上市首日——不传就不给「上市初期不设涨跌幅」那条形豁免，
     因为豁免的位置一旦按请求窗口算，一只老票的窄窗口就能把 −30% 的不可能跳变放出去。
+
+    `coverage` 与 `today` 都没有默认值：一个数要出门，得同时有「谁查过这段」和
+    「什么时候查的」。少任何一个都还能算出一个像模像样的涨跌，而那正是最难发现的那种错。
     """
     window = bars.filter((pl.col("date") >= start) & (pl.col("date") <= end)).sort("date")
     if window.height < 2:
@@ -84,8 +91,16 @@ def interval_return(
         raw=raw,
         adjusted=hfq,
         ex_dates=series.ex_dates,
+        start_is_ex_date=_has_ex_date_on(actions, first),
         covered_by=series.covered_by,
     )
+
+
+def _has_ex_date_on(actions: pl.DataFrame, day: date) -> bool:
+    """这一天在除权记录里有行吗。空表要直接答否：`filter` 在没有 `ex_date` 列时会崩栈。"""
+    if actions.is_empty():
+        return False
+    return bool(actions.filter(pl.col("ex_date") == day).height)
 
 
 def _ratio(frame: pl.DataFrame, start: date, end: date, column: str) -> float:

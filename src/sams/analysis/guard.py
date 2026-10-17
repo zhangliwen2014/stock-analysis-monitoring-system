@@ -55,16 +55,20 @@ class ConfirmedSpan(Protocol):
 
 
 def is_covered(
-    spans: Sequence[ConfirmedSpan], *, start: date, end: date, today: date | None = None
+    spans: Sequence[ConfirmedSpan], *, start: date, end: date, today: date
 ) -> ConfirmedSpan | None:
     """这个区间的除权记录是否被某个源完整确认过。
 
     全历史确认只看上界：源说「这只票的历史我给全了，截至 covered_to」，那么
     covered_to 之前的每一天都有答案，包括它派息之前的年份。
+
+    `today` 没有默认值：确认是**过去某天**做出的陈述，今天已经更晚时，那段确认对
+    最后一天之后就没有任何主张了。让这个参数可以省略，等于「忘了传时钟」也能出数——
+    而出来的数与新鲜确认过的长得一模一样。
     """
     for span in spans:
         if span.full_history:
-            if span.covered_to >= end and (today is None or span.covered_to >= today):
+            if span.covered_to >= end and span.covered_to >= today:
                 return span
         elif span.covered_from <= start and span.covered_to >= end:
             return span
@@ -78,8 +82,8 @@ def require_coverage(
     end: date,
     spans: Sequence[ConfirmedSpan],
     *,
-    today: date | None,
-) -> str | None:
+    today: date,
+) -> str:
     """没有确认记录就拒绝出数，返回放行那个源的名字。
 
     拒绝文案把「为什么不能直接算」写全：裸价区间涨跌在「没查过」那种情况下是一个错数，

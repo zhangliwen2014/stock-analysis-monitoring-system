@@ -63,6 +63,21 @@ def service(provider=None, store=None, bus=None) -> CalendarService:
     return CalendarService(store or FakeStore(), providers, bus=bus)
 
 
+def test_known_status_answers_only_what_the_store_can_back_up():
+    """`is_trading_day` 在未知时按「是交易日」降级（多轮一次无害），报告里不能这么猜。
+
+    `sams analysis return` 那句「缺口那几天是周末」要是从降级值来的，它就把
+    「开市日没采到」说成了常态——而后者才是需要有人去补采集的那种缺口。
+    """
+    store = FakeStore(days=[trading_day(date(2026, 3, 9))], covered={2026})
+    provider = FakeProvider()
+    svc = service(provider, store)
+    assert svc.known_status("HK", date(2026, 3, 9)) is True
+    assert svc.known_status("HK", date(2026, 3, 10)) is False, "已覆盖 + 无行 = 休市"
+    assert svc.known_status("HK", date(2027, 3, 9)) is None, "那年没铺，就是不知道"
+    assert provider.calls == 0, "问「我们是否已经知道」不该顺手打一次来源"
+
+
 def test_requires_at_least_one_provider():
     with pytest.raises(CalendarSourceError, match="未配置"):
         CalendarService(FakeStore(), {})

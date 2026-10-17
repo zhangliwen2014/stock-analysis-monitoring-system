@@ -7,11 +7,28 @@
 
 from __future__ import annotations
 
+from sams.core.errors import ValidationError
+
+
+def canonical_market(market: str) -> str:
+    """市场名归一：大小写与空格不算语义。
+
+    这不是排版问题。`daily_price_limit` 只认 `"A"`，收到 `"a"` 就返回 None——
+    翻译过来是「这个市场没有涨跌幅证据」，于是 D37 那道闸静默关掉，而区间涨跌
+    照样出一个数。港美股的键同样存的是大写，`"hk"` 查出来是空，症状换成
+    「这只票从没分过红」。宁可在这里拒绝一个空市场名，也不让每种小写长出一条路。
+    """
+    cleaned = (market or "").strip().upper()
+    if not cleaned:
+        raise ValidationError("market 不能为空：A / HK / US")
+    return cleaned
+
 
 def canonical_code(market: str, code: str) -> str:
+    market = canonical_market(market)
     cleaned = (code or "").strip().upper()
     if not cleaned:
-        raise ValueError("code 不能为空")
+        raise ValidationError("code 不能为空")
     if market == "HK":
         # HK00700 / HK.00700 / 00700.HK / 700 是同一只票，落库必须只有 00700 一种写法
         digits = cleaned.removeprefix("HK").removesuffix(".HK").removeprefix(".").strip()
@@ -38,6 +55,7 @@ def currency_override(market: str, code: str) -> str | None:
     A 股 B 股以外币报价、港股人民币双柜台以 CNY 报价。把 CNY 写进 900901 或把 HKD
     写进 80700，会顺着 `symbols.currency` 一路污染到展示与换算，且再也看不出错。
     """
+    market = canonical_market(market)
     if market == "A":
         if code.startswith("900"):
             return "USD"  # 沪市 B 股
@@ -56,6 +74,7 @@ def lot_size_of(market: str) -> int | None:
 
     存 1 冒充「知道」比留 NULL 危险——M2 的下单手数换算会算错一个数量级。
     """
+    market = canonical_market(market)
     if market == "A":
         return 100
     if market == "US":
@@ -78,7 +97,7 @@ def daily_price_limit(market: str, code: str) -> float | None:
     而按 10% 判只会漏判（漏判由 D36 的覆盖标记兜住）。港美股没有涨跌幅限制，返回 None
     等于承认「这条证据在这里不存在」。
     """
-    if market != "A" or not code.isdigit():
+    if canonical_market(market) != "A" or not code.isdigit():
         return None
     if code.startswith(_WIDE_LIMIT_PREFIXES):
         return 0.20

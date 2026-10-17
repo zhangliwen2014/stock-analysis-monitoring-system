@@ -12,7 +12,7 @@ from datetime import date
 
 import polars as pl
 
-from sams.core.codes import canonical_code, currency_override, lot_size_of
+from sams.core.codes import canonical_code, canonical_market, currency_override, lot_size_of
 from sams.core.config import MarketCfg
 from sams.core.errors import DatasourceError
 from sams.datasource.registry import AdapterRegistry, Attempt
@@ -61,8 +61,10 @@ class SyncService:
         """幂等：同区间重复执行行数不变（bars_daily 主键 + INSERT OR REPLACE）。
 
         代码在入口就归一：主档、K 线、读取回看用同一个形态，否则别名会把同一只票
-        存成多份主键。
+        存成多份主键。市场名同理——`--market us` 会在主档里造出一个 `us` 的行，
+        而 K 线仍然按源给的 `US` 入库，同一只票从此有两个键。
         """
+        market = canonical_market(market)
         code = canonical_code(market, code)
         result = self.registry.fetch_daily(market, code, start, end)
         if result.empty_everywhere:

@@ -26,6 +26,9 @@ from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 
 START = date(2024, 7, 1)
+#: 这批用例测的是闸门本身，时钟落在 `fresh_coverage()` 的确认范围内即可；
+#: 唯一测「确认过期」的那条自己传一个更晚的日期
+TODAY = date(2024, 12, 1)
 
 
 @dataclass(frozen=True)
@@ -210,6 +213,7 @@ def test_a_recorded_bonus_split_jump_is_not_refused_as_unrecorded():
         start=START,
         end=START + timedelta(days=10),
         coverage=fresh_coverage(),
+        today=TODAY,
     )
     assert result.adjusted == pytest.approx(0.0), "除权日开盘价恰为参考价 ⇒ 复权涨跌 0%"
 
@@ -240,6 +244,7 @@ def test_d37_skip_counts_bars_since_listing_not_since_the_window():
             start=START,
             end=START + timedelta(days=5),
             coverage=fresh_coverage(),
+            today=TODAY,
         )
 
 
@@ -260,6 +265,7 @@ def test_a_null_close_refuses_with_reason_not_with_a_crash():
             start=START,
             end=START + timedelta(days=6),
             coverage=fresh_coverage(),
+            today=TODAY,
         )
 
 
@@ -288,6 +294,7 @@ def test_an_unknown_kind_inside_the_window_still_refuses():
             start=START,
             end=START + timedelta(days=7),
             coverage=fresh_coverage(),
+            today=TODAY,
         )
 
 
@@ -311,6 +318,7 @@ def test_fractional_bonus_hand_checked_through_the_interval():
         start=START,
         end=START + timedelta(days=10),
         coverage=fresh_coverage(),
+        today=TODAY,
     )
     assert result.raw == pytest.approx(-0.2)
     assert result.adjusted == pytest.approx(0.0)
@@ -329,6 +337,7 @@ def test_hk_and_us_have_no_evidence_rule_but_still_require_coverage():
             start=START,
             end=START + timedelta(days=11),
             coverage=[],
+            today=TODAY,
         )
 
 

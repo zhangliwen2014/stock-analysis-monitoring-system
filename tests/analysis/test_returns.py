@@ -55,7 +55,11 @@ def covered(end=END, *, full=True, start=START) -> list[Span]:
 
 
 def get(**kwargs):
-    """默认给一份「已确认覆盖 + 无除权」的正常输入，让每个用例只改自己那一条。"""
+    """默认给一份「已确认覆盖 + 无除权」的正常输入，让每个用例只改自己那一条。
+
+    `today` 取 `END`：这批用例测的是闸门判定本身，时钟只需要落在 `covered()` 那段
+    确认的有效期内。测「确认过期」的那条自己传更晚的日期。
+    """
     kwargs.setdefault("bars", frame([10.0] * 11))
     kwargs.setdefault("actions", actions())
     kwargs.setdefault("market", "A")
@@ -63,7 +67,36 @@ def get(**kwargs):
     kwargs.setdefault("start", START)
     kwargs.setdefault("end", END)
     kwargs.setdefault("coverage", covered())
+    kwargs.setdefault("today", END)
     return interval_return(**kwargs)
+
+
+def test_the_clock_and_the_confirmation_cannot_be_forgotten():
+    """`today` 与 `coverage` 没有默认值——这条把「没有默认值」本身锁住。
+
+    漏传一次时钟，D36 的新鲜度与 PIT 两条闸一起静音，出来的数与新鲜确认过的长得一样。
+    这种接口约束不写用例，下一次「顺手加个默认值」就把它抹掉了，而且没人会察觉。
+    """
+    with pytest.raises(TypeError, match="today"):
+        interval_return(
+            frame([10.0] * 11),
+            actions(),
+            market="A",
+            code="601088",
+            start=START,
+            end=END,
+            coverage=covered(),
+        )
+    with pytest.raises(TypeError, match="coverage"):
+        interval_return(
+            frame([10.0] * 11),
+            actions(),
+            market="A",
+            code="601088",
+            start=START,
+            end=END,
+            today=END,
+        )
 
 
 # --- D36：覆盖标记 ---------------------------------------------------------------
@@ -226,14 +259,28 @@ def test_an_ex_date_before_the_window_needs_no_bars_from_that_day():
 
 
 def test_the_ex_date_on_the_first_bar_of_the_window_is_not_double_counted():
-    """首根已经是除权后的价格：这一天的事件不该再进区间之比。"""
+    """首根已经是除权后的价格：这一天的事件不该再进区间之比。
+
+    但它**确实**在这段时间里发生了。`ex_dates` 数为 0 时那句「没有除权日」因此是错的
+    ——读的人据此会以为这只票这段时间没动过公司行为，而起点正是除权那天。
+    """
     ex_day = START
     result = get(
         bars=frame([42.80, 43.00, 43.30, 43.40, 43.50, 43.60, 43.70, 43.80, 44.00, 44.10, 44.20]),
         actions=actions((ex_day, "dividend", 2.26, None, None)),
     )
     assert result.ex_dates == 0
+    assert result.start_is_ex_date is True
     assert result.adjusted == pytest.approx(result.raw)
+
+
+def test_an_earlier_ex_date_is_not_reported_as_the_start_being_one():
+    """窗口之前那天的除权既不进因子，也不该被说成「起点就是除权日」。"""
+    result = get(
+        bars=frame([10.0] * 11),
+        actions=actions((START - timedelta(days=3), "dividend", 0.5, None, None)),
+    )
+    assert result.start_is_ex_date is False
 
 
 # --- 请求窗口与读数锚点 -----------------------------------------------------------

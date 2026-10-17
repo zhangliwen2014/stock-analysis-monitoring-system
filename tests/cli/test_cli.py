@@ -10,6 +10,7 @@ import sams.cli as cli
 from sams.bootstrap import build_container
 from sams.core.config import Settings
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited
+from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.storage.db import Database
 from sams.storage.migrate import apply_migrations, discover
 from sams.storage.repos.bars import BarRepo
@@ -470,12 +471,12 @@ def test_health_says_a_market_has_no_bars_yet(container, capsys):
 # --- `sams analysis return`：唯一一条过闸的读数路径 ---------------------------------
 
 
-def analysis_argv(start="2024-07-01", end="2024-07-11", code="601088"):
+def analysis_argv(start="2024-07-01", end="2024-07-11", code="601088", market="A"):
     return [
         "analysis",
         "return",
         "--market",
-        "A",
+        market,
         "--code",
         code,
         "--start",
@@ -485,7 +486,7 @@ def analysis_argv(start="2024-07-01", end="2024-07-11", code="601088"):
     ]
 
 
-def seed_crossing_ex_date(container, *, cover=True):
+def seed_crossing_ex_date(container, *, cover=True, cash=2.10):
     """601088 那一次：除息前收 42.00、每股派 2.10 ⇒ 参考价 39.90，除息当天收 40.40。
 
     裸价读作 −3.81%、交易所口径读作 +1.26% 的那一对数，就是这条命令要区分的两件事。
@@ -510,11 +511,11 @@ def seed_crossing_ex_date(container, *, cover=True):
                 "code": ["601088"],
                 "ex_date": [date(2024, 7, 8)],
                 "kind": ["dividend"],
-                "cash_per_share": [2.10],
+                "cash_per_share": [cash],
                 "ratio": [None],
                 "price": [None],
                 "src": ["akshare"],
-                "note": ["10派21.00元(含税)"],
+                "note": [f"10派{cash * 10:.2f}元(含税)"],
             }
         )
     )
@@ -527,6 +528,22 @@ def seed_crossing_ex_date(container, *, cover=True):
             full_history=False,
             src="akshare",
         )
+
+
+#: 锚点那条文案要说「这三天休市」，就得真有一条日历行撑着；空日历时它只能说「无法判断」
+_ASESSIONS = (SessionWindow("regular", "09:30", "15:00"),)
+
+
+def seed_calendar(container, *, closed=()):
+    """把 2024 年的工作日铺成开市日，`closed` 里的那些例外（不写行 = 已覆盖且休市）。"""
+    closed = set(closed)
+    days = []
+    cursor = date(2024, 1, 1)
+    while cursor <= date(2024, 12, 31):
+        if cursor.weekday() < 5 and cursor not in closed:
+            days.append(CalendarDay("A", cursor, True, False, "Asia/Shanghai", _ASESSIONS))
+        cursor += timedelta(days=1)
+    container.calendar_store.save(days, source="test")
 
 
 def test_analysis_return_prints_both_calibers_and_which_one_to_trust(container, capsys):
@@ -550,15 +567,81 @@ def test_analysis_return_refuses_an_unconfirmed_window(container, capsys):
 
 
 def test_analysis_return_says_which_two_bars_it_anchored_on(container, capsys):
-    """请求 7-15 而库里到 7-11 为止：数照样给（几天缺口是常态），但锚点要写在脸上。"""
+    """请求 7-15 而库里到 7-11 为止：数照样给（几天缺口是常态），但锚点要写在脸上。
+
+    7-12 与 7-15 在日历上是开市日，库里却没有那两根 K 线——这正是「数不是请求
+    那个区间的数」，退出码因此不是 0：脚本不能把它当成一次正常的读数。
+    """
     seed_crossing_ex_date(container)
-    assert cli_run_on(container, analysis_argv(end="2024-07-15")) == 0
+    seed_calendar(container)
+    assert cli_run_on(container, analysis_argv(end="2024-07-15")) == 3
     out = capsys.readouterr().out
     assert "这两根出的数" in out and "2024-07-11" in out
+    assert "开市日没有 K 线" in out and "2024-07-12" in out
+    assert "周末" not in out, "没查过日历就不许把缺口归给周末"
+
+
+def test_analysis_return_charges_nothing_when_the_gap_is_only_rest_days(container, capsys):
+    """缺口全是休市日时，这就是请求的那个区间：0 退出，且要说清依据来自日历。"""
+    seed_crossing_ex_date(container)
+    seed_calendar(container, closed=[date(2024, 7, 12), date(2024, 7, 15)])
+    assert cli_run_on(container, analysis_argv(end="2024-07-15")) == 0
+    out = capsys.readouterr().out
+    assert "这两根出的数" in out and "都是休市日" in out
+
+
+def test_analysis_return_admits_the_calendar_cannot_answer(container, capsys):
+    """日历没铺到那一年时，「（周末、长假、停牌）」是猜的：猜就要说不知道。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv(end="2024-07-15")) == 3
+    out = capsys.readouterr().out
+    assert "无法判断" in out and "calendar refresh" in out
+
+
+def test_analysis_return_declares_the_adjustment_convention(container, capsys):
+    """两个数并列而不说口径，读的人不知道自己采信的是哪一种复权。
+
+    D34 选的是「派到的现金不再投资」：同一个跨除权区间，按再投资算是另一个数。
+    """
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv()) == 0
+    out = capsys.readouterr().out
+    assert "口径" in out and "现金到手不再投资" in out and "除权参考价" in out
+
+
+def seed_tiny_dividend(container, cash: float = 0.001):
+    """一笔小到两位小数看不出的派息：两个数其实是不同的数，只是打印成了同一个。"""
+    seed_crossing_ex_date(container, cash=cash)
+
+
+def test_analysis_return_shows_more_digits_when_the_two_calibers_look_identical(
+    container, capsys
+):
+    """「+2.44% vs +2.44%，采信复权」这句话没有信息量：那位小数正是差别所在。"""
+    seed_tiny_dividend(container)
+    assert cli_run_on(container, analysis_argv()) == 0
+    out = capsys.readouterr().out
+    assert "+2.4390%" in out and "+2.4415%" in out
+    assert "四位小数" in out
 
 
 def test_analysis_return_names_a_window_the_bars_do_not_cover(container, capsys):
     seed_crossing_ex_date(container)
     assert cli_run_on(container, analysis_argv(end="2024-12-31")) == 1
     assert "只覆盖" in capsys.readouterr().out
+
+
+def test_analysis_return_takes_a_lowercase_market(container, capsys):
+    """`--market a` 不许关掉 D37，也不许把三个仓库都查成空表。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv(market="a")) == 0
+    out = capsys.readouterr().out
+    assert "+7.83%" in out and "A/601088" in out
+
+
+def test_a_malformed_date_is_a_message_not_a_trace(config_path, capsys):
+    """手滑打成 2024-7-1 不该看到一段栈：这是最常见的输入错误，不是程序错误。"""
+    assert cli.run(analysis_argv(start="2024-7-1")) == 1
+    err = capsys.readouterr().err
+    assert "错误:" in err and "YYYY-MM-DD" in err
 

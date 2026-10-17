@@ -9,6 +9,8 @@ import getpass
 from argparse import _SubParsersAction
 from datetime import date
 
+from sams.core.errors import ValidationError
+
 
 def group(subparsers: _SubParsersAction, name: str, help_text: str) -> _SubParsersAction:
     """建一层 `sams <name> <action>` 分组，返回 action 用的 subparsers。"""
@@ -26,4 +28,15 @@ def ask_password(prompt: str = "密码") -> str:
 
 
 def iso_date(value: str) -> date:
-    return date.fromisoformat(value)
+    """解析 `YYYY-MM-DD`。
+
+    包一层是因为 `date.fromisoformat` 抛的是裸 `ValueError`，而 CLI 只兜 `SamsError`：
+    手滑打成一个 2024-7-1 会让整条命令吐一段栈，运维读到的是 Python 的行号，
+    不是「这个日期该怎么写」。
+    """
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValidationError(
+            f"日期 {value!r} 看不懂：要的是 YYYY-MM-DD，例如 2024-07-01"
+        ) from None

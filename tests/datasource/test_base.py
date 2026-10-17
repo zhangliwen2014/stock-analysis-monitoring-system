@@ -5,7 +5,14 @@ from datetime import date
 import polars as pl
 import pytest
 
-from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited, TransientError
+from sams.core.errors import (
+    DatasourceError,
+    EmptyResponse,
+    FieldDrift,
+    RateLimited,
+    TransientError,
+    ValidationError,
+)
 from sams.datasource.base import (
     BAR_COLUMNS,
     LOTS_TO_SHARES,
@@ -141,8 +148,13 @@ def test_code_in_market(market, code, symbol):
 
 
 def test_code_in_market_rejects_blank():
+    """空代码由 `core.codes` 统一拒绝（`ValidationError`），这里只是转 pass 给它。
+
+    异常类型换成 SamsError 家族是有意的：命令行拿到它该打印一行「错误:」并退 1，
+    而不是一段栈——归一规则只有一处，报错形态因此也只有一处。
+    """
     for bad in ("", "   ", None):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValidationError):
             code_in_market("A", bad)
 
 

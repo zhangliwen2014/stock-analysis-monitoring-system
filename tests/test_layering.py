@@ -22,12 +22,14 @@ SRC = ROOT / "sams"
 #: ——守卫一旦为了临时方便被放宽，就再也不会被收紧。
 #: services → analysis 是单向的：读用例负责取数与定口径，分析层不反向认识任何服务，
 #: 否则指标引擎将来被 monitor/trading 复用时会出现第二条绕过守卫的取数路径。
+#: analysis 因此也不 import storage：它拿到的三份事实是参数（K 线、公司行为、覆盖区间），
+#: 「能 import storage」与「会自己去看一眼库」只差一个顺手，而后者的结果没有过闸。
 ALLOWED: dict[str, set[str]] = {
     "core": set(),
     "storage": {"core"},
     "datasource": {"core"},
     "services": {"core", "storage", "datasource", "analysis"},
-    "analysis": {"core", "storage"},
+    "analysis": {"core"},
     "monitor": {"core", "storage", "datasource", "services", "analysis"},
     "trading": {"core", "storage", "services", "analysis"},
     "cli": {"core", "services"},
@@ -135,6 +137,41 @@ def test_bootstrap_is_the_only_assembly_root():
         and _layer(path) != ASSEMBLY
     ]
     assert all_three == [], f"{all_three} 自行组装依赖，应改为从 bootstrap 注入"
+
+
+#: 只有一个符号值得单独点名：`hfq_frame` 是**不过闸**的裸算原语（不查覆盖、不听
+#: 未标记跳变）。分层规则管得住「谁能 import 哪一层」，管不住「同一层里谁挑了哪个函数」，
+#: 而绕过 `adjusted_series` 拿它出数，症状恰恰是一条看起来完全正常的错曲线——
+#: U12 那个数只是换个形状出门。所以它的消费者必须只有一个，且由机器守着。
+SOLE_CONSUMER: dict[str, str] = {"hfq_frame": "analysis/adjust.py"}
+
+
+def _used_names(path: Path) -> set[str]:
+    """模块里出现过的标识符：调用、属性、`from x import y` 都算「用了这个名字」。"""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.alias):
+            names.add(node.name.split(".")[-1])
+    return names
+
+
+@pytest.mark.parametrize(
+    "path", sorted(SRC.rglob("*.py")), ids=lambda p: str(p.relative_to(SRC))
+)
+def test_unguarded_primitives_have_only_their_declared_consumer(path: Path):
+    rel = str(path.relative_to(SRC))
+    used = _used_names(path)
+    for symbol, owner in SOLE_CONSUMER.items():
+        if rel == owner:
+            continue
+        assert symbol not in used, (
+            f"{rel} 用了不过闸的裸原语 {symbol}：出数只能走 analysis.adjust.adjusted_series，"
+            "它后面那三道闸（覆盖 / 未标记跳变 / 收盘价）才会生效"
+        )
 
 
 @pytest.mark.parametrize(

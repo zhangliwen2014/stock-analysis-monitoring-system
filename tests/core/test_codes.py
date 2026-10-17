@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from sams.core.codes import canonical_code, currency_override, lot_size_of
+from sams.core.codes import canonical_code, currency_override, daily_price_limit, lot_size_of
+from sams.core.errors import ValidationError
 
 
 @pytest.mark.parametrize(
@@ -52,8 +53,38 @@ def test_a_code_that_is_not_a_number_is_handed_back_untouched():
 
 def test_an_empty_code_is_refused():
     for market in ("A", "HK", "US"):
-        with pytest.raises(ValueError, match="不能为空"):
+        with pytest.raises(ValidationError, match="code 不能为空"):
             canonical_code(market, "   ")
+
+
+# ---------------------------------------------------------------- 市场名
+
+# 大小写看着像排版问题，其实是闸的问题：`daily_price_limit("a", …)` 返回 None 的含义是
+# 「这个市场没有涨跌幅证据」，D37 就此静默关掉；而 `--market hk` 查不到 market='HK' 的
+# K 线，症状换成「这段没有数据」。两种都不报错。
+
+
+@pytest.mark.parametrize("market", ["A", "a", " a ", "A "])
+def test_a_lowercase_market_keeps_the_price_limit(market):
+    assert daily_price_limit(market, "601088") == 0.10
+
+
+@pytest.mark.parametrize("market", ["HK", "hk", " hk"])
+def test_a_lowercase_hk_still_pads_the_code(market):
+    assert canonical_code(market, "700") == "00700"
+
+
+def test_an_empty_market_is_refused():
+    for market in ("", "   "):
+        with pytest.raises(ValidationError, match="market 不能为空"):
+            canonical_code(market, "601088")
+
+
+def test_the_currency_override_reads_the_market_too():
+    """B 股与人民币双柜台的例外按市场名匹配：认不出市场就等于按默认币种入库。"""
+    assert currency_override("hk", "80700") == "CNY"
+    assert currency_override("a", "900901") == "USD"
+    assert lot_size_of("a") == 100
 
 
 # ---------------------------------------------------------------- 币种

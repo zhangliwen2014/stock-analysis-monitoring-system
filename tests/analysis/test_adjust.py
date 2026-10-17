@@ -192,7 +192,7 @@ def test_the_guarded_entry_refuses_where_the_bare_primitive_would_answer():
     frame = bars(100.0, 99.0)
     assert hfq_frame(frame, actions())["close_hfq"].to_list() == [100.0, 99.0]
     with pytest.raises(NotAdjustable, match="覆盖确认"):
-        adjusted_series("A", "600000", frame, actions(), coverage=[])
+        adjusted_series("A", "600000", frame, actions(), coverage=[], today=D3)
 
 
 def test_every_price_column_carries_the_factor_not_just_the_close():
@@ -208,7 +208,8 @@ def test_every_price_column_carries_the_factor_not_just_the_close():
         }
     )
     series = adjusted_series(
-        "A", "600000", frame, actions((D1, "dividend", 1.0, None, None)), coverage=CONFIRMED
+        "A", "600000", frame, actions((D1, "dividend", 1.0, None, None)), coverage=CONFIRMED,
+        today=D3,
     )
     factor = 100.0 / 99.0
     for column in ("open", "high", "low", "close"):
@@ -221,7 +222,7 @@ def test_a_missing_close_is_refused_with_a_reason_instead_of_a_traceback():
     """缺数要说不出口。`None / 100.0` 那种 TypeError 不是拒绝，是崩。"""
     frame = pl.DataFrame({"date": [D0, D1], "close": [100.0, None]})
     with pytest.raises(NotAdjustable, match="缺收盘价"):
-        adjusted_series("A", "600000", frame, actions(), coverage=CONFIRMED)
+        adjusted_series("A", "600000", frame, actions(), coverage=CONFIRMED, today=D3)
 
 
 def test_a_recorded_split_is_not_refused_as_an_unmarked_one():
@@ -232,7 +233,8 @@ def test_a_recorded_split_is_not_refused_as_an_unmarked_one():
     """
     frame = pl.DataFrame({"date": [D0, D1], "close": [100.0, 50.0]})
     series = adjusted_series(
-        "A", "600000", frame, actions((D1, "bonus", None, 2.0, None)), coverage=CONFIRMED
+        "A", "600000", frame, actions((D1, "bonus", None, 2.0, None)), coverage=CONFIRMED,
+        today=D3,
     )
     assert series.frame["close_hfq"].to_list() == pytest.approx([100.0, 100.0])
 
@@ -241,4 +243,4 @@ def test_an_unrecorded_split_sized_move_still_gets_refused():
     """同一段行情，库里没有那天的记录，豁免就不成立——否则上面那条等于关掉守卫。"""
     frame = pl.DataFrame({"date": [D0, D1], "close": [100.0, 50.0]})
     with pytest.raises(NotAdjustable, match="未记录的公司行为"):
-        adjusted_series("A", "600000", frame, actions(), coverage=CONFIRMED)
+        adjusted_series("A", "600000", frame, actions(), coverage=CONFIRMED, today=D3)

@@ -153,6 +153,20 @@ class CalendarService:
     def is_trading_day(self, market: str, day: date) -> bool:
         return self.day(market, day).is_trading
 
+    def known_status(self, market: str, day: date) -> bool | None:
+        """日历**能不能**回答这一天：True 开市、False 休市、None 是「还没铺到」。
+
+        与 `is_trading_day` 的差别是方向的差别。轮询时未知按开市处理是对的——多问一次
+        空数据无害；把同一个降级值写进报告就错了，那句「那几天是周末」会把
+        「开市日没采到」这种真缺口说成常态。这个函数因此只读库，绝不顺手补来源。
+        """
+        stored = self.store.get(market, day)
+        if stored is not None:
+            return stored.is_trading
+        if self.store.year_covered(market, day.year, through=self._today()):
+            return False
+        return None
+
     def sessions(
         self,
         market: str,
