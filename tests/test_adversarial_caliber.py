@@ -262,13 +262,27 @@ def test_proof_kind_is_validated_in_python_only(db):
     assert repo.count() == 1, "kind 无 CHECK 约束，Python 校验挡不住第二条写入路径"
 
 
-def test_proof_right_issue_has_no_price_field(db):
-    """配股需要 (每股配比 ratio, 配股价 price)，schema 只有 cash_per_share/ratio。"""
-    with pytest.raises(TypeError):
-        CorpAction(market="A", code="600519", ex_date=D1, kind="rights",
-                   ratio=0.3, price=8.7, src="akshare")  # 配股价无处安放
+def test_proof_right_issue_carries_its_price(db):
+    """配股要 (每股配比 ratio, 配股价 price) 两个数才能推导除权参考价。
+
+    这条原先记录的是「schema 里没有 price，配股因子无从计算」（spec §18 U4）。
+    迁移 0008 补上了列，U4 结案，于是这里改成把新契约钉住：price 存在、
+    只属于配股、且配股没有 price 就写不进库。
+    """
+    repo = CorpActionRepo(db)
     columns = db.query("SELECT * FROM corp_actions LIMIT 0").columns
-    assert "price" not in columns
+    assert "price" in columns
+
+    repo.upsert(CorpAction(market="A", code="600519", ex_date=D1, kind="rights",
+                           ratio=1.3, price=8.7, src="akshare"))
+    assert repo.count() == 1
+
+    with pytest.raises(ValidationError, match="配股必须给配股价"):
+        repo.upsert(CorpAction(market="A", code="600519", ex_date=D1, kind="rights",
+                               ratio=1.3, src="akshare"))
+    with pytest.raises(ValidationError, match="只属于配股"):
+        repo.upsert(CorpAction(market="A", code="600519", ex_date=D1, kind="dividend",
+                               cash_per_share=1.0, price=8.7, src="akshare"))
     expected = {"dividend", "split", "bonus", "transfer", "rights"}
     assert set(KINDS) == expected
 

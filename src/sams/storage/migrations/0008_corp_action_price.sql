@@ -1,0 +1,12 @@
+-- 0008：公司行为的字段语义定案（spec D34 / §18 U4）
+--
+-- `ratio` 之前同时装着「每股送几股」「拆股比例」「配股比例」三种理解，同一个因子公式
+-- 无法同时正确——601088 那笔 −3.81% vs +1.26% 的差就是这么来的。定案后：
+--   ratio          = 除权后股数 / 除权前股数（乘数，派息时为 NULL）
+--   cash_per_share = 每股收到的现金
+--   price          = 每股新股需要支付的现金（只有配股用得上）
+-- 有了 price，配股除权参考价才推得出来：只记「10 配 2」不记配股价，等于记了一半事实。
+--
+-- DuckDB 的 ADD COLUMN IF NOT EXISTS 让重放安全：迁移器虽已记账不重跑，
+-- 但同一份 SQL 在「手工建过渡库」时也必须是幂等的。
+ALTER TABLE corp_actions ADD COLUMN IF NOT EXISTS price DOUBLE;

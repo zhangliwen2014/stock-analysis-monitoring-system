@@ -590,10 +590,12 @@ def test_corp_action_upsert_is_idempotent_and_last_write_wins(actions):
 def test_corp_action_validation_matrix(actions):
     with pytest.raises(ValidationError, match="未知公司行为类型"):
         actions.upsert(_action(kind="Dividend"))
-    with pytest.raises(ValidationError, match="现金或比例"):
+    with pytest.raises(ValidationError, match="cash_per_share"):
         actions.upsert(_action(cash_per_share=None))
-    actions.upsert(_action(ratio=0.5))  # 现金与比例同时给：不报错
-    assert actions.count() == 1
+    # D34 之后「同时给」不是宽容而是矛盾：派息带乘数会让同一笔事件被乘两次
+    with pytest.raises(ValidationError, match="dividend 只给现金"):
+        actions.upsert(_action(cash_per_share=30.0, ratio=1.5))
+    assert actions.count() == 0
 
 
 def test_should_reject_nan_cash_per_share(actions):
