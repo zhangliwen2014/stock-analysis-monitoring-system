@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+from datetime import date
+
+import polars as pl
+import pytest
+
+from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited, TransientError
+from sams.datasource.base import BAR_COLUMNS
+from sams.datasource.ratelimit import TokenBucket
+from sams.datasource.registry import AdapterRegistry
+from sams.storage.repos.source_health import SourceHealthRepo
+
+D1, D2 = date(2024, 1, 2), date(2024, 1, 3)
+
+
+def frame(source: str) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "market": ["A", "A"],
+            "code": ["600519", "600519"],
+            "date": [D1, D2],
+            "open": [1.0, 2.0],
+            "high": [1.5, 2.5],
+            "low": [0.5, 1.5],
+            "close": [1.2, 2.2],
+            "volume": [100.0, 200.0],
+            "amount": [120.0, 440.0],
+            "source": [source, source],
+        }
+    )
+
+
+class FakeAdapter:
+    """按脚本应答：outcomes 里每一项要么是返回帧，要么是要抛的异常。"""
+
+    def __init__(self, name: str, markets=("A",), *outcomes) -> None:
+        self.name = name
+        self.markets = frozenset(markets)
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def daily_bars(self, market, code, start, end):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def registry(*adapters, markets=("A",), store=None) -> AdapterRegistry:
+    by_name = {a.name: a for a in adapters}
+    return AdapterRegistry(
+        adapters=by_name,
+        market_sources={m: tuple(by_name) for m in markets},
+        sleep=lambda seconds: None,
+        store=store,
+    )
+
+
+def test_primary_success_is_not_degraded():
+    reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")))
+    result = reg.fetch_daily("A", "600519", D1, D2)
+    assert result.source == "akshare"
+    assert not result.degraded
+    assert result.frame.columns == BAR_COLUMNS
+    assert reg.health()[0].ok and reg.health()[0].consecutive_failures == 0
+
+
+def test_rate_limited_primary_falls_back_and_is_recorded():
+    primary = FakeAdapter("akshare", ["A"], RateLimited("akshare", "429"))
+    backup = FakeAdapter("eastmoney", ["A"], frame("eastmoney"))
+    reg = registry(primary, backup)
+
+    result = reg.fetch_daily("A", "600519", D1, D2)
+    assert result.source == "eastmoney", "主源被限流要立刻换备源"
+    assert result.degraded
+    assert [a.source for a in result.attempts] == ["akshare", "eastmoney"]
+    by_name = {h.name: h for h in reg.health()}
+    assert not by_name["akshare"].ok and by_name["akshare"].consecutive_failures == 1
+    assert by_name["eastmoney"].ok and by_name["eastmoney"].last_ok_at == date.today()
+
+
+def test_field_drift_switches_source_without_wasting_retries():
+    """改版重试不会变好：一次就定性，立刻换源。"""
+    primary = FakeAdapter("akshare", ["A"], FieldDrift("akshare", "少列"))
+    backup = FakeAdapter("eastmoney", ["A"], frame("eastmoney"))
+    reg = registry(primary, backup)
+    result = reg.fetch_daily("A", "600519", D1, D2)
+    assert primary.calls == 1
+    assert result.source == "eastmoney"
+
+
+def test_transient_error_is_retried_with_backoff_before_switching():
+    sleeps: list[float] = []
+    primary = FakeAdapter(
+        "akshare",
+        ["A"],
+        TransientError("akshare", "timeout"),
+        TransientError("akshare", "timeout"),
+        RateLimited("akshare", "429"),
+    )
+    backup = FakeAdapter("eastmoney", ["A"], frame("eastmoney"))
+    reg = AdapterRegistry(
+        adapters={primary.name: primary, backup.name: backup},
+        market_sources={"A": ("akshare", "eastmoney")},
+        attempts_per_source=3,
+        sleep=sleeps.append,
+    )
+    result = reg.fetch_daily("A", "600519", D1, D2)
+    assert primary.calls == 3
+    assert sleeps == [1.0, 4.0], "两次重试之间按 1、4 秒退避"
+    assert result.source == "eastmoney"
+
+
+def test_every_source_failing_raises_with_both_reasons():
+    reg = registry(
+        FakeAdapter("akshare", ["A"], RateLimited("akshare", "429")),
+        FakeAdapter("eastmoney", ["A"], FieldDrift("eastmoney", "少列")),
+    )
+    with pytest.raises(DatasourceError, match="所有源均失败") as excinfo:
+        reg.fetch_daily("A", "600519", D1, D2)
+    assert "akshare" in str(excinfo.value) and "eastmoney" in str(excinfo.value)
+    assert all(not h.ok for h in reg.health())
+
+
+def test_all_sources_empty_is_reported_as_empty_not_failure():
+    """停牌：两个源都回答「没有数据」，这不是采集失败。"""
+    reg = registry(
+        FakeAdapter("akshare", ["A"], EmptyResponse("akshare", "无")),
+        FakeAdapter("eastmoney", ["A"], EmptyResponse("eastmoney", "无")),
+    )
+    result = reg.fetch_daily("A", "600519", D1, D2)
+    assert result.empty_everywhere and result.frame.is_empty()
+    assert result.frame.columns == BAR_COLUMNS
+
+
+def test_source_that_doesnt_cover_the_market_is_skipped_with_a_note():
+    reg = registry(FakeAdapter("yfinance", ["US"], frame("yfinance")), markets=("A",))
+    result = None
+    with pytest.raises(DatasourceError, match="不支持市场"):
+        reg.fetch_daily("A", "600519", D1, D2)
+    assert result is None
+
+
+def test_market_without_sources_or_unknown_market_fails_clearly():
+    reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")), markets=("A",))
+    with pytest.raises(DatasourceError, match="JP"):
+        reg.fetch_daily("JP", "AAPL", D1, D2)
+
+
+def test_configured_but_unregistered_source_is_caught_at_construction():
+    with pytest.raises(DatasourceError, match="未注册"):
+        AdapterRegistry(
+            adapters={"akshare": FakeAdapter("akshare", ["A"], frame("akshare"))},
+            market_sources={"A": ("akshare", "sina")},
+        )
+
+
+def test_bucket_is_consulted_for_every_call():
+    clock = {"now": 0.0}
+    waits: list[float] = []
+
+    def advance_sleep(seconds):
+        waits.append(seconds)
+        clock["now"] += seconds
+
+    bucket = TokenBucket(rate=1.0, capacity=1.0, clock=lambda: clock["now"], sleep=advance_sleep)
+    primary = FakeAdapter("akshare", ["A"], frame("akshare"), frame("akshare"))
+    reg = AdapterRegistry(
+        adapters={primary.name: primary},
+        market_sources={"A": ("akshare",)},
+        bucket=bucket,
+        sleep=advance_sleep,
+    )
+    reg.fetch_daily("A", "600519", D1, D2)
+    reg.fetch_daily("A", "600519", D1, D2)
+    assert waits, "第二次请求必须被限速器按住"
+
+
+def test_unexpected_adapter_error_does_not_escape_the_router():
+    reg = registry(FakeAdapter("akshare", ["A"], ZeroDivisionError("boom")))
+    with pytest.raises(DatasourceError, match="ZeroDivisionError"):
+        reg.fetch_daily("A", "600519", D1, D2)
+
+
+def test_from_settings_uses_configured_source_order(settings):
+    stubs = {
+        name: FakeAdapter(name, ["A", "US", "HK"], frame(name))
+        for name in ("akshare", "eastmoney", "yfinance")
+    }
+    reg = AdapterRegistry.from_settings(settings, adapters=stubs, bucket=None)
+    assert reg.sources_for("A") == ("akshare", "eastmoney")
+    assert reg.sources_for("US") == ("yfinance",)
+    assert {h.name for h in reg.health()} == {"akshare", "eastmoney", "yfinance"}
+
+
+def test_failures_survive_into_the_next_process(db):
+    """健康记录落库：`sams health` 是另一个进程，不该只看自己的内存。"""
+    store = SourceHealthRepo(db)
+    failing = registry(FakeAdapter("akshare", ["A"], RateLimited("akshare", "429")), store=store)
+    with pytest.raises(DatasourceError):
+        failing.fetch_daily("A", "600519", D1, D2)
+
+    reopened = registry(FakeAdapter("akshare", ["A"], RateLimited("akshare", "429")), store=store)
+    assert [(r.name, r.ok, r.consecutive_failures) for r in reopened.health()] == [
+        ("akshare", False, 1)
+    ]
+
+
+def test_recovered_source_clears_the_stored_failure(db):
+    store = SourceHealthRepo(db)
+    broken = registry(FakeAdapter("akshare", ["A"], RateLimited("akshare", "429")), store=store)
+    with pytest.raises(DatasourceError):
+        broken.fetch_daily("A", "600519", D1, D2)
+
+    fixed = registry(FakeAdapter("akshare", ["A"], frame("akshare")), store=store)
+    fixed.fetch_daily("A", "600519", D1, D2)
+    assert SourceHealthRepo(db).load()["akshare"].ok is True
