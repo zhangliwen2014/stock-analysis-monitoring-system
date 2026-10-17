@@ -50,3 +50,31 @@ def lot_size_of(market: str) -> int | None:
     if market == "US":
         return 1
     return None
+
+
+#: 创业板与科创板：±20%（新股前五日不设限，那是另一回事，由调用方按「跳过开头几根」处理）
+_WIDE_LIMIT_PREFIXES = ("30", "68")
+
+
+def daily_price_limit(market: str, code: str) -> float | None:
+    """该标的单日最大**正常**涨跌幅，判不出返回 None。
+
+    这个数只用于一件事（D37）：裸价序列里出现超过它的跳变，就一定不是交易出来的——
+    A 股没有任何合法情形能让主板一天跌 15%，除了除权。所以它是「一定有没记录的除权」
+    的证据，而不是给使用者看的行情字段。
+
+    取的是该板块**最宽**的口径：ST 是 ±5%，但按 5% 判会把 ST 股的正常跌停误报成除权，
+    而按 10% 判只会漏判（漏判由 D36 的覆盖标记兜住）。港美股没有涨跌幅限制，返回 None
+    等于承认「这条证据在这里不存在」。
+    """
+    if market != "A" or not code.isdigit():
+        return None
+    if code.startswith(_WIDE_LIMIT_PREFIXES):
+        return 0.20
+    # 北交所：43 / 83 / 87 / 88 / 92 开头，±30%
+    if code.startswith(("43", "83", "87", "88", "92")):
+        return 0.30
+    if code.startswith(("60", "00")):
+        return 0.10
+    # B 股（900/200）与其它老代码：不猜——判错一次的代价是把正常行情说成除权
+    return None

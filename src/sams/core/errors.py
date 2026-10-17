@@ -42,3 +42,12 @@ class FieldDrift(DatasourceError):
 
 class CalendarSourceError(SamsError):
     """交易日历来源不可用。"""
+
+
+class NotAdjustable(SamsError):
+    """区间涨跌无法复权 ⇒ 不出数。
+
+    裸价跨除权日算出来的涨跌是**一个看起来完全正常的错数**（601088 的 −3.81% vs
+    交易所公布的 +1.26%），所以这一层的拒绝不是保守而是必要：算不出必须说算不出，
+    而且原因要一起抛出去——「没采集过」和「确实没分过红」对使用者是两个结论。
+    """
