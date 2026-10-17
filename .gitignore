@@ -10,3 +10,6 @@ logs/
 .pytest_cache/
 .ruff_cache/
 .qoder/settings.local.json
+*.swp
+*.swo
+*~
