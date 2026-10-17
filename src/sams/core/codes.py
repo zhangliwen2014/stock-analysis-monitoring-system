@@ -16,8 +16,19 @@ def canonical_code(market: str, code: str) -> str:
         # HK00700 / HK.00700 / 00700.HK / 700 是同一只票，落库必须只有 00700 一种写法
         digits = cleaned.removeprefix("HK").removesuffix(".HK").removeprefix(".").strip()
         return f"{int(digits):05d}" if digits.isdigit() else cleaned
-    # A 股/美股的交易所后缀是数据源要的形态，不是本系统的键
-    return cleaned.removesuffix(".SH").removesuffix(".SS").removesuffix(".SZ")
+    # A 股：交易所前后缀是数据源要的形态，不是本系统的键。
+    # `sh600519` 不剥掉的话会一路传到只认 6 位数字的东财接口——那里的症状不是报错，
+    # 是「这只票从没分过红」（空响应），比多一个主键更难查。
+    cleaned = (
+        cleaned.removesuffix(".SH")
+        .removesuffix(".SS")
+        .removesuffix(".SZ")
+        .removesuffix(".BJ")
+    )
+    for prefix in ("SH", "SZ", "BJ"):
+        if cleaned.startswith(prefix) and cleaned[len(prefix) :].isdigit():
+            return cleaned[len(prefix) :]
+    return cleaned
 
 
 def currency_override(market: str, code: str) -> str | None:

@@ -26,6 +26,20 @@ def test_a_share_drops_the_exchange_suffix_only(raw):
         assert canonical_code("A", value) == raw.strip().split(".")[0]
 
 
+@pytest.mark.parametrize("raw", ["sh601088", "SH601088", "sz000001", "bj830799"])
+def test_a_share_drops_the_exchange_prefix_too(raw):
+    """新浪/腾讯形态的前缀也是别名。留着它，只认 6 位数字的东财接口会回「没有记录」——
+    症状不是报错，而是「这只票从没分过红」，比多一个主键更难查。"""
+    assert canonical_code("A", raw) == raw[2:]
+
+
+def test_an_alphabetic_ticker_is_never_mistaken_for_a_prefixed_code():
+    """NYSE:SH（中石化上海）剥掉 `SH` 会变成空串；`SHLX` 会变成 `LX`。
+    只在剩余部分全是数字时才剥前缀，就是为了不把美股符号啃掉一块。"""
+    assert canonical_code("US", "sh") == "SH"
+    assert canonical_code("US", "SHLX") == "SHLX"
+
+
 def test_us_ticker_keeps_its_shape_and_uppercases():
     assert canonical_code("US", "brk-b") == "BRK-B"
     assert canonical_code("US", "AAPL") == "AAPL"
