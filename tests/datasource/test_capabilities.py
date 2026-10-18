@@ -16,8 +16,14 @@ from sams.datasource.sources import build, catalog, known
 
 
 def test_the_kind_name_is_the_adapter_method_name():
-    """种类名 = 方法名：没有第二套词，也就没有「两处叫法漂移」这件事。"""
-    assert set(CAPABILITIES) == {"daily_bars", "corp_actions"}
+    """种类名 = 方法名 = `fetch_<方法名>`：没有第二套词，也就没有「两处叫法漂移」这件事。"""
+    assert set(CAPABILITIES) == {
+        "daily_bars",
+        "corp_actions",
+        "financials",
+        "valuation",
+        "funding_flow",
+    }
 
 
 def test_an_unknown_kind_says_which_ones_exist():

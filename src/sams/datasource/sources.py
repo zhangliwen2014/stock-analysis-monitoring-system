@@ -29,12 +29,13 @@ from sams.datasource.capabilities import CAPABILITIES, provided_by
 _NOT_ADAPTERS = frozenset(
     {
         "base",
-        "capabilities",
         "registry",
         "ratelimit",
         "sources",
         "calendar_providers",
         "actions",
+        "capabilities",
+        "fundamentals",
         "akshare_actions",
     }
 )

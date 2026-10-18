@@ -63,13 +63,38 @@ FLOW_COLUMNS = (
 )
 
 
+#: 文本列：三张表共用的键列与来源列。类型判断只看这一份名单——采集侧与仓库侧各写一份
+#: 「哪些列是文本」时，漏写的那一份会把 `market` 补成数值 null，然后在键归一那步炸掉。
+TEXT_COLUMNS = ("market", "code", "source")
+
+#: 百分数 → 小数的除数。写成常量而不是在两侧各写一个 `100.0`：口径换算的**数值**也只有一个出处。
+PERCENT_DIVISOR = 100.0
+
+
 def from_percent(value: float | None) -> float | None:
     """百分数 → 小数口径（D58）。None 原样交回，**不折成 0.0**。
 
     「股息率 0」与「不知道股息率」在选股里后果不同：前者是一只好票真的不分红，
     后者是源没给——把后者写成 0，「高股息」那条筛子就会把它静默排除掉。
+
+    逐帧换算走 `datasource.fundamentals`（那里除数用的就是上面这个常量），
+    这个标量版本留给源侧返回单个数字的场合（yfinance 的 info 字典）。
     """
-    return None if value is None else value / 100.0
+    return None if value is None else value / PERCENT_DIVISOR
+
+
+#: 小数口径下不可能出现的绝对值（`roe` 的上限 5.0 = 500%）。越过它最可能的解释不是
+#: 「这家公司 ROE 600%」，而是「百分数没换算就被存了下来」（D58）。
+#: 仓库层的处置是**把那一列置空、留下这一行**：留着那个数，PR 会算出小两个数量级的
+#: 「便宜」并把这只票排进低 PR 前列；置空则 PR 直接拒绝出数。两者之间选「不出数」。
+#: 这条闸有已知的漏网：没换算的「营收 +15%」存成 15.0 也在上限内。它挡的是量级错，
+#: 挡不住每一项具体数值——所以采集侧的真实用例仍然逐列断言区间。
+RATIO_BOUNDS = {
+    "roe": 5.0,
+    "revenue_yoy": 5.0,
+    "profit_yoy": 5.0,
+    "dividend_yield": 1.0,
+}
 
 
 def caliber_note() -> str:

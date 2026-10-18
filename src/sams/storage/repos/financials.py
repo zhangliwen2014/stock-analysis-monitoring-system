@@ -32,6 +32,7 @@ from sams.core.fundamentals import (
     FINANCIAL_COLUMNS,
     FLOW_COLUMNS,
     RATIO_BOUNDS,
+    TEXT_COLUMNS,
     VALUATION_COLUMNS,
 )
 from sams.storage.db import Database
@@ -57,7 +58,7 @@ def _prepare(
     for column in columns:
         if column not in out.columns:
             out = out.with_columns(
-                pl.lit(None, dtype=_dtype(column, date_columns, key)).alias(column)
+                pl.lit(None, dtype=_dtype(column, date_columns)).alias(column)
             )
     out = out.select(list(columns))
     for column in date_columns:
@@ -67,7 +68,7 @@ def _prepare(
                 f"{table}.{column} 必须是 pl.Date，收到 {out.schema[column]}；"
                 "带时刻请先按该市场时区取 date"
             )
-    numeric = [c for c in columns if _dtype(c, date_columns, key) is pl.Float64]
+    numeric = [c for c in columns if _dtype(c, date_columns) is pl.Float64]
     out = out.with_columns(*[pl.col(c).cast(pl.Float64) for c in numeric]) if numeric else out
     out = normalize_keys(out, logger=logger, table=table)
     # NaN/Inf 挡不住 is_not_null，而它一旦入库就会覆盖上一期的好数（与 bars 同一条理由）
@@ -103,26 +104,22 @@ def _prepare(
     return out.unique(subset=list(key), keep="last").sort(list(key))
 
 
-def _dtype(
-    column: str, date_columns: tuple[str, ...], key: tuple[str, ...]
-) -> pl.DataType:
-    """词表里每一列的类型：键与来源是文本，日期列是 Date，其余是数值。
+def _dtype(column: str, date_columns: tuple[str, ...]) -> pl.DataType:
+    """词表里每一列的类型：文本列的名单在 core，日期列由调用方给，其余是数值。
 
     缺列补 null 时也用这一个判据——补成 Utf8 会把「这一列没给」变成「这一列是文本」，
     越界检查会在 `str` 上做 `abs()` 而当场炸掉。
     """
     if column in date_columns:
         return pl.Date
-    if column in (*key, "source"):
+    if column in TEXT_COLUMNS:
         return pl.Utf8
     return pl.Float64
 
 
-def _empty(
-    columns: tuple[str, ...], date_columns: tuple[str, ...], key: tuple[str, ...]
-) -> pl.DataFrame:
+def _empty(columns: tuple[str, ...], date_columns: tuple[str, ...]) -> pl.DataFrame:
     """空批次的形状与真实读取一致：调用方不必为「一只票都没同步」写分支。"""
-    return pl.DataFrame(schema={c: _dtype(c, date_columns, key) for c in columns})
+    return pl.DataFrame(schema={c: _dtype(c, date_columns) for c in columns})
 
 
 def _as_date(value: object) -> date | None:
@@ -196,7 +193,7 @@ class FinancialRepo:
         if as_of is None:
             raise ValidationError("load_as_of 必须给截至日：PIT 读取没有『默认今天』这条路")
         if not codes:
-            return _empty(FINANCIAL_COLUMNS, self.DATE_COLUMNS, self.KEY), 0
+            return _empty(FINANCIAL_COLUMNS, self.DATE_COLUMNS), 0
         wanted = [canonical_code(market, c) for c in codes]
         frame = self.db.query(
             """
@@ -327,7 +324,7 @@ class ValuationRepo:
         """
         market = canonical_market(market)
         if not codes:
-            return _empty(VALUATION_COLUMNS, self.DATE_COLUMNS, self.KEY)
+            return _empty(VALUATION_COLUMNS, self.DATE_COLUMNS)
         wanted = [canonical_code(market, c) for c in codes]
         sql = """
             SELECT * EXCLUDE (rnk) FROM (

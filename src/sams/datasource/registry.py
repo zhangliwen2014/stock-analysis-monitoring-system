@@ -23,6 +23,11 @@ from sams.core.sources import SourceHealthStore, SourceRecord
 from sams.datasource.actions import answers_full_history, empty_actions
 from sams.datasource.base import BarAdapter
 from sams.datasource.capabilities import capability
+from sams.datasource.fundamentals import (
+    empty_financials,
+    empty_flow,
+    empty_valuation,
+)
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
 from sams.datasource.sources import known
@@ -132,6 +137,32 @@ class ActionsResult:
     full_history: bool = False
     #: 说「查无记录」的源，且只有当链上每个有能力的源都这么说时才有值（D36）：
     #: 一个源的空答复不能替另一个源的沉默发覆盖确认，而服务层要给每个确认各记一行
+    confirmed_empty_by: tuple[str, ...] = ()
+
+    @property
+    def degraded(self) -> bool:
+        return len(self.attempts) > 1
+
+
+@dataclass(frozen=True)
+class FrameResult:
+    """基本面 / 按日估值 / 资金流三条链的返回，形状与 `ActionsResult` 同一侧（D43）。
+
+    为什么单独立一个而不是复用 `FetchResult`：`FetchResult` 里的 `empty_everywhere`
+    说的是「所有源都说这段没交易」，对日线那是一次成功的取数；这三类数据里 0 行的意思是
+    「这只票在那张表里没记录」，还不能写成「这只票没有财务数据」。把两种语义塞进一个
+    结果类型，服务层就会在某一次重构里把它们当成同一件事——那正是 D43 拆开的两个概念。
+    """
+
+    market: str
+    code: str
+    #: 哪一类取数（`基本面`/`按日估值`/`资金流`）：同一条链的失败要说清是哪条链断了
+    kind: str
+    frame: pl.DataFrame
+    source: str
+    attempts: tuple[Attempt, ...] = ()
+    skipped: tuple[tuple[str, str], ...] = ()
+    #: 链上每个有能力的源都独立答了「查无记录」时才非空（D36）
     confirmed_empty_by: tuple[str, ...] = ()
 
     @property
@@ -396,6 +427,103 @@ class AdapterRegistry:
             f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}"
             + (f"；说查无记录的 {said_no}（因为 {('、'.join(unanswered))} 没答上来，"
                f"这些「没有」还不能写成确认）" if empties else ""),
+        )
+
+    def fetch_financials(self, market: str, code: str, start: date, end: date) -> FrameResult:
+        """按报告期的财务指标（ROE、增速、股息率）。
+
+        粒度是**期**：按日的 PE/PB 走 `fetch_valuation`，两者在读取层才汇合成市赚率（D60）。
+        """
+        return self._fetch_frame(
+            market, code, start, end, method="financials", empty=empty_financials()
+        )
+
+    def fetch_valuation(self, market: str, code: str, start: date, end: date) -> FrameResult:
+        """按交易日的估值倍数：市赚率公式里那个「今天的 PE」的唯一来源（D60）。"""
+        return self._fetch_frame(
+            market, code, start, end, method="valuation", empty=empty_valuation()
+        )
+
+    def fetch_funding_flow(self, market: str, code: str, start: date, end: date) -> FrameResult:
+        """按交易日的资金流。港美股这条链上可能一个源都没有——那是要说出口的缺（D38），
+        不是「0 行」：后者会被读成「这只票没有主力进过场」。"""
+        return self._fetch_frame(
+            market, code, start, end, method="funding_flow", empty=empty_flow()
+        )
+
+    def _fetch_frame(
+        self, market: str, code: str, start: date, end: date, *, method: str, empty: pl.DataFrame
+    ) -> FrameResult:
+        """基本面三类的同一条降级链：0 行继续问，全链都说没有才成一句确认。
+
+        与 `fetch_actions` 同侧、与 `fetch_daily` 反侧（D43）：日线的 0 行是「这段日子确实
+        没交易」，是一次成功的取数；基本面的 0 行只是「这张表里没这只票的记录」——把它当
+        答复交付，服务层就写下「601088 没有财务数据」，而真相可能只是主源那天没这张表。
+        走同一段循环而不是复制三份，是 T-0 收敛的全部意义：加一种数据只加一个语义判断，
+        不再加三十行会各自漂移的走法。
+        """
+        cap = capability(method)
+        attempts: list[Attempt] = []
+        skipped: list[tuple[str, str]] = []
+        empties: list[str] = []
+        unanswered: list[str] = []
+        for out in self._walk(market, code, start, end, method=method):
+            if out.kind == "skipped":
+                skipped.append((out.source, out.error))
+                continue
+            if out.kind == "failed":
+                attempts.append(Attempt(out.source, False, out.tries, out.error))
+                unanswered.append(out.source)
+                continue
+            if out.kind == "no_answer":
+                # 源连「没有」都没说清（接口回空、解析不出）：不能替它写成查过（D36）
+                attempts.append(Attempt(out.source, False, 1, f"无数据: {out.error}"))
+                unanswered.append(out.source)
+                logger.info("%s %s 回答无数据（%s %s），换源", cap.label, out.source, market, code)
+                continue
+            if out.frame.height == 0:
+                empties.append(out.source)
+                attempts.append(Attempt(out.source, True, 1, "查无记录"))
+                logger.info(
+                    "%s %s 说 %s %s 查无记录，继续问下一个源", cap.label, out.source, market, code
+                )
+                continue
+            self._mark_ok(out.source)
+            attempts.append(Attempt(out.source, True))
+            return FrameResult(
+                market,
+                code,
+                cap.label,
+                out.frame,
+                out.source,
+                tuple(attempts),
+                tuple(skipped),
+            )
+
+        if empties and not unanswered:
+            return FrameResult(
+                market,
+                code,
+                cap.label,
+                empty,
+                empties[0],
+                tuple(attempts),
+                tuple(skipped),
+                confirmed_empty_by=tuple(empties),
+            )
+
+        detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
+        said_no = "、".join(empties)
+        raise DatasourceError(
+            "registry",
+            f"{market} {code} 取不到{cap.label}。链 {list(self.sources_for(market))} 里"
+            f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}"
+            + (
+                f"；说查无记录的 {said_no}（因为 {'、'.join(unanswered)} 没答上来，"
+                f"这些「没有」还不能写成确认）"
+                if empties
+                else ""
+            ),
         )
 
     def _call(

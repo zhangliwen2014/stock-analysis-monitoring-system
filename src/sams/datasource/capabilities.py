@@ -16,22 +16,26 @@ from typing import Any
 from sams.core.errors import DatasourceError
 from sams.datasource.actions import has_actions
 from sams.datasource.base import has_bars
+from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
 
 
 @dataclass(frozen=True)
 class Capability:
-    #: 给用户看的那三个字：日志、健康页、拒绝文案里都念它，不再各写一份
+    #: 给用户看的那几个字：日志、健康页、拒绝文案里都念它，不再各写一份
     label: str
     #: 链上缺这个能力时的那句原因（进 `FetchResult.skipped`，最终会被打印）
     lacking: str
     probe: Callable[[Any], bool]
 
 
-#: 每加一种取数（基本面、资金流…）就在这里加一行：注册表、降级链、健康检查
-#: 三处同时看到它，不存在「某处忘了加」这种失败模式
+#: 每加一种取数就在这里加一行：注册表、降级链、健康检查三处同时看到它，
+#: 不存在「某处忘了加」这种失败模式。M2-C 加的基本面三种就在下面三条。
 CAPABILITIES: dict[str, Capability] = {
     "daily_bars": Capability(label="日线", lacking="不提供日线", probe=has_bars),
     "corp_actions": Capability(label="公司行为", lacking="不提供公司行为", probe=has_actions),
+    "financials": Capability(label="基本面", lacking="不提供基本面", probe=has_financials),
+    "valuation": Capability(label="按日估值", lacking="不提供按日估值", probe=has_valuation),
+    "funding_flow": Capability(label="资金流", lacking="不提供资金流", probe=has_flow),
 }
 
 
