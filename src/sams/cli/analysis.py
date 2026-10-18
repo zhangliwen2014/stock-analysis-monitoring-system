@@ -21,12 +21,165 @@ from collections.abc import Sequence
 from datetime import date
 
 from sams.bootstrap import Container
-from sams.cli.common import group, iso_date
+from sams.cli.common import group, iso_date, ratio_arg
 from sams.core.codes import exchange_folds_dividend_into_daily_change
 from sams.core.errors import NotAdjustable, ValidationError
+from sams.core.fundamentals import caliber_note
 from sams.core.timeutil import gap_days
 from sams.services.analysis import PERIODS, default_indicators, indicator_names
 from sams.services.calendar import GapKinds
+
+# --- fundamentals：基本面 + 市赚率 PR --------------------------------------------------
+
+
+def add_fundamentals(subparsers) -> None:
+    fun = subparsers.add_parser(
+        "fundamentals",
+        help="基本面与市赚率 PR：报告期的 ROE 配截至日的 PE，两个粒度各说各的日期",
+    )
+    fun.add_argument("--market", required=True, help="A / HK / US")
+    fun.add_argument("--code", required=True, help="如 601088")
+    fun.add_argument("--as-of", help="YYYY-MM-DD，默认今天（PIT：只采信这天已披露的期）")
+    fun.add_argument(
+        "--roe-estimate",
+        help="预估 ROE，小数口径（15% 写 0.15）：PE 不为正时那一支要用它",
+    )
+    fun.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    fun.set_defaults(handler=run_fundamentals)
+
+
+def run_fundamentals(container: Container, args: argparse.Namespace) -> int:
+    try:
+        as_of = iso_date(args.as_of) if args.as_of else None
+        estimate = ratio_arg("--roe-estimate", args.roe_estimate) if args.roe_estimate else None
+        read = container.fundamentals.read(
+            args.market, args.code, as_of=as_of, roe_estimate=estimate
+        )
+    except ValidationError as exc:
+        # D57：`--json` 下参数错也是 JSON。让它冒到顶层会变成 stderr 上的一段纯文本，
+        # 而管道里的下游只会拿到一个空 stdin
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "exit": 2})
+        else:
+            print(f"参数有误：{exc}")
+        return 2
+    code = 0 if read.pr.ok else 1
+    if args.json:
+        _emit(_fundamentals_payload(read, code))
+        return code
+    return _print_fundamentals(read, code)
+
+
+def _print_fundamentals(read, code: int) -> int:
+    print(f"{read.market}/{read.code}  截至 {read.as_of}")
+    print(f"  采信期  {_period_line(read)}")
+    print(f"  估值日  {_valuation_line(read)}")
+    ratio = f"PR = {read.pr.value:.3f}" if read.pr.ok else "PR = 无"
+    print(f"  市赚率  {ratio:<12} ← {read.pr.explain()}")
+    print(f"  {caliber_note()}")
+    for line in _fundamentals_warnings(read):
+        print(f"  {line}")
+    if code == 1:
+        print("    ⇒ 这次没有给出 PR：脚本按退出码 1 处理（`--json` 里 exit 同值）")
+    return code
+
+
+def _period_line(read) -> str:
+    if read.period is None:
+        return (
+            f"无 ← 库里没有 {read.market} {read.code} 已披露的财务数据"
+            "（先跑 `sams sync financials`）"
+        )
+    head = (
+        f"{read.period}（披露 {read.published_on}，源 {read.source}）"
+        if read.published_on
+        else f"{read.period}（无披露日，源 {read.source}）"
+    )
+    return (
+        f"{head}  ROE {_ratio(read.roe)}  营收 {_signed(read.revenue_yoy)}"
+        f"  利润 {_signed(read.profit_yoy)}  股息率 {_ratio(read.dividend_yield)}"
+    )
+
+
+def _valuation_line(read) -> str:
+    if read.valuation_on is None:
+        return "无 ← 库里没有这只票的按日估值（先跑 `sams sync valuation`）"
+    return (
+        f"{read.valuation_on}（源 {read.valuation_source}）  PE(TTM) {_number(read.pe_ttm)}"
+        f"  PB {_number(read.pb)}  市值 {_money(read.market_cap)}"
+    )
+
+
+def _fundamentals_warnings(read) -> list[str]:
+    out = []
+    if read.dropped_unpublished:
+        out.append(
+            f"⚠ 另有 {read.dropped_unpublished} 行没有披露日、未被采信（D61）："
+            "这不等于那几期不存在，也不等于它们已经公开"
+        )
+    if read.valuation_on is None and read.market_cap is not None:
+        out.append(
+            f"⚠ 那个市值来自报告期 {read.period} 那一行（没有按日估值可配）："
+            "它不是截至日当天的市值（D60）"
+        )
+    if read.pr.basis == "pb_estimate":
+        out.append(
+            "⚠ 这一支的 PR 里嵌了一个人为的 ROE 预估：它只与**同一个预估**下的数可比，"
+            "不能与 PE 那一支的 PR 直接排序"
+        )
+    return out
+
+
+def _number(value) -> str:
+    return "–" if value is None else f"{value:.2f}"
+
+
+def _ratio(value) -> str:
+    """库里的口径是小数，屏幕上换成百分数——这一步换算只发生在打印（D58）。"""
+    return "–" if value is None else f"{value:.2%}"
+
+
+def _signed(value) -> str:
+    return "–" if value is None else f"{value:+.2%}"
+
+
+def _money(value) -> str:
+    if value is None:
+        return "–"
+    return f"{value / 1e8:,.2f}亿" if abs(value) >= 1e8 else f"{value:,.0f}"
+
+
+def _fundamentals_payload(read, code: int) -> dict:
+    return {
+        "status": "ok" if read.pr.ok else "refused",
+        "exit": code,
+        "market": read.market,
+        "code": read.code,
+        "as_of": str(read.as_of),
+        "period": str(read.period) if read.period else None,
+        "published_on": str(read.published_on) if read.published_on else None,
+        # JSON 里给**库里的口径**（小数），不给屏幕上的百分数：两套口径同存一个文件
+        # 迟早有人在某一侧再乘一次 100
+        "roe": read.roe,
+        "revenue_yoy": read.revenue_yoy,
+        "profit_yoy": read.profit_yoy,
+        "dividend_yield": read.dividend_yield,
+        "pe_ttm": read.pe_ttm,
+        "pb": read.pb,
+        "market_cap": read.market_cap,
+        "valuation_on": str(read.valuation_on) if read.valuation_on else None,
+        "source": read.source,
+        "valuation_source": read.valuation_source,
+        "dropped_unpublished": read.dropped_unpublished,
+        "pr": {
+            "value": read.pr.value,
+            "basis": read.pr.basis,
+            "roe_used": read.pr.roe_used,
+            "estimated": read.pr.estimated,
+            "reason": read.pr.reason or read.pr.explain(),
+        },
+        "caliber": caliber_note(),
+    }
 
 
 def add_to(subparsers) -> None:
@@ -79,6 +232,8 @@ def add_to(subparsers) -> None:
     )
     ser.add_argument("--json", action="store_true", help="机器可读输出（含整张表）")
     ser.set_defaults(handler=run_series)
+
+    add_fundamentals(analysis)
 
 
 def run_return(container: Container, args: argparse.Namespace) -> int:

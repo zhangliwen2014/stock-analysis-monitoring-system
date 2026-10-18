@@ -10,6 +10,7 @@ from argparse import _SubParsersAction
 from datetime import date
 
 from sams.core.errors import ValidationError
+from sams.core.fundamentals import RATIO_BOUNDS
 
 
 def group(subparsers: _SubParsersAction, name: str, help_text: str) -> _SubParsersAction:
@@ -40,3 +41,25 @@ def iso_date(value: str) -> date:
         raise ValidationError(
             f"日期 {value!r} 看不懂：要的是 YYYY-MM-DD，例如 2024-07-01"
         ) from None
+
+
+def ratio_arg(name: str, value: str) -> float:
+    """比率参数按**小数口径**解析（D58）：`--roe-estimate 15` 拒收。
+
+    这不是洁癖。PR 的 PB 那一支把 ROE 乘两遍（`PB ÷ ROE ÷ ROE ÷ 100`），
+    把 15% 写成 15 会让那个数小两百倍——屏幕上它长得像「极度便宜」，而这是
+    一条会把票排进 `PR ≤ 0.4` 前列的选股规则。仓库层对库里的数有同一道闸
+    （`core.fundamentals.RATIO_BOUNDS`），命令行是这条口径的另一个入口，
+    不能只挡一边。上限直接取那一处，不在这里再造一个数。
+    """
+    try:
+        number = float(value)
+    except ValueError:
+        raise ValidationError(f"{name} 要的是一个数，收到 {value!r}") from None
+    ceiling = RATIO_BOUNDS["roe"]
+    if not 0.0 < number <= ceiling:
+        raise ValidationError(
+            f"{name}={value} 不像一个小数口径的比率：要 0 < x ≤ {ceiling:g}"
+            "（15% 写 0.15，不是 15）"
+        )
+    return number

@@ -1,8 +1,13 @@
-"""`sams sync` —— 手动补数：日线与公司行为。
+"""`sams sync` —— 手动补数：日线、公司行为，以及基本面三件套。
 
-两个子命令走的是两条独立的能力链（D38）：`daily` 只走有日线的源，`actions` 只走能给
-除权记录的源。把它们合成一个 `sams sync` 靠参数区分，等于让「今天的日线拿到了」这件事
-替「这只票的除权记录齐了」背书——后者才是区间收益能不能信的依据。
+每个子命令走的是一条独立的能力链（D38）：`daily` 只走有日线的源，`actions` 只走能给
+除权记录的源，`financials`/`valuation`/`flow` 各走能给基本面/按日估值/资金流的源。
+把它们合成一个 `sams sync` 靠参数区分，等于让「今天的日线拿到了」这件事替
+「这只票的除权记录齐了」背书——后者才是区间收益能不能信的依据。
+
+三条基本面链的 0 行与日线的 0 行不是一件事（D43）：日线那段没数据是一次**成功的**
+取数，基本面的 0 行只是「这几家都没这只票的记录」。所以这里的输出把「查无记录」与
+「取回 0 条」分开写，并列出到底是哪几家说的「没有」。
 """
 
 from __future__ import annotations
@@ -15,6 +20,17 @@ from sams.cli.common import group, iso_date
 
 #: 除权记录的默认起点：沪深交易所 1990/1991 年才成立，再早不存在可查的 A 股除权日
 DEFAULT_ACTIONS_START = date(1990, 1, 1)
+#: 基本面与估值的默认起点同上：这些接口的答复本来就是「这只票的全部历史」，
+#: 窗口只用来切源返回的帧，把默认值编成「近五年」会让人以为更早的期数不存在
+DEFAULT_FUNDAMENTALS_START = DEFAULT_ACTIONS_START
+
+#: 命令行上的名字 → （服务方法名, 给人看的种类名）。`flow` 而不是 `funding_flow`：
+#: 命令要短，而名字对不上服务层这件事由这张表一次性承担，不在各处猜
+FUNDAMENTAL_KINDS = {
+    "financials": ("sync_financials", "基本面"),
+    "valuation": ("sync_valuation", "按日估值"),
+    "flow": ("sync_flow", "资金流"),
+}
 
 
 def add_to(subparsers) -> None:
@@ -36,6 +52,38 @@ def add_to(subparsers) -> None:
     acts.add_argument("--start", help=f"YYYY-MM-DD，默认 {DEFAULT_ACTIONS_START}")
     acts.add_argument("--end", help="YYYY-MM-DD，默认今天")
     acts.set_defaults(handler=run_actions)
+
+    for name, (_, label) in FUNDAMENTAL_KINDS.items():
+        parser = actions.add_parser(name, help=f"{label}（按各源能力路由）")
+        parser.add_argument("--market", required=True, help="A / HK / US")
+        parser.add_argument("--code", required=True, action="append", help="可多次传入")
+        parser.add_argument("--start", help=f"YYYY-MM-DD，默认 {DEFAULT_FUNDAMENTALS_START}")
+        parser.add_argument("--end", help="YYYY-MM-DD，默认今天")
+        parser.set_defaults(handler=run_fundamental)
+
+
+def run_fundamental(container: Container, args: argparse.Namespace) -> int:
+    """三条基本面链共用的一条打印路径：种类由表里带出来，不在这里再判一次参数。"""
+    method, label = FUNDAMENTAL_KINDS[args.action]
+    start = iso_date(args.start) if args.start else DEFAULT_FUNDAMENTALS_START
+    end = iso_date(args.end) if args.end else container.clock.today()
+    for code in args.code:
+        summary = getattr(container.fundamental_sync, method)(args.market, code, start, end)
+        line = f"{code:<10} {label}  源={summary.source or '—'} 取回={summary.fetched}"
+        if summary.empty:
+            # 「这几家都说了没有」不是「取回 0 条」：前者的下一步是接受，后者的下一步是查源
+            line += (
+                f" 入库=0  链上每个有能力的源都说查无记录"
+                f"（{'+'.join(summary.confirmed_empty_by)}）"
+            )
+        else:
+            line += f" 入库={summary.written}"
+        if summary.degraded:
+            line += f" [降级: {_trail(summary.attempts)}]"
+        print(line)
+        for name, reason in summary.skipped:
+            print(f"           跳过 {name}：{reason}")
+    return 0
 
 
 def run_daily(container: Container, args: argparse.Namespace) -> int:
