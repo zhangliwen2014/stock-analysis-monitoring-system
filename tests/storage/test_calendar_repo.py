@@ -120,3 +120,11 @@ def test_corrupt_json_fails_loudly(repo, db):
     db.execute("UPDATE trading_calendar SET sessions_json = '{oops'")
     with pytest.raises(StorageError, match="sessions_json"):
         repo.get("A", date(2026, 3, 9))
+
+
+def test_a_lowercase_market_lands_on_the_canonical_key(repo):
+    """日历的小写键不会报错，只会让 `known_status` 永远答「不知道」⇒ 读数一律 rc 3。"""
+    repo.save([day(market="a")], source="akshare")
+    assert repo.get("A", date(2026, 3, 9)) is not None
+    assert repo.trading_days("a", 2026) == repo.trading_days("A", 2026) == 1
+    assert repo.source_of("A", 2026) == "akshare"

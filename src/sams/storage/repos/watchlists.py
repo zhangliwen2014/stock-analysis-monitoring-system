@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from sams.core.codes import canonical_code
+from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import ValidationError
 from sams.storage.db import Database
 
@@ -17,15 +17,18 @@ MAX_ITEMS_PER_USER = 500
 
 
 def _norm(market: str, code: str) -> tuple[str, str]:
-    """清单里的代码必须和 bars 里的代码同一个形态。
+    """清单里的键必须和 bars 同一个形态——市场名与代码两半都是。
 
     不归一时 `700` 落库成功、永远查不到 00700 的数据，而且不报错——用户看到的是
     「这个自选股没有行情」，实际是键写错了。仓库层兜底，不指望调用方先归一。
+    小写市场名同理：`a/601088` 这一行在清单里看得见，行情与告警按 `A` 查，一律读不到，
+    而这条链上再没有别人会归一它（D46 的下沉）。
     """
     if not market or not code:
         raise ValidationError("market 与 code 不能为空")
     try:
-        return market, canonical_code(market, code)
+        cleaned = canonical_market(market)
+        return cleaned, canonical_code(cleaned, code)
     except ValueError as exc:
         # CLI 只把 SamsError 当「用户输入错了」，ValueError 会炸出栈回溯
         raise ValidationError(str(exc)) from exc

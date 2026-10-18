@@ -132,6 +132,36 @@ def test_every_source_failing_raises_with_both_reasons():
     assert all(not h.ok for h in reg.health())
 
 
+class InterruptingAdapter:
+    """用户按了 Ctrl-C：这不是「这个源坏了，换下一个」。"""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.markets = frozenset({"A"})
+        self.calls = 0
+
+    def daily_bars(self, market, code, start, end):
+        self.calls += 1
+        raise KeyboardInterrupt
+
+
+def test_interrupt_is_not_a_source_failure():
+    """兜底必须是 Exception 而不是 BaseException：兜住 Ctrl-C 会连着犯三个错——
+
+    中断被当成源故障记进健康表，整条链每个源都要再试一遍才退出，
+    而那个源下一次被正常选中去背这次的账。
+    """
+    primary = InterruptingAdapter("akshare")
+    backup = FakeAdapter("eastmoney", ["A"], frame("eastmoney"))
+    reg = registry(primary, backup)
+    with pytest.raises(KeyboardInterrupt):
+        reg.fetch_daily("A", "600519", D1, D2)
+    assert backup.calls == 0, "用户要停，不该接着打备源"
+    # 三态的 `ok`：None 是「从没被路由过」。中断必须停在这里——记成 False 就是
+    # 把一次 Ctrl-C 存成源故障，而下一个人看到的健康页会说这个源有问题
+    assert all(h.ok is None and h.consecutive_failures == 0 for h in reg.health())
+
+
 def test_all_sources_empty_is_reported_as_empty_not_failure():
     """停牌：两个源都回答「没有数据」，这不是采集失败。"""
     reg = registry(

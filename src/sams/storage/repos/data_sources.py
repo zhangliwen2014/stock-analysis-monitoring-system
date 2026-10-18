@@ -7,6 +7,11 @@ datasource 与 Settings，分层上不允许出现在 storage（`datasource` 与
 
 `chains()` 是采集与组装根读的唯一视图：只含启用中的源，按 priority 升序，
 同一 priority 再按名字——降级顺序必须是一个确定的序列，不能取决于 DuckDB 的返回顺序。
+
+路由的 `market` 形态也在这一层落定（D46 的下沉）：`chains()` 的键就是这一列，而采集按 `A`
+取链。今天这条路有两重遮挡（迁移种子是大写的，`services/sources.py` 的市场成员检查会把
+`a` 判成「实现不支持」）——但键的形态不该取决于「调用方记得归一」：主键定义在哪一层，
+形态就在哪一层保证。一条种成 `a` 的路由不会报错，只会让那个市场「一个源都没有」。
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import json
 import re
 from dataclasses import dataclass
 
+from sams.core.codes import canonical_market
 from sams.core.errors import StorageError
 from sams.storage.db import Database
 
@@ -100,6 +106,7 @@ class DataSourceRepo:
         return [(r["market"], r["name"], int(r["priority"])) for r in rows]
 
     def set_route(self, market: str, name: str, priority: int) -> None:
+        market = canonical_market(market)
         if priority < 1:
             raise StorageError(f"priority 必须从 1 开始，收到 {priority}")
         if self.get(name) is None:
@@ -128,6 +135,7 @@ class DataSourceRepo:
         逐条 set_route 会先撞上「优先级已被占用」——插入位和现有位天然冲突，
         所以重排必须是一次整体写入，而不是 n 次单点写入。
         """
+        market = canonical_market(market)
         for name in names:
             if self.get(name) is None:
                 raise StorageError(f"路由指向不存在的数据源 {name}")
@@ -139,6 +147,7 @@ class DataSourceRepo:
             )
 
     def remove_route(self, market: str, name: str) -> bool:
+        market = canonical_market(market)
         existed = any(m == market and n == name for m, n, _ in self.routes())
         self.db.execute(
             "DELETE FROM data_source_routes WHERE market = ? AND name = ?", [market, name]

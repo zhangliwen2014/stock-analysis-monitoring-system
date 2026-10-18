@@ -8,6 +8,12 @@
 收盘价为 0（区间跌幅立刻变 −100%）、非正的开高低与 high<low 的不自洽极值（置空，不陪葬整行）。
 负成交量/负成交额原样存——那是源侧数据质量问题，属于采集与清洗的职责，
 在这里丢弃会让「源给了脏数」和「这一天没数据」在库里长得一样；它由 `sams health` 如实报出来。
+
+`market` 的形态在这里归一（D46 的下沉）：主键由这一层定义，键的形态就该由这一层保证。
+只在服务边界归一是漏的——`WatchlistRepo.add` 过去只归一 code，`market` 原样收下：写成 `a`
+的那一行在清单里看得见，行情按 `A` 查，症状是「这只票没有行情」而库里明明有行。
+键的形态不该取决于哪个调用方记得归一。
+读侧与此同一条规则：`_prepare` 大写过的两半，查询也必须按同样形态给。
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ from uuid import uuid4
 
 import polars as pl
 
+from sams.core.codes import canonical_market
 from sams.core.errors import StorageError
 from sams.storage.db import Database
 
@@ -43,6 +50,15 @@ COLUMNS = (
 _OPTIONAL_NUMERIC = ("open", "high", "low", "volume", "amount")
 
 
+def _form(code: str) -> str:
+    """读侧的 code 形态与 `_prepare` 写侧同一件事：写侧把 code 大写了，读侧不大写就查不到。
+
+    两侧的形态规则必须是一条，否则「写进去的形状」和「用来查的形状」会再次分叉——
+    那还是同一个「读不到且不报错」的洞，只是换了半边。
+    """
+    return (code or "").strip().upper()
+
+
 def _prepare(df: pl.DataFrame) -> pl.DataFrame:
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
@@ -64,8 +80,8 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
             dtype = pl.Date if col == "date" else pl.Float64
             out = out.with_columns(pl.lit(None, dtype=dtype).alias(col))
     out = out.select(list(COLUMNS)).with_columns(
-        pl.col("market").cast(pl.Utf8),
-        pl.col("code").cast(pl.Utf8),
+        pl.col("market").cast(pl.Utf8).str.strip_chars().str.to_uppercase(),
+        pl.col("code").cast(pl.Utf8).str.strip_chars().str.to_uppercase(),
         pl.col("source").cast(pl.Utf8),
         *[pl.col(c).cast(pl.Float64) for c in ("close", *_OPTIONAL_NUMERIC)],
     )
@@ -80,6 +96,13 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
     if dropped:
         # 缺收盘价（或收盘价为 0）的行不能存，但也不静默消失：记录后再丢弃
         logger.warning("bars_daily 丢弃 %d 行（收盘价缺失或非正）", dropped)
+    # 空市场名是另一回事：那一行有正确的价格，却再也没有任何查询能读到它
+    keyed = out.filter(pl.col("market").str.len_chars() > 0)
+    if keyed.height < out.height:
+        logger.warning(
+            "bars_daily 丢弃 %d 行（市场名为空：那一行永远读不到）", out.height - keyed.height
+        )
+    out = keyed
     bad = out.select(
         pl.sum_horizontal(
             *[~pl.col(c).is_finite() & pl.col(c).is_not_null() for c in _OPTIONAL_NUMERIC]
@@ -153,7 +176,7 @@ class BarRepo:
     def latest_date(self, market: str, code: str) -> date | None:
         value = self.db.scalar(
             "SELECT max(date) FROM bars_daily WHERE adjust = ? AND market = ? AND code = ?",
-            [ADJUST, market, code],
+            [ADJUST, canonical_market(market), _form(code)],
         )
         if value is None:
             return None
@@ -171,7 +194,7 @@ class BarRepo:
             schema = {c: pl.Float64 for c in COLUMNS if c != "date"} | {"date": pl.Date}
             return pl.DataFrame(schema=schema)
         sql = ["SELECT * FROM bars_daily WHERE adjust = ? AND market = ? AND code = ANY(?)"]
-        params: list = [ADJUST, market, codes]
+        params: list = [ADJUST, canonical_market(market), [_form(c) for c in codes]]
         if start is not None:
             sql.append("AND date >= ?")
             params.append(start)
@@ -186,8 +209,8 @@ class BarRepo:
         params: list = [ADJUST]
         if market:
             sql += " AND market = ?"
-            params.append(market)
+            params.append(canonical_market(market))
         if code:
             sql += " AND code = ?"
-            params.append(code)
+            params.append(_form(code))
         return int(self.db.scalar(sql, params) or 0)

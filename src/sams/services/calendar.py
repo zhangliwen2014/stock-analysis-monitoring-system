@@ -10,11 +10,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sams.core.calendar import CalendarProvider, CalendarStore
 from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.codes import canonical_market
 from sams.core.errors import CalendarSourceError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.timeutil import (
@@ -30,6 +33,28 @@ from sams.core.timeutil import (
 logger = logging.getLogger("sams.services.calendar")
 
 
+@dataclass(frozen=True)
+class GapKinds:
+    """一段日期缺口按「日历怎么说」分成的三堆。
+
+    `matters` 是这道判定，而不是调用方的口味：缺口里有开市日 ⇒ 那几天本该有 K 线而沒有
+    （没同步到，或停牌）；有判不了的日子 ⇒ 不能替它担保。两种都意味着「给出的数不是
+    请求那段行情的数」。全是休市日才是无害的缺口——请求的本来就只有那么几根 K 线。
+    """
+
+    trading: tuple[date, ...] = ()
+    closed: tuple[date, ...] = ()
+    unknown: tuple[date, ...] = ()
+
+    @property
+    def total(self) -> int:
+        return len(self.trading) + len(self.closed) + len(self.unknown)
+
+    @property
+    def matters(self) -> bool:
+        return bool(self.trading or self.unknown)
+
+
 class CalendarService:
     def __init__(
         self,
@@ -42,7 +67,14 @@ class CalendarService:
         if not providers:
             raise CalendarSourceError("未配置任何日历来源")
         self.store = store
-        self.providers = providers
+        # 提供方的键按配置里的市场名给，归一后才是查找用的形态（D46）：`"a"` 与 `"A"`
+        # 折叠成同一个键时不能静默留一个，那是两个市场的日历被当成一个
+        collapsed = {canonical_market(k): v for k, v in providers.items()}
+        if len(collapsed) != len(providers):
+            raise CalendarSourceError(
+                f"市场名在忽略大小写后撞车了: {sorted(providers)} → {sorted(collapsed)}"
+            )
+        self.providers = collapsed
         self.bus = bus
         self.clock = clock
         self._refresh_attempts: set[tuple[str, int]] = set()
@@ -57,13 +89,14 @@ class CalendarService:
 
     def provider(self, market: str) -> CalendarProvider:
         try:
-            return self.providers[market]
+            return self.providers[canonical_market(market)]
         except KeyError:
             raise CalendarSourceError(
                 f"市场 {market} 没有日历来源，已配置: {sorted(self.providers)}"
             ) from None
 
     def refresh(self, market: str, year: int) -> int:
+        market = canonical_market(market)
         provider = self.provider(market)
         days = provider.days_for_year(year)
         if not days:
@@ -80,6 +113,7 @@ class CalendarService:
 
     def day(self, market: str, day: date) -> CalendarDay:
         """取当日日历。库中没有且该年未覆盖 → 补齐 → 再取；仍失败 → 保守降级。"""
+        market = canonical_market(market)
         key = (market, day)
         cached = self._day_cache.get(key)
         if cached is not None:
@@ -160,12 +194,27 @@ class CalendarService:
         空数据无害；把同一个降级值写进报告就错了，那句「那几天是周末」会把
         「开市日没采到」这种真缺口说成常态。这个函数因此只读库，绝不顺手补来源。
         """
+        market = canonical_market(market)
         stored = self.store.get(market, day)
         if stored is not None:
             return stored.is_trading
         if self.store.year_covered(market, day.year, through=self._today()):
             return False
         return None
+
+    def gap(self, market: str, days: Sequence[date]) -> GapKinds:
+        """把一段日期缺口按「日历能不能回答」分堆——判不了的那一堆不能替它担保。
+
+        这里绝不调 `day()`：那会在缺口本身没铺满时顺手去问来源，而一次读数不该
+        触发采集。`known_status` 只读库正是为了这条边界。
+        """
+        market = canonical_market(market)
+        buckets: dict[bool | None, list[date]] = {True: [], False: [], None: []}
+        for day in days:
+            buckets[self.known_status(market, day)].append(day)
+        return GapKinds(
+            trading=tuple(buckets[True]), closed=tuple(buckets[False]), unknown=tuple(buckets[None])
+        )
 
     def sessions(
         self,

@@ -38,6 +38,9 @@ class IntervalReturn:
     start_is_ex_date: bool
     #: 放行这段区间的覆盖确认出自哪个源。过闸的数一定有人背书，所以这里不可能是 None
     covered_by: str
+    #: 那条确认做到哪一天为止。读取层不再按「今天」拒绝过期确认（D49），所以这句话的
+    #: 有效期限必须跟着数一起出门
+    covered_through: date
 
     @property
     def differs(self) -> bool:
@@ -93,6 +96,7 @@ def interval_return(
         ex_dates=series.ex_dates,
         start_is_ex_date=_has_ex_date_on(actions, first),
         covered_by=series.covered_by,
+        covered_through=series.covered_through,
     )
 
 

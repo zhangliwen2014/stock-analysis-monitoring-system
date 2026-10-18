@@ -2,9 +2,12 @@
 
 这个文件存在的理由只有一条：**守卫必须站在出数的路上，而不是站在某个调用方的习惯里**。
 如果只有 `interval_return` 检查覆盖与未标记跳变，那么下一个想要「一条后复权序列」的人
-（M2-B 的指标引擎）调 `hfq_frame` 就绕过了全部检查——症状不是报错，是一条看起来完全
-正常的错曲线，正是 U12 要防的那一类。所以判定放这里，`adjust.adjusted_frame` 是它唯一的
-消费者，任何新调用方走进来的第一步就是过闸。
+（M2-B 的指标引擎）调 `hfq_frame` 或自己拿 `day_factors` 累乘，就绕过了全部检查——症状不是
+报错，是一条看起来完全正常的错曲线，正是 U12 要防的那一类。所以判定放这里，
+`adjust.adjusted_series` 是它唯一的出口，任何新调用方走进来的第一步就是过闸；
+`tests/test_layering.py::SOLE_CONSUMER` 把这组裸原语钉成「只有 `analysis/adjust.py` 能用」，
+钉不住的是「有人自己写一遍乘法」——那一条留给 M2-B：指标入口只收 `AdjustedSeries` 这个类型，
+不收 `pl.DataFrame`，让裸序列在签名层面就递不进去。
 
 三道闸各挡一种说谎：
 
@@ -55,20 +58,24 @@ class ConfirmedSpan(Protocol):
 
 
 def is_covered(
-    spans: Sequence[ConfirmedSpan], *, start: date, end: date, today: date
+    spans: Sequence[ConfirmedSpan], *, start: date, end: date
 ) -> ConfirmedSpan | None:
-    """这个区间的除权记录是否被某个源完整确认过。
+    """这个区间的除权记录是否被某个源完整确认过（D49：只问窗口，不问今天）。
 
     全历史确认只看上界：源说「这只票的历史我给全了，截至 covered_to」，那么
     covered_to 之前的每一天都有答案，包括它派息之前的年份。
 
-    `today` 没有默认值：确认是**过去某天**做出的陈述，今天已经更晚时，那段确认对
-    最后一天之后就没有任何主张了。让这个参数可以省略，等于「忘了传时钟」也能出数——
-    而出来的数与新鲜确认过的长得一模一样。
+    这里**不再**要求 `covered_to >= today`。那条规则的出发点是「确认做于过去某天，
+    它对 covered_to 之后没有主张」，这个理由是对的，但它管的是 covered_to 之后的日子，
+    管不到一个早已结束的窗口：2024 年 7 月那段不会因为今天没人重新问过源就长出新的除权日。
+    把它做成读取层的拒绝闸，实际效果是每天第一次查历史区间都得先联网重采集，采集失败就打
+    「拒绝出数」——那句话看起来像数据有问题，而它真正说的是「今天没人去问过」。
+    「什么时候该重新问源」因此归同步调度（M3/M4），不归这里；作为交换，放行时把
+    `covered_to` 一起交出去，让读数的人自己看得见这条陈述有多新。
     """
     for span in spans:
         if span.full_history:
-            if span.covered_to >= end and span.covered_to >= today:
+            if span.covered_to >= end:
                 return span
         elif span.covered_from <= start and span.covered_to >= end:
             return span
@@ -81,15 +88,13 @@ def require_coverage(
     start: date,
     end: date,
     spans: Sequence[ConfirmedSpan],
-    *,
-    today: date,
-) -> str:
-    """没有确认记录就拒绝出数，返回放行那个源的名字。
+) -> ConfirmedSpan:
+    """没有确认记录就拒绝出数，返回放行那一条（源名 + 它做到哪天为止）。
 
     拒绝文案把「为什么不能直接算」写全：裸价区间涨跌在「没查过」那种情况下是一个错数，
     而调用方此刻正打算把它当成收益写进快照。
     """
-    span = is_covered(spans, start=start, end=end, today=today)
+    span = is_covered(spans, start=start, end=end)
     if span is None:
         raise NotAdjustable(
             f"{market}/{code} 的 {start}~{end} 没有公司行为覆盖确认："
@@ -97,7 +102,7 @@ def require_coverage(
             "裸价区间涨跌在第二种情况下是错数。先跑 `sams sync actions --market "
             f"{market} --code {code}`"
         )
-    return span.src
+    return span
 
 
 def require_real_closes(market: str, code: str, bars: pl.DataFrame) -> pl.DataFrame:

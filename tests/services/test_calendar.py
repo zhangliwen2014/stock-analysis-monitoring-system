@@ -247,3 +247,60 @@ def test_an_explicit_refresh_is_a_new_chance_at_the_provider():
     svc.day("HK", date(2026, 3, 12))
     # 显式刷新自己打了一次来源，又让下一个日期有权再问一次
     assert provider.calls == 3
+
+
+def test_a_lowercase_market_names_the_same_calendar():
+    """`--market hk` 问的是同一份日历：大小写不是语义，服务边界是第二重归一。
+
+    不归一时的答案是「市场 hk 没有日历来源，已配置: ['HK']」——一句话把一个拼写问题
+    说成配置缺失，而缓存与「本问过年份」的登记还会为同一件事长两种键。
+    """
+    provider = FakeProvider(days=[trading_day(date(2026, 3, 9))])
+    store = FakeStore(days=[trading_day(date(2026, 3, 9))], covered={2026})
+    svc = service(provider, store)
+    assert svc.provider("hk") is provider
+    assert svc.day("hk", date(2026, 3, 9)).is_trading is True
+    assert svc.known_status("hk", date(2026, 3, 9)) is True
+    assert svc.is_trading_day("hk", date(2026, 3, 9)) is True
+    # 已覆盖的年份里没这一行 = 确定休市，不该因为换了拼写又去问来源
+    assert svc.day("HK", date(2026, 3, 10)).is_trading is False
+    assert provider.calls == 0
+
+
+def test_two_provider_keys_collapsing_to_one_market_are_refused():
+    """`{"a": …, "A": …}` 归一后是同一个键：静默留一个等于让另一个市场的日历消失。"""
+    with pytest.raises(CalendarSourceError, match="撞车"):
+        CalendarService(FakeStore(), {"a": FakeProvider(), "A": FakeProvider()})
+
+
+def test_a_gap_is_bucketed_by_what_the_calendar_can_back_up():
+    """`sams analysis return` 的退出码来自这一堆，所以分堆规则不能长在命令行里。
+
+    「缺口那几天是周末」这句话只有在日历真的铺过那几天时才成立；判不了的那天
+    必须留在 `unknown` 里，让退出码说「这个数不是请求那段行情的数」。
+    """
+    covered = FakeStore(days=[trading_day(date(2026, 3, 9))], covered={2026})
+    kinds = service(FakeProvider(), covered).gap(
+        "HK", [date(2026, 3, 9), date(2026, 3, 10), date(2026, 3, 11)]
+    )
+    assert kinds.trading == (date(2026, 3, 9),)
+    assert kinds.closed == (date(2026, 3, 10), date(2026, 3, 11))
+    assert kinds.total == 3 and kinds.matters is True
+
+    # 日历没铺到的那一年：没有行既可能是休市也可能是没数据，只能承认不知道
+    bare = service(FakeProvider(), FakeStore(days=[trading_day(date(2026, 3, 9))])).gap(
+        "HK", [date(2026, 3, 10)]
+    )
+    assert bare.unknown == (date(2026, 3, 10),) and bare.matters is True
+
+    # 全是休市日：请求的那段本来就只有这么几根 K 线，这个数就是那段行情
+    harmless = service(FakeProvider(), covered).gap("HK", [date(2026, 3, 10)])
+    assert harmless.matters is False
+
+
+def test_filling_a_gap_never_asks_the_provider():
+    """问「缺口要不要紧」不能顺手触发采集：一次读数不该打来源。"""
+    provider = FakeProvider(days=[])
+    svc = service(provider, FakeStore())
+    svc.gap("HK", [date(2026, 3, 10), date(2026, 3, 11)])
+    assert provider.calls == 0

@@ -179,17 +179,23 @@ def actions_in_span(
 
 @dataclass(frozen=True)
 class AdjustedSeries:
-    """一份过了闸的复权序列，带上「谁确认的」与「哪些天动了」。
+    """一份过了闸的复权序列，带上「谁确认的、确认到哪天」与「哪些天动了」。
 
-    `covered_by` 与 `factors` 不是装饰：快照要写下是谁替这段历史背书，交易员要能问
-    「这几天里哪几天除权」。少了它们，调用方只能自己再去查一遍，而自己查的那一遍
+    `covered_by`、`covered_through` 与 `factors` 不是装饰：快照要写下是谁替这段历史背书，
+    交易员要能问「这几天里哪几天除权」。少了它们，调用方只能自己再去查一遍，而自己查的那一遍
     通常就是绕过守卫的那一遍。
+
+    `covered_through` 是那条确认的**截止日**（D49）：读取层不再因为「今天比它晚」而拒绝，
+    所以这条陈述有多新必须跟着数一起出门，否则「覆盖确认：akshare」就成了一个无法核对的
+    形容词——三个字的背书背后可能是一周前的一次采集。
     """
 
     frame: pl.DataFrame
     #: 放行这段的那个源。类型是 `str` 而不是 `str | None`：过闸的数一定有人背书，
     #: 没背书的数到不了这里
     covered_by: str
+    #: 那条确认做到哪一天为止（不含之后）
+    covered_through: date
     factors: tuple[DayFactor, ...]
 
     @property
@@ -215,19 +221,20 @@ def adjusted_series(
     * **因子只吃落在 `bars` 首尾之间的除权日**。对区间涨跌这是约掉的常数，对
       **绝对**后复权价不是：想要一条不漏乘的绝对 hfq 曲线，`bars` 必须取到上市首日。
       M2-B 的指标引擎要么全量取，要么只比形状。
-    * `today` 由调用方给（服务层给 `clock.today()`），同时用作 PIT 上界与覆盖新鲜度。
-      它没有默认值：省略它会让 PIT 与 D36 的新鲜度两条闸一起静音，而漏乘未来除权的
-      序列与正确的序列在图上看不出区别。
+    * `today` 由调用方给（服务层给 `clock.today()`），用途是 **PIT 上界**：除权日在未来
+      的记录不进这条序列。它没有默认值：省略它等于让「还没发生的那次除权」提前乘进历史，
+      而乘过的序列与正确的序列在图上看不出区别。（它不再管覆盖新鲜度，见 D49。）
     """
     ordered = require_real_closes(market, code, bars)
     first, last = ordered["date"].to_list()[0], ordered["date"].to_list()[-1]
     inside = actions_in_span(actions, first, last, until=today)
     factors = day_factors(ordered, inside)
     reject_unmarked_jumps(market, code, ordered, factors, listed_on=listed_on)
-    covered_by = require_coverage(market, code, first, last, coverage, today=today)
+    span = require_coverage(market, code, first, last, coverage)
     return AdjustedSeries(
         frame=hfq_frame(ordered, inside, factors=factors, price_columns=price_columns),
-        covered_by=covered_by,
+        covered_by=span.src,
+        covered_through=span.covered_to,
         factors=tuple(factors),
     )
 

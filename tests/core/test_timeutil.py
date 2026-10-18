@@ -10,9 +10,14 @@ from sams.core.timeutil import (
     SessionWindow,
     day_sessions,
     find_active_session,
+    gap_days,
     parse_hm,
     post_close_run_at,
 )
+
+
+def D(day: int) -> date:
+    return date(2024, 1, day)
 
 CN = CalendarDay(
     market="A",
@@ -137,3 +142,15 @@ def test_post_close_run_at_needs_a_trading_day():
 def test_naive_datetime_is_rejected():
     with pytest.raises(ValidationError, match="tz-aware"):
         find_active_session(day_sessions(CN), datetime(2026, 3, 9, 10, 0))
+
+
+def test_gap_days_lists_both_open_ends():
+    """请求 1~10，锚点落在 3~7：缺口是 1、2 与 8、9、10 —— 两端都要算。
+
+    这条算式决定「这个数是不是请求那段行情的数」，所以它在 core，不在命令行里。
+    """
+    assert gap_days(D(1), D(3), D(7), D(10)) == [D(1), D(2), D(8), D(9), D(10)]
+
+
+def test_gap_days_is_empty_when_the_anchors_are_the_request():
+    assert gap_days(D(1), D(1), D(10), D(10)) == []

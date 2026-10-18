@@ -139,11 +139,17 @@ def test_bootstrap_is_the_only_assembly_root():
     assert all_three == [], f"{all_three} 自行组装依赖，应改为从 bootstrap 注入"
 
 
-#: 只有一个符号值得单独点名：`hfq_frame` 是**不过闸**的裸算原语（不查覆盖、不听
-#: 未标记跳变）。分层规则管得住「谁能 import 哪一层」，管不住「同一层里谁挑了哪个函数」，
-#: 而绕过 `adjusted_series` 拿它出数，症状恰恰是一条看起来完全正常的错曲线——
-#: U12 那个数只是换个形状出门。所以它的消费者必须只有一个，且由机器守着。
-SOLE_CONSUMER: dict[str, str] = {"hfq_frame": "analysis/adjust.py"}
+#: 值得单独点名的是一组**不过闸**的裸算原语（`hfq_frame` 与它能拼出因子的那几个零件：
+#: 不查覆盖、不听未标记跳变）。分层规则管得住「谁能 import 哪一层」，管不住「同一层里谁挑了
+#: 哪个函数」，而绕过 `adjusted_series` 拿它们出数，症状恰恰是一条看起来完全正常的错曲线——
+#: U12 那个数只是换个形状出门。`day_factors` 单独就够拼出 hfq 序列，所以只钉 `hfq_frame`
+#: 等于留了一扇写着「请勿使用」的门。消费者必须只有一个，且由机器守着。
+SOLE_CONSUMER: dict[str, str] = {
+    "hfq_frame": "analysis/adjust.py",
+    "day_factors": "analysis/adjust.py",
+    "ex_reference": "analysis/adjust.py",
+    "group_by_ex_date": "analysis/adjust.py",
+}
 
 
 def _used_names(path: Path) -> set[str]:

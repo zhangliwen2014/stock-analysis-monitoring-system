@@ -216,6 +216,8 @@ def test_every_price_column_carries_the_factor_not_just_the_close():
         assert series.frame[f"{column}_hfq"][1] == pytest.approx(frame[column][1] * factor)
     assert series.ex_dates == 1
     assert series.covered_by == "akshare"
+    # 放行这个数的那条确认做到哪天为止，是数的一部分：不给日期，读的人无从判断它多新
+    assert series.covered_through == D3
 
 
 def test_a_missing_close_is_refused_with_a_reason_instead_of_a_traceback():

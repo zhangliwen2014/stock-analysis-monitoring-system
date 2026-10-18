@@ -137,3 +137,23 @@ def post_close_run_at(
     if offset_min < 0:
         raise ValidationError("post_close_min 不能为负")
     return sessions[-1].close.astimezone(UTC) + timedelta(minutes=offset_min)
+
+
+def gap_days(
+    requested_start: date, used_start: date, used_end: date, requested_end: date
+) -> list[date]:
+    """请求了、但两根锚点 K 线没覆盖到的那些日历天。
+
+    放在 core 而不是命令里：「这段缺口有多大」是一次读数可采信与否的一半依据，
+    命令行只该问结果，不该自己算区间（另一半「缺口里有开市日吗」在日历服务）。
+    """
+    days: list[date] = []
+    cursor = requested_start
+    while cursor < used_start:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    cursor = used_end + timedelta(days=1)
+    while cursor <= requested_end:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    return days

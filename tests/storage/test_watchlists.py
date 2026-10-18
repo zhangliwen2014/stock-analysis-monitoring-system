@@ -98,3 +98,11 @@ def test_codes_are_canonicalised_on_the_way_in(repo):
 def test_the_exchange_suffix_is_not_part_of_the_key(repo):
     repo.add(A_ID, "A", "601088.SH")
     assert [i.code for i in repo.list(A_ID)] == ["601088"]
+
+
+def test_a_lowercase_market_lands_on_the_canonical_key(repo):
+    """自选清单里的小写市场：加进去成功、列表里看得见，行情与告警一律读不到（D46 的下沉）。"""
+    repo.add(A_ID, "a", "601088")
+    assert repo.contains(A_ID, "A", "601088") is True
+    assert [item.market for item in repo.list(A_ID)] == ["A"]
+    assert repo.remove(A_ID, "A", "601088") is True

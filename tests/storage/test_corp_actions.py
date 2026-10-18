@@ -121,6 +121,72 @@ def test_a_batch_with_a_conflict_writes_no_rows_at_all(repo):
     assert repo.list_for("A", "600519")["cash_per_share"].to_list() == [2.0]
 
 
+def test_two_rows_of_one_batch_sharing_a_key_are_a_conflict_too(repo):
+    """D45 的漏检：冲突检查以前只查库，不查同一批次里排在前面那一行。
+
+    一个源在一次应答里给同日两条派息（东财年报 + 中期各一条被归成同一 kind）时，
+    两行走同一个 `upsert_many`：库里那时是空的，于是两条都放行，后写的把前写的盖掉——
+    正是这条规则要拦的「凭空少一笔」，只是它发生在批次内部而不是跨源。
+    """
+    frame = pl.DataFrame(
+        {
+            "market": ["A", "A"],
+            "code": ["600519", "600519"],
+            "ex_date": [D, D],
+            "kind": ["dividend", "dividend"],
+            "cash_per_share": [2.10, 3.00],
+            "ratio": [None, None],
+            "price": [None, None],
+            "src": ["eastmoney", "eastmoney"],
+            "note": ["10派21元", "10派30元"],
+        }
+    )
+    with pytest.raises(StorageError, match="冲突"):
+        repo.upsert_many(frame)
+    assert repo.count() == 0, "同键的两行都别写：留下 3.0 等于 2.10 那笔从没发生过"
+
+
+def test_an_intra_batch_conflict_says_which_row_it_collides_with(repo):
+    """`where` 要说清另一条在哪：库里的要重新采集才会变，同批的是这次应答自己不自洽。"""
+    frame = pl.DataFrame(
+        {
+            "market": ["A", "A"],
+            "code": ["600519", "600519"],
+            "ex_date": [D, D],
+            "kind": ["dividend", "dividend"],
+            "cash_per_share": [2.10, 3.00],
+            "ratio": [None, None],
+            "price": [None, None],
+            "src": ["eastmoney", "eastmoney"],
+            "note": ["10派21元", "10派30元"],
+        }
+    )
+    with pytest.raises(StorageError) as excinfo:
+        repo.upsert_many(frame)
+    text = str(excinfo.value)
+    assert "同批的前一行" in text and "2.1" in text and "3.0" in text
+
+
+def test_two_rows_of_one_batch_agreeing_are_a_correction_not_a_conflict(repo):
+    """同一个键、两个源在同一批里给了同一个数（差在半分内）：按修正处理，照写。"""
+    frame = pl.DataFrame(
+        {
+            "market": ["A", "A"],
+            "code": ["600519", "600519"],
+            "ex_date": [D, D],
+            "kind": ["dividend", "dividend"],
+            "cash_per_share": [2.10, 2.099],
+            "ratio": [None, None],
+            "price": [None, None],
+            "src": ["eastmoney", "akshare"],
+            "note": ["10派21元", "10派20.99元"],
+        }
+    )
+    assert repo.upsert_many(frame) == 2
+    assert repo.count() == 1
+    assert repo.list_for("A", "600519")["cash_per_share"].to_list() == [2.099]
+
+
 def test_an_unrecognized_kind_spelling_is_rejected(repo):
     with pytest.raises(ValidationError, match="未知公司行为类型"):
         repo.upsert(_action(kind="分紅"))
@@ -212,3 +278,28 @@ def test_price_is_returned_by_the_read(repo):
     row = repo.list_for("A", "600519").to_dicts()[0]
     assert row["price"] == 8.5
 
+
+
+def test_a_lowercase_market_lands_on_the_canonical_key(repo):
+    """记录存在 `a` 下面，读取层按 `A` 查 ⇒ 0 条行为、`ex_dates=0`、区间照出数（真值差一截）。
+
+    这正是 U12 那个错数换一条路回来：D37 抓不住它，因为一次 4% 的派息跳变在 15% 阈值之下。
+    """
+    frame = pl.DataFrame(
+        {
+            "market": ["a"],
+            "code": ["600519"],
+            "ex_date": [D],
+            "kind": ["dividend"],
+            "cash_per_share": [2.10],
+            "ratio": [None],
+            "price": [None],
+            "src": ["eastmoney"],
+            "note": ["10派21元"],
+        }
+    )
+    assert repo.upsert_many(frame) == 1
+    assert repo.list_for("A", "600519")["cash_per_share"].to_list() == [2.10]
+    assert repo.list_for("a", "600519").height == 1
+    with pytest.raises(StorageError, match="冲突"):
+        repo.upsert(_action(src="akshare", cash_per_share=3.0, market="A"))

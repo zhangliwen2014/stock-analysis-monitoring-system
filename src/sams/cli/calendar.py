@@ -1,4 +1,8 @@
-"""`sams calendar` —— 刷新与查询交易日历。"""
+"""`sams calendar` —— 刷新与查询交易日历。
+
+回显打印的是归一后的市场名（D46）：命令行敲 `--market a`，答复却说 `a`，
+而库里、告警、别处的输出都写 `A` —— 同一条数据在屏幕上留下两种拼写。
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,7 @@ from datetime import UTC
 
 from sams.bootstrap import Container
 from sams.cli.common import group, iso_date
+from sams.core.codes import canonical_market
 
 
 def add_to(subparsers) -> None:
@@ -24,19 +29,21 @@ def add_to(subparsers) -> None:
 
 
 def refresh_year(container: Container, args: argparse.Namespace) -> int:
-    written = container.calendar.refresh(args.market, args.year)
-    print(f"{args.market} {args.year} 年写入 {written} 个交易日")
+    market = canonical_market(args.market)
+    written = container.calendar.refresh(market, args.year)
+    print(f"{market} {args.year} 年写入 {written} 个交易日")
     return 0
 
 
 def check_day(container: Container, args: argparse.Namespace) -> int:
     day = iso_date(args.date)
-    info = container.calendar.day(args.market, day)
+    market = canonical_market(args.market)
+    info = container.calendar.day(market, day)
     if not info.is_trading:
-        print(f"{args.market} {day} 休市（时区 {info.tz}）")
+        print(f"{market} {day} 休市（时区 {info.tz}）")
         return 0
-    print(f"{args.market} {day} 交易日{'（半天）' if info.is_half_day else ''}")
-    for session in container.calendar.sessions(args.market, day):
+    print(f"{market} {day} 交易日{'（半天）' if info.is_half_day else ''}")
+    for session in container.calendar.sessions(market, day):
         # 同一个绝对时刻的两种写法：漏掉 astimezone(UTC) 就会把本地时间标成 UTC
         utc_open = session.open.astimezone(UTC)
         utc_close = session.close.astimezone(UTC)

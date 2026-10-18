@@ -99,6 +99,35 @@ def test_the_clock_and_the_confirmation_cannot_be_forgotten():
         )
 
 
+# --- D48：口径的名字由算式决定 -----------------------------------------------------
+
+
+def test_the_adjusted_number_is_the_dividend_reinvested_at_the_ex_reference_price():
+    """因子法（D34）等价于「分红在除权日按交易所参考价买回该股」，不是现金躺账上。
+
+    601088 那一段：起点 45.28、除权前收 45.10、每股派 2.26 ⇒ 参考价 42.84、终点 42.39。
+    再投资口径 −1.4413%，现金到手口径 (42.39+2.26)/45.28−1 = −1.3914%。差的那 5 个基点
+    在这里不起眼，但它是有方向的：除权后股价越涨，两个口径越分家。
+    把它们说成同一个东西，等于屏幕上两个数都没错、而那句说明是错的。
+    """
+    closes = [45.28, 45.40, 45.10, 43.38, 42.39]
+    days = [date(2024, 7, d) for d in (1, 2, 5, 8, 15)]
+    result = get(
+        bars=frame(closes, days=days),
+        actions=actions((date(2024, 7, 8), "dividend", 2.26, None, None)),
+    )
+    reinvested = 42.39 * (45.10 / (45.10 - 2.26)) / 45.28 - 1
+    cash_in_hand = (42.39 + 2.26) / 45.28 - 1
+    assert result.adjusted == pytest.approx(reinvested)
+    assert result.adjusted != pytest.approx(cash_in_hand)
+    # 除权日当天：交易所公布的当日涨跌幅就是按参考价算的，我们的序列在这一点上必须与它同数
+    one_day = get(
+        bars=frame([45.10, 43.38], days=[date(2024, 7, 5), date(2024, 7, 8)]),
+        actions=actions((date(2024, 7, 8), "dividend", 2.26, None, None)),
+    )
+    assert one_day.adjusted == pytest.approx(43.38 / 42.84 - 1)
+
+
 # --- D36：覆盖标记 ---------------------------------------------------------------
 
 
@@ -122,15 +151,30 @@ def test_a_partial_confirmation_does_not_cover_a_wider_window():
         )
 
 
-def test_today_after_the_confirmation_expires_a_full_history_claim():
-    """确认是过去某天做的。今天已经更晚，那之后的除权没人看过。"""
+def test_a_full_history_claim_keeps_answering_after_the_clock_passes_it():
+    """确认做于 7-15、今天已经 7-16：窗口早在 7-15 就结束了，重不重新问源都变不出新除权日。
+
+    D49：读取层不管「什么时候该重新问源」，那是同步调度的事。把它做成一道拒绝闸，
+    后果是一个昨天还成立的历史数今天变成「拒绝出数」，而这句话看起来像数据本身有问题——
+    它其实只说明没人今天去问过。
+    """
+    result = get(
+        coverage=[Span(covered_from=START, covered_to=END)], today=END + timedelta(days=1)
+    )
+    assert result.covered_by == "akshare"
+    assert result.covered_through == END
+
+
+def test_a_window_running_past_the_confirmation_is_refused():
+    """反面对照：窗口末落在确认之外，那之后的除权确实没人看过——这才是该拒的那一种。"""
     with pytest.raises(NotAdjustable, match="覆盖确认"):
-        get(coverage=[Span(covered_from=START, covered_to=END)], today=END + timedelta(days=1))
+        get(coverage=[Span(covered_from=START, covered_to=MID)], today=END)
 
 
-def test_a_stale_full_history_span_never_qualifies():
+def test_is_covered_asks_the_span_only_about_the_window():
     span = Span(covered_from=START, covered_to=date(2024, 7, 20), full_history=True)
-    assert is_covered([span], start=START, end=END, today=date(2025, 1, 1)) is None
+    assert is_covered([span], start=START, end=END).covered_to == date(2024, 7, 20)
+    assert is_covered([span], start=START, end=date(2024, 8, 1)) is None
 
 
 # --- D37：超涨跌停的跳变 ---------------------------------------------------------

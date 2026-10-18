@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timedelta
 
-from sams.core.codes import canonical_code
+from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import ValidationError
 from sams.storage.db import Database
 
@@ -46,11 +46,16 @@ class CoverageRecord:
 
 
 def _norm(market: str, code: str) -> tuple[str, str]:
-    """和 watchlists 同一个理由：键的形态必须和 bars 一致，否则查不到又不报错。"""
+    """和 watchlists 同一个理由：键的形态必须和 bars 一致，否则查不到又不报错。
+
+    确认记录的小写市场名比行情的小写键更坏：读取层按 `A` 查不到任何确认，
+    于是那条「这个源的区间已被完整确认过」的事实永远放行不了任何区间（D46 的下沉）。
+    """
     if not market or not code:
         raise ValidationError("market 与 code 不能为空")
     try:
-        return market, canonical_code(market, code)
+        cleaned = canonical_market(market)
+        return cleaned, canonical_code(cleaned, code)
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
 

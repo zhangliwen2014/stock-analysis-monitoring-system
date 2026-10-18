@@ -1,11 +1,21 @@
-"""证券主档仓库。"""
+"""证券主档仓库。
+
+`market` / `code` 的形态在这里落定（D46 的下沉，理由见 bars.py 的同名说明）：主档的键
+是 (market, code)，而 list_market 按大写市场名过滤——一个小写形态落库后，这一行在
+「列出某市场的所有标的」里永久消失，症状是「这只票不存在」而不是「这行写错了」。
+"""
 
 from __future__ import annotations
 
+import logging
+
 import polars as pl
 
+from sams.core.codes import canonical_market
 from sams.core.errors import StorageError
 from sams.storage.db import Database
+
+logger = logging.getLogger("sams.storage.symbols")
 
 REQUIRED = ("market", "code", "currency")
 COLUMNS = (
@@ -32,10 +42,21 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
         if col not in out.columns:
             dtype = pl.Int64 if col == "lot_size" else pl.Utf8
             out = out.with_columns(pl.lit(_DEFAULTS.get(col), dtype=dtype).alias(col))
+    out = out.with_columns(
+        pl.col("market").cast(pl.Utf8).str.strip_chars().str.to_uppercase(),
+        pl.col("code").cast(pl.Utf8).str.strip_chars().str.to_uppercase(),
+    )
+    # 键的一半为空，这一行就谁也都读不到：与 bars 同一个处理（丢弃 + warn），
+    # 而不是让一条来路不明的空市场名占住主档的一行
+    keyed = out.filter(pl.col("market").str.len_chars() > 0)
+    if keyed.height < out.height:
+        logger.warning(
+            "symbols 丢弃 %d 行（市场名为空：那一行永远读不到）", out.height - keyed.height
+        )
     # 同一批里有人给了 list_status、有人没给时，缺的那个是 null 而不是默认值：
     # list_market 按 'L' 过滤，null 行会静默消失，所以在这里补平
-    out = out.with_columns(pl.col("list_status").fill_null(_DEFAULTS["list_status"]))
-    return out.select(list(COLUMNS)).unique(subset=["market", "code"], keep="last")
+    keyed = keyed.with_columns(pl.col("list_status").fill_null(_DEFAULTS["list_status"]))
+    return keyed.select(list(COLUMNS)).unique(subset=["market", "code"], keep="last")
 
 
 class SymbolRepo:
@@ -69,14 +90,17 @@ class SymbolRepo:
         return prepared.height
 
     def get(self, market: str, code: str) -> dict | None:
+        # 读侧的键形态必须与 `_prepare` 写侧同一条规则，否则「大写过的 code」
+        # 存进去、拿原样去查，又是同一个读不到且不报错的洞
         rows = self.db.query(
-            "SELECT * FROM symbols WHERE market = ? AND code = ?", [market, code]
+            "SELECT * FROM symbols WHERE market = ? AND code = ?",
+            [canonical_market(market), (code or "").strip().upper()],
         )
         return rows.to_dicts()[0] if not rows.is_empty() else None
 
     def list_market(self, market: str, *, listed_only: bool = True) -> pl.DataFrame:
         sql = "SELECT * FROM symbols WHERE market = ?"
-        params: list = [market]
+        params: list = [canonical_market(market)]
         if listed_only:
             sql += " AND list_status = 'L'"
         return self.db.query(sql, params)

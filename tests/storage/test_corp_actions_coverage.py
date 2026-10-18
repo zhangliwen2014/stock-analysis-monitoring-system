@@ -85,3 +85,11 @@ def test_reversed_span_is_rejected(repo):
 def test_sourceless_coverage_is_useless_and_rejected(repo):
     with pytest.raises(ValidationError, match="src"):
         record(repo, src="")
+
+
+def test_a_lowercase_market_lands_on_the_canonical_key(repo):
+    """确认写到 `a`、读取查 `A`：这条确认就永远放行不了任何区间（D46 的下沉）。"""
+    record(repo, market="a")
+    assert repo.count() == 1
+    assert repo.get("A", "601088", src="akshare") is not None
+    assert repo.for_code("a", "601088") != []

@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 
 import polars as pl
 
+from sams.core.codes import canonical_market
 from sams.core.errors import StorageError
 from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.storage.db import Database
@@ -42,7 +43,9 @@ class CalendarRepo:
             return 0
         frame = pl.DataFrame(
             {
-                "market": [d.market for d in days],
+                # 键的形态在这一层落定（D46 的下沉）：日历的小写市场名不报错，
+                # 只会让 `known_status` 永远答「不知道」，于是每个读数都带 rc 3 出门
+                "market": [canonical_market(d.market) for d in days],
                 "date": [d.day for d in days],
                 "is_trading": [d.is_trading for d in days],
                 "is_half_day": [d.is_half_day for d in days],
@@ -71,6 +74,7 @@ class CalendarRepo:
         return frame.height
 
     def get(self, market: str, day: date) -> CalendarDay | None:
+        market = canonical_market(market)
         rows = self.db.query(
             "SELECT * FROM trading_calendar WHERE market = ? AND date = ?",
             [market, day],
@@ -105,6 +109,7 @@ class CalendarRepo:
         要求年末有行会永远判为未覆盖；但下界不早于 1 月底，否则一月初的
         一次残缺刷新就能把整年判成已覆盖。
         """
+        market = canonical_market(market)
         end = date(year, 12, 31)
         if through is not None and through.year == year:
             end = max(through, date(year, 1, 31))
@@ -128,7 +133,7 @@ class CalendarRepo:
             self.db.scalar(
                 "SELECT count(*) FROM trading_calendar "
                 "WHERE market = ? AND year(date) = ? AND is_trading",
-                [market, year],
+                [canonical_market(market), year],
             )
             or 0
         )
@@ -137,7 +142,7 @@ class CalendarRepo:
         return int(
             self.db.scalar(
                 "SELECT count(*) FROM trading_calendar WHERE market = ? AND year(date) = ?",
-                [market, year],
+                [canonical_market(market), year],
             )
             or 0
         )
@@ -145,5 +150,5 @@ class CalendarRepo:
     def source_of(self, market: str, year: int) -> str | None:
         return self.db.scalar(
             "SELECT any_value(source) FROM trading_calendar WHERE market = ? AND year(date) = ?",
-            [market, year],
+            [canonical_market(market), year],
         )

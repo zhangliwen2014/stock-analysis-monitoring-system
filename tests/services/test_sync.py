@@ -81,8 +81,12 @@ def test_a_lowercase_market_lands_on_the_canonical_key(db, settings):
     assert registry.calls == [("US", "AAPL", D1, D2)]
     assert summary.market == "US"
     assert bars.count("US", "AAPL") == 2
-    assert symbols.get("US", "AAPL")["currency"] == "USD"
-    assert symbols.get("us", "AAPL") is None
+    row = symbols.get("US", "AAPL")
+    assert row["currency"] == "USD"
+    # D50：读侧也归一，所以这条断言不能再写 `get("us") is None`。要锁的是「库里只有一行、
+    # 且那一行的键是大写形态」——屏幕上的拼写不再决定能不能读到它。
+    assert row["market"] == "US"
+    assert symbols.list_market("us").height == 1
 
 
 def test_rerun_is_idempotent(db, settings):

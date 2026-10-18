@@ -114,8 +114,10 @@ def test_list_market_filters_delisted(symbols):
             ]
         )
     )
-    assert set(symbols.list_market("A")["code"]) == {"live"}
-    assert set(symbols.list_market("A", listed_only=False)["code"]) == {"live", "gone"}
+    # code 的形态在 `_prepare` 里落定（与 bars 同一条规则），所以回来的是大写形态：
+    # 断言写成小写等于允许「存进去的形状」和「用来查的形状」分叉，那正是这轮要堵的洞
+    assert set(symbols.list_market("A")["code"]) == {"LIVE"}
+    assert set(symbols.list_market("A", listed_only=False)["code"]) == {"LIVE", "GONE"}
 
 
 def test_adj_factor_placeholder_column_is_gone(bars, db):
@@ -207,3 +209,42 @@ def test_negative_volume_is_still_stored_as_a_fact(bars):
     frame = support.bars_frame().with_columns(pl.lit(-5.0).alias("volume"))
     assert bars.upsert(frame) == 3
     assert bars.load("A", ["600519"])["volume"].unique().to_list() == [-5.0]
+
+
+# --- 键形态由仓库层保证（D46 的下沉）------------------------------------------------
+#
+# D46 原本只在三个服务入口归一市场名，而仓库层原样收下 `market`：`WatchlistRepo.add`
+# 就漏在那里（那一层只归一 code）。这类没经过归一入口的写路径会往主键里种一个小写形态，
+# 而读取层此后一律按大写查，那一行就永久隐形——症状是「从没采集过 / 没有行情」，库里明明有。
+# 主键定义在哪一层，键的形态就该由哪一层保证，服务边界那层留作第二重。
+
+
+def test_a_lowercase_market_lands_on_the_canonical_key(bars):
+    bars.upsert(support.sample_bars(market="a", code="600519"))
+    assert bars.load("A", ["600519"]).height == 2, "写进去的必须是大写形态，否则读取层看不见"
+    assert bars.load("a", ["600519"]).height == 2, "读的时候大小写都不是语义"
+    assert bars.count("A", "600519") == 2
+    assert bars.latest_date("a", "600519") == date(2024, 1, 3)
+
+
+def test_an_empty_market_is_refused_rather_than_stored_as_the_empty_key(bars, db):
+    """空市场名以前会写出一行 `market=''`：它谁也都读不到，却在 `sams health` 的行数里。"""
+    bars.upsert(support.sample_bars(market=" ", code="600519"))
+    assert int(db.scalar("SELECT count(*) FROM bars_daily") or 0) == 0
+
+
+def test_symbol_writes_and_reads_share_one_market_spelling(symbols):
+    symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["hk"],
+                "code": ["00700"],
+                "name": ["腾讯控股"],
+                "currency": ["HKD"],
+                "lot_size": [100],
+            }
+        )
+    )
+    assert symbols.get("HK", "00700") is not None
+    assert symbols.get("hk", "00700") is not None
+    assert symbols.list_market("hk").height == 1

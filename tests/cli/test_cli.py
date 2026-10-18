@@ -579,6 +579,8 @@ def test_analysis_return_says_which_two_bars_it_anchored_on(container, capsys):
     assert "这两根出的数" in out and "2024-07-11" in out
     assert "开市日没有 K 线" in out and "2024-07-12" in out
     assert "周末" not in out, "没查过日历就不许把缺口归给周末"
+    # 「采信这个」不能悬空：锚点挪走时，那行得当场说清它采信的是哪一段
+    assert "采信这个，但它算的是 2024-07-01~2024-07-11 这一段" in out
 
 
 def test_analysis_return_charges_nothing_when_the_gap_is_only_rest_days(container, capsys):
@@ -601,12 +603,21 @@ def test_analysis_return_admits_the_calendar_cannot_answer(container, capsys):
 def test_analysis_return_declares_the_adjustment_convention(container, capsys):
     """两个数并列而不说口径，读的人不知道自己采信的是哪一种复权。
 
-    D34 选的是「派到的现金不再投资」：同一个跨除权区间，按再投资算是另一个数。
+    D48：那句话的名字必须由算式决定。因子法（D34）等价于**分红在除权日按交易所参考价
+    买回该股**，而「现金到手不再投资」是另一个数——以前这里印的正是后者那句话，
+    于是给的是再投资口径、承诺的是到手口径，两个都在屏幕上，没人知道自己信的是哪个。
     """
     seed_crossing_ex_date(container)
     assert cli_run_on(container, analysis_argv()) == 0
     out = capsys.readouterr().out
-    assert "口径" in out and "现金到手不再投资" in out and "除权参考价" in out
+    assert "口径" in out and "除权参考价" in out and "再投资" in out
+    # 起点 41.00、除权前收 42.00、每股派 2.10 ⇒ 参考价 39.90、终点 42.00
+    reinvested = 42.00 * (42.00 / (42.00 - 2.10)) / 41.00 - 1
+    cash_in_hand = (42.00 + 2.10) / 41.00 - 1
+    assert f"{reinvested:+.2%}" in out
+    assert f"{cash_in_hand:+.2%}" not in out
+    # 放行这个数的那条确认做到哪天为止：不给日期，「覆盖确认」这四个字没有可核对的内容
+    assert "记录截至 2024-07-11" in out
 
 
 def seed_tiny_dividend(container, cash: float = 0.001):

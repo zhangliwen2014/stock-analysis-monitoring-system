@@ -341,18 +341,39 @@ def test_hk_and_us_have_no_evidence_rule_but_still_require_coverage():
         )
 
 
-def test_stale_full_history_claim_expires_when_today_is_passed():
+def test_a_full_history_claim_outlives_the_day_it_was_made():
+    """D49：确认做到 7-20、今天已经 2025 —— 窗口早在 7 月结束，之后不会长出新的除权日。
+
+    这一条从前是「过期就拒绝」。拒绝对一个纯历史窗口没有任何保护意义（要变的只能是
+    源补记的旧数据，那要靠重新采集去发现），却会让人以为数据不可信。
+    """
+    span = Span(covered_from=START, covered_to=date(2024, 7, 20), full_history=True)
+    result = interval_return(
+        frame([10.0] * 8),
+        NO_ACTIONS,
+        market="A",
+        code="600000",
+        start=START,
+        end=START + timedelta(days=7),
+        coverage=[span],
+        today=date(2025, 1, 1),
+    )
+    assert result.covered_through == date(2024, 7, 20)
+
+
+def test_a_window_running_past_the_claim_is_still_refused():
+    """同一份确认，窗口延伸到它断言之外的日子 ⇒ 那几天没人看过，拒绝。"""
     span = Span(covered_from=START, covered_to=date(2024, 7, 20), full_history=True)
     with pytest.raises(NotAdjustable, match="覆盖确认"):
         interval_return(
-            frame([10.0] * 8),
+            frame([10.0] * 25),
             NO_ACTIONS,
             market="A",
             code="600000",
             start=START,
-            end=START + timedelta(days=7),
+            end=START + timedelta(days=24),
             coverage=[span],
-            today=date(2025, 1, 1),
+            today=date(2024, 7, 20),
         )
 
 

@@ -201,18 +201,23 @@ def test_an_alias_reads_the_same_stock(db):
     )
 
 
-def test_the_clock_decides_whether_a_confirmation_is_still_fresh(db):
-    """确认做到 7-15 为止，今天已经 7-20：那之后的除权没人看过，拒绝。
+def test_an_ended_window_is_still_answered_once_the_clock_has_moved_on(db):
+    """D49：确认做到 7-15，今天 7-20 —— 那段窗口早在 7-15 结束，之后不会长出新的除权日。
 
-    新鲜度只能来自注入的时钟——按请求窗口的末日判新鲜，等于让调用方用一次窄窗口
-    买到一张免检票。
+    以前这里要求「确认必须新鲜到今天」，于是每天第一次查历史区间都要先联网重采集，
+    采集失败就说「拒绝出数」。那句话听起来像数据有问题，实际只说明今天没人问过源，
+    而它挡住的是一个已经完整成立的历史数。「什么时候重新问源」是同步调度的判断，
+    不是读取层的正确性闸。
     """
-    stale = seeded(db, covered_to=date(2024, 7, 15), today=date(2024, 7, 20))
+    later = seeded(db, covered_to=date(2024, 7, 15), today=date(2024, 7, 20))
+    assert later.interval_return("A", CODE, START, END).ex_dates == 1
+
+
+def test_a_window_reaching_past_the_confirmation_is_refused(db):
+    """反面对照：窗口末落在确认之外，那之后的除权没人看过，这个数就不能给。"""
+    past_the_claim = seeded(db, covered_to=date(2024, 7, 10), today=date(2024, 7, 10))
     with pytest.raises(NotAdjustable, match="覆盖确认"):
-        stale.interval_return("A", CODE, START, END)
-    # 同一个库，把时钟拨回确认那天的下午，同一段区间就该出数
-    fresh = seeded(db, covered_to=date(2024, 7, 15), today=date(2024, 7, 15))
-    assert fresh.interval_return("A", CODE, START, END).ex_dates == 1
+        past_the_claim.interval_return("A", CODE, START, END)
 
 
 def test_a_window_the_bars_do_not_really_cover_is_refused(db):

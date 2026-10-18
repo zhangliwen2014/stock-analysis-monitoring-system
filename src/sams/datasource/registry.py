@@ -385,7 +385,9 @@ class AdapterRegistry:
         except DatasourceError as exc:
             self._mark_failure(name, exc)
             raise _SourceFailed(name, calls, str(exc)) from exc
-        except BaseException as exc:  # noqa: BLE001 — 适配器漏归类时兜底，路由不能被打断
+        except Exception as exc:  # noqa: BLE001 — 适配器漏归类时兜底，路由不能被打断
+            # 不是 BaseException：Ctrl-C 不是「这个源坏了，换下一个」，
+            # 兜住它等于让中断要等整条链每个源都试完才生效，还把一次取消记成源故障
             wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
             self._mark_failure(name, wrapped)
             raise _SourceFailed(name, calls, str(wrapped)) from exc

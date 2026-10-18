@@ -17,12 +17,13 @@ M2 起因子由 `analysis/adjust.py` 现算，本仓库只负责「这一条记�
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 
 import polars as pl
 
 from sams.core.actions import ACTION_KINDS
+from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
 
@@ -41,6 +42,8 @@ _GROWING = frozenset({"bonus", "transfer"})
 #: 两个源对同一条记录差多少以内算「说的是同一件事」（见模块开头的冲突规则）。
 #: 取半分：源的舍入口径差不到一分（2.10 与 2.099），而「两笔派息被当成一条」那种
 #: 错数差的是三成。定得越松，越多真冲突被静默覆盖；定得越紧，越多改数被判成冲突。
+#: 与 `datasource/akshare_actions._TOLERANCE` 数字相同而量的是两件事：这个比两个源的意见，
+#: 那个比同一条记录里文本与数值是否自洽（D45）。改一个不必动另一个。
 _TOL = 0.005
 
 #: 同一条记录上会比的三个数。`src` 与 `note` 不在内：换源本身就是常态，
@@ -70,13 +73,35 @@ class CorpAction:
     note: str | None = None
 
 
+def _canonicalize(action: CorpAction) -> CorpAction:
+    """键的形态在这一层落定（D46 的下沉）：主键 (市场, 代码, 除权日, 类型) 由这里定义。
+
+    记录种在小写市场名下不会报错，只会让读取层按 `A` 查出 0 条行为：区间收益于是
+    认为「首尾之间没有除权日」，照实用裸价出一个看起来完全正常的错数——
+    U12 那个错数换一条路回来，而且 D37 抓不住它（一次 4% 的派息跳变在 15% 阈值之下）。
+    """
+    market = canonical_market(action.market)
+    return replace(action, market=market, code=canonical_code(market, action.code))
+
+
+def _as_view(action: CorpAction) -> dict:
+    """把同批里那一行摆成与库里读出来的一样的形状，好让冲突比对口径只有一处。"""
+    return {
+        "cash_per_share": action.cash_per_share,
+        "ratio": action.ratio,
+        "price": action.price,
+        "src": action.src,
+    }
+
+
 class CorpActionRepo:
     def __init__(self, db: Database) -> None:
         self.db = db
 
     def upsert(self, action: CorpAction) -> None:
+        action = _canonicalize(action)
         self._check(action)
-        self._check_no_conflict(action, self._existing(action))
+        self._check_no_conflict(action, self._existing(action), where="库里那条")
         self._write(action)
 
     def upsert_many(self, frame: pl.DataFrame) -> int:
@@ -86,13 +111,22 @@ class CorpActionRepo:
         但**先看完一整批再动手**——一条冲突的记录不该把同批其余的好数据半写进库：
         那会留下一个「这次查过、但记录不齐」的区间，而读取层只看除权记录，
         看不出采集断在半路，也就不会有第二次机会想起它。
+
+        冲突要比两处：库里那一条，**以及同一批次里排在前面、键相同的那一行**。
+        只查库等于给「一个源在一次应答里给同键两行」留了后门——那一刻库里是空的，
+        两行都放行，后写的静默盖掉前写的，正是 D45 拦的那种「凭空少一笔」。
         """
         if frame.is_empty():
             return 0
-        batch = [CorpAction(**row) for row in frame.iter_rows(named=True)]
+        batch = [_canonicalize(CorpAction(**row)) for row in frame.iter_rows(named=True)]
+        queued: dict[tuple[str, str, date, str], CorpAction] = {}
         for action in batch:
             self._check(action)
-            self._check_no_conflict(action, self._existing(action))
+            self._check_no_conflict(action, self._existing(action), where="库里那条")
+            prior = queued.get((action.market, action.code, action.ex_date, action.kind))
+            if prior is not None:
+                self._check_no_conflict(action, _as_view(prior), where="同批的前一行")
+            queued[(action.market, action.code, action.ex_date, action.kind)] = action
         for action in batch:
             self._write(action)
         return len(batch)
@@ -108,11 +142,13 @@ class CorpActionRepo:
         )
         return rows.to_dicts()[0] if not rows.is_empty() else None
 
-    def _check_no_conflict(self, action: CorpAction, prior: dict | None) -> None:
+    def _check_no_conflict(self, action: CorpAction, prior: dict | None, *, where: str) -> None:
         """同一条记录上两个对不上的数：写谁都是凭空丢掉一件事（见模块开头）。
 
         出错信息里点名两条记录与两个源，是因为这一步之后没有别的现场可查：
         调用方只知道 `sync actions` 失败了，而它要决定的是信哪个数。
+        `where` 说清另一条在哪——库里那条还是同批的前一行：前者要重新采集才能改，
+        后者是这一次应答自己就不自洽，重跑一遍还是这样。
         """
         if prior is None:
             return
@@ -126,7 +162,7 @@ class CorpActionRepo:
         raise StorageError(
             f"{action.market}/{action.code} {action.ex_date} {action.kind} 记录冲突："
             + "；".join(diffs)
-            + f"（库里那条来自 {prior['src']}，这次要写 {action.src}）。"
+            + f"（{where}来自 {prior['src']}，这次要写 {action.src}）。"
             "主键是 (市场, 代码, 除权日, 类型)：同日同类型的两件事装不下，"
             "覆盖写会丢掉一笔，留两条会把一笔算两次。"
             "这次同步不写覆盖确认，这只票的区间收益在查清两个数之前继续拒绝出数。"
@@ -220,7 +256,7 @@ class CorpActionRepo:
         而这个仓库方法不做时钟：仓库层读的是事实，不看现在是几点。
         """
         sql = ["SELECT * FROM corp_actions WHERE market = ? AND code = ?"]
-        params: list = [market, code]
+        params: list = [canonical_market(market), canonical_code(market, code)]
         if until is not None:
             sql.append("AND ex_date <= ?")
             params.append(until)
