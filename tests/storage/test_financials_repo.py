@@ -57,20 +57,20 @@ def test_a_period_published_after_the_as_of_date_is_not_visible(fin):
     结论好看得没有意义——而这在结果上完全看不出来。
     """
     fin.upsert(pl.DataFrame([row()]))
-    latest, dropped = fin.load_as_of("A", ["601088"], date(2024, 4, 25))
+    latest, dropped = fin.load_as_of("A", ["601088"], date(2024, 4, 25), basis="latest")
     assert latest.height == 0
     assert dropped == 0
 
-    adopted, _ = fin.load_as_of("A", ["601088"], PUBLISHED_Q1)
+    adopted, _ = fin.load_as_of("A", ["601088"], PUBLISHED_Q1, basis="latest")
     assert adopted["roe"].to_list() == [0.20]
 
 
 def test_the_latest_already_published_period_wins(fin):
     fin.upsert(pl.DataFrame([row(), row(report_date=Q4, published_date=PUBLISHED_Q4)]))
-    latest, _ = fin.load_as_of("A", ["601088"], date(2024, 4, 30))
+    latest, _ = fin.load_as_of("A", ["601088"], date(2024, 4, 30), basis="latest")
     assert latest["report_date"].to_list() == [Q1]
     # 更早的截至日：2024Q1 还没公开，能采信的只有 2023Q4
-    earlier, _ = fin.load_as_of("A", ["601088"], date(2024, 3, 25))
+    earlier, _ = fin.load_as_of("A", ["601088"], date(2024, 3, 25), basis="latest")
     assert earlier["report_date"].to_list() == [Q4]
 
 
@@ -83,15 +83,73 @@ def test_a_period_without_a_publication_date_is_not_trusted_and_is_counted(fin):
     fin.upsert(
         pl.DataFrame([row(), row(report_date=date(2024, 6, 30), published_date=None)])
     )
-    latest, dropped = fin.load_as_of("A", ["601088"], date(2024, 12, 31))
+    latest, dropped = fin.load_as_of("A", ["601088"], date(2024, 12, 31), basis="latest")
     assert latest["report_date"].to_list() == [Q1]
     assert dropped == 1
 
 
 def test_covered_codes_only_counts_periods_we_know_the_publication_of(fin):
     fin.upsert(pl.DataFrame([row(), row(report_date=Q4, published_date=None)]))
-    assert fin.covered_codes("A", as_of=date(2024, 4, 30)) == ["601088"]
-    assert fin.covered_codes("A", as_of=date(2024, 4, 25)) == [], "截至日在披露日之前就是没有"
+    assert fin.covered_codes("A", as_of=date(2024, 4, 30), basis="latest") == ["601088"]
+    # 截至日在披露日之前就是没有
+    assert fin.covered_codes("A", as_of=date(2024, 4, 25), basis="latest") == []
+
+
+# ---------- 年报口径（D62）：PR 的分母要与 PE(TTM) 同为一年 ----------
+
+FY_2023 = date(2023, 12, 31)
+PUBLISHED_FY_2023 = date(2024, 3, 20)
+H1_2024 = date(2024, 6, 30)
+PUBLISHED_H1_2024 = date(2024, 8, 29)
+
+
+def test_the_annual_basis_is_the_default_and_skips_interim_periods(fin):
+    """源的 ROE 是**该期累计**（Q1 是三个月、H1 是六个月），PE 却是滚动十二个月。
+
+    默认按最新已披露一期时，601088 在 2026-04-30 给 PR=8.41、2026-10-18 给 3.51，
+    而它的年报口径只有 ~1.6：那个数主要在读「最近报的是哪个季度」，不是读贵不贵。
+    """
+    fin.upsert(
+        pl.DataFrame(
+            [
+                row(report_date=Q1, published_date=PUBLISHED_Q1, roe=0.024),
+                row(report_date=FY_2023, published_date=PUBLISHED_FY_2023, roe=0.19),
+            ]
+        )
+    )
+    adopted, _ = fin.load_as_of("A", ["601088"], date(2024, 4, 30))
+    assert adopted["report_date"].to_list() == [FY_2023]
+    assert adopted["roe"].to_list() == [0.19]
+
+    newest, _ = fin.load_as_of("A", ["601088"], date(2024, 4, 30), basis="latest")
+    assert newest["report_date"].to_list() == [Q1], "口径是调用方选的，仓库不替它决定"
+
+
+def test_annual_means_the_report_date_is_a_year_end(fin):
+    """认报告期的日历日，不认名字：`2024-06-30` 是半年报，`2024-12-31` 才是年报。"""
+    fin.upsert(
+        pl.DataFrame(
+            [
+                row(report_date=H1_2024, published_date=PUBLISHED_H1_2024, roe=0.058),
+                row(report_date=date(2024, 12, 31), published_date=date(2025, 3, 28), roe=0.13),
+            ]
+        )
+    )
+    adopted, _ = fin.load_as_of("A", ["601088"], date(2025, 4, 1))
+    assert adopted["report_date"].to_list() == [date(2024, 12, 31)]
+
+
+def test_a_code_with_only_interim_periods_is_not_covered_on_the_annual_basis(fin):
+    """universe 也按口径走：只有季报的票在年报口径下不该被当成「有基本面」。"""
+    fin.upsert(pl.DataFrame([row()]))
+    assert fin.covered_codes("A", as_of=date(2024, 4, 30)) == []
+    assert fin.covered_codes("A", as_of=date(2024, 4, 30), basis="latest") == ["601088"]
+
+
+def test_an_unknown_basis_is_refused_with_the_two_names(fin):
+    with pytest.raises(Exception, match="annual|latest"):
+        fin.load_as_of("A", ["601088"], date(2024, 4, 30), basis="quarterly")
+
 
 
 def test_a_percent_caliber_ratio_is_emptied_not_stored(fin, db):
@@ -125,7 +183,7 @@ def test_key_forms_converge_on_write(fin):
     PR」，而真相是两次采集用了两种写法。
     """
     fin.upsert(pl.DataFrame([row(market="hk", code="00700", roe=0.24)]))
-    latest, dropped = fin.load_as_of("HK", ["700"], date(2024, 4, 30))
+    latest, dropped = fin.load_as_of("HK", ["700"], date(2024, 4, 30), basis="latest")
     assert dropped == 0
     assert latest["roe"].to_list() == [0.24]
 

@@ -25,6 +25,7 @@ import polars as pl
 from sams.analysis.fundamentals import BASIS_REFUSED, MarketProfitRatio, pr
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
+from sams.core.fundamentals import ROE_BASIS_ANNUAL, ROE_BASIS_LATEST
 from sams.datasource.registry import AdapterRegistry, Attempt
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 
@@ -137,6 +138,12 @@ class FundamentalRead:
     valuation_source: str = ""
     #: D61：因没有披露日而未被采信的行数——「我们不知道它何时公开」不等于「它不存在」
     dropped_unpublished: int = 0
+    #: D62：这一期的 ROE 是按哪个口径被采信的（年报 / 最新一期）
+    roe_basis: str = ROE_BASIS_ANNUAL
+    #: 年报口径下，比被采信那期**更新**的一期已披露报表（周期不同，故未用于 PR）
+    interim_period: date | None = None
+    interim_roe: float | None = None
+    interim_published_on: date | None = None
     pr: MarketProfitRatio = MarketProfitRatio(None, BASIS_REFUSED, reason="未计算")
 
 
@@ -158,30 +165,40 @@ class FundamentalService:
         *,
         as_of: date | None = None,
         roe_estimate: float | None = None,
+        roe_basis: str = ROE_BASIS_ANNUAL,
     ) -> FundamentalRead:
         """「截至 `as_of` 已披露的最新一期 ROE」配「`as_of` 当天或之前最近的 PE」，算出 PR。
 
         `as_of` 缺省取今天，且**绝不以 None 的形式往下传**：那个值一路到 SQL 就等于
         「不设时间闸门」，库里的每一期都算已披露（M2-A 那条同名的红线）。
+
+        `roe_basis`（D62）默认只认年报：源的 ROE 是该期累计值，而 PE 是滚动十二个月，
+        按「最新已披露一期」时同一个 PE 会因最近报的是 Q1 还是 H1 而给出差数倍的 PR。
+        选 `latest` 仍然算数，但那个 PR 只与同口径的 PR 可比——这句话由调用方打印。
         """
         market = canonical_market(market)
         code = canonical_code(market, code)
         until = as_of if as_of is not None else self.clock.today()
-        frame, dropped = self.financials.load_as_of(market, [code], until)
+        frame, dropped = self.financials.load_as_of(market, [code], until, basis=roe_basis)
         reported = _first(frame)
         valued = _first(self.valuation.latest(market, [code], until))
+        # 年报口径下顺手问一次「最新一期是哪天」：那只票可能刚报了半年数。不说这句，
+        # 读的人会以为我们不知道有更新的一期——而我们知道，只是那个数的周期不同
+        newest = (
+            None
+            if roe_basis == ROE_BASIS_LATEST
+            else _first(
+                self.financials.load_as_of(market, [code], until, basis=ROE_BASIS_LATEST)[0]
+            )
+        )
+        interim = _newer_than_adopted(newest, reported)
 
-        if reported is None and valued is None:
-            # 不是「PE 缺失」也不是「ROE 为负」：这两种下一步不同（换源 vs 给预估），
-            # 而这一种的下一步是同步。让 pr() 去猜会指错方向
+        if reported is None:
+            # 三种「算不出」的下一步各不相同，所以分开说（M2-A 的拒绝分诊同一条规矩）
             ratio = MarketProfitRatio(
-                None,
-                BASIS_REFUSED,
-                reason=(
-                    f"{market} {code} 库里没有已披露的财务数据，也没有按日估值："
-                    "先跑 `sams sync financials` 与 `sams sync valuation`"
-                    "（有数据但披露日为空的行不会被采信）"
-                ),
+                None, BASIS_REFUSED, reason=_missing_roe_reason(
+                    market, code, until, valued, interim, roe_basis
+                )
             )
         else:
             ratio = pr(
@@ -208,8 +225,49 @@ class FundamentalService:
             source=_get(reported, "source") or "",
             valuation_source=_get(valued, "source") or "",
             dropped_unpublished=dropped,
+            roe_basis=roe_basis,
+            interim_period=_get(interim, "report_date"),
+            interim_roe=_get(interim, "roe"),
+            interim_published_on=_get(interim, "published_date"),
             pr=ratio,
         )
+
+
+def _missing_roe_reason(
+    market: str, code: str, until: date, valued: dict | None, interim: dict | None, basis: str
+) -> str:
+    """PR 算不出，但「为什么」有三种，各自的下一步命令不同（D62 + D43）。"""
+    if valued is None and interim is None:
+        return (
+            f"{market} {code} 库里截至 {until} 没有已披露的财务数据，也没有按日估值："
+            "先跑 `sams sync financials` 与 `sams sync valuation`"
+            "（有数据但披露日为空的行不会被采信）"
+        )
+    if interim is not None:
+        return (
+            f"{market} {code} 截至 {until} 只披露到 {interim['report_date']}（"
+            f"{ROE_BASIS_LATEST} 口径下的一期），没有已披露的**年报**可用："
+            "年报口径算不出 PR——传 `--roe-basis latest` 可以用那一期，"
+            "但那里的 ROE 是该期累计值、与 PE(TTM) 的十二个月不同周期"
+        )
+    return (
+        f"{market} {code} 截至 {until} 库里没有已披露的财务数据"
+        f"（口径 {basis}）：先跑 `sams sync financials`，"
+        "披露日为空的行不会被采信"
+    )
+
+
+def _newer_than_adopted(newest: dict | None, adopted: dict | None) -> dict | None:
+    """比被采信那期**更新**的一期，没有则 None。
+
+    年报口径下这是必须说的一句话：库里有 2026-06-30 的半年数而我们用的是 2025-12-31 的
+    年度数，不写出来就像没看见更新的那期。
+    """
+    if newest is None:
+        return None
+    if adopted is None:
+        return newest
+    return newest if newest["report_date"] > adopted["report_date"] else None
 
 
 def _first(frame: pl.DataFrame) -> dict[str, Any] | None:

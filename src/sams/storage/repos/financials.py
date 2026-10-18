@@ -32,6 +32,8 @@ from sams.core.fundamentals import (
     FINANCIAL_COLUMNS,
     FLOW_COLUMNS,
     RATIO_BOUNDS,
+    ROE_BASIS,
+    ROE_BASIS_ANNUAL,
     TEXT_COLUMNS,
     VALUATION_COLUMNS,
 )
@@ -39,6 +41,23 @@ from sams.storage.db import Database
 from sams.storage.repos._keys import normalize_keys
 
 logger = logging.getLogger("sams.storage.fundamentals")
+
+
+def _basis_clause(basis: str) -> str:
+    """ROE 口径 → SQL 谓词（D62）。认报告期的日历日，不认名字或字段。
+
+    拼在这里而不是散在两条 SQL 里：`load_as_of` 与 `covered_codes` 必须说同一个口径，
+    两边各写一份时漏改一边，选股的 universe 与真正算出 PR 的票数就对不上。
+    """
+    if basis not in ROE_BASIS:
+        raise ValidationError(
+            f"ROE 口径只认 {' 或 '.join(ROE_BASIS)}（年报 / 最新一期），收到 {basis!r}"
+        )
+    return (
+        "AND month(report_date) = 12 AND day(report_date) = 31"
+        if basis == ROE_BASIS_ANNUAL
+        else ""
+    )
 
 
 def _prepare(
@@ -181,28 +200,34 @@ class FinancialRepo:
         return prepared.height
 
     def load_as_of(
-        self, market: str, codes: list[str], as_of: date
+        self, market: str, codes: list[str], as_of: date, *, basis: str = ROE_BASIS_ANNUAL
     ) -> tuple[pl.DataFrame, int]:
-        """每只票取「`as_of` 那天已经披露的最新一期」，另带回被 NULL 披露日挡掉的行数。
+        """每只票取「`as_of` 那天已经披露的、该口径下最新的一期」，另带回被 NULL 披露日挡掉的行数。
 
         返回的是两个数不是一个：`dropped` 那一句必须由调用方打印（D61）。只说
         「最新一期是 2024-03-31」而不说「另有 3 期因为没有披露日未被采信」，
         读的人会以为那 3 期不存在，而不是以为我们不知道它们何时公开。
+
+        `basis`（D62）决定「最新一期」允许落在哪些报告期上：默认只认年报，因为源的
+        ROE 是该期累计值，而 PR 的分子 PE(TTM) 是十二个月。`dropped` 按同一口径计——
+        把季报的 NULL 披露日也算进「年报口径下被挡掉的行数」，那句话就成了一句谎话。
         """
         market = canonical_market(market)
         if as_of is None:
             raise ValidationError("load_as_of 必须给截至日：PIT 读取没有『默认今天』这条路")
+        clause = _basis_clause(basis)
         if not codes:
             return _empty(FINANCIAL_COLUMNS, self.DATE_COLUMNS), 0
         wanted = [canonical_code(market, c) for c in codes]
         frame = self.db.query(
-            """
+            f"""
             SELECT * EXCLUDE (rnk) FROM (
                 SELECT *,
                        rank() OVER (PARTITION BY code ORDER BY report_date DESC) AS rnk
                 FROM financials
                 WHERE market = ? AND code = ANY(?)
                   AND published_date IS NOT NULL AND published_date <= ?
+                  {clause}
             ) WHERE rnk = 1
             ORDER BY code
             """,
@@ -210,8 +235,8 @@ class FinancialRepo:
         )
         dropped = int(
             self.db.scalar(
-                "SELECT count(*) FROM financials"
-                " WHERE market = ? AND code = ANY(?) AND published_date IS NULL",
+                f"SELECT count(*) FROM financials"
+                f" WHERE market = ? AND code = ANY(?) AND published_date IS NULL {clause}",
                 [market, wanted],
             )
             or 0
@@ -235,12 +260,18 @@ class FinancialRepo:
             sql.append(f"LIMIT {int(limit)}")
         return self.db.query(" ".join(sql), params)
 
-    def covered_codes(self, market: str, *, as_of: date) -> list[str]:
-        """这个市场里至少有一期**已披露**财务数据的代码：按 PR 选股的 universe 的一半。"""
+    def covered_codes(
+        self, market: str, *, as_of: date, basis: str = ROE_BASIS_ANNUAL
+    ) -> list[str]:
+        """该口径下「至少有一期已披露财务数据」的代码：按 PR 选股的 universe 的一半。
+
+        universe 必须与 `load_as_of` 同一个 `basis`，否则选股会说「扫了 137 只」而其中
+        一部分在读取时根本没有可用的期——那只票既不在结果里、也不在「排除」里，静默消失。
+        """
         rows = self.db.query(
-            "SELECT DISTINCT code FROM financials"
-            " WHERE market = ? AND published_date IS NOT NULL AND published_date <= ?"
-            " ORDER BY code",
+            f"SELECT DISTINCT code FROM financials"
+            f" WHERE market = ? AND published_date IS NOT NULL AND published_date <= ?"
+            f" {_basis_clause(basis)} ORDER BY code",
             [canonical_market(market), as_of],
         )
         return list(rows["code"].to_list())

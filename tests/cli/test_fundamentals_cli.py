@@ -9,6 +9,8 @@
   是这条公式最贵的一个误读。
 * `--json` 的每个出口都是可解析 JSON 且带 `exit`（D57），参数错也是。
 * 百分数写法的 `--roe-estimate 15` 必须被拒收：它会让 PR 静默小两百倍（D58）。
+* 分母那一期是哪一种周期，跟着 PR 一起出门（D62）。实测同一只票同一个 PE，按最新一期
+  能给到 8.41（一季报）与 3.51（半年报），按年报是 ~1.6——不写口径的那一行没有可比性。
 """
 
 from __future__ import annotations
@@ -24,18 +26,39 @@ from support_fundamentals import StubFundamentalsAdapter
 import sams.cli as cli
 from sams.bootstrap import build_container
 
-Q1 = date(2024, 3, 31)
-PUBLISHED = date(2024, 4, 26)
+FY = date(2023, 12, 31)
+FY_PUBLISHED = date(2024, 3, 20)
+H1 = date(2024, 6, 30)
+H1_PUBLISHED = date(2024, 7, 5)
 VALUATION_DAY = date(2024, 6, 28)
 
 
 def financials_rows(**over) -> pl.DataFrame:
+    """默认那一行是**年报**（12-31）：命令行不给 `--roe-basis` 时，PR 的分母就是它（D62）。"""
     row = {
         "market": "A",
         "code": "601088",
-        "report_date": Q1,
-        "published_date": PUBLISHED,
+        "report_date": FY,
+        "published_date": FY_PUBLISHED,
         "roe": 0.2,
+        "revenue_yoy": 0.12,
+        "profit_yoy": 0.08,
+        "dividend_yield": 0.042,
+        "market_cap": 6.4e11,
+        "source": "akshare",
+    }
+    row.update(over)
+    return pl.DataFrame([row])
+
+
+def interim_rows(**over) -> pl.DataFrame:
+    """比年报更新的一期（半年累计 ROE 0.08，已披露）：默认口径必须「说出来但不采信」。"""
+    row = {
+        "market": "A",
+        "code": "601088",
+        "report_date": H1,
+        "published_date": H1_PUBLISHED,
+        "roe": 0.08,
         "revenue_yoy": 0.12,
         "profit_yoy": 0.08,
         "dividend_yield": 0.042,
@@ -127,6 +150,21 @@ def wired(db, settings, capsys):
     return container
 
 
+@pytest.fixture
+def two_periods(db, settings, capsys):
+    """库里同时有年报与更新的半年期：D62 的两条口径在这个 fixture 里会给出两个数。"""
+    container = seeded(
+        db,
+        settings,
+        financials=pl.concat([financials_rows(), interim_rows()]),
+        valuation=valuation_rows(),
+    )
+    sync(container, "financials")
+    sync(container, "valuation")
+    capsys.readouterr()
+    return container
+
+
 def argv(*extra: str, code: str = "601088") -> list[str]:
     return ["analysis", "fundamentals", "--market", "A", "--code", code, *extra]
 
@@ -181,7 +219,7 @@ def test_the_pr_line_carries_the_period_and_the_valuation_day(wired, capsys):
     assert run(wired, argv()) == 0
     out = capsys.readouterr().out
     assert "PR = 0.925" in out, "18.5 / 0.2 / 100 = 0.925"
-    assert str(Q1) in out and str(VALUATION_DAY) in out, "两个粒度都要印出来（D60）"
+    assert str(FY) in out and str(VALUATION_DAY) in out, "两个粒度都要印出来（D60）"
     assert "已披露" in out, "ROE 是已披露的还是预估的，得跟着数走"
 
 
@@ -204,7 +242,7 @@ def test_ratios_are_printed_as_percentages_while_multiples_are_not(wired, capsys
 def test_as_of_before_the_publication_date_loses_the_period(wired, capsys):
     """把截至日挪到披露日之前：那一期的 ROE 与由它算出的 PR 一起消失（D61）。"""
     capsys.readouterr()
-    code = run(wired, argv("--as-of", "2024-04-25"))
+    code = run(wired, argv("--as-of", "2024-03-19"))
     out = capsys.readouterr().out
     assert "采信期" in out and "无" in out
     assert "PR = 无" in out, "没有已披露的 ROE 就不该给出 PR"
@@ -271,7 +309,7 @@ def test_json_carries_the_two_grains_the_pr_and_the_exit(wired, capsys):
     assert run(wired, argv("--json")) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["exit"] == 0 and payload["status"] == "ok"
-    assert payload["period"] == str(Q1) and payload["valuation_on"] == str(VALUATION_DAY)
+    assert payload["period"] == str(FY) and payload["valuation_on"] == str(VALUATION_DAY)
     assert payload["pr"]["value"] == pytest.approx(0.925)
     assert payload["pr"]["basis"] == "pe"
     assert payload["roe"] == pytest.approx(0.2), "JSON 里给库里的口径，不给屏幕上的百分数"
@@ -280,7 +318,7 @@ def test_json_carries_the_two_grains_the_pr_and_the_exit(wired, capsys):
 def test_json_refusals_are_still_json(wired, capsys):
     """D57：管道里退出码会被下游覆盖，所以拒绝也得是 JSON——包括参数错。"""
     capsys.readouterr()
-    assert run(wired, argv("--as-of", "2024-04-25", "--json")) == 1
+    assert run(wired, argv("--as-of", "2024-03-19", "--json")) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["exit"] == 1 and payload["status"] == "refused"
     assert payload["pr"]["value"] is None and payload["pr"]["reason"]
@@ -288,3 +326,64 @@ def test_json_refusals_are_still_json(wired, capsys):
     capsys.readouterr()
     assert run(wired, argv("--roe-estimate", "15", "--json")) == 2
     assert json.loads(capsys.readouterr().out)["exit"] == 2
+
+# ---------- ROE 口径（D62）----------
+
+
+def test_the_default_names_the_denominator_period_kind(wired, capsys):
+    """默认口径那句话必须跟着 PR 出门：只印日期的那一行，读的人不知道周期多长。"""
+    capsys.readouterr()
+    assert run(wired, argv()) == 0
+    out = capsys.readouterr().out
+    assert "2023-12-31 年报" in out
+    assert "分母口径：ROE 取最新已披露年报" in out
+
+
+def test_a_newer_interim_period_is_announced_but_not_adopted(two_periods, capsys):
+    """半年期的 ROE 是六个月累计，配十二个月的 PE 会给出跳动的 PR：不采信，但要说出来。"""
+    capsys.readouterr()
+    assert run(two_periods, argv()) == 0
+    out = capsys.readouterr().out
+    assert "PR = 0.925" in out, "18.5 / 0.2 / 100：用的是年报，不是那期半年数"
+    assert f"库里另有更新的一期 {H1}" in out
+
+
+def test_the_latest_basis_adopts_the_interim_period_and_renames_the_caliber(two_periods, capsys):
+    capsys.readouterr()
+    assert run(two_periods, argv("--roe-basis", "latest")) == 0
+    out = capsys.readouterr().out
+    assert "PR = 2.312" in out, "18.5 / 0.08 / 100 = 2.3125——同一个 PE，差了近三倍"
+    assert "2024-06-30 6 月末期" in out
+    assert "季报是三个月、半年报是六个月" in out
+    assert "库里另有更新的一期" not in out, "已经采信了，就不是「放下了另一期」"
+
+
+def test_a_stock_with_only_interim_periods_refuses_and_names_the_flag(db, settings, capsys):
+    """只有半年报可采信时，默认口径给不出 PR——那句拒绝要指回 `--roe-basis`。"""
+    capsys.readouterr()
+    container = seeded(db, settings, financials=interim_rows(), valuation=valuation_rows())
+    sync(container, "financials")
+    sync(container, "valuation")
+    capsys.readouterr()
+    assert run(container, argv()) == 1
+    out = capsys.readouterr().out
+    assert "PR = 无" in out and "roe-basis latest" in out
+
+
+def test_json_carries_the_basis_and_the_period_let_go(two_periods, capsys):
+    """脚本按 PR 排序时，`roe_basis` 是它唯一能拿到的可比性证据（D57 + D62）。"""
+    capsys.readouterr()
+    assert run(two_periods, argv("--json")) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["roe_basis"] == "annual"
+    assert payload["period"] == str(FY)
+    assert payload["interim_period"] == str(H1)
+    assert payload["interim_roe"] == pytest.approx(0.08)
+    assert payload["basis_note"].startswith("分母口径：ROE 取最新已披露年报")
+
+
+def test_the_default_refusal_still_names_the_basis_when_nothing_is_annual(wired, capsys):
+    """截至日报表还没公开：那一行说「annual 口径下没有已披露数据」，不是「库里没数据」。"""
+    capsys.readouterr()
+    assert run(wired, argv("--as-of", "2024-03-19")) == 1
+    assert "annual" in capsys.readouterr().out

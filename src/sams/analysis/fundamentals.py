@@ -16,10 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-#: `MarketProfitRatio.basis` 的三个取值。调用方比字符串，不比文案
-BASIS_PE = "pe"
-BASIS_PB_ESTIMATE = "pb_estimate"
-BASIS_REFUSED = "refused"
+from sams.core.fundamentals import BASIS_PB_ESTIMATE, BASIS_PE, BASIS_REFUSED
+
+__all__ = ["BASIS_PB_ESTIMATE", "BASIS_PE", "BASIS_REFUSED", "MarketProfitRatio", "pr"]
 
 
 @dataclass(frozen=True)

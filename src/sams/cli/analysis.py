@@ -24,7 +24,14 @@ from sams.bootstrap import Container
 from sams.cli.common import group, iso_date, ratio_arg
 from sams.core.codes import exchange_folds_dividend_into_daily_change
 from sams.core.errors import NotAdjustable, ValidationError
-from sams.core.fundamentals import caliber_note
+from sams.core.fundamentals import (
+    BASIS_PB_ESTIMATE,
+    ROE_BASIS,
+    ROE_BASIS_ANNUAL,
+    ROE_BASIS_LATEST,
+    caliber_note,
+    roe_basis_note,
+)
 from sams.core.timeutil import gap_days
 from sams.services.analysis import PERIODS, default_indicators, indicator_names
 from sams.services.calendar import GapKinds
@@ -41,6 +48,15 @@ def add_fundamentals(subparsers) -> None:
     fun.add_argument("--code", required=True, help="如 601088")
     fun.add_argument("--as-of", help="YYYY-MM-DD，默认今天（PIT：只采信这天已披露的期）")
     fun.add_argument(
+        "--roe-basis",
+        default=ROE_BASIS_ANNUAL,
+        choices=list(ROE_BASIS),
+        help=(
+            "PR 分母用哪一期 ROE：annual=最新已披露**年报**（默认，与 PE(TTM) 同为十二个月）"
+            f"（默认 {ROE_BASIS_ANNUAL}）"
+        ),
+    )
+    fun.add_argument(
         "--roe-estimate",
         help="预估 ROE，小数口径（15% 写 0.15）：PE 不为正时那一支要用它",
     )
@@ -53,7 +69,11 @@ def run_fundamentals(container: Container, args: argparse.Namespace) -> int:
         as_of = iso_date(args.as_of) if args.as_of else None
         estimate = ratio_arg("--roe-estimate", args.roe_estimate) if args.roe_estimate else None
         read = container.fundamentals.read(
-            args.market, args.code, as_of=as_of, roe_estimate=estimate
+            args.market,
+            args.code,
+            as_of=as_of,
+            roe_estimate=estimate,
+            roe_basis=args.roe_basis,
         )
     except ValidationError as exc:
         # D57：`--json` 下参数错也是 JSON。让它冒到顶层会变成 stderr 上的一段纯文本，
@@ -76,6 +96,7 @@ def _print_fundamentals(read, code: int) -> int:
     print(f"  估值日  {_valuation_line(read)}")
     ratio = f"PR = {read.pr.value:.3f}" if read.pr.ok else "PR = 无"
     print(f"  市赚率  {ratio:<12} ← {read.pr.explain()}")
+    print(f"  {roe_basis_note(read.roe_basis)}")
     print(f"  {caliber_note()}")
     for line in _fundamentals_warnings(read):
         print(f"  {line}")
@@ -87,18 +108,23 @@ def _print_fundamentals(read, code: int) -> int:
 def _period_line(read) -> str:
     if read.period is None:
         return (
-            f"无 ← 库里没有 {read.market} {read.code} 已披露的财务数据"
-            "（先跑 `sams sync financials`）"
+            f"无 ← 库里没有 {read.market} {read.code} 在「{read.roe_basis}」口径下"
+            "已披露的财务数据（先跑 `sams sync financials`）"
         )
+    kind = "年报" if _is_year_end(read.period) else f"{read.period.month} 月末期"
     head = (
-        f"{read.period}（披露 {read.published_on}，源 {read.source}）"
+        f"{read.period} {kind}（披露 {read.published_on}，源 {read.source}）"
         if read.published_on
-        else f"{read.period}（无披露日，源 {read.source}）"
+        else f"{read.period} {kind}（无披露日，源 {read.source}）"
     )
     return (
         f"{head}  ROE {_ratio(read.roe)}  营收 {_signed(read.revenue_yoy)}"
         f"  利润 {_signed(read.profit_yoy)}  股息率 {_ratio(read.dividend_yield)}"
     )
+
+
+def _is_year_end(day) -> bool:
+    return day is not None and day.month == 12 and day.day == 31
 
 
 def _valuation_line(read) -> str:
@@ -112,6 +138,12 @@ def _valuation_line(read) -> str:
 
 def _fundamentals_warnings(read) -> list[str]:
     out = []
+    if read.interim_period is not None:
+        out.append(
+            f"⚠ 库里另有更新的一期 {read.interim_period}（ROE {_ratio(read.interim_roe)}，"
+            f"披露 {read.interim_published_on}）未用于 PR：那个 ROE 是该期累计值，"
+            f"与 PE(TTM) 的十二个月不同周期（要用它：`--roe-basis {ROE_BASIS_LATEST}`）"
+        )
     if read.dropped_unpublished:
         out.append(
             f"⚠ 另有 {read.dropped_unpublished} 行没有披露日、未被采信（D61）："
@@ -122,7 +154,7 @@ def _fundamentals_warnings(read) -> list[str]:
             f"⚠ 那个市值来自报告期 {read.period} 那一行（没有按日估值可配）："
             "它不是截至日当天的市值（D60）"
         )
-    if read.pr.basis == "pb_estimate":
+    if read.pr.basis == BASIS_PB_ESTIMATE:
         out.append(
             "⚠ 这一支的 PR 里嵌了一个人为的 ROE 预估：它只与**同一个预估**下的数可比，"
             "不能与 PE 那一支的 PR 直接排序"
@@ -171,6 +203,13 @@ def _fundamentals_payload(read, code: int) -> dict:
         "source": read.source,
         "valuation_source": read.valuation_source,
         "dropped_unpublished": read.dropped_unpublished,
+        # D62：分母是哪一种周期，是这个数可不可比的前提，脚本侧必须能读到它
+        "roe_basis": read.roe_basis,
+        "interim_period": str(read.interim_period) if read.interim_period else None,
+        "interim_roe": read.interim_roe,
+        "interim_published_on": (
+            str(read.interim_published_on) if read.interim_published_on else None
+        ),
         "pr": {
             "value": read.pr.value,
             "basis": read.pr.basis,
@@ -179,6 +218,7 @@ def _fundamentals_payload(read, code: int) -> dict:
             "reason": read.pr.reason or read.pr.explain(),
         },
         "caliber": caliber_note(),
+        "basis_note": roe_basis_note(read.roe_basis),
     }
 
 

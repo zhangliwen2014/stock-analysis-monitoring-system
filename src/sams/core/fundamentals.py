@@ -107,3 +107,37 @@ def caliber_note() -> str:
         "口径：比率列一律小数（0.20 = 20%），PE/PB 是倍数，金额是本币原值；"
         "ROE 按报告期、PE/PB 按交易日，两个粒度各取各的截至日"
     )
+
+
+#: PR 的分母用哪一期 ROE（D62）。这一对拼写只有一个出处：命令行、仓库的 SQL、
+#: 屏幕上的说明都引用它，漏改任何一处的症状都是「说明与算式不是同一个口径」。
+ROE_BASIS_ANNUAL = "annual"
+ROE_BASIS_LATEST = "latest"
+ROE_BASIS = (ROE_BASIS_ANNUAL, ROE_BASIS_LATEST)
+
+#: `MarketProfitRatio.basis` 的三个取值（D59）。词表放 core 而不是 analysis：命令行要按
+#: 它分支措辞，而分层守卫不许 `cli` import `analysis`——把名单挪到 analysis 里等于
+#: 让每个打印方自己重打一遍字符串，打错的那一处不会报错，只会把话说反。
+BASIS_PE = "pe"
+BASIS_PB_ESTIMATE = "pb_estimate"
+BASIS_REFUSED = "refused"
+
+
+def roe_basis_note(basis: str) -> str:
+    """跟着 PR 出门的第二句口径话：分母那一期的**周期长度**。
+
+    为什么单独立一条：源的 `ROEJQ` 是该期累计加权 ROE（Q1 是三个月、H1 是六个月），
+    而 PE(TTM) 是滚动十二个月。实测 601088 在 PE≈20 不变时，按最新一期能给到
+    PR=8.41（Q1）与 3.51（H1），按年报是 ~1.6——那个数主要在读「最近报的是哪个季度」。
+    不说清这一条，`PR ≤ 0.4` 的排序就把「reporting 日历」当成了「便宜」。
+    """
+    if basis == ROE_BASIS_ANNUAL:
+        return (
+            "分母口径：ROE 取最新已披露年报（12-31 那一报告期）的加权值——十二个月，"
+            "与 PE(TTM) 同周期；年报尚未披露时用的是上一份年报，可能滞后近一年"
+        )
+    return (
+        "分母口径：ROE 取最新已披露一期的累计加权值——季报是三个月、半年报是六个月，"
+        "而 PE(TTM) 是十二个月：这个 PR 会随最近报的是哪个季度而跳动，"
+        "不能与年报口径的 PR 放在一篮子里排序"
+    )
