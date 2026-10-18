@@ -22,6 +22,7 @@ from sams.services.accounts import AccountService
 from sams.services.analysis import AnalysisService
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
+from sams.services.fundamentals import FundamentalService, FundamentalSyncService
 from sams.services.health import HealthService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
@@ -32,6 +33,7 @@ from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
+from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -67,6 +69,11 @@ class Container:
     bars: BarRepo
     corp_actions: CorpActionRepo
     corp_actions_coverage: CorpActionsCoverageRepo
+    # 三个基本面仓库带 `_store`：`container.financials` 与 `container.fundamentals`
+    # 只差一个后缀，而一个是仓库、一个是读取用例，混用的代价是读代码的人猜
+    financials_store: FinancialRepo
+    valuation_store: ValuationRepo
+    flow_store: FundingFlowRepo
     watchlists: WatchlistRepo
     calendar_store: CalendarRepo
     source_health: SourceHealthRepo
@@ -76,6 +83,8 @@ class Container:
     calendar: CalendarService
     sync: SyncService
     corp_action_sync: CorpActionSyncService
+    fundamental_sync: FundamentalSyncService
+    fundamentals: FundamentalService
     analysis: AnalysisService
     health: HealthService
     source_admin: SourceAdminService
@@ -154,6 +163,9 @@ def build_container(
     sessions = SessionRepo(database, clock)
     corp_actions = CorpActionRepo(database)
     corp_actions_coverage = CorpActionsCoverageRepo(database)
+    financials_store = FinancialRepo(database)
+    valuation_store = ValuationRepo(database)
+    flow_store = FundingFlowRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
 
@@ -172,6 +184,9 @@ def build_container(
         bars=bars,
         corp_actions=corp_actions,
         corp_actions_coverage=corp_actions_coverage,
+        financials_store=financials_store,
+        valuation_store=valuation_store,
+        flow_store=flow_store,
         watchlists=WatchlistRepo(database),
         calendar_store=calendar_store,
         source_health=source_health,
@@ -184,6 +199,10 @@ def build_container(
         corp_action_sync=CorpActionSyncService(
             registry, corp_actions, corp_actions_coverage, clock=clock
         ),
+        fundamental_sync=FundamentalSyncService(
+            registry, financials_store, valuation_store, flow_store
+        ),
+        fundamentals=FundamentalService(financials_store, valuation_store, clock=clock),
         analysis=AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )
