@@ -71,7 +71,13 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
     assert entries["akshare_hk"].capabilities == ("corp_actions",)
     assert entries["akshare_ths"].capabilities == ("corp_actions",)
     assert entries["tencent"].capabilities == ("daily_bars",)
-    assert entries["akshare"].capabilities == ("daily_bars", "corp_actions")
+    assert entries["akshare"].capabilities == (
+        "daily_bars",
+        "corp_actions",
+        "financials",
+        "valuation",
+        "funding_flow",
+    ), "A 股主源现在是五种数据都能给：加一个方法就多一种能力，这里跟着动，别处不用改"
 
 
 def test_registering_exposes_the_implementations_own_markets():

@@ -3,12 +3,19 @@
 盘中快照在 M3 接入，届时新增 SnapshotAdapter 协议而不是往本类里塞方法——
 保持「一个类一个职责」。公司行为挂在同一个类上则是另一回事：它和日线是同一个源的
 两种能力（D38），拆成两个 kind 会让「yfinance 挂了」变成两条互不相干的告警。
+
+估值（`valuation`）在这里只是**当日一行**的快照，理由与它不给 `financials` 是同一个，
+两条都写在 `datasource/test_yfinance_valuation.py` 的模块文档里：Yahoo 给不出
+「这一期是什么时候公开的」，而 D61 的 PIT 闸门只认披露日。
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import date, timedelta
+import logging
+from collections.abc import Callable, Mapping
+from datetime import date, datetime, timedelta
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -20,7 +27,10 @@ from sams.datasource.base import (
     normalize_bars,
     parses_as_date,
 )
+from sams.datasource.fundamentals import normalize_valuation
 from sams.datasource.sources import source
+
+logger = logging.getLogger("sams.datasource")
 
 #: 标准列 → 源列（yfinance 首字母大写）。
 #: 这里刻意不映射 amount：`Ticker.history()` 不提供成交额，写个假列名只会让
@@ -89,6 +99,54 @@ def normalize_history(frame, *, market: str, code: str) -> pl.DataFrame:
         source="yfinance",
         column_map=COLUMN_MAP,
     )
+
+
+#: `Ticker.info` 里能直接当「今天的倍数/市值」用的键。`dividendYield` **刻意不在内**：
+#: 它的单位在 Yahoo/yfinance 版本之间漂移过（0.52 是 0.52% 还是 52%），本机被限流无法实测，
+#: 而一个未核实的比率口径进库的后果是那一列静默差一百倍（D58）。留 null，读取侧会说明。
+VALUATION_KEYS = {"pe_ttm": "trailingPE", "pb": "priceToBook", "market_cap": "marketCap"}
+#: 快照日期先折算成交易所当地日历日（`snapshot_date`），归一层看到的只是一个日期列
+SNAPSHOT_DATE_COLUMN = "snapshotDate"
+VALUATION_MAP = {"date": SNAPSHOT_DATE_COLUMN, **VALUATION_KEYS}
+_TIMEZONE_KEY = "exchangeTimezoneName"
+
+
+def yfinance_info(symbol: str) -> Mapping[str, Any]:
+    """真实网络调用：某只票的当前概况（含 trailingPE/priceToBook/marketCap）。
+
+    走 `Ticker.info` 而不是 `fast_info`：后者不给市值之外的比率的日期线索，而这一条链
+    必须要知道「这个 PE 属于哪一个交易日」。
+    """
+    import yfinance as yf
+
+    return yf.Ticker(symbol).info
+
+
+def snapshot_date(info: Mapping[str, Any]) -> date:
+    """这份快照属于**哪一个交易日**：交易所当地的日历日。
+
+    两个坑，都只可能安静地错：采集日（周末跑同步会把周五的估值写成周六），
+    以及 UTC 日（美东下午的快照在 UTC 已经是次日——`corp_actions` 那条同一形状的坑）。
+    时间戳不带时区时直接拒绝：这一列猜错一天，按日 PE 序列就整段平移，M2-D 的分位跟着偏。
+    """
+    stamp = info.get("regularMarketTime")
+    tz_name = info.get("exchangeTimezoneName")
+    if stamp is None or tz_name is None:
+        raise EmptyResponse(
+            "yfinance",
+            f"估值快照里没有时区信息（regularMarketTime={stamp!r}、"
+            f"{_TIMEZONE_KEY}={tz_name!r}），无法确定它属于哪个交易日",
+        )
+    zone = ZoneInfo(str(tz_name))
+    if hasattr(stamp, "tzinfo"):
+        moment = stamp.to_pydatetime() if hasattr(stamp, "to_pydatetime") else stamp
+        if moment.tzinfo is None:
+            raise EmptyResponse("yfinance", "估值快照的时间戳不带时区，猜不出当地是几号")
+        return moment.astimezone(zone).date()
+    try:
+        return datetime.fromtimestamp(float(stamp), zone).date()
+    except (TypeError, ValueError, OSError) as exc:
+        raise EmptyResponse("yfinance", f"估值快照的时间戳读不出来：{stamp!r}") from exc
 
 
 def yfinance_actions(symbol: str):
@@ -198,9 +256,11 @@ class YfinanceAdapter:
         self,
         fetch: Callable[[str, date, date], object] = yfinance_fetch,
         actions_fetch: Callable[[str], object] = yfinance_actions,
+        info_fetch: Callable[[str], Mapping[str, Any]] = yfinance_info,
     ) -> None:
         self._fetch = fetch
         self._actions_fetch = actions_fetch
+        self._info_fetch = info_fetch
 
     def daily_bars(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         if market not in self.markets:
@@ -232,4 +292,46 @@ class YfinanceAdapter:
             raise classify_error(self.name, exc) from exc
 
 
-source("yfinance", note="yfinance 港美股日线 + 公司行为（Yahoo）")(YfinanceAdapter)
+    def valuation(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+        """当日一行的估值快照：`Ticker.info` 是快照不是序列。
+
+        只给一行意味着它填不进 M2-D 要的「PE 历史分位」——那句话写在模块文档里，
+        不写在这里假装能力更多。`percent_columns=()`：倍数不参与 ÷100（D58），
+        而股息率那一列压根不映射（单位未核实），进库即 null。
+        """
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        symbol = code_in_market(market, code)
+        try:
+            info = self._info_fetch(symbol)
+            if not isinstance(info, Mapping):
+                raise FieldDrift(
+                    "yfinance",
+                    f"{market} {code} 的估值概况不是键值结构（拿到 {type(info).__name__}）："
+                    "接口改版或被代理页拦下，这一页读不出任何倍数",
+                )
+            row = {SNAPSHOT_DATE_COLUMN: snapshot_date(info)}
+            row.update({key: info.get(key) for key in VALUATION_KEYS.values()})
+            if all(row.get(key) is None for key in VALUATION_KEYS.values()):
+                # 一个数都没有的一行不是「这只票没估值」，是这一页没读到东西：
+                # 写成 0 行会让降级链把它当成一次可信的「查无记录」并落下覆盖确认（D43）
+                raise EmptyResponse(
+                    "yfinance",
+                    f"{market} {code} 的估值概况里 trailingPE/priceToBook/marketCap 全为空",
+                )
+            frame = normalize_valuation(
+                pl.DataFrame([row]),
+                market=market,
+                code=code,
+                source=self.name,
+                column_map=VALUATION_MAP,
+                percent_columns=(),
+            )
+            return frame.filter(pl.col("date").is_between(start, end))
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
+
+source("yfinance", note="yfinance 港美股日线 + 公司行为 + 当日估值快照（Yahoo）")(YfinanceAdapter)
