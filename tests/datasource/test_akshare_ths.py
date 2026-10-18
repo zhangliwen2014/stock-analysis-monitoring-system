@@ -210,7 +210,7 @@ def test_the_adapter_is_registered_with_only_the_actions_capability():
     """能力决定它能不能被算成 A 股日线的备源（D38）：它拉不到价格。"""
     entry = catalog().by_kind()["akshare_ths"]
     assert entry.markets == frozenset({"A"})
-    assert entry.capabilities == ("actions",)
+    assert entry.capabilities == ("corp_actions",)
 
 
 def test_a_full_history_answer_is_not_sliced_to_the_window():

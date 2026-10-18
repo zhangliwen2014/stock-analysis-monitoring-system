@@ -21,6 +21,7 @@ from typing import Any
 
 from sams.core.errors import DatasourceError
 from sams.datasource.base import BarAdapter
+from sams.datasource.capabilities import CAPABILITIES, provided_by
 
 #: 本包里的基础设施模块，不是适配器，不参与自动发现。
 #: `*_actions.py` 是纯解析件：能力（`CorpActionAdapter`）由适配器类实现，注册表按 kind
@@ -28,6 +29,7 @@ from sams.datasource.base import BarAdapter
 _NOT_ADAPTERS = frozenset(
     {
         "base",
+        "capabilities",
         "registry",
         "ratelimit",
         "sources",
@@ -49,8 +51,9 @@ class SourceEntry:
     options: tuple[str, ...] = ()
     note: str = ""
     module: str = ""
-    #: 这个实现提供的能力（D38）：`bars` / `actions`。路由按它跳过缺能力的源，
-    #: 管理后台按它回答「为什么这个源在公司行为链上不发挥作用」
+    #: 这个实现提供的数据种类（D38），键取自 `datasource.capabilities.CAPABILITIES`：
+    #: `daily_bars` / `corp_actions`。路由按它跳过缺能力的源，管理后台按它回答
+    #: 「为什么这个源在公司行为链上不发挥作用」
     capabilities: tuple[str, ...] = ()
 
 
@@ -68,12 +71,12 @@ def source(kind: str, *, options: tuple[str, ...] = (), note: str = "") -> Calla
         markets = frozenset(getattr(cls, "markets", ()))
         if not markets:
             raise DatasourceError("sources", f"{cls.__name__} 未声明 markets，无法注册为数据源")
-        if not callable(getattr(cls, "daily_bars", None)) and not callable(
-            getattr(cls, "corp_actions", None)
-        ):
+        offered = provided_by(cls)
+        if not offered:
             raise DatasourceError(
                 "sources",
-                f"{cls.__name__} 既没有 daily_bars 也没有 corp_actions：注册进来也谁都路由不到",
+                f"{cls.__name__} 不提供任何一种数据（已登记的种类: "
+                f"{', '.join(CAPABILITIES)}）：注册进来也谁都路由不到",
             )
         _validate_options(cls, options)
         _REGISTRY[kind] = SourceEntry(
@@ -83,20 +86,11 @@ def source(kind: str, *, options: tuple[str, ...] = (), note: str = "") -> Calla
             options=options,
             note=note,
             module=cls.__module__.rsplit(".", 1)[-1],
-            capabilities=_capabilities(cls),
+            capabilities=provided_by(cls),
         )
         return cls
 
     return decorate
-
-
-def _capabilities(cls: type) -> tuple[str, ...]:
-    found = []
-    if callable(getattr(cls, "daily_bars", None)):
-        found.append("bars")
-    if callable(getattr(cls, "corp_actions", None)):
-        found.append("actions")
-    return tuple(found)
 
 
 def _validate_options(cls: type, options: tuple[str, ...]) -> None:

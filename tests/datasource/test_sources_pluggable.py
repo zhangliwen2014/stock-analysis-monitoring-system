@@ -68,10 +68,10 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
     公司行为的源算成日线的备源，管理后台也就允许摘掉最后一个能拉价格的源。
     """
     entries = catalog().by_kind()
-    assert entries["akshare_hk"].capabilities == ("actions",)
-    assert entries["akshare_ths"].capabilities == ("actions",)
-    assert entries["tencent"].capabilities == ("bars",)
-    assert entries["akshare"].capabilities == ("bars", "actions")
+    assert entries["akshare_hk"].capabilities == ("corp_actions",)
+    assert entries["akshare_ths"].capabilities == ("corp_actions",)
+    assert entries["tencent"].capabilities == ("daily_bars",)
+    assert entries["akshare"].capabilities == ("daily_bars", "corp_actions")
 
 
 def test_registering_exposes_the_implementations_own_markets():

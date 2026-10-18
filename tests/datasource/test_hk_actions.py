@@ -218,7 +218,7 @@ def test_the_adapter_refuses_a_market_it_does_not_serve():
 def test_the_source_is_registered_as_actions_only():
     """路由与备源判据都读这个能力标记（D38），所以它是契约不是实现细节。"""
     entry = known()["akshare_hk"]
-    assert entry.capabilities == ("actions",)
+    assert entry.capabilities == ("corp_actions",)
     assert not hasattr(AkshareHkAdapter(), "daily_bars")
     assert AkshareHkAdapter.corp_actions_full_history is True
 

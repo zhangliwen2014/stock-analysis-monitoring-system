@@ -433,3 +433,58 @@ def test_a_window_scoped_source_cannot_corroborate_a_full_history_claim():
         ActionsAdapter("sina", outcome=empty_actions(), full_history=False),
     )
     assert reg.fetch_actions("A", "600000", D1, D2).full_history is False
+
+
+# --- 降级链收敛成一份之后，两类取数的不同语义仍各归各（M2-C T-0） ----------------
+
+
+def test_the_chain_stops_at_the_first_source_that_answers():
+    """降级链不是广播：命中之后不该再敲后面的源——限速预算和延迟都在这句话里。
+
+    链收敛成 `_walk` 之后这条最容易悄悄丢：把遍历写成「先把所有源问一遍再挑」，
+    每个市场每次采集都会多出 N-1 次请求，而被跳过的源还会开始限流。
+    """
+    primary = FakeAdapter("primary", ["A"], frame("primary"))
+    backup = FakeAdapter("backup", ["A"], frame("backup"))
+    result = registry(primary, backup).fetch_daily("A", "600519", D1, D2)
+    assert result.source == "primary"
+    assert (primary.calls, backup.calls) == (1, 0)
+
+
+def test_a_zero_row_bar_frame_is_a_hit_while_a_zero_row_action_frame_is_not():
+    """同一个「0 行」在两类数据上不是同一句话（D43）。
+
+    日线的 0 行是「这个区间确实没有交易」，是一次成功的取数，直接交付；
+    公司行为的 0 行是「这只票在那张表里没有记录」，还不能写成覆盖确认，得继续问。
+    链只上报发生了什么，性质由取数种类自己定——把两个 fetcher 合并成一个的那天，
+    这两个断言会同时变红。
+    """
+    quiet_bars = FakeAdapter("sina", ["A"], frame("sina").clear())
+    reg = registry(quiet_bars, FakeAdapter("akshare", ["A"], frame("akshare")))
+    result = reg.fetch_daily("A", "600519", D1, D2)
+    assert (result.source, result.frame.height, result.empty_everywhere) == ("sina", 0, False)
+    assert (quiet_bars.calls, result.attempts[0].ok) == (1, True)
+
+    asked_actions = ActionsAdapter("sina", outcome=empty_actions())
+    actions = registry(asked_actions, ActionsAdapter("akshare")).fetch_actions(
+        "A", "601088", D1, D2
+    )
+    assert (actions.source, actions.confirmed_empty_by) == ("akshare", ())
+    assert asked_actions.calls == 1
+
+
+def test_the_same_no_answer_is_ok_for_bars_and_not_ok_for_actions():
+    """`EmptyResponse` 这个事件也一样：日线算答上了（停牌无数据），公司行为算没答上。
+
+    后者若被当成「答上了但说没有」，覆盖标记就会把「从没查过」写成「查过且没有」，
+    守卫从此对这只票放行裸价涨跌（D36 / D43 那条线上出过的错数）。
+    """
+    quiet = FakeAdapter("sina", ["A"], EmptyResponse("sina", "区间无数据"))
+    bars = registry(quiet, FakeAdapter("akshare", ["A"], frame("akshare"))).fetch_daily(
+        "A", "600519", D1, D2
+    )
+    assert bars.attempts[0].ok is True
+
+    mute = ActionsAdapter("sina", error=EmptyResponse("sina", "区间无数据"))
+    acts = registry(mute, ActionsAdapter("akshare")).fetch_actions("A", "601088", D1, D2)
+    assert acts.attempts[0].ok is False

@@ -282,7 +282,7 @@ class SourceAdminService:
     def _has_bars(self, name: str) -> bool:
         row = self.repo.get(name)
         entry = known().get(row.kind) if row else None
-        return bool(entry and "bars" in entry.capabilities)
+        return bool(entry and "daily_bars" in entry.capabilities)
 
     def _is_enabled(self, name: str) -> bool:
         row = self.repo.get(name)

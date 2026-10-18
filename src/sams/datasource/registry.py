@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -20,8 +20,9 @@ from sams.core.config import Settings
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited, TransientError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.sources import SourceHealthStore, SourceRecord
-from sams.datasource.actions import answers_full_history, empty_actions, has_actions
-from sams.datasource.base import BarAdapter, has_bars
+from sams.datasource.actions import answers_full_history, empty_actions
+from sams.datasource.base import BarAdapter
+from sams.datasource.capabilities import capability
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
 from sams.datasource.sources import known
@@ -76,6 +77,23 @@ class _SourceFailed(Exception):
         self.source = source
         self.tries = tries
         self.error = error
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """一个源在一次降级链遍历里的原始结果（见 `_walk`）。
+
+    `kind` 只描述发生了什么，不描述它意味着什么：`no_answer` 是「接口回空/解析不了」，
+    对日线算一次成功的取数（停牌）、对公司行为算「这只票还没被问清楚」（D43）——
+    那句话由调用方说，不由链说。
+    """
+
+    source: str
+    #: skipped 链上被跳过（没这个能力）| failed 调用失败 | no_answer 答不上来 | ok 拿到帧
+    kind: str
+    frame: pl.DataFrame | None = None
+    error: str | None = None
+    tries: int = 1
 
 
 @dataclass(frozen=True)
@@ -229,45 +247,78 @@ class AdapterRegistry:
         except KeyError:
             raise DatasourceError("registry", f"数据源 {name} 未注册") from None
 
-    #: 两类能力各自的判据，取数与健康检查共用（D38）
-    CAPABILITIES = {"daily_bars": has_bars, "corp_actions": has_actions}
-
     def chain_for(self, market: str, method: str) -> tuple[str, ...]:
         """链上真有这个能力的源。
 
-        缺能力的源在 `fetch_daily`/`fetch_actions` 里被跳过，所以「这个市场有几个备源」
-        必须按同一口径数：把只有公司行为的 akshare_hk 算成港股日线的备源，健康页就会在
-        「HK 只剩一个源在拉价格」的时候显示一切正常。
+        缺能力的源在降级链里被跳过，所以「这个市场有几个备源」必须按同一口径数：
+        把只有公司行为的 akshare_hk 算成港股日线的备源，健康页就会在「HK 只剩一个源在拉价格」
+        的时候显示一切正常。
         """
-        probe = self.CAPABILITIES[method]
+        probe = capability(method).probe
         return tuple(name for name in self.sources_for(market) if probe(self.adapter(name)))
+
+    def _walk(
+        self, market: str, code: str, start: date, end: date, *, method: str
+    ) -> Iterator[_Outcome]:
+        """按路由顺序逐源取一次数，把每个源的结果**原样**上报，由调用方定性质。
+
+        链只知道四件事：谁没这个能力、谁调用失败、谁正常应答但没有行、谁给了行。
+        「没有行」是什么后果属于取数种类：日线的 0 行是停牌或区间过短，是一次成功的取数；
+        公司行为的 0 行还不能写成「这只票没分过红」（D43）。把判定放进链里，
+        第三种数据（基本面）一进来就得在链里加一个 if，而那两个 if 会开始互相打架。
+
+        生成器在调用方 `return` 时就停止推进——链上排在命中源之后的那些**不会被调用**，
+        这与收敛前逐字一致（多打一次网络请求是行为改变，不是重构）。
+        成功标记也交给调用方：同样一次「0 行」，日线算成功、公司行为不算，
+        链没有立场替它们决定这个源这次表现如何。
+        """
+        cap = capability(method)
+        for name in self.sources_for(market):
+            adapter = self.adapter(name)
+            if not cap.probe(adapter):
+                logger.info("%s 跳过 %s（%s %s 链上没有这个能力）", cap.label, name, market, code)
+                yield _Outcome(name, "skipped", error=cap.lacking)
+                continue
+            try:
+                frame = self._call(name, market, code, start, end, method=method)
+            except _SourceFailed as failed:
+                yield _Outcome(name, "failed", error=failed.error, tries=failed.tries)
+                continue
+            except EmptyResponse as exc:
+                yield _Outcome(name, "no_answer", error=str(exc))
+                continue
+            yield _Outcome(name, "ok", frame=frame)
 
     def fetch_daily(self, market: str, code: str, start: date, end: date) -> FetchResult:
         attempts: list[Attempt] = []
         skipped: list[tuple[str, str]] = []
         empties: list[str] = []
-        for name in self.sources_for(market):
-            if not has_bars(self.adapter(name)):
-                skipped.append((name, "不提供日线"))
-                logger.info("日线跳过 %s（%s %s 链上没有这个能力）", name, market, code)
+        for out in self._walk(market, code, start, end, method="daily_bars"):
+            if out.kind == "skipped":
+                skipped.append((out.source, out.error))
                 continue
-            try:
-                frame = self._call(name, market, code, start, end)
-            except _SourceFailed as failed:
-                attempts.append(Attempt(failed.source, False, failed.tries, failed.error))
+            if out.kind == "failed":
+                attempts.append(Attempt(out.source, False, out.tries, out.error))
                 continue
-            except EmptyResponse as exc:
-                empties.append(name)
-                attempts.append(Attempt(name, True, 1, f"无数据: {exc}"))
+            if out.kind == "no_answer":
+                empties.append(out.source)
+                attempts.append(Attempt(out.source, True, 1, f"无数据: {out.error}"))
                 continue
-            self._mark_ok(name)
-            attempts.append(Attempt(name, True))
-            return FetchResult(market, code, frame, name, tuple(attempts), tuple(skipped))
+            self._mark_ok(out.source)
+            attempts.append(Attempt(out.source, True))
+            return FetchResult(
+                market, code, out.frame, out.source, tuple(attempts), tuple(skipped)
+            )
 
         if empties:
             return FetchResult(
-                market, code, EMPTY_BARS, empties[0],
-                tuple(attempts), tuple(skipped), empty_everywhere=True,
+                market,
+                code,
+                EMPTY_BARS,
+                empties[0],
+                tuple(attempts),
+                tuple(skipped),
+                empty_everywhere=True,
             )
         detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
         raise DatasourceError("registry", f"{market} {code} 所有源均失败 → {detail}")
@@ -288,36 +339,37 @@ class AdapterRegistry:
         skipped: list[tuple[str, str]] = []
         empties: list[tuple[str, bool]] = []
         unanswered: list[str] = []
-        for name in self.sources_for(market):
-            adapter = self.adapter(name)
-            if not has_actions(adapter):
-                skipped.append((name, "不提供公司行为"))
-                logger.info("公司行为跳过 %s（%s %s 链上没有这个能力）", name, market, code)
+        for out in self._walk(market, code, start, end, method="corp_actions"):
+            if out.kind == "skipped":
+                skipped.append((out.source, out.error))
                 continue
-            try:
-                frame = self._call(name, market, code, start, end, method="corp_actions")
-            except _SourceFailed as failed:
-                attempts.append(Attempt(failed.source, False, failed.tries, failed.error))
-                unanswered.append(name)
+            if out.kind == "failed":
+                attempts.append(Attempt(out.source, False, out.tries, out.error))
+                unanswered.append(out.source)
                 continue
-            except EmptyResponse as exc:
+            if out.kind == "no_answer":
                 # 源连「没有」这句话都没说清（接口回空/解析不了）：不能替它写成查过（D36）
-                attempts.append(Attempt(name, False, 1, f"无数据: {exc}"))
-                unanswered.append(name)
-                logger.info("公司行为 %s 回答无数据（%s %s），换源", name, market, code)
+                attempts.append(Attempt(out.source, False, 1, f"无数据: {out.error}"))
+                unanswered.append(out.source)
+                logger.info(
+                    "公司行为 %s 回答无数据（%s %s），换源", out.source, market, code
+                )
                 continue
-            if frame.height == 0:
-                empties.append((name, answers_full_history(adapter)))
-                attempts.append(Attempt(name, True, 1, "查无记录"))
-                logger.info("公司行为 %s 说 %s %s 查无记录，继续问下一个源", name, market, code)
+            adapter = self.adapter(out.source)
+            if out.frame.height == 0:
+                empties.append((out.source, answers_full_history(adapter)))
+                attempts.append(Attempt(out.source, True, 1, "查无记录"))
+                logger.info(
+                    "公司行为 %s 说 %s %s 查无记录，继续问下一个源", out.source, market, code
+                )
                 continue
-            self._mark_ok(name)
-            attempts.append(Attempt(name, True))
+            self._mark_ok(out.source)
+            attempts.append(Attempt(out.source, True))
             return ActionsResult(
                 market,
                 code,
-                frame,
-                name,
+                out.frame,
+                out.source,
                 tuple(attempts),
                 tuple(skipped),
                 answers_full_history(adapter),
