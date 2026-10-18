@@ -251,9 +251,50 @@ verdict 是「**谨慎用**」：9 个真实区间的对账全部对齐，数字
 「4 个开市日没有 K 线（07-16/17/18 等）＋1 天休市」，仍然 3；`--code 000001` ⇒ 「主档里也没有这个代码」；
 `--start 2024-09-01` ⇒ 「全库有 11 根，最新到 2024-07-15」。离线 `uv run pytest -q` 1000 passed / 8 deselected。
 
+**A-7 第五轮：同一道闸再走一遍，查的是「归一为什么还会漏」** ✅
+
+上一轮的 D46 把市场名归一放在**服务边界**，第五轮三个 agent 一致指出那是错的层：主键形态的正确性
+于是取决于「调用方走没走那条路」。全部先写复现用例再修，一条一条列在这里：
+
+| # | 症状（能复现的那句） | 处置 |
+|---|---|---|
+| 1 | 对抗 + 架构师：仓库层原样收下 `market`——`WatchlistRepo.add(user, "a", "601088")` 把 `a` 直接写进主键（那一层只归一了 code；自选清单的命令行要到 M5 才接上，所以这条路今天只有调用方能走）。那一行在清单里看得见、行情按 `A` 查 ⇒ 覆盖确认查出 0 行，输出「首尾之间没有除权日」并照实用裸价出一个**错数**而不是报错；D37 也抓不住（4% 的派息跳变在 15% 阈值之下） | **D50**：主键的形态由**定义主键的那一层**保证，不该取决于哪个调用方记得归一。`bars_daily`/`symbols`/`corp_actions`/`corp_actions_coverage`/`watchlists`/`trading_calendar`/`data_source_routes` 七个仓库的写侧归一 `market` 与 code 形态，读侧用同一条规则处理入参（`_form()` / `canonical_market()`）；D46 降为第二重。实测本机库 18 张带 `market`、13 张带 `code` 的表都没有非规范行 ⇒ **不做一次性迁移** |
+| 2 | 架构师：写侧大写了键、读侧还按调用方给的原样查——这比第 1 条更隐蔽，因为修了一半的归一看起来像修完了 | 每个仓库的读方法（`bars.get/latest_date/load/count`、`symbols.get/list_market`、`corp_actions.list_for`、`calendar.get/known_status/trading_days/year_covered/source_of`）都先归一再进 SQL；`test_bars_symbols.py` 与 `test_d50_*.py` 逐仓库钉住 |
+| 3 | 架构师：`CalendarService` 的 providers 按原样字符串 key，配置里同时写 `a` 与 `A` 时后一条静默盖掉前一条；CLI 的 `calendar show/refresh --market a` 也照原样回显，人以为铺开的是另一个市场 | 构造时先 `canonical_market` 再建映射，撞车 ⇒ `CalendarSourceError`（点名两个形态）；`provider()/refresh()/day()/known_status()/gap()` 入口各归一；`cli/calendar.py` 打印归一后的形态（回显即归一，D46 的那条规矩） |
+| 4 | 交易员：Ctrl-C 打一次 `sync`，降级链把 `KeyboardInterrupt` 当成「这个源坏了，换下一个」，于是中断要等整条链每个源都试完才生效，还把一次取消记成源故障、扣掉那个源的降级计数 | `datasource/registry.py` 的兜底从 `BaseException` 收窄到 `Exception`（`# noqa: BLE001` 说明为什么）；`test_interrupt_is_not_a_source_failure` 断言备源 `calls == 0` 且健康里 `ok is None`（**从没被路由过**，不是 `ok=False`） |
+| 5 | 交易员：缺口区间怎么算、哪一堆缺口该升级成退出码 3，全写在 `cli/analysis.py` 里——命令行自己算了两次区间算术 | 判定挪出命令行：`core/timeutil.gap_days()`（纯日期算术）+ `services/calendar.GapKinds`（按开市/休市/未知分堆）+ `CalendarService.gap()`（`known_status` 判不了的那一堆不能替它担保），**`matters` 就是那道判定**；CLI 只措辞、只换成退出码 |
+| 6 | 架构师：`storage/repos/corp_actions._TOL` 与 `datasource/akshare_actions._TOLERANCE` 数字都是 0.005 而量的是两件事（前者比两个源的意见，后者比同一条记录里文本与数值是否自洽），改一个容易被「顺手同步」改掉 | 两处各加一条互指注释：数字相同是巧合，语义不同，改一个不必动另一个 |
+| 7 | 我自己在上一轮写下的注释与文档断言了一条**不存在的机制**（「`sams source add --markets a` 会种出一条小写路由」）——实际走不到：`services/sources.py` 的市场成员检查先把 `a` 判成「实现不支持」并抛错。同一轮里我还把第 1 条写成「`sams watch add` 敲出来的」，而 CLI 至今没有 `watch` 命令 | 注释与 docstring 全部改成**能当场验的那条路径**：仓库层的 `WatchlistRepo.add` 收小写 `market`（第 1 条）。**在注释里断言一条错误的机制，和在有缺陷的代码里工作是完全同一类问题**：下一轮 agent 会照它去修，而那里没有东西可修 |
+| 8 | 交易员 + 架构师：打印的口径声明写着「现金到手不再投资」，而产出那个数的算式是因子法——它在数学上就是按除权参考价把分红买回该股 | **D48**：改文案而不是改算式（锚点是交易所公布的当日参考价，那是唯一的外部证据）。单测把两个口径各算一遍钉住：601088 2024-07-01~07-15 再投资 `−1.4413%`、现金到手 `−1.3914%`；只取除权日当天给出 `+1.2605%` = 交易所公布值。要不要并排打第二个数 ⇒ **U22** |
+| 9 | 交易员：采集完成后的第二天，一段 2024 年的窗口从「给数」变成「拒绝出数」——那段区间的除权记录一条都没变，变的只是时钟 | **D49**：`is_covered()` 只问请求窗口落在确认区间内，`covered_to` 语义改为「查到哪一天为止」而非「哪一天作废」；换来的诚实是 `covered_through` 随数出行（`AdjustedSeries` → `IntervalReturn` → CLI「记录截至 …」）。何时该重新问源，归 M3/M4 的同步调度（修订 D36） |
+| 10 | 架构师：`analysis` 层的守卫与 `services` 层各存一份「这段有没有除权记录」的判断，而 `hfq_frame` 那条不过闸的裸原语只靠 docstring 约束 | `tests/test_layering.py::SOLE_CONSUMER` 白名单随 D44/D50 的新读路径一并复核收紧；`analysis` 仍只依赖 `core` |
+
+**第五轮之后新增的债**：spec §18 **U22**（现金到手口径要先定送转/配股的语义才谈并排打印）。
+
+实测验收（本机真实网络，库为本机 `data/sams.duckdb` 的一份副本，命令行只读数）：
+`--market a` 与 `--market A` 给**同一个数**（601088 2024-07-01~07-15 ⇒ 复权 −1.44% / 裸价 −6.38%），
+口径那行现在写「按除权参考价再投资……与交易所公布的当日涨跌幅同一算法」并明说「现金到手」那个数
+这里不给（D48）；采信那行末尾带着「覆盖确认：akshare，记录截至 2026-10-17」（D49 换来的可审计性）；
+`2024-07-05~07-08` ⇒ **+1.26%**（交易所公布的除权日涨跌幅）；
+`2024-07-01~07-20` ⇒ 同一对锚点出数、明说算的是 07-01~07-15、缺口 5 天里「4 个开市日没有 K 线
+（07-16/17/18 等）＋1 天休市」，以 **3** 结尾（分堆与判定已在 `CalendarService.gap()`，命令行只措辞）；
+`--market HK --code 700 --start 2025-05-15` ⇒ 拒绝并说明「全库有 59 根，最新到 2023-03-01」——本机这份
+库里 00700 只铺到 2023 年（第三轮那句 2025-05 的对账数不是在现在这份库里取的）；同一段用 `700` 与
+`00700` 敲，得到同一条拒绝，而 `2022-12-01~2023-03-01` 仍按 D39 拒绝（实物分派 `kind=unknown`）。离线 `uv run pytest -q` **1021 passed / 8 deselected**，
+`uv run ruff check .` 全绿。
+
 ### B 块：指标引擎（§8.2）
 
-- [ ] `indicators.py` 全部为纯函数（输入 `pl.DataFrame`，输出带新列的帧），入口拒绝未复权序列
+先写死的三条约束（A 块这几轮的成果，别让 B 块重新踩）：
+
+- **指标不许自己建读路径**：唯一取数出口是 `AnalysisService`（D44 的那三个事实一起进同一个闸）。
+  绕过它去调 `bars.load` + `corp_actions.list_for`，等于把守卫变成装饰——第四轮已经为此收紧过分层。
+- **入口类型是 `AdjustedSeries`，不是 `pl.DataFrame`**：否则「拒绝未复权序列」这句只能靠自觉，
+  而 `hfq_frame` 的存在证明自觉靠不住（要靠 `SOLE_CONSUMER` 机器校验）。
+- **先给 U20 那条序列出口定形**：`sams analysis series` 与指标共用同一条取数路径，列名与窗口语义
+  在这一步定下来，不要各自发明。
+
+- [ ] `indicators.py` 全部为纯函数（输入已复权序列，输出带新列的帧），入口拒绝未复权序列
 - [ ] 黄金样例：MA/MACD/RSI/ATR 与手算/已知值逐位对齐；KDJ/DMI/CCI/WR 至少一条与公开样例对齐
 - [ ] `resample.py`：周/月 K 由日线现算（周五收市口径、非交易日跳过），不入库
 - [ ] **反未来函数专项**（spec §13）：篡改 T+1 及之后数据，T 日每个指标逐位不变；盘中未完成 K 线参与计算时结果带 `intraday=true` 标记
