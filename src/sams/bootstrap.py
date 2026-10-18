@@ -24,6 +24,7 @@ from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
 from sams.services.health import HealthService
+from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
 from sams.storage.db import Database
@@ -34,6 +35,7 @@ from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -74,6 +76,7 @@ class Container:
     financials_store: FinancialRepo
     valuation_store: ValuationRepo
     flow_store: FundingFlowRepo
+    scan_store: ScanResultRepo
     watchlists: WatchlistRepo
     calendar_store: CalendarRepo
     source_health: SourceHealthRepo
@@ -85,6 +88,7 @@ class Container:
     corp_action_sync: CorpActionSyncService
     fundamental_sync: FundamentalSyncService
     fundamentals: FundamentalService
+    screen: ScreenService
     analysis: AnalysisService
     health: HealthService
     source_admin: SourceAdminService
@@ -166,6 +170,7 @@ def build_container(
     financials_store = FinancialRepo(database)
     valuation_store = ValuationRepo(database)
     flow_store = FundingFlowRepo(database)
+    scan_store = ScanResultRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
 
@@ -187,6 +192,7 @@ def build_container(
         financials_store=financials_store,
         valuation_store=valuation_store,
         flow_store=flow_store,
+        scan_store=scan_store,
         watchlists=WatchlistRepo(database),
         calendar_store=calendar_store,
         source_health=source_health,
@@ -203,6 +209,9 @@ def build_container(
             registry, financials_store, valuation_store, flow_store
         ),
         fundamentals=FundamentalService(financials_store, valuation_store, clock=clock),
+        screen=ScreenService(
+            financials_store, valuation_store, symbols, scan_store, clock=clock
+        ),
         analysis=AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )

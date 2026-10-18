@@ -1,0 +1,225 @@
+"""`sams screen pr` —— 按市赚率选股。
+
+这条命令的输出**从范围开始**，不从结果开始：库里同步过基本面的票与这个市场的票数差着
+三四个数量级，而「今天一只都没命中」在这两种范围上是两件完全不同的事（前者的下一步是
+再去同步几只，后者才接近「市场不便宜」）。第一行不说这个数字，屏幕上那句话就在替人
+做一个我们没做过的普查（D60）。
+
+第二件必须出声的是**算不出 PR 的票**：`PR ≤ 0.4` 想找的正是困境反转与周期底部，而那一
+类票恰恰最容易算不出（PE 为负、只披露到季报、估值行停在两个月前）。静默丢掉它们，结果
+看起来完整，实则把这条规则最该抓的东西筛掉了——所以每一只都点名，原因里带着下一步命令。
+
+退出码只有一种非零：一只都没扫成（universe 为空）时给 1。「扫了，没有命中」是 0，
+那是这条规则给出的一条有效答案，不是失败。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import asdict
+from datetime import date
+
+from sams.bootstrap import Container
+from sams.cli.common import group, iso_date
+from sams.core.errors import ValidationError
+from sams.core.fundamentals import ROE_BASIS, ROE_BASIS_ANNUAL, caliber_note, roe_basis_note
+from sams.services.screen import PrHit
+
+PR_USAGE = "例如 0.4（PR 是小数口径的比值，不是百分数：`PR ≤ 0.4` 写 0.4）"
+
+
+def add_to(subparsers) -> None:
+    screen = group(
+        subparsers,
+        "screen",
+        "选股：把一条规则跑在一个说得清范围的票池上，算不出的票逐个点名",
+    )
+    pr = screen.add_parser(
+        "pr",
+        help="市赚率选股：PR ≤ 门槛的一篮子，按 PR 升序；没有 PR 的票带原因出门",
+    )
+    pr.add_argument("--market", required=True, help="A / HK / US")
+    pr.add_argument("--pr-max", required=True, help=f"门槛，含等号：{PR_USAGE}")
+    pr.add_argument("--codes", help="逗号分隔的代码，只在它们里面扫（默认=库里已同步基本面的全部）")
+    pr.add_argument("--as-of", help="YYYY-MM-DD，默认今天（PIT：只采信这天已披露的期）")
+    pr.add_argument(
+        "--roe-basis",
+        default=ROE_BASIS_ANNUAL,
+        choices=list(ROE_BASIS),
+        help=(
+            "PR 分母用哪一期 ROE：annual=最新已披露**年报**（默认，与 PE(TTM) 同为十二个月）"
+            f"（默认 {ROE_BASIS_ANNUAL}）"
+        ),
+    )
+    pr.add_argument(
+        "--include-estimated",
+        action="store_true",
+        help="把 PE 不为正那一支（嵌了预估 ROE）也放进同一张表排序",
+    )
+    pr.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    pr.set_defaults(handler=run_pr)
+
+
+def run_pr(container: Container, args: argparse.Namespace) -> int:
+    try:
+        threshold = _threshold(args.pr_max)
+        scan = container.screen.pr_max(
+            args.market,
+            threshold,
+            as_of=iso_date(args.as_of) if args.as_of else None,
+            codes=_codes(args.codes),
+            roe_basis=args.roe_basis,
+            include_estimated=args.include_estimated,
+        )
+    except ValidationError as exc:
+        # D57：`--json` 下参数错也是 JSON——让它冒到顶层，管道里的下游只会拿到空 stdin
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "exit": 2})
+        else:
+            print(f"参数有误：{exc}")
+        return 2
+    code = 1 if scan.universe_size == 0 else 0
+    if args.json:
+        _emit(_payload(scan, code))
+        return code
+    return _print(scan, code)
+
+
+def _threshold(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise ValidationError(f"--pr-max {value!r} 不是一个数：{PR_USAGE}") from None
+    if number <= 0:
+        raise ValidationError(f"--pr-max {value} 要的是一个正数：{PR_USAGE}")
+    return number
+
+
+def _codes(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    picked = [item.strip() for item in value.split(",") if item.strip()]
+    if not picked:
+        raise ValidationError("--codes 拆不出任何代码：逗号分隔，例如 601088,600000")
+    return picked
+
+
+def _print(scan, code: int) -> int:
+    print(
+        f"{scan.market}  市赚率选股  PR ≤ {_g(scan.threshold)}  截至 {scan.as_of}"
+        f"（按日估值旧过 {scan.stale_within_days} 天的票进「排除」，不算落选）"
+    )
+    print(f"扫描范围 {_universe_line(scan)}")
+    print(roe_basis_note(scan.roe_basis))
+    if code == 1:
+        print(
+            f"⇒ 一只都没扫成：{scan.market} 在库里没有已披露的基本面数据。"
+            "先跑 `sams sync financials --market "
+            f"{scan.market} --code <代码>`，这条命令的输入是**同步过的票**，不是全市场"
+        )
+        return code
+    print(f"命中 {len(scan.hits)} 只（按 PR 升序）：")
+    for hit in scan.hits:
+        print(f"  {_hit_line(hit)}")
+    if scan.excluded:
+        print(f"排除 {len(scan.excluded)} 只（算不出 PR，或按默认口径不与其他票同列）：")
+        for exclusion in scan.excluded:
+            print(f"  {exclusion.code}  {exclusion.reason}")
+    print(f"落选 {scan.priced_out} 只  算得出 PR、只是高于 {_g(scan.threshold)}")
+    print(caliber_note())
+    for line in _warnings(scan):
+        print(f"⚠ {line}")
+    if not scan.hits:
+        print(
+            f"⇒ 这一篮子是空的：{scan.priced_out} 只算得出 PR 但高于门槛，"
+            f"{len(scan.excluded)} 只连 PR 都算不出——空篮子不等于「市场不便宜」"
+        )
+    return code
+
+
+def _g(value: float) -> str:
+    """门槛按命令行上敲的样子打印：`0.4` 不打印成 `0.400000`。"""
+    return f"{value:g}"
+
+
+def _universe_line(scan) -> str:
+    head = f"已同步基本面的 {scan.universe_size} 只"
+    if scan.market_size is None:
+        # 票数未知时不给 0：「主档 0 只」会被读成「这个市场没有票」，真正的原因是没有票池同步命令
+        return f"{head}；这个市场主档里一行都没有，总票数未知（本系统没有全市场票池的同步入口）"
+    gap = scan.market_size - scan.universe_size
+    return (
+        f"{head}；主档 {scan.market_size} 只在市"
+        + (
+            f"——范围外的 {gap} 只先跑 `sams sync financials --market {scan.market} --code <代码>`"
+            if gap
+            else "——本次已覆盖主档里的全部"
+        )
+    )
+
+
+def _hit_line(hit: PrHit) -> str:
+    period = (
+        f"{hit.period} {'年报' if _is_year_end(hit.period) else f'{hit.period.month} 月末期'}"
+        if hit.period
+        else "无期"
+    )
+    return (
+        f"{hit.code}  PR {hit.value:.3f}  {hit.basis}  ROE {_ratio(hit.roe_used)}（{period}）"
+        f"  PE(TTM) {_number(hit.pe_ttm)}  PB {_number(hit.pb)}  估值日 {hit.valuation_on}"
+    )
+
+
+def _is_year_end(day: date | None) -> bool:
+    return day is not None and day.month == 12 and day.day == 31
+
+
+def _warnings(scan) -> list[str]:
+    if not scan.dropped_unpublished:
+        return []
+    return [
+        f"另有 {scan.dropped_unpublished} 行没有披露日、未被采信（D61）："
+        "这不等于那几期不存在，也不等于它们已经公开"
+    ]
+
+
+def _number(value) -> str:
+    return "–" if value is None else f"{value:.2f}"
+
+
+def _ratio(value) -> str:
+    """库里是小数口径，屏幕上换成百分数——这一步换算只发生在打印（D58）。"""
+    return "–" if value is None else f"{value:.2%}"
+
+
+def _payload(scan, code: int) -> dict:
+    return {
+        "status": "empty" if scan.universe_size == 0 else "ok",
+        "exit": code,
+        "market": scan.market,
+        "as_of": str(scan.as_of),
+        "threshold": scan.threshold,
+        "roe_basis": scan.roe_basis,
+        "strategy_id": scan.strategy_id,
+        "universe_size": scan.universe_size,
+        "market_size": scan.market_size,
+        "hits": [_hit_json(hit) for hit in scan.hits],
+        "excluded": [asdict(e) for e in scan.excluded],
+        "priced_out": scan.priced_out,
+        "dropped_unpublished": scan.dropped_unpublished,
+        "stale_within_days": scan.stale_within_days,
+        "caliber": caliber_note(),
+        "basis_note": roe_basis_note(scan.roe_basis),
+    }
+
+
+def _hit_json(hit: PrHit) -> dict:
+    row = asdict(hit)
+    row["period"] = str(hit.period) if hit.period else None
+    row["valuation_on"] = str(hit.valuation_on) if hit.valuation_on else None
+    return row
+
+
+def _emit(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
