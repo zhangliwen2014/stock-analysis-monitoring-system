@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from sams.core.errors import StorageError
@@ -20,6 +22,7 @@ EXPECTED_TABLES = {
     "quotes_snapshot",
     "funding_flow",
     "financials",
+    "valuation_daily",
     "indices",
     "index_constituents",
     "scan_results",
@@ -172,6 +175,84 @@ def test_upgrade_from_pre_semantics_database_with_rows(tmp_path):
                 "SELECT name, checksum FROM schema_migrations"
             ).to_dicts()
             assert all(row["checksum"] for row in recorded), "升级后每个迁移都有指纹"
+        finally:
+            upgraded.close()
+    finally:
+        if path.exists():
+            path.unlink()
+
+
+def columns_of(db, table: str) -> set[str]:
+    return set(db.query(f"DESCRIBE {table}")["column_name"].to_list())
+
+
+def test_fundamentals_schema_carries_the_three_things_pr_needs(db):
+    """市赚率要「今天的 PE」配「最近已披露那期的 ROE」（D59/D60/D61）。
+
+    这三样缺任何一样，PR 都能算但算错：没有披露日就会把 4 月才公开的报表当成
+    3 月就知道的（未来函数）；倍数没有按日那张表，就只能拿某一期里的 PE 冒充今天的。
+    """
+    assert {"report_date", "published_date", "roe", "dividend_yield"} <= columns_of(
+        db, "financials"
+    )
+    assert {
+        "market",
+        "code",
+        "date",
+        "pe_ttm",
+        "pb",
+        "dividend_yield",
+        "market_cap",
+        "source",
+    } <= columns_of(db, "valuation_daily")
+    assert "listed_on" in columns_of(db, "symbols"), "U18：上市日得有一列可写"
+
+
+def test_valuation_daily_key_is_the_trading_day_not_the_fetch_moment(db):
+    """同一天重跑采集覆盖，不同一天各留一行：这是「按日 PE」的全部含义。"""
+    sql = (
+        "INSERT OR REPLACE INTO valuation_daily"
+        " (market, code, date, pe_ttm, pb, source) VALUES ('A', '601088', ?, ?, ?, ?)"
+    )
+    db.execute(sql, [date(2024, 6, 28), 18.5, 2.1, "akshare"])
+    db.execute(sql, [date(2024, 6, 28), 18.4, 2.1, "akshare"])
+    db.execute(sql, [date(2024, 6, 27), 18.0, 2.0, "akshare"])
+    rows = db.query("SELECT * FROM valuation_daily ORDER BY date").to_dicts()
+    assert [r["pe_ttm"] for r in rows] == [18.0, 18.4]
+
+
+def test_upgrade_from_a_financials_database_keeps_existing_rows(tmp_path):
+    """带库升级到 0012：既有 financials 行不能丢，新加的披露日是 NULL 而不是 0。
+
+    0001 建的 financials 从来没有写入者，所以这条路径今天还是纯理论——但 M2-C 之后
+    它就不是了，而「新列在老行上是什么」这个问题只在升级那一刻答得清楚。
+    """
+    up_to_0011 = [p.name for p in discover() if not p.name.startswith("0012")]
+    old_dir = tmp_path / "old"
+    old_dir.mkdir()
+    for name in up_to_0011:
+        source = next(p for p in discover() if p.name == name)
+        (old_dir / name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    path = tmp_path / "prod.duckdb"
+    legacy = Database.open(path)
+    try:
+        assert apply_migrations(legacy, old_dir) == up_to_0011
+        legacy.execute(
+            "INSERT INTO financials (market, code, report_date, roe, source)"
+            " VALUES ('A', '601088', DATE '2024-03-31', 0.20, 'akshare')"
+        )
+        legacy.close()
+
+        upgraded = Database.open(path)
+        try:
+            assert apply_migrations(upgraded) == ["0012_fundamentals_and_valuation.sql"]
+            rows = upgraded.query("SELECT * FROM financials").to_dicts()
+            assert len(rows) == 1
+            # 0.20 是小数口径（D58）：升级不重算、不改写别人存过的数
+            assert rows[0]["roe"] == 0.20
+            assert rows[0]["published_date"] is None, "没有披露日就是没有，不能填一个日期进去"
+            assert "valuation_daily" in upgraded.table_names()
         finally:
             upgraded.close()
     finally:
