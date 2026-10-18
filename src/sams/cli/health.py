@@ -47,6 +47,37 @@ def _print_data(report) -> None:
         print("  ⚠ corp_actions 0 行：库存裸价，跨除权日的区间涨跌幅不可用")
 
 
+def _d(value) -> str:
+    return "–" if value is None else f"{value:%Y-%m-%d}"
+
+
+def _print_fundamentals(container: Container, report) -> None:
+    """`sams screen pr` 与 `analysis fundamentals` 的输入边界，按市场一屏说完。
+
+    报的是**只数**：A 股主档 5000 多只，同步过基本面的是其中一小撮。「今天没有一只满足
+    PR ≤ 0.4」在这一格里是「市场不便宜」，在只同步了 1 只的那一格里是「还没看其余」。
+    资金流那一栏跟着链上的能力：库里 0 行可能只是没跑，链上 0 个源则是跑也跑不出来（D38）。
+    """
+    print("[基本面覆盖]")
+    for market, cov in report.fundamentals.items():
+        line = (
+            f"  {market:<4} 财务 {cov.financials_codes} 只"
+            f"（最新报告期 {_d(cov.financials_latest_period)}，"
+            f"最新披露 {_d(cov.financials_latest_published)}）"
+            f" · 估值 {cov.valuation_codes} 只（最新 {_d(cov.valuation_latest)}）"
+            f" · 资金流 {cov.flow_codes} 只（最新 {_d(cov.flow_latest)}）"
+        )
+        flow_sources = container.registry.chain_for(market, "funding_flow")
+        marks = []
+        if not flow_sources:
+            marks.append("链上没有资金流源，`sams sync flow` 在这个市场取不回任何东西")
+        elif len(flow_sources) == 1:
+            marks.append(f"资金流单源（{flow_sources[0]}），挂了没有备源")
+        if cov.financials_codes == 0:
+            marks.append("`sams screen pr` 在这个市场没有输入")
+        print(line + "".join(f"  ⚠ {m}" for m in marks))
+
+
 def show(container: Container, args: argparse.Namespace) -> int:
     report = container.health.report()
     print(f"库: {report.db_path}")
@@ -56,6 +87,7 @@ def show(container: Container, args: argparse.Namespace) -> int:
     for name, rows in report.tables.items():
         print(f"  {name:<18} {rows:>8} 行")
     _print_data(report)
+    _print_fundamentals(container, report)
     print("[日历覆盖]")
     for market, years in report.calendar_years.items():
         shown = ", ".join(str(y) for y in years) or "（无）"

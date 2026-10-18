@@ -14,6 +14,7 @@ from sams.storage.db import Database
 from sams.storage.migrate import discover
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
+from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
 
@@ -175,3 +176,145 @@ def test_the_bar_lag_survives_a_later_write(db, settings):
     assert health.report().market_data["A"].latest == date(2024, 1, 3)
     BarRepo(db).upsert(sample_bars(start=date(2024, 4, 1)))
     assert health.report().market_data["A"].latest == date(2024, 4, 2)
+
+
+# ---------------------------------------------------------------- 基本面覆盖
+
+
+FIN_SCHEMA = {
+    "market": pl.Utf8,
+    "code": pl.Utf8,
+    "report_date": pl.Date,
+    "published_date": pl.Date,
+    "roe": pl.Float64,
+    "revenue_yoy": pl.Float64,
+    "profit_yoy": pl.Float64,
+    "dividend_yield": pl.Float64,
+    "market_cap": pl.Float64,
+    "source": pl.Utf8,
+}
+VAL_SCHEMA = {
+    "market": pl.Utf8,
+    "code": pl.Utf8,
+    "date": pl.Date,
+    "pe_ttm": pl.Float64,
+    "pb": pl.Float64,
+    "dividend_yield": pl.Float64,
+    "market_cap": pl.Float64,
+    "source": pl.Utf8,
+}
+FLOW_SCHEMA = {
+    "market": pl.Utf8,
+    "code": pl.Utf8,
+    "date": pl.Date,
+    "main_net_in": pl.Float64,
+    "north_net": pl.Float64,
+    "north_hold": pl.Float64,
+    "margin_bal": pl.Float64,
+    "source": pl.Utf8,
+}
+
+
+def write_financials(db, rows: list[dict]) -> None:
+    defaults = {
+        "market": "A",
+        "code": "600000",
+        "report_date": date(2023, 12, 31),
+        "published_date": date(2024, 3, 20),
+        "roe": 0.2,
+        "revenue_yoy": None,
+        "profit_yoy": None,
+        "dividend_yield": None,
+        "market_cap": None,
+        "source": "akshare",
+    }
+    FinancialRepo(db).upsert(
+        pl.DataFrame([{**defaults, **row} for row in rows], schema=FIN_SCHEMA)
+    )
+
+
+def write_valuation(db, rows: list[dict]) -> None:
+    defaults = {
+        "market": "A",
+        "code": "600000",
+        "date": date(2024, 7, 5),
+        "pe_ttm": 18.0,
+        "pb": 2.0,
+        "dividend_yield": None,
+        "market_cap": None,
+        "source": "akshare",
+    }
+    ValuationRepo(db).upsert(
+        pl.DataFrame([{**defaults, **row} for row in rows], schema=VAL_SCHEMA)
+    )
+
+
+def write_flow(db, rows: list[dict]) -> None:
+    defaults = {
+        "market": "A",
+        "code": "600000",
+        "date": date(2024, 7, 5),
+        "main_net_in": 1e8,
+        "north_net": None,
+        "north_hold": None,
+        "margin_bal": None,
+        "source": "akshare",
+    }
+    FundingFlowRepo(db).upsert(
+        pl.DataFrame([{**defaults, **row} for row in rows], schema=FLOW_SCHEMA)
+    )
+
+
+def coverage(db, settings, market: str | None = None):
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+    return report.fundamentals if market is None else report.fundamentals[market]
+
+
+def test_fundamentals_coverage_counts_codes_and_latest_per_grain(db, settings):
+    """三个数各说各的粒度：财务按报告期、估值与资金流按交易日。
+
+    这里最有用的一格是「只数」而不是「行数」：`financials = 400 行` 可能是 200 只票两期，
+    而选股扫的是**票**——2 只还是 200 只决定了那一篮子能不能叫「扫描」。
+    """
+    write_financials(
+        db,
+        [
+            {"code": "600000", "report_date": date(2022, 12, 31)},
+            {
+                "code": "600000",
+                "report_date": date(2023, 12, 31),
+                "published_date": date(2024, 4, 1),
+            },
+            {"code": "600001", "report_date": date(2023, 12, 31)},
+        ],
+    )
+    write_valuation(db, [{"code": "600000"}, {"code": "600001", "date": date(2024, 7, 8)}])
+    write_flow(db, [{"code": "600000"}])
+    cov = coverage(db, settings, "A")
+    assert (cov.financials_codes, cov.valuation_codes, cov.flow_codes) == (2, 2, 1)
+    assert cov.financials_latest_period == date(2023, 12, 31)
+    assert cov.financials_latest_published == date(2024, 4, 1)
+    assert cov.valuation_latest == date(2024, 7, 8)
+    assert cov.flow_latest == date(2024, 7, 5)
+
+
+def test_a_market_never_synced_appears_with_zeros(db, settings):
+    """HK/US 一个数都没有时必须在报告里出现：缺席会被读成「这个市场的覆盖不错」，
+    而「0 只」才是那条规则真正的输入边界（资金流尤其：港美股根本没有源）。
+    """
+    write_financials(db, [{"code": "600000"}])
+    cov = coverage(db, settings)
+    assert set(cov) == {"A", "HK", "US"}
+    hk = cov["HK"]
+    assert (hk.financials_codes, hk.flow_codes, hk.valuation_latest) == (0, 0, None)
+
+
+def test_an_unknown_publication_date_does_not_become_the_latest_one(db, settings):
+    """NULL 披露日是「源没给」，不是「很久以前披露」：它不能顶掉真正已知的那一天。"""
+    write_financials(db, [{"report_date": date(2024, 6, 30), "published_date": None}])
+    write_financials(
+        db, [{"report_date": date(2023, 12, 31), "published_date": date(2024, 3, 20)}]
+    )
+    cov = coverage(db, settings, "A")
+    assert cov.financials_latest_period == date(2024, 6, 30), "库里最新报告期照实说"
+    assert cov.financials_latest_published == date(2024, 3, 20)

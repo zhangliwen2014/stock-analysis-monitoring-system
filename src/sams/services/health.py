@@ -35,6 +35,11 @@ KEY_TABLES = (
     "users",
     "user_sessions",
     "watchlists",
+    # 基本面这三张表的行数只说明「库里有什么」，能不能拿它算 PR 要看下面的覆盖只数
+    "financials",
+    "valuation_daily",
+    "funding_flow",
+    "scan_results",
 )
 
 
@@ -62,6 +67,27 @@ class MarketData:
 
 
 @dataclass(frozen=True)
+class FundamentalsCoverage:
+    """一个市场的基本面输入：三张表各按自己的粒度报「有几只票、最新到哪一天」。
+
+    报**只数**而不是行数：`financials = 400 行` 可能是 200 只票两期，也可能是 2 只票
+    两百期，而 `sams screen pr` 扫的是票——2 只与 200 只决定了那一篮子能不能叫「扫描」。
+    最新日期也分粒度：财务的最新值是**报告期**（不是采集日，这一张表没有采集时间列），
+    估值与资金流的最新值是**交易日**。
+    """
+
+    market: str
+    financials_codes: int
+    financials_latest_period: date | None
+    #: 只数已知的最近披露日；源没给披露日的那些期不参与（NULL 不是「很久以前」）
+    financials_latest_published: date | None
+    valuation_codes: int
+    valuation_latest: date | None
+    flow_codes: int
+    flow_latest: date | None
+
+
+@dataclass(frozen=True)
 class HealthReport:
     db_path: str
     tables: dict[str, int] = field(default_factory=dict)
@@ -69,6 +95,7 @@ class HealthReport:
     sources: list[SourceRecord] = field(default_factory=list)
     pending_migrations: list[str] = field(default_factory=list)
     market_data: dict[str, MarketData] = field(default_factory=dict)
+    fundamentals: dict[str, FundamentalsCoverage] = field(default_factory=dict)
 
     @property
     def degraded_sources(self) -> list[SourceRecord]:
@@ -79,6 +106,49 @@ class HealthReport:
     @property
     def unverified_sources(self) -> list[SourceRecord]:
         return [s for s in self.sources if s.ok is None]
+
+
+#: 三张基本面表各自的「有几只票、最新到哪一天」。列名到报告字段的映射写在同一行，
+#: 因为漏掉一张表的代价是那一格永远显示 0 只，而 0 只看起来像「这个市场没数据」
+_COVERAGE_QUERIES = (
+    (
+        "financials",
+        """
+        SELECT market, count(DISTINCT code) AS codes,
+               max(report_date) AS latest_period, max(published_date) AS latest_published
+        FROM financials GROUP BY market
+        """,
+        {
+            "codes": "financials_codes",
+            "latest_period": "financials_latest_period",
+            "latest_published": "financials_latest_published",
+        },
+    ),
+    (
+        "valuation_daily",
+        "SELECT market, count(DISTINCT code) AS codes, max(date) AS latest"
+        " FROM valuation_daily GROUP BY market",
+        {"codes": "valuation_codes", "latest": "valuation_latest"},
+    ),
+    (
+        "funding_flow",
+        "SELECT market, count(DISTINCT code) AS codes, max(date) AS latest"
+        " FROM funding_flow GROUP BY market",
+        {"codes": "flow_codes", "latest": "flow_latest"},
+    ),
+)
+
+
+def _blank() -> dict:
+    return {
+        "financials_codes": 0,
+        "financials_latest_period": None,
+        "financials_latest_published": None,
+        "valuation_codes": 0,
+        "valuation_latest": None,
+        "flow_codes": 0,
+        "flow_latest": None,
+    }
 
 
 class HealthService:
@@ -110,7 +180,27 @@ class HealthService:
             sources=self.registry.health(),
             pending_migrations=pending(self.db),
             market_data=self._market_data(),
+            fundamentals=self._fundamentals_coverage(),
         )
+
+    def _fundamentals_coverage(self) -> dict[str, FundamentalsCoverage]:
+        """按市场报「这条规则的输入到底有几只票」，不是「库里有几行」。
+
+        没同步过的市场照样出现（全 0）：`sams screen pr` 在 HK 上扫不出东西，
+        原因必须是「0 只」这个事实，而不是这一屏上看不见这一项。
+        """
+        tables = self.db.table_names()
+        buckets = {m: _blank() for m in self.settings.markets}
+        for table, sql, targets in _COVERAGE_QUERIES:
+            if table not in tables:
+                continue
+            for row in self.db.query(sql, []).to_dicts():
+                bucket = buckets.setdefault(row["market"], _blank())
+                for column, target in targets.items():
+                    bucket[target] = (
+                        int(row[column]) if target.endswith("_codes") else _as_date(row[column])
+                    )
+        return {m: FundamentalsCoverage(market=m, **v) for m, v in sorted(buckets.items())}
 
     def _market_data(self) -> dict[str, MarketData]:
         """按市场汇总日线事实。

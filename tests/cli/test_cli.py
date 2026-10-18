@@ -484,6 +484,79 @@ def test_health_says_a_market_has_no_bars_yet(container, capsys):
     assert "（无日线，还没采集过）" in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------- 基本面覆盖
+
+
+def _financial_row(**over) -> pl.DataFrame:
+    row = {
+        "market": "A",
+        "code": "600519",
+        "report_date": date(2023, 12, 31),
+        "published_date": date(2024, 3, 20),
+        "roe": 0.3,
+        "revenue_yoy": None,
+        "profit_yoy": None,
+        "dividend_yield": None,
+        "market_cap": None,
+        "source": "akshare",
+    }
+    row.update(over)
+    return pl.DataFrame([row], schema={
+        "market": pl.Utf8, "code": pl.Utf8, "report_date": pl.Date,
+        "published_date": pl.Date, "roe": pl.Float64, "revenue_yoy": pl.Float64,
+        "profit_yoy": pl.Float64, "dividend_yield": pl.Float64,
+        "market_cap": pl.Float64, "source": pl.Utf8,
+    })
+
+
+def _valuation_row(**over) -> pl.DataFrame:
+    row = {
+        "market": "A",
+        "code": "600519",
+        "date": date(2024, 7, 5),
+        "pe_ttm": 20.0,
+        "pb": 8.0,
+        "dividend_yield": None,
+        "market_cap": None,
+        "source": "akshare",
+    }
+    row.update(over)
+    return pl.DataFrame([row], schema={
+        "market": pl.Utf8, "code": pl.Utf8, "date": pl.Date, "pe_ttm": pl.Float64,
+        "pb": pl.Float64, "dividend_yield": pl.Float64, "market_cap": pl.Float64,
+        "source": pl.Utf8,
+    })
+
+
+def test_health_reports_how_many_stocks_the_screening_rules_can_see(container, capsys):
+    """`sams screen pr` 的输入是「同步过基本面的票」，不是全市场：这一屏要说这个数字。
+
+    少了它，「今天没有一只满足 PR ≤ 0.4」会被读成「市场不便宜」，
+    而真正的原因可能是只同步了 1 只。
+    """
+    container.financials_store.upsert(_financial_row())
+    container.valuation_store.upsert(_valuation_row())
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "[基本面覆盖]" in out
+    assert "财务 1 只" in out and "最新报告期 2023-12-31" in out
+    assert "估值 1 只" in out and "最新 2024-07-05" in out
+    assert "资金流 0 只" in out
+
+
+def test_health_lists_a_market_whose_fundamentals_were_never_synced(container, capsys):
+    """HK 一个数都没有时也要出现：缺席会被读成「覆盖不错」，而 0 只才是那条规则的输入边界。"""
+    assert cli_run_on(container, ["health"]) == 0
+    hk = [line for line in capsys.readouterr().out.splitlines() if line.strip().startswith("HK")]
+    assert any("财务 0 只" in line for line in hk)
+
+
+def test_health_names_the_funding_flow_capability_gap(container, capsys):
+    """D38 的续：能力比数据薄要出声。链上一家资金流源都没有时，`sync flow` 永远取不回东西。"""
+    assert cli_run_on(container, ["health"]) == 0
+    assert "没有资金流源" in capsys.readouterr().out
+
+
 # --- `sams analysis return`：唯一一条过闸的读数路径 ---------------------------------
 
 
