@@ -251,7 +251,7 @@ verdict 是「**谨慎用**」：9 个真实区间的对账全部对齐，数字
 「4 个开市日没有 K 线（07-16/17/18 等）＋1 天休市」，仍然 3；`--code 000001` ⇒ 「主档里也没有这个代码」；
 `--start 2024-09-01` ⇒ 「全库有 11 根，最新到 2024-07-15」。离线 `uv run pytest -q` 1000 passed / 8 deselected。
 
-**A-7 第五轮：同一道闸再走一遍，查的是「归一为什么还会漏」** ✅
+**A-7 第五轮：同一道闸再走一遍，查的是「归一为什么还会漏」** ✅（代码 `f3d8544`、文档 `5a77d0e`；其中 D50 的「七个仓库同一条规则」被第六轮的 D51 补了一半）
 
 上一轮的 D46 把市场名归一放在**服务边界**，第五轮三个 agent 一致指出那是错的层：主键形态的正确性
 于是取决于「调用方走没走那条路」。全部先写复现用例再修，一条一条列在这里：
@@ -259,8 +259,8 @@ verdict 是「**谨慎用**」：9 个真实区间的对账全部对齐，数字
 | # | 症状（能复现的那句） | 处置 |
 |---|---|---|
 | 1 | 对抗 + 架构师：仓库层原样收下 `market`——`WatchlistRepo.add(user, "a", "601088")` 把 `a` 直接写进主键（那一层只归一了 code；自选清单的命令行要到 M5 才接上，所以这条路今天只有调用方能走）。那一行在清单里看得见、行情按 `A` 查 ⇒ 覆盖确认查出 0 行，输出「首尾之间没有除权日」并照实用裸价出一个**错数**而不是报错；D37 也抓不住（4% 的派息跳变在 15% 阈值之下） | **D50**：主键的形态由**定义主键的那一层**保证，不该取决于哪个调用方记得归一。`bars_daily`/`symbols`/`corp_actions`/`corp_actions_coverage`/`watchlists`/`trading_calendar`/`data_source_routes` 七个仓库的写侧归一 `market` 与 code 形态，读侧用同一条规则处理入参（`_form()` / `canonical_market()`）；D46 降为第二重。实测本机库 18 张带 `market`、13 张带 `code` 的表都没有非规范行 ⇒ **不做一次性迁移** |
-| 2 | 架构师：写侧大写了键、读侧还按调用方给的原样查——这比第 1 条更隐蔽，因为修了一半的归一看起来像修完了 | 每个仓库的读方法（`bars.get/latest_date/load/count`、`symbols.get/list_market`、`corp_actions.list_for`、`calendar.get/known_status/trading_days/year_covered/source_of`）都先归一再进 SQL；`test_bars_symbols.py` 与 `test_d50_*.py` 逐仓库钉住 |
-| 3 | 架构师：`CalendarService` 的 providers 按原样字符串 key，配置里同时写 `a` 与 `A` 时后一条静默盖掉前一条；CLI 的 `calendar show/refresh --market a` 也照原样回显，人以为铺开的是另一个市场 | 构造时先 `canonical_market` 再建映射，撞车 ⇒ `CalendarSourceError`（点名两个形态）；`provider()/refresh()/day()/known_status()/gap()` 入口各归一；`cli/calendar.py` 打印归一后的形态（回显即归一，D46 的那条规矩） |
+| 2 | 架构师：写侧大写了键、读侧还按调用方给的原样查——这比第 1 条更隐蔽，因为修了一半的归一看起来像修完了 | 带市场入参的读方法全部先归一再进 SQL：`bars.latest_date/load/count`、`symbols.get/list_market`、`corp_actions.list_for`、`calendar.get/trading_days/rows_for_year/source_of/year_covered`、`coverage.get/for_code`、`watchlists.contains/remove`、`data_sources.set_route/reorder/remove_route`，钉在 `tests/storage/` 那四个文件里 |
+| 3 | 架构师：`CalendarService` 的 providers 按原样字符串 key，配置里同时写 `a` 与 `A` 时后一条静默盖掉前一条；CLI 的 `calendar check/refresh --market a` 也照原样回显，人以为铺开的是另一个市场 | 构造时先 `canonical_market` 再建映射，撞车 ⇒ `CalendarSourceError`（点名两个形态）；`provider()/refresh()/day()/known_status()/gap()` 入口各归一；`cli/calendar.py` 打印归一后的形态（回显即归一，D46 的那条规矩） |
 | 4 | 交易员：Ctrl-C 打一次 `sync`，降级链把 `KeyboardInterrupt` 当成「这个源坏了，换下一个」，于是中断要等整条链每个源都试完才生效，还把一次取消记成源故障、扣掉那个源的降级计数 | `datasource/registry.py` 的兜底从 `BaseException` 收窄到 `Exception`（`# noqa: BLE001` 说明为什么）；`test_interrupt_is_not_a_source_failure` 断言备源 `calls == 0` 且健康里 `ok is None`（**从没被路由过**，不是 `ok=False`） |
 | 5 | 交易员：缺口区间怎么算、哪一堆缺口该升级成退出码 3，全写在 `cli/analysis.py` 里——命令行自己算了两次区间算术 | 判定挪出命令行：`core/timeutil.gap_days()`（纯日期算术）+ `services/calendar.GapKinds`（按开市/休市/未知分堆）+ `CalendarService.gap()`（`known_status` 判不了的那一堆不能替它担保），**`matters` 就是那道判定**；CLI 只措辞、只换成退出码 |
 | 6 | 架构师：`storage/repos/corp_actions._TOL` 与 `datasource/akshare_actions._TOLERANCE` 数字都是 0.005 而量的是两件事（前者比两个源的意见，后者比同一条记录里文本与数值是否自洽），改一个容易被「顺手同步」改掉 | 两处各加一条互指注释：数字相同是巧合，语义不同，改一个不必动另一个 |
@@ -281,6 +281,28 @@ verdict 是「**谨慎用**」：9 个真实区间的对账全部对齐，数字
 `--market HK --code 700 --start 2025-05-15` ⇒ 拒绝并说明「全库有 59 根，最新到 2023-03-01」——本机这份
 库里 00700 只铺到 2023 年（第三轮那句 2025-05 的对账数不是在现在这份库里取的）；同一段用 `700` 与
 `00700` 敲，得到同一条拒绝，而 `2022-12-01~2023-03-01` 仍按 D39 拒绝（实物分派 `kind=unknown`）。离线 `uv run pytest -q` **1021 passed / 8 deselected**，
+`uv run ruff check .` 全绿。
+
+**A-7 第六轮：拿第五轮的修法当靶子** ✅（代码 `3b43797`）
+
+对抗 agent 这一轮的题目就是刚改完的那五处，结果是**其中一处自己留了洞**。全部先写复现用例再修：
+
+| # | 症状（能复现的那句） | 处置 |
+|---|---|---|
+| 1 | `sams source unroute a sina` ⇒ 「错误: 市场 a 摘掉 sina 就没有能取日线的源了；先加备源」，而 A 股那时四个日线源都还在；同一条命令用 `A` 敲则成功 | D50 只写进注释里的那句「两重遮挡」是假的：`route/reorder/probe` 因为先过 `_require_routable` 侥幸挡住了小写，`unroute` 是唯一一条**直接进字符串比对**的（`_bars_sources_in` 的 `m == market` 对不上库里的大写行 ⇒ 集合为空）。四个动词的入口各 `canonical_market`，报错文案从此点名的是真市场 |
+| 2 | `bars.upsert(market="HK", code="700")` 落库 `700`，而 `corp_actions`/`watchlists` 落 `00700` ⇒ `bars.load("HK", ["00700"])` 查出 0 行，「这天的除权在 K 线上没有对应记录」那条闸为一只**存在**的票报警 | D50 的「七个仓库同一条规则」当时只对了一半：bars 与 symbols 只 `upper()`。两处改调 `canonical_code`（`_canonical_codes`/`_form` 都走它），空代码行与空市场一样丢弃并 warn；`bars.count(code=…)` 不给市场时**拒绝**——没有市场就不知道该按哪种形态归一，蒙一个是同一个洞换边 |
+| 3 | `analysis return --start 2024-07-15 --end 2024-07-01` 走到 `_why_no_bars`，打出「把区间挪到有数据的那一段，或先跑 `sams sync daily … --start 2024-07-15 --end 2024-07-01`」——**那条命令自己也是空区间** | `AnalysisService.interval_return` 在读库之前拒反向区间（`ValidationError`：这是空区间，不是「这段时间没有行情」）。守卫给的下一步必须跑得通，否则它把用户钉在同一个敲错的参数上 |
+| 4 | 计划第五轮 row 2/3 点了三个不存在的名字（`bars.get`、`calendar.known_status`、`test_d50_*.py`）和一个不存在的命令（`calendar show`） | 全部改成 `grep`/`--help` 当场能验的名字。这是第五轮第 7 条那个缺陷的复发——**我自己写下的东西也要过同一道闸** |
+| 5 | 修完第 1 条之后自己敲出来的：`sams source unroute a sina` 现在成功了，但回显打印「**a** 链里已移除 sina」——屏幕上说的形态与库里那一行不是同一个字（`calendar` 第四轮就定了「回显即归一」这条规矩，`source` 的三个动词漏了） | `route_`/`unroute_`/`move_` 的入参与回显都用 `canonical_market`；顺带把 `_markets`（`--markets a,HK`）自己那套 `strip().upper()` 也换成同一条规则——CLI 里再写一遍归一，等于允许「`--markets` 接受的形态」与「路由表里的形态」从此不一样 |
+| — | 复核通过的：`covered_to` 放宽挡得住（窗口超出断言范围、`full_history=False`、多段 span、非 A 市场逐条试过）；`gap_days`/`GapKinds`/退出码 0-1-3 的每种区间形状都对得上锚点；`grep except BaseException\|except:` 在 src 里零命中；本机库非规范行仍为 0 | 不动 |
+
+实测验收（本机真实网络，库为 `data/sams.duckdb` 的一份副本，命令行只读数与做一次路由试演）：
+`source unroute a sina` ⇒ 「A 链里已移除 sina」（rc 0），`route a sina --priority 4` ⇒ 「已把 sina
+排到 A 的第 4 位」，`move a …` ⇒ 「A 链已重排」+ 大写形态的链；`analysis return --start 2024-07-15
+--end 2024-07-01` ⇒ 「错误: 起日 2024-07-15 晚于止日 2024-07-01：这是一个空区间，不是「这段时间没有
+行情」」（rc 1，不再教人跑一条同样空的 `sync daily`）；`--code HK00700` 与 `--code 700` 给同一条
+D39 拒绝；`--market a` 的 601088 2024-07-01~07-15 仍是 **复权 −1.44%**（D50 之后 `HK 700 → 00700`
+这一路改动没有挪动任何已有的数）。离线 `uv run pytest -q` **1028 passed / 8 deselected**，
 `uv run ruff check .` 全绿。
 
 ### B 块：指标引擎（§8.2）
