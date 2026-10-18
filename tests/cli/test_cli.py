@@ -930,3 +930,89 @@ def test_a_malformed_date_is_a_message_not_a_trace(config_path, capsys):
     err = capsys.readouterr().err
     assert "错误:" in err and "YYYY-MM-DD" in err
 
+
+
+# --- `sams analysis series`：指标那条出口的命令行 -------------------------------------
+
+
+def analysis_series_argv(start="2024-07-01", end="2024-07-11", code="601088", market="A",
+                         extra=()):
+    return [
+        "analysis",
+        "series",
+        "--market",
+        market,
+        "--code",
+        code,
+        "--start",
+        start,
+        "--end",
+        end,
+        *extra,
+    ]
+
+
+def test_analysis_series_prints_the_table_with_its_anchor_and_warm_up(container, capsys):
+    """闸在服务层再严，命令敲不出那三行口径也等于没有：锚、预热、`–` 的含义都要出门。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_series_argv(extra=["--indicators", "ma,rsi"])) == 0
+    out = capsys.readouterr().out
+    assert "A/601088  day  2024-07-01 ~ 2024-07-11  表里 11 行" in out
+    assert "后复权倍数锚在 2024-07-01" in out
+    assert "覆盖确认：akshare，记录截至 2024-07-11" in out
+    assert "样本不足，不是 0" in out
+    # 请求从库里第一根起：没有预热根，递推指标的种子就是这一天——这条警告必须出声
+    assert "往回多读 0 根" in out
+    assert "没有预热根数" in out
+
+
+def test_analysis_series_counts_the_warm_up_it_read(container, capsys):
+    """请求 7-05 起：往回多读的 4 根要打印出来，屏幕必须说清指标吃到了哪一段。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_series_argv(
+        start="2024-07-05", extra=["--indicators", "ma"])) == 0
+    out = capsys.readouterr().out
+    assert "往回多读 4 根" in out
+    assert "表里 7 行" in out
+
+
+def test_analysis_series_shows_null_as_a_dash_not_a_zero(container, capsys):
+    """11 根凑不满 ma20：屏幕上必须是 `–`。涂成 0 的话，均线会在开头几天画出假的金叉。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_series_argv(extra=["--indicators", "ma"])) == 0
+    out = capsys.readouterr().out
+    assert "–" in out
+
+
+def test_analysis_series_refuses_the_same_way_return_does(container, capsys):
+    """同一道闸、同一个退出码：换一条出口，「没确认过就不出数」不能变成「照常给」。"""
+    seed_crossing_ex_date(container, cover=False)
+    assert cli_run_on(container, analysis_series_argv(extra=["--indicators", "ma"])) == 1
+    out = capsys.readouterr().out
+    assert "拒绝出数" in out and "sync actions" in out
+
+
+def test_analysis_series_json_carries_the_provenance_and_keeps_nulls_null(container, capsys):
+    """`--json` 是管道里那条机器路：口径字段要在 payload 里，null 不许被涂成 0。"""
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_series_argv(
+        extra=["--json", "--indicators", "ma"])) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok" and payload["exit"] == 0
+    assert payload["anchored_on"] == "2024-07-01"
+    assert payload["warmup_bars"] == 0
+    assert payload["covered_by"] == "akshare"
+    assert payload["indicators"] == ["ma"]
+    assert payload["rows"] == 11
+    # ma20 在前 19 根都没有值：JSON 里也必须逐位是 null，而不是 0.0
+    assert payload["table"][0]["ma20"] is None
+    assert payload["table"][-1]["close_hfq"] is not None
+
+
+def test_analysis_series_reports_an_unmarked_jump_on_this_path(container, capsys):
+    """D37 在这条出口同样拦得下来：命令行给的是拒绝，不是一条「看起来正常」的错曲线。"""
+    seed_ipo_jump(container)
+    assert cli_run_on(container, analysis_series_argv(
+        code="601999", extra=["--indicators", "ma"])) == 1
+    out = capsys.readouterr().out
+    assert "裸价变动" in out and "-30.0%" in out

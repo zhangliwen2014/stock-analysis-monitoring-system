@@ -50,8 +50,10 @@ _AGG = {
     "adjust": "first",  # 读路径按 `adjust = 'raw'` 过滤，这是常数
     "updated_at": "last",  # 最后一根是谁在什么时候写的，与 `source` 同一口径
 }
-_WEEK = "week"
-_MONTH = "month"
+#: `resample()` 能处理的两个周期名；`services` 层组装 `PERIODS` 取值表时引用这两个，
+#: 不重新写字符串——两处各管一份会在有人只改一处的时候静默漂移
+WEEK = "week"
+MONTH = "month"
 
 
 def _require_series(series: object) -> AdjustedSeries:
@@ -66,7 +68,7 @@ def _require_series(series: object) -> AdjustedSeries:
 
 def _period_end(day: date, period: str) -> date:
     """该日所在周期的**日历收市日**：周五（周）或该月最后一天（月）。"""
-    if period == _WEEK:
+    if period == WEEK:
         return day + timedelta(days=4 - day.weekday())
     following = (day.replace(day=28) + timedelta(days=4)).replace(day=1)
     return following - timedelta(days=1)
@@ -89,7 +91,7 @@ def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
     * `bars` —— 聚进来几根日线（一根周 K 只有一根日线，通常是停牌或长假）
     * `pending` —— 周期收市日还在 `as_of` 之后（口径 2）
     """
-    if period not in (_WEEK, _MONTH):
+    if period not in (WEEK, MONTH):
         raise ValidationError(
             f"重采样周期只认 `week` 与 `month`，收到的是 {period!r}："
             "写成 \"weekly\" 静默当成 week 等于让调用方以为自己要的东西被给了"
@@ -102,7 +104,7 @@ def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
     ordered = frame.sort("date")
     days = ordered["date"].to_list()
     group_of = (
-        (lambda day: _week_group(day)) if period == _WEEK else (lambda day: day.replace(day=1))
+        (lambda day: _week_group(day)) if period == WEEK else (lambda day: day.replace(day=1))
     )
     columns = list(ordered.columns)
     aggregates = []

@@ -87,8 +87,14 @@ def _wilder(values: list[float | None], window: int) -> list[float | None]:
     avg = sum(values[start - window + 1 : start + 1]) / window
     out[start] = avg
     for i in range(start + 1, len(values)):
-        avg = (avg * (window - 1) + (values[i] or 0.0)) / window
-        out[i] = avg
+        if values[i] is None:
+            # 中段 null 不折成 0.0：DMI 在 s_tr==0（一字板/零波幅窗）那一步会把 dx 打成
+            # None，`or 0.0` 会在那一刻之后把整条 ADX 钉死在错误值上。
+            # 正确行为：这一根输出 None，递推状态冻结，下一根从上一个有效 avg 继续。
+            out[i] = None
+        else:
+            avg = (avg * (window - 1) + values[i]) / window
+            out[i] = avg
     return out
 
 

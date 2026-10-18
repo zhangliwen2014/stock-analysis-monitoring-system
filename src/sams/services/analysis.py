@@ -35,7 +35,7 @@ import polars as pl
 from sams.analysis.adjust import AdjustedSeries, adjusted_series
 from sams.analysis.guard import ConfirmedSpan, is_covered
 from sams.analysis.indicators import DEFAULT_INDICATORS, INDICATORS, metrics
-from sams.analysis.resample import resample
+from sams.analysis.resample import MONTH, WEEK, resample
 from sams.analysis.returns import IntervalReturn, interval_return
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
@@ -48,7 +48,7 @@ from sams.storage.repos.symbols import SymbolRepo
 #: `resample()` 认的两个周期之外的唯一取值：日线不重采样，直接吃闸后那条序列。
 #: 公开给命令行做 `--period` 的取值表（`cli` 不许 import 分析层，名单只能从这里转一道）
 _DAY = "day"
-PERIODS: tuple[str, ...] = (_DAY, "week", "month")
+PERIODS: tuple[str, ...] = (_DAY, WEEK, MONTH)
 
 
 @dataclass(frozen=True)
@@ -191,6 +191,14 @@ class AnalysisService:
                 f"周期只认 {', '.join(PERIODS)}，收到的是 {period!r}："
                 "写成一个不认识的名字静默按日线算，等于给你一段不是你请求的行情"
             )
+        # 先验指标名，再动库：拼错一个名字不应该让三道闸全部跑完才出声（架构评审第 9 项）。
+        # `metrics()` 里同样有这道检查，这里是把它提前——两处口径相同，不在此重新造那套文案。
+        names = tuple(dict.fromkeys(indicators)) if indicators else DEFAULT_INDICATORS
+        unknown = [n for n in names if n not in INDICATORS]
+        if unknown:
+            raise ValidationError(
+                f"不认识的指标名 {unknown}：可选的是 {', '.join(sorted(INDICATORS))}"
+            )
         today = self.clock.today()
         loaded = self.bars.load(market, [code], end=end)
         in_window = loaded.filter(pl.col("date") >= start).height
@@ -199,17 +207,37 @@ class AnalysisService:
         spans = self.coverage.for_code(market, code)
         db_first = loaded["date"].min()
         read_from, floor = _warmup_span(spans, db_first=db_first, start=start, end=end)
+        actions = self.actions.list_for(market, code, until=today)
+        # D39 的预热修正：`_refuse_unpriceable` 的自救指引「起日 ≥ 该除权日」在 `series`
+        # 这里不成立，因为 `_warmup_span` 把 `read_from` 推回覆盖起点，预热段可能横跨那条
+        # 无法折算的记录。把 `read_from` 推到那条记录的除权日为止（`actions_in_span` 用的是
+        # `> first`，等于该日那条 unknown 不再进 `inside`）；请求段本身仍由守卫兜住。
+        if actions.height and "kind" in actions.columns:
+            blockers = actions.filter(
+                (pl.col("kind") == "unknown")
+                & (pl.col("ex_date") > read_from)
+                & (pl.col("ex_date") <= start)
+            )
+            if blockers.height:
+                new_from = blockers["ex_date"].max()
+                if new_from and new_from > read_from:
+                    read_from = new_from
+                    floor = new_from
         bars = loaded.filter(pl.col("date") >= read_from)
         series = adjusted_series(
             market,
             code,
             bars,
-            # PIT：与 interval_return 同一把锁，晚于今天的除权日不进这条序列
-            self.actions.list_for(market, code, until=today),
+            actions,
             coverage=spans,
             today=today,
             listed_on=listed_on,
         )
+        # 预热根数与锚都在**日线**口径上算：重采样后 `date` 是周期收市日标签，
+        # 用它计预热会把"那一个月里前 7 天其实参与了递推"说成"0 根"（交易员闸第 2 项）。
+        daily_dates = series.frame["date"].to_list()
+        warmup_bars_count = sum(1 for d in daily_dates if d < start)
+        anchor = daily_dates[0]
         if period != _DAY:
             series = resample(series, period, as_of=today)
         frame = series.frame
@@ -221,10 +249,8 @@ class AnalysisService:
             for c in ("close", "close_hfq", "volume", "pending", "first", "last", "bars")
             if c in frame.columns
         ]
-        names = tuple(dict.fromkeys(indicators)) if indicators else DEFAULT_INDICATORS
         table = frame.select(["date", *keep]).hstack(metrics(series, names).drop("date"))
         rows = table.filter(pl.col("date") >= start)
-        days = frame["date"].to_list()
         return SeriesRead(
             market=market,
             code=code,
@@ -234,9 +260,9 @@ class AnalysisService:
             indicators=names,
             requested_from=start,
             requested_to=end,
-            warmup_bars=sum(1 for day in days if day < start),
+            warmup_bars=warmup_bars_count,
             warmup_floor=floor,
-            anchored_on=days[0],
+            anchored_on=anchor,
             covered_by=series.covered_by,
             covered_through=series.covered_through,
             ex_dates=series.ex_dates,

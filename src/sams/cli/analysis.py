@@ -23,7 +23,7 @@ from datetime import date
 from sams.bootstrap import Container
 from sams.cli.common import group, iso_date
 from sams.core.codes import exchange_folds_dividend_into_daily_change
-from sams.core.errors import NotAdjustable
+from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.timeutil import gap_days
 from sams.services.analysis import PERIODS, default_indicators, indicator_names
 from sams.services.calendar import GapKinds
@@ -327,6 +327,14 @@ def run_series(container: Container, args: argparse.Namespace) -> int:
         else:
             print(f"拒绝出数：{exc}")
         return 1
+    except ValidationError as exc:
+        # D57：`--json` 模式下所有出口都应是 JSON——参数拼错（周期名、指标名、
+        # 反向区间）也是拒绝，不是程序崩溃；走顶层 SamsError 的纯文本路径在管道里不可解析
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "exit": 2})
+        else:
+            print(f"参数有误：{exc}")
+        return 2
     if args.json:
         _emit(_series_payload(read))
         return 0

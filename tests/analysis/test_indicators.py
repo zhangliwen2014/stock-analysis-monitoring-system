@@ -427,6 +427,38 @@ def test_indicators_keep_the_frame_keyed_and_ordered():
         assert out["date"].to_list() == [d for d in DAYS[:10]]
 
 
+# --- 样本不足的 null 规则：平滑类一个都不漏 ---------------------------------------------
+
+
+def test_the_smoothing_indicators_are_null_before_their_first_average():
+    """`atr/dmi/cci/wr` 与 `ma/boll` 同一条规矩：窗口凑不满就是 null。
+
+    凑数错法的诱因是每个函数各自的默认参数，所以「凑不满时不给数」得一条一条钉——
+    只给 ma 钉一条，等于其余四个随时可以被「顺手改成 min_samples=1」放走。
+    """
+    s = series([float(i + 1) for i in range(4)])
+    assert set(atr(s, window=14)["atr"].to_list()) == {None}
+    assert set(wr(s, window=14)["wr"].to_list()) == {None}
+    assert set(cci(s, window=14)["cci"].to_list()) == {None}
+    out = dmi(s, window=5)
+    for column in ("pdi", "mdi", "adx"):
+        assert set(out[column].to_list()) == {None}, column
+
+
+def test_wr_has_no_denominator_when_the_window_never_moved():
+    """窗口内最高=最低 ⇒ WR 没有分母：与 KDJ 同款，给 null，不蒙 0 也不蒙 50。"""
+    flat = [10.0] * 6
+    out = wr(series(flat, highs=flat, lows=flat), window=3)
+    assert set(out["wr"].to_list()[2:]) == {None}
+
+
+def test_cci_has_no_denominator_when_the_window_never_moved():
+    """平盘窗口 ⇒ 平均绝对偏差 0，(TP−SMA)/(0.015×0) 没有答案：给 null。"""
+    flat = [10.0] * 6
+    out = cci(series(flat, highs=flat, lows=flat), window=3)
+    assert set(out["cci"].to_list()[2:]) == {None}
+
+
 # --- 反未来函数（spec §8.1）---------------------------------------------------------
 
 #: 逐条指标都要过这条，一条都不能漏：漏的那一条正是将来回测里最贵的一条
@@ -533,3 +565,37 @@ def test_the_future_function_check_is_actually_looking_at_a_number(name):
     frame = ALL_INDICATORS[name](series(closes, highs=highs, lows=lows, volumes=volumes))
     row = row_at(frame, CHECK_AT)
     assert all(v is not None for k, v in row.items() if k != "ma250"), row
+
+
+# --- 锚动、比值不动：缩放不变性 ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", sorted(["rsi", "kdj", "wr"]))
+def test_ratio_indicators_do_not_move_when_the_whole_series_is_scaled(name):
+    """换锚 = 整条读取窗口同乘一个常数；比值型指标必须逐位不变（spec §8.2 锚口径）。
+
+    这是「绝对价要报锚、比值不用报」那句话的强版本。服务层里 whole/short 两条读的
+    对比证不了它：那两条读的历史长度不同，单调数据上「相等」只是 RSI=100 的天花板
+    效应。这里把「乘一个常数」单独拎出来，数据有涨有跌（`prices()`），退化值躲不掉。
+    """
+    closes, highs, lows, volumes = prices()
+    compute = {"rsi": lambda s: rsi(s, 6, 14), "kdj": kdj, "wr": wr}[name]
+    before = compute(series(closes, highs=highs, lows=lows, volumes=volumes))
+    after = compute(
+        series(
+            [c * 1.7 for c in closes],
+            highs=[h * 1.7 for h in highs],
+            lows=[lo * 1.7 for lo in lows],
+            volumes=volumes,
+        )
+    )
+    for column in before.columns:
+        if column == "date":
+            continue
+        assert after[column].to_list() == pytest.approx(before[column].to_list()), column
+    # 上一条在「整列都是 null」时也会通过：这里确认末端确实出了有意义的数
+    if name == "rsi":
+        last = before["rsi14"].to_list()[-1]
+        assert last is not None and 0.0 < last < 100.0, last
+    else:
+        assert before[f"{name}_k" if name == "kdj" else name].to_list()[-1] is not None
