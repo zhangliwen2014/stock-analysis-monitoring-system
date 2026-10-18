@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 
@@ -41,12 +41,23 @@ PRICE_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close")
 
 @dataclass(frozen=True)
 class DayFactor:
-    """一个除权日的合成因子。同一天既派息又送股时合并成一个，不连乘两次。"""
+    """一个除权日的合成因子。同一天既派息又送股时合并成一个，不连乘两次。
+
+    `cash`/`paid`/`multiplier` 不是日志字段：出数那一屏要能说清「这个因子是干什么的」——
+    只有 `45.10 → 42.84` 的话，交易员不知道那 2.26 是现金还是配股价，也不知道自己的股数
+    有没有变（D54：裸价与复权并列给，就得并列给「差在哪件事上」）。
+    """
 
     ex_date: date
     prev_close: float | None
     ex_ref: float | None
     factor: float
+    #: 每股收到的现金（**含税**：源给的派息是税前额，见 `datasource/akshare_actions` 的第 1 条口径）
+    cash: float = 0.0
+    #: 每股旧股为新股应付的现金（配股）
+    paid: float = 0.0
+    #: 股数乘数：10 送 3 转 2 是 1.5
+    multiplier: float = 1.0
 
 
 def ex_reference(
@@ -107,6 +118,7 @@ def day_factors(bars: pl.DataFrame, actions: pl.DataFrame) -> list[DayFactor]:
                 DayFactor(
                     ex_date=ex_date, prev_close=prev_close, ex_ref=ex_ref,
                     factor=prev_close / ex_ref,
+                    cash=day["cash"], paid=day["paid"], multiplier=multiplier,
                 )
             )
         else:
@@ -116,7 +128,7 @@ def day_factors(bars: pl.DataFrame, actions: pl.DataFrame) -> list[DayFactor]:
             out.append(
                 DayFactor(
                     ex_date=ex_date, prev_close=prev_close, ex_ref=ex_ref,
-                    factor=multiplier,
+                    factor=multiplier, multiplier=multiplier,
                 )
             )
     return out
@@ -228,7 +240,12 @@ def adjusted_series(
     ordered = require_real_closes(market, code, bars)
     first, last = ordered["date"].to_list()[0], ordered["date"].to_list()[-1]
     inside = actions_in_span(actions, first, last, until=today)
-    factors = day_factors(ordered, inside)
+    try:
+        factors = day_factors(ordered, inside)
+    except NotAdjustable as exc:
+        # 因子层的文案里只有日期：同时筛几只票时，「2023-01-05 有一条无法折算的公司行为」
+        # 认不出主语是哪只，而拒绝的意义正是要让人对那一只做下一步（D55）
+        raise NotAdjustable(f"{market}/{code}：{exc}") from exc
     reject_unmarked_jumps(market, code, ordered, factors, listed_on=listed_on)
     span = require_coverage(market, code, first, last, coverage)
     return AdjustedSeries(
@@ -245,6 +262,9 @@ def _refuse_unpriceable(actions: pl.DataFrame) -> None:
     这是港美股唯一那道闸：D37 的涨跌停证据规则只对 A 股生效（HK/US 没有涨跌幅上限可依据），
     所以一条被静默丢弃的实物分派在图上不会留下任何痕迹——它只会让跨那天的涨跌差几个点，
     而几个点看起来完全像正常波动。宁可不出数。
+
+    拒绝必须给得出下一步（D55）：那句「折不出数」如果不说清「再采集也不会变」与「把窗口
+    挪到哪一边才给得出数」，听的人只会去跑 `sync actions`，然后收到同一条拒绝。
     """
     if "kind" not in actions.columns:
         return
@@ -252,10 +272,14 @@ def _refuse_unpriceable(actions: pl.DataFrame) -> None:
     if blocked.is_empty():
         return
     first = blocked.row(0, named=True)
+    day: date = first["ex_date"]
     extra = f"等 {blocked.height} 条" if blocked.height > 1 else ""
     raise NotAdjustable(
-        f"{first['ex_date']} 有一条无法折算的公司行为"
-        f"（{first.get('note') or '源未给原文'}{extra}）：推不出因子，这一段的复权涨跌不能给"
+        f"{day} 有一条无法折算的公司行为"
+        f"（{first.get('note') or '源未给原文'}{extra}）：推不出因子，覆盖它的窗口不能给复权涨跌。"
+        "这不是「没查到」——`unknown` 那一行就是查到的结果，重新采集不会让它变成能折算的数。"
+        f"要数就得把窗口挪开：止日 ≤ {day - timedelta(days=1)}，或起日 ≥ {day}"
+        "（除权日当天起它就不再进这段的因子了）"
     )
 
 

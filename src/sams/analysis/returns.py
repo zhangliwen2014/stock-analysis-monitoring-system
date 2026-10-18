@@ -13,11 +13,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 
-from sams.analysis.adjust import adjusted_series
+from sams.analysis.adjust import DayFactor, adjusted_series
 from sams.analysis.guard import ConfirmedSpan
 from sams.core.errors import NotAdjustable
 
@@ -30,10 +30,11 @@ class IntervalReturn:
     end: date
     raw: float
     adjusted: float
-    #: 区间内参与计算的除权日个数。0 时 raw 与 adjusted 必然相等——这不是「复权没影响结果」，
-    #: 而是这一段压根没乘过因子；这段时间到底有没有发生除权，看 `start_is_ex_date`
-    ex_dates: int
-    #: 首根那根本身就是除权日：它的效果已经在起点价里，所以不进 `ex_dates`，
+    #: 区间内参与计算的除权日（首根当日除外）。空的时候 raw 与 adjusted 必然相等——
+    #: 这不是「复权没影响结果」，而是这一段压根没乘过因子；
+    #: 这段时间到底有没有发生除权，看 `start_is_ex_date`
+    factors: tuple[DayFactor, ...]
+    #: 首根那根本身就是除权日：它的效果已经在起点价里，所以不进 `factors`，
     #: 但「这段时间没有公司行为」那句话从此不能说
     start_is_ex_date: bool
     #: 放行这段区间的覆盖确认出自哪个源。过闸的数一定有人背书，所以这里不可能是 None
@@ -41,6 +42,16 @@ class IntervalReturn:
     #: 那条确认做到哪一天为止。读取层不再按「今天」拒绝过期确认（D49），所以这句话的
     #: 有效期限必须跟着数一起出门
     covered_through: date
+    #: 止日之后这几天里有没有「折不出数」的行为。窗口刚好躲开一条 `unknown` 记录时，
+    #: 这一屏给得出一个干净的数，而它离拒绝只有一天之隔（D55）
+    nearby_unpriceable: tuple[tuple[date, str], ...] = ()
+    #: 用了上市日豁免（D37 的那条形证据在这段没生效）。它必须跟着数出门：
+    #: 「过闸的数」这句话在传了 `--listed-on` 时说的不是原来那件事
+    listed_on: date | None = None
+
+    @property
+    def ex_dates(self) -> int:
+        return len(self.factors)
 
     @property
     def differs(self) -> bool:
@@ -93,10 +104,31 @@ def interval_return(
         end=last,
         raw=raw,
         adjusted=hfq,
-        ex_dates=series.ex_dates,
+        factors=series.factors,
         start_is_ex_date=_has_ex_date_on(actions, first),
         covered_by=series.covered_by,
         covered_through=series.covered_through,
+        nearby_unpriceable=_unpriceable_after(actions, last),
+        listed_on=listed_on,
+    )
+
+
+#: 止日之后这几天算「近旁」：一条躲开的 `unknown` 记录通常就躺在下一根 K 线上
+#: （00700 的实物分派在 2023-01-05，把止日收到 01-04 就是一个复权=裸价的「干净」数）。
+#: 7 个日历日盖住一个周末加一次短暂停牌，又不至于把下个月的除权也说成在躲。
+_NEARBY_DAYS = 7
+
+
+def _unpriceable_after(actions: pl.DataFrame, last: date) -> tuple[tuple[date, str], ...]:
+    if actions.is_empty() or "kind" not in actions.columns:
+        return ()
+    near = actions.filter(
+        (pl.col("kind") == "unknown")
+        & (pl.col("ex_date") > last)
+        & (pl.col("ex_date") <= last + timedelta(days=_NEARBY_DAYS))
+    ).sort("ex_date")
+    return tuple(
+        (row["ex_date"], row.get("note") or "源未给原文") for row in near.iter_rows(named=True)
     )
 
 

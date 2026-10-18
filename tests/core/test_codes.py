@@ -1,14 +1,21 @@
-"""代码归一与币种例外（spec §5.4）。
+"""代码归一、币种例外与市场级的交易所规则（spec §5.4）。
 
-这两个函数决定「一只票在库里只有一个键、以什么币种记账」，写错的后果都不是报错，
-而是同一只票长出两条曲线、或一条曲线被当成另一种钱。
+这些函数决定「一只票在库里只有一个键、以什么币种记账、那个复权数能不能拿去跟板上核对」，
+写错的后果都不是报错，而是同一只票长出两条曲线、一条曲线被当成另一种钱、
+或一句在两个市场根本不成立的核对承诺。
 """
 
 from __future__ import annotations
 
 import pytest
 
-from sams.core.codes import canonical_code, currency_override, daily_price_limit, lot_size_of
+from sams.core.codes import (
+    canonical_code,
+    currency_override,
+    daily_price_limit,
+    exchange_folds_dividend_into_daily_change,
+    lot_size_of,
+)
 from sams.core.errors import ValidationError
 
 
@@ -124,3 +131,20 @@ def test_lot_size_is_known_where_it_is_a_rule_and_null_where_it_is_per_stock():
     assert lot_size_of("US") == 1
     # 港股每手逐票由交易所定：存 1 冒充知道，下单换算会错一个数量级
     assert lot_size_of("HK") is None
+
+
+# ---------------------------------------------------------------- 除权日的当日涨跌
+
+
+def test_only_a_shares_exchange_folds_a_cash_dividend_into_the_daily_change():
+    """那句「与交易所公布的当日涨跌幅同一算法」在三个市场里只对得上一个（D53）。
+
+    A 股交易所在除权日给除权参考价，公布涨跌幅按它算；港交所与美股交易所对现金分红
+    都不复权前收盘价——00700 在 2023-05-19 板上就是 −1.94%，而我们的复权数是 −1.24%。
+    把那句话无条件打印，等于在两个市场上承诺了一个可以拿去核对、却永远核对不上的性质。
+    """
+    assert exchange_folds_dividend_into_daily_change("A") is True
+    assert exchange_folds_dividend_into_daily_change("HK") is False
+    assert exchange_folds_dividend_into_daily_change("US") is False
+    # 大小写不许开出第三个答案：这句话讲的不是拼写，是哪个交易所在算数
+    assert exchange_folds_dividend_into_daily_change("a") is True

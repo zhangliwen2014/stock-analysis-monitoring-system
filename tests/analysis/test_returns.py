@@ -365,3 +365,78 @@ def test_a_holiday_or_suspension_at_the_edge_of_the_window_is_not_a_refusal():
     result = get(bars=frame([10.0] * 11), start=START, end=END)
     assert result.start == START
     assert result.end == date(2024, 7, 11)
+
+
+# --- 出数要带着「差在哪件事上」（D54 / D55）---------------------------------------
+
+
+def test_the_result_carries_the_ex_date_behind_the_pair():
+    """只给一对百分数，读的人还是得自己找公告、自己算参考价、自己判断那笔现金是不是到手额。
+
+    交易员试用报告的原话：`复权 −1.44% / 裸价 −6.38%` 这一屏没有说清是什么造成的差距。
+    而这三步守卫全都走过了——就乘在因子那几行里，不出去等于白算。
+    """
+    days = [START + timedelta(days=i) for i in range(11)]
+    closes = [41.00, 41.20, 41.40, 41.60, 41.80, 42.00, 42.00, 40.40, 41.00, 41.40, 42.00]
+    result = get(
+        bars=frame(closes, days),
+        actions=actions((days[7], "dividend", 2.10, None, None)),
+        start=days[6],
+        end=days[7],
+    )
+    (factor,) = result.factors
+    assert factor.ex_date == days[7]
+    assert factor.prev_close == pytest.approx(42.00)
+    assert factor.ex_ref == pytest.approx(39.90)
+    assert factor.cash == pytest.approx(2.10)
+    assert factor.multiplier == 1.0
+    assert result.ex_dates == 1
+
+
+def test_a_bonus_issue_shares_the_multiplier_it_used():
+    """送转不进现金那一栏，但「你的股数变了」必须与那两个数一起出门。"""
+    closes = [10.0] * 8 + [9.09, 9.09, 9.09]
+    days = [START + timedelta(days=i) for i in range(11)]
+    result = get(
+        bars=frame(closes, days),
+        actions=actions((days[8], "bonus", None, 1.1, None)),
+        start=days[7],
+        end=days[8],
+    )
+    (factor,) = result.factors
+    assert factor.cash == 0.0
+    assert factor.multiplier == pytest.approx(1.1)
+
+
+def test_an_unpriceable_action_one_day_past_the_end_is_said_out_loud():
+    """把窗口收到那条 `unknown` 之前，就得到一个复权=裸价的「干净」数，而它离拒绝一天之隔。
+
+    躲开拒绝不等于穿过守卫：这一屏要给得出数（那段确实没有折不出数的日子），
+    但不说出来就是在奖励「收窄窗口」这个动作，而它得到的数离错只有根 K 线。
+    """
+    days = [START + timedelta(days=i) for i in range(11)]
+    result = get(
+        bars=frame([10.0] * 11, days),
+        actions=actions((date(2024, 7, 12), "unknown", None, None, None)),
+        end=date(2024, 7, 11),
+    )
+    assert result.raw == pytest.approx(0.0)
+    assert result.nearby_unpriceable == ((date(2024, 7, 12), "源未给原文"),)
+
+
+def test_an_unpriceable_action_a_month_later_is_not_the_readers_problem():
+    """近旁的判据是 7 个日历日：把下个月的除权也说成「你在躲它」只会让这句话贬值。"""
+    days = [START + timedelta(days=i) for i in range(11)]
+    result = get(
+        bars=frame([10.0] * 11, days),
+        actions=actions((date(2024, 8, 12), "unknown", None, None, None)),
+        end=date(2024, 7, 11),
+    )
+    assert result.nearby_unpriceable == ()
+
+
+def test_the_exemption_the_caller_asked_for_travels_with_the_number():
+    """豁免是调用方要的，不是守卫给的：说过「这个数过了 D37」就得同时说它没有。"""
+    closes = [10.0, 30.0, 45.0, 60.0, 75.0, 90.0, 85.0, 80.0, 82.0, 83.0, 84.0]
+    assert get(bars=frame(closes), listed_on=START).listed_on == START
+    assert get(bars=frame([10.0] * 11)).listed_on is None

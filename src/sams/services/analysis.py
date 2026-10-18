@@ -14,8 +14,9 @@ D37 那道闸要的是「这个市场有没有涨跌幅证据」：拼写走不�
 「今天看到的库里有什么」这件事的函数，让调用方用一次窄窗口买到一张免检票，
 守卫就成了装饰。
 
-`listed_on`（上市首日）目前库里没有这一列，因此一律不传：守卫对上市初期的
-不可能跳变因此按「不豁免」处理，多拒一次上市首日的暴涨。等主档补上来源再放开。
+`listed_on`（上市首日）透传给守卫：库里没有这一列，所以调用方不传就是「不豁免」，
+守卫对上市初期的不可能跳变因此多拒一次上市首日的暴涨。要豁免只有 `sams analysis return
+--listed-on` 这一条显式的路（D56）——它换掉的是 D37 那条形证据，所以必须跟着数一起打印。
 """
 
 from __future__ import annotations
@@ -47,7 +48,15 @@ class AnalysisService:
         self.symbols = symbols
         self.clock = clock
 
-    def interval_return(self, market: str, code: str, start: date, end: date) -> IntervalReturn:
+    def interval_return(
+        self,
+        market: str,
+        code: str,
+        start: date,
+        end: date,
+        *,
+        listed_on: date | None = None,
+    ) -> IntervalReturn:
         """[start, end] 的区间涨跌，裸价与复权一起给。拒绝时抛 `NotAdjustable` 带原因。
 
         代码先归一：`sh601088` 与 `601088` 是同一只票，而库里的键只有一个形态——
@@ -56,6 +65,10 @@ class AnalysisService:
         反向区间在这里就拒：`start > end` 读回来是 0 根，而 0 根的那套文案会教人
         去跑一条同样空的 `sams sync daily --start … --end …`。下一步命令自己跑不通的
         拒绝，等于把用户钉在同一个敲错的参数上。
+
+        `listed_on`（上市首日）由调用方显式给（`sams analysis return --listed-on`，D56）：
+        库里还没有这一列，所以不传就是「不豁免」。传了要跟着数一起打印——豁免掉的正是
+        D37 那条形证据，一句「过了闸」在这种数上说的不是原来那件事。
         """
         market = canonical_market(market)
         code = canonical_code(market, code)
@@ -77,6 +90,7 @@ class AnalysisService:
             end=end,
             coverage=self.coverage.for_code(market, code),
             today=today,
+            listed_on=listed_on,
         )
 
     def _why_no_bars(self, market: str, code: str, start: date, end: date, in_window: int) -> str:

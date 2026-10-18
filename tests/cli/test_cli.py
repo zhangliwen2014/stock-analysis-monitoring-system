@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 
 import polars as pl
@@ -663,6 +664,264 @@ def test_analysis_return_takes_a_lowercase_market(container, capsys):
     assert cli_run_on(container, analysis_argv(market="a")) == 0
     out = capsys.readouterr().out
     assert "+7.83%" in out and "A/601088" in out
+
+
+def seed_hk_crossing_ex_date(container):
+    """00700：除净前收 400.00、每股派 20.00 ⇒ 参考价 380.00、除净当天收 380.00。
+
+    裸价 −5.00%、复权 0.00%。而港交所不为现金分红复权前收盘价，板上那天就是 −5.00%：
+    同一句「与交易所公布的当日涨跌幅同一算法」在 A 股是真、在这里是假（D53）。
+    """
+    days = [date(2024, 7, 1) + timedelta(days=i) for i in range(11)]
+    container.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"] * 11,
+                "code": ["00700"] * 11,
+                "date": days,
+                "close": [400.00] * 7 + [380.00] * 4,
+                "source": ["yfinance"] * 11,
+            }
+        )
+    )
+    container.corp_actions.upsert_many(
+        pl.DataFrame(
+            {
+                "market": ["HK"],
+                "code": ["00700"],
+                "ex_date": [date(2024, 7, 8)],
+                "kind": ["dividend"],
+                "cash_per_share": [20.0],
+                "ratio": [None],
+                "price": [None],
+                "src": ["akshare_hk"],
+                "note": ["每股派港币20.00元"],
+            }
+        )
+    )
+    container.corp_actions_coverage.record(
+        "HK",
+        "00700",
+        covered_from=date(2024, 7, 1),
+        covered_to=date(2024, 7, 11),
+        full_history=False,
+        src="akshare_hk",
+    )
+
+
+def test_the_exchange_claim_only_prints_where_that_exchange_actually_does_it(container, capsys):
+    """同一句核对承诺，在 A 股能核对、在港股永远核对不上——而它以前无条件打印。
+
+    交易员闸的 BLOCKER #1：`HK/00700` 那天板上就是裸价那个数（港交所不复权前收盘价），
+    屏幕却说「复权这一行与交易所公布的当日涨跌幅同一算法」，把**对的**那个数标成错数。
+    """
+    seed_crossing_ex_date(container)
+    seed_hk_crossing_ex_date(container)
+
+    assert cli_run_on(container, analysis_argv()) == 0
+    a_share = capsys.readouterr().out
+    assert "同一算法" in a_share and "错数" in a_share
+
+    assert cli_run_on(container, analysis_argv(market="HK", code="00700")) == 0
+    hk = capsys.readouterr().out
+    assert "同一算法" not in hk
+    assert "-5.00%" in hk and "+0.00%" in hk
+    assert "不为现金分红复权前收盘价" in hk
+    assert "交易所公布的那个数就是它" in hk
+    # A 股那句「含税」的丑话讲的是红利税，港股没有这件事
+    assert "红利税" not in hk
+
+
+def test_the_pair_names_the_ex_date_that_made_it_move(container, capsys):
+    """「复权 −1.44% / 裸价 −6.38%」这一对数以前从不说是哪件事造成的（D54）。
+
+    参考价、每股现金、因子——这三步守卫全都算过，不出去等于让读的人自己再去查一遍，
+    而他查的那一遍通常就是绕过守卫的那一遍。
+    """
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv()) == 0
+    out = capsys.readouterr().out
+    assert "除权  窗口内 1 个除权日：2024-07-08" in out
+    assert "前收 42.00 → 参考价 39.90" in out
+    assert "每股现金 2.1000" in out
+    assert "因子 1.0526" in out
+
+
+def test_a_cash_dividend_says_the_number_is_gross_of_tax(container, capsys):
+    """源给的派息是**税前**额（`10派22.60元(含税,扣税后20.34元)`），复权数因此不是到手收益。
+
+    持有不满一年要缴 10–20% 红利税：这句话不改算式（改了就丢掉与交易所公布值同一算法那条
+    外部证据，D48），但它必须跟着数出门，否则高派息票的这个数会被直接当成交易员的 P&L。
+    """
+    seed_crossing_ex_date(container)
+    assert cli_run_on(container, analysis_argv()) == 0
+    out = capsys.readouterr().out
+    assert "因子按含税派息折股" in out and "每股 2.1000" in out and "红利税" in out
+
+
+def test_a_bonus_issue_says_the_share_count_changed(container, capsys):
+    """送转给的是股数不是钱：跨那天的「每股成本」不再与之前可比，这一点没人说。"""
+    days = [date(2024, 7, 1) + timedelta(days=i) for i in range(11)]
+    container.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * 11,
+                "code": ["601999"] * 11,
+                "date": days,
+                "close": [10.0] * 8 + [9.09, 9.09, 9.09],
+                "source": ["akshare"] * 11,
+            }
+        )
+    )
+    container.corp_actions.upsert_many(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["601999"],
+                "ex_date": [days[8]],
+                "kind": ["bonus"],
+                "cash_per_share": [None],
+                "ratio": [1.1],
+                "price": [None],
+                "src": ["akshare"],
+                "note": ["10送1股"],
+            }
+        )
+    )
+    container.corp_actions_coverage.record(
+        "A",
+        "601999",
+        covered_from=days[0],
+        covered_to=days[10],
+        full_history=False,
+        src="akshare",
+    )
+    assert cli_run_on(container, analysis_argv(code="601999")) == 0
+    out = capsys.readouterr().out
+    assert "股数 ×1.1000" in out and "这段里股数变了" in out
+    assert "每股成本" in out
+
+
+def test_a_window_that_stops_just_short_of_an_unpriceable_action_says_so(container, capsys):
+    """把窗口收窄到那条 `unknown` 之前，就得到一个「干净」的数——躲开拒绝不等于穿过守卫。
+
+    00700 实测：止日 2023-01-04 ⇒ 复权=裸价 +16.68%、rc 0，而 01-05 那天躺着一条
+    折不出数的实物分派。这一段确实没有需要折算的日子，数可以给（D39 的判据是按窗口），
+    但「再往后一天就给不出了」必须跟着打印，否则屏幕在教人用收窄窗口换取一个没有守卫的数。
+    """
+    seed_crossing_ex_date(container)
+    container.corp_actions.upsert_many(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["601088"],
+                "ex_date": [date(2024, 7, 12)],
+                "kind": ["unknown"],
+                "cash_per_share": [None],
+                "ratio": [None],
+                "price": [None],
+                "src": ["akshare"],
+                "note": ["以股代息（选股权）"],
+            }
+        )
+    )
+    assert cli_run_on(container, analysis_argv(end="2024-07-11")) == 0
+    out = capsys.readouterr().out
+    assert "止日之后 2024-07-12 有一条无法折算的公司行为" in out
+    assert "以股代息（选股权）" in out
+
+
+def test_a_refused_unpriceable_action_names_the_stock_and_the_way_out(container, capsys):
+    """拒绝文案的两半：这句说的是谁（同时筛几只票时认得出主语），以及怎么出去。
+
+    交易员按以前那句建议跑了 `sync actions`，回来还是同一条拒绝——`unknown` 这一行
+    就是采集的结果，重采不会让它变成能折算的数；唯一的路是把窗口挪开，而它没人说过。
+    """
+    seed_crossing_ex_date(container)
+    container.corp_actions.upsert_many(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["601088"],
+                "ex_date": [date(2024, 7, 10)],
+                "kind": ["unknown"],
+                "cash_per_share": [None],
+                "ratio": [None],
+                "price": [None],
+                "src": ["akshare"],
+                "note": ["以股代息"],
+            }
+        )
+    )
+    assert cli_run_on(container, analysis_argv(end="2024-07-11")) == 1
+    out = capsys.readouterr().out
+    assert "A/601088：" in out
+    assert "止日 ≤ 2024-07-09" in out and "起日 ≥ 2024-07-10" in out
+    assert "重新采集不会让它变成能折算的数" in out
+
+
+def test_the_json_flag_is_the_machine_path_that_survives_a_pipe(container, capsys):
+    """退出码 3 进了管道就没了（`echo $?` 拿的是 `grep` 的码），而筛选循环处处是管道。
+
+    没有 `--json` 之前，机器唯一的路是正则中文文案，而 0 与 3 在那里分辨不出来。
+    """
+    seed_crossing_ex_date(container)
+    seed_calendar(container)
+    assert cli_run_on(container, analysis_argv(end="2024-07-15") + ["--json"]) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "anchor_outside_request" and payload["exit"] == 3
+    assert payload["raw"] == pytest.approx(42.00 / 41.00 - 1)
+    assert payload["ex_dates"][0]["date"] == "2024-07-08"
+    assert payload["ex_dates"][0]["cash_per_share"] == pytest.approx(2.10)
+    assert payload["exchange_folds_dividend"] is True
+    assert "2024-07-12" in payload["gap"]["trading"]
+
+
+def test_the_json_flag_reports_a_refusal_as_an_answer(container, capsys):
+    """拒绝也是一种答案：机器读得到原因，才不必在 stderr 里找一行「错误:」。"""
+    seed_crossing_ex_date(container, cover=False)
+    assert cli_run_on(container, analysis_argv() + ["--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "refused" and payload["exit"] == 1
+    assert "覆盖确认" in payload["reason"]
+
+
+def seed_ipo_jump(container):
+    """上市第二天的 −30%：主板不可能，D37 因此拒绝——而它以前给的下一步根本跑不通。"""
+    days = [date(2024, 7, 1) + timedelta(days=i) for i in range(11)]
+    container.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * 11,
+                "code": ["601999"] * 11,
+                "date": days,
+                "close": [10.0, 7.0] + [7.0] * 9,
+                "source": ["akshare"] * 11,
+            }
+        )
+    )
+    container.corp_actions_coverage.record(
+        "A",
+        "601999",
+        covered_from=days[0],
+        covered_to=days[10],
+        full_history=False,
+        src="akshare",
+    )
+
+
+def test_the_listing_date_exemption_the_guard_offers_is_actually_a_flag(container, capsys):
+    """D37 的拒绝写着「请传 listed_on 豁免」，而命令行没有这个参数（U18）：假建议比没建议更坏。"""
+    seed_ipo_jump(container)
+    assert cli_run_on(container, analysis_argv(code="601999")) == 1
+    out = capsys.readouterr().out
+    assert "--listed-on" in out
+
+    assert cli_run_on(container, analysis_argv(code="601999") + ["--listed-on", "2024-07-01"]) == 0
+    out = capsys.readouterr().out
+    assert "-30.00%" in out
+    assert "豁免了它起 10 个日历日内的跳变检查" in out
+    assert "没有 D37 那条" in out
 
 
 def test_a_malformed_date_is_a_message_not_a_trace(config_path, capsys):

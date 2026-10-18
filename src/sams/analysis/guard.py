@@ -159,8 +159,9 @@ def reject_unmarked_jumps(
         if recorded is not None and abs(today - recorded.ex_ref) <= recorded.ex_ref * limit:
             continue
         hint = (
-            f"；若这几天正是上市初期（上市日起 {_IPO_GRACE_DAYS} 个日历日内），"
-            "请传 listed_on 豁免"
+            "；若这几天正是上市初期（上市日起 "
+            f"{_IPO_GRACE_DAYS} 个日历日内），用 `sams analysis return --listed-on <上市日>` "
+            "显式豁免——那条命令有这个参数，这里也给得出下一步"
             if listed_on is None
             else ""
         )
