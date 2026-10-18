@@ -11,7 +11,7 @@ import logging
 
 import polars as pl
 
-from sams.core.codes import canonical_market
+from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import StorageError
 from sams.storage.db import Database
 
@@ -56,7 +56,24 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
     # 同一批里有人给了 list_status、有人没给时，缺的那个是 null 而不是默认值：
     # list_market 按 'L' 过滤，null 行会静默消失，所以在这里补平
     keyed = keyed.with_columns(pl.col("list_status").fill_null(_DEFAULTS["list_status"]))
-    return keyed.select(list(COLUMNS)).unique(subset=["market", "code"], keep="last")
+    # 空代码与空市场同一回事：那一行谁也都读不到
+    coded = keyed.filter(pl.col("code").cast(pl.Utf8).str.len_chars() > 0)
+    if coded.height < keyed.height:
+        logger.warning(
+            "symbols 丢弃 %d 行（代码为空：那一行永远读不到）", keyed.height - coded.height
+        )
+    # code 的形态用 `canonical_code`，与 bars 同一个函数：各仓库自己 upper() 会让
+    # 主档存 `700`、K 线存 `00700`，主档与行情于是描述两只不同的票
+    coded = coded.with_columns(
+        pl.Series(
+            "code",
+            [
+                canonical_code(m, c)
+                for m, c in zip(coded["market"].to_list(), coded["code"].to_list(), strict=True)
+            ],
+        )
+    )
+    return coded.select(list(COLUMNS)).unique(subset=["market", "code"], keep="last")
 
 
 class SymbolRepo:
@@ -90,11 +107,11 @@ class SymbolRepo:
         return prepared.height
 
     def get(self, market: str, code: str) -> dict | None:
-        # 读侧的键形态必须与 `_prepare` 写侧同一条规则，否则「大写过的 code」
+        # 读侧的键形态必须与 `_prepare` 写侧同一条规则，否则「归一过的 code」
         # 存进去、拿原样去查，又是同一个读不到且不报错的洞
         rows = self.db.query(
             "SELECT * FROM symbols WHERE market = ? AND code = ?",
-            [canonical_market(market), (code or "").strip().upper()],
+            [canonical_market(market), canonical_code(market, code)],
         )
         return rows.to_dicts()[0] if not rows.is_empty() else None
 

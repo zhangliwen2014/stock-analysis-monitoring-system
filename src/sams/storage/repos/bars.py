@@ -9,11 +9,12 @@
 负成交量/负成交额原样存——那是源侧数据质量问题，属于采集与清洗的职责，
 在这里丢弃会让「源给了脏数」和「这一天没数据」在库里长得一样；它由 `sams health` 如实报出来。
 
-`market` 的形态在这里归一（D46 的下沉）：主键由这一层定义，键的形态就该由这一层保证。
-只在服务边界归一是漏的——`WatchlistRepo.add` 过去只归一 code，`market` 原样收下：写成 `a`
-的那一行在清单里看得见，行情按 `A` 查，症状是「这只票没有行情」而库里明明有行。
+`market` 与 `code` 的形态在这里归一（D46 的下沉 + D50）：主键由这一层定义，键的形态就该由
+这一层保证。只在服务边界归一是漏的——`WatchlistRepo.add` 过去只归一 code，`market` 原样收下：
+写成 `a` 的那一行在清单里看得见，行情按 `A` 查，症状是「这只票没有行情」而库里明明有行。
 键的形态不该取决于哪个调用方记得归一。
-读侧与此同一条规则：`_prepare` 大写过的两半，查询也必须按同样形态给。
+读侧与写侧同一条规则（`_form`/`_canonical_codes` 都调 `canonical_code`）：各仓库自己
+`upper()` 看着一样，实际会让 K 线存 `700`、除权记录存 `00700`——同一只票两个键。
 """
 
 from __future__ import annotations
@@ -24,8 +25,8 @@ from uuid import uuid4
 
 import polars as pl
 
-from sams.core.codes import canonical_market
-from sams.core.errors import StorageError
+from sams.core.codes import canonical_code, canonical_market
+from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
 
 logger = logging.getLogger("sams.storage.bars")
@@ -50,13 +51,23 @@ COLUMNS = (
 _OPTIONAL_NUMERIC = ("open", "high", "low", "volume", "amount")
 
 
-def _form(code: str) -> str:
-    """读侧的 code 形态与 `_prepare` 写侧同一件事：写侧把 code 大写了，读侧不大写就查不到。
+def _canonical_codes(markets: list[str], codes: list[str]) -> list[str]:
+    """按市场归一代码形态：`canonical_code` 是唯一的规则（域规则在 `core/codes.py`）。
 
-    两侧的形态规则必须是一条，否则「写进去的形状」和「用来查的形状」会再次分叉——
-    那还是同一个「读不到且不报错」的洞，只是换了半边。
+    各仓库自己 `upper()` 看着像同一条规则，其实是两条：`700` 归一成 `00700` 是域规则，
+    而 `upper()` 留它作 `700`。K 线于是与 `corp_actions`/`watchlists` 用两个键描述同一只票，
+    「这天的除权在 K 线上找不到对应记录」那条闸会为一个**存在**的键报警。
     """
-    return (code or "").strip().upper()
+    return [_form(m, c) for m, c in zip(markets, codes, strict=True)]
+
+
+def _form(market: str, code: str) -> str:
+    """读侧的键形态与 `_prepare` 写侧同一条规则（D50）：两条规则迟早会分叉。
+
+    分叉的症状不是报错而是「读不到」：写侧存 `00700`、读侧拿 `700` 查，
+    报告上就成了「这只票这段时间没行情」，而库里那排 K 线好好的。
+    """
+    return canonical_code(market, code)
 
 
 def _prepare(df: pl.DataFrame) -> pl.DataFrame:
@@ -103,6 +114,15 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
             "bars_daily 丢弃 %d 行（市场名为空：那一行永远读不到）", out.height - keyed.height
         )
     out = keyed
+    # 空代码与空市场同一回事：那一行有正确的价格，却再也没有任何查询能读到它
+    coded = out.filter(pl.col("code").str.len_chars() > 0)
+    if coded.height < out.height:
+        logger.warning(
+            "bars_daily 丢弃 %d 行（代码为空：那一行永远读不到）", out.height - coded.height
+        )
+    out = coded.with_columns(
+        pl.Series("code", _canonical_codes(out["market"].to_list(), out["code"].to_list()))
+    )
     bad = out.select(
         pl.sum_horizontal(
             *[~pl.col(c).is_finite() & pl.col(c).is_not_null() for c in _OPTIONAL_NUMERIC]
@@ -176,7 +196,7 @@ class BarRepo:
     def latest_date(self, market: str, code: str) -> date | None:
         value = self.db.scalar(
             "SELECT max(date) FROM bars_daily WHERE adjust = ? AND market = ? AND code = ?",
-            [ADJUST, canonical_market(market), _form(code)],
+            [ADJUST, canonical_market(market), _form(market, code)],
         )
         if value is None:
             return None
@@ -194,7 +214,8 @@ class BarRepo:
             schema = {c: pl.Float64 for c in COLUMNS if c != "date"} | {"date": pl.Date}
             return pl.DataFrame(schema=schema)
         sql = ["SELECT * FROM bars_daily WHERE adjust = ? AND market = ? AND code = ANY(?)"]
-        params: list = [ADJUST, canonical_market(market), [_form(c) for c in codes]]
+        wanted = _canonical_codes([market] * len(codes), codes)
+        params: list = [ADJUST, canonical_market(market), wanted]
         if start is not None:
             sql.append("AND date >= ?")
             params.append(start)
@@ -211,6 +232,10 @@ class BarRepo:
             sql += " AND market = ?"
             params.append(canonical_market(market))
         if code:
+            if not market:
+                # 没有市场就不知道该按哪种形态归一代码（`700` 在 HK 是 00700，在 A 是原样），
+                # 蒙一个形态去查就是「读不到且不报错」那条老路
+                raise ValidationError("按代码统计行数必须给市场：代码的键形态按市场归一")
             sql += " AND code = ?"
-            params.append(_form(code))
+            params.append(_form(market, code))
         return int(self.db.scalar(sql, params) or 0)

@@ -16,6 +16,7 @@ import argparse
 
 from sams.bootstrap import Container
 from sams.cli.common import group, iso_date
+from sams.core.codes import canonical_market
 from sams.core.errors import ValidationError
 
 
@@ -72,7 +73,9 @@ def add_to(subparsers) -> None:
 
 
 def _markets(value: str) -> list[str]:
-    items = [m.strip().upper() for m in value.split(",") if m.strip()]
+    # 归一规则只有 `canonical_market` 这一条：这里再写一遍 `strip().upper()`，
+    # 就等于允许「`--markets` 接受的形态」与「路由表里的形态」哪天开始不一样
+    items = [canonical_market(m) for m in value.split(",") if m.strip()]
     if not items:
         raise ValidationError(f"--markets 为空，收到 {value!r}")
     return items
@@ -198,20 +201,23 @@ def remove_(container: Container, args: argparse.Namespace) -> int:
 
 
 def route_(container: Container, args: argparse.Namespace) -> int:
-    container.source_admin.route(args.market, args.name, args.priority)
-    print(f"已把 {args.name} 排到 {args.market} 的第 {args.priority} 位")
+    market = canonical_market(args.market)
+    container.source_admin.route(market, args.name, args.priority)
+    print(f"已把 {args.name} 排到 {market} 的第 {args.priority} 位")
     return 0
 
 
 def unroute_(container: Container, args: argparse.Namespace) -> int:
-    existed = container.source_admin.unroute(args.market, args.name)
-    print(f"{args.market} 链里{'没有' if not existed else '已移除'} {args.name}")
+    market = canonical_market(args.market)
+    existed = container.source_admin.unroute(market, args.name)
+    print(f"{market} 链里{'没有' if not existed else '已移除'} {args.name}")
     return 0
 
 
 def move_(container: Container, args: argparse.Namespace) -> int:
-    container.source_admin.reorder(args.market, args.names)
-    print(f"{args.market} 链已重排")
+    market = canonical_market(args.market)
+    container.source_admin.reorder(market, args.names)
+    print(f"{market} 链已重排")
     _print_chains(container.source_admin.chains())
     return 0
 

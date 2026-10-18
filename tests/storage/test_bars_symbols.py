@@ -248,3 +248,44 @@ def test_symbol_writes_and_reads_share_one_market_spelling(symbols):
     assert symbols.get("HK", "00700") is not None
     assert symbols.get("hk", "00700") is not None
     assert symbols.list_market("hk").height == 1
+
+
+def test_hk_bar_aliases_share_the_key_the_actions_use(bars, db):
+    """`700` 归一成 `00700`：K 线与除权记录必须落在同一个键上（D50 没做完的那半边）。
+
+    `corp_actions` 与 `watchlists` 用 `canonical_code`，bars 以前只 `upper()`：
+    腾讯的 K 线会存成 `700`、除权记录存成 `00700`，于是「这天的除权在 K 线上找不到
+    对应记录」那条闸（D37 的镜像）会为一个**存在**的键报警，而 `analysis return` 按
+    归一后的 `00700` 查 K 线，报「这只票从没采集过」。两个仓库各自 trim+upper
+    看着像同一条规则，其实是两条。
+    """
+    bars.upsert(support.sample_bars(market="HK", code="700"))
+    stored = db.scalar("SELECT code FROM bars_daily LIMIT 1")
+    assert stored == "00700", f"落库形态必须是 canonical 的 5 位，收到 {stored!r}"
+    assert bars.load("HK", ["00700"]).height == 2
+    assert bars.load("HK", ["700"]).height == 2, "读的时候别名也算同一只票"
+    assert bars.count("HK", "HK.00700") == 2
+    assert bars.latest_date("HK", "00700") == date(2024, 1, 3)
+
+
+def test_a_share_exchange_prefix_is_not_part_of_the_bar_key(bars, db):
+    """`sh600519` 是数据源要的形态，不是本系统的键：剥掉它，否则同一天两条主键。"""
+    bars.upsert(support.sample_bars(market="A", code="sh600519"))
+    assert db.scalar("SELECT code FROM bars_daily LIMIT 1") == "600519"
+    assert bars.load("A", ["600519"]).height == 2
+
+
+def test_symbol_aliases_share_the_bar_key(symbols, db):
+    symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"],
+                "code": ["HK00700"],
+                "name": ["腾讯控股"],
+                "currency": ["HKD"],
+                "lot_size": [100],
+            }
+        )
+    )
+    assert db.scalar("SELECT code FROM symbols") == "00700"
+    assert symbols.get("HK", "700") is not None

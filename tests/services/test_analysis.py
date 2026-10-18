@@ -193,6 +193,18 @@ def test_a_window_outside_the_collected_range_says_where_the_bars_are(db):
     assert "最新到 2024-07-11" in str(exc.value)
 
 
+def test_a_reversed_window_is_refused_before_the_advice(db):
+    """起日晚于止日不是「这段时间没行情」，而下一步文案会让人再跑一次同样的失败。
+
+    以前 `--start 2024-07-15 --end 2024-07-01` 走到 `_why_no_bars`，打出「把区间挪到
+    有数据的那一段，或先跑 `sams sync daily … --start 2024-07-15 --end 2024-07-01`」——
+    那条命令自己也是空区间。守卫给的下一步必须跑得通，否则它把用户钉在同一个错误里。
+    """
+    service = seeded(db)
+    with pytest.raises(ValidationError, match="起日"):
+        service.interval_return("A", CODE, END, START)
+
+
 def test_an_alias_reads_the_same_stock(db):
     """别名查不到又不报错，读的就是一个空区间：进库和读数必须同一个键形态。"""
     service = seeded(db)

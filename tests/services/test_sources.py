@@ -131,6 +131,23 @@ def test_unroute_is_refused_for_the_last_source(admin):
         admin.unroute("HK", "yfinance")
 
 
+def test_unroute_joins_the_market_the_way_the_routes_are_stored(admin):
+    """`unroute a …` 不许报「市场 a 摘掉它就失明了」——A 还有四个源，且那句是劝你别敲。
+
+    `route`/`reorder`/`probe` 先过 `_require_routable`（那里按大写比对能力），小写市场
+    到不了比较；`unroute` 是唯一绕过它的一条，于是 `a` 一路走到 `_bars_sources_in`
+    的 `m == market`，对上的是库里的大写行 ⇒ 一个都不剩，报错。键的比对两侧同形（D50）。
+    """
+    assert admin.unroute("a", "sina") is True
+    assert "sina" not in admin.chains()["A"]
+
+
+def test_unroute_names_the_canonical_market_when_the_chain_would_go_dark(admin):
+    admin.unroute("hk", "tencent")
+    with pytest.raises(ValidationError, match="市场 HK"):
+        admin.unroute("Hk", "yfinance")
+
+
 def test_an_actions_only_source_is_not_a_backup_for_bars(admin):
     """摘掉最后一个能取日线的源，链上还剩 akshare_hk——它一个价格都拉不到。
 

@@ -25,7 +25,7 @@ from datetime import date
 from sams.analysis.returns import IntervalReturn, interval_return
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
-from sams.core.errors import NotAdjustable
+from sams.core.errors import NotAdjustable, ValidationError
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
@@ -52,9 +52,17 @@ class AnalysisService:
 
         代码先归一：`sh601088` 与 `601088` 是同一只票，而库里的键只有一个形态——
         拿别名查出来的空区间，在报告上长得和「这只票这段时间没行情」一模一样。
+
+        反向区间在这里就拒：`start > end` 读回来是 0 根，而 0 根的那套文案会教人
+        去跑一条同样空的 `sams sync daily --start … --end …`。下一步命令自己跑不通的
+        拒绝，等于把用户钉在同一个敲错的参数上。
         """
         market = canonical_market(market)
         code = canonical_code(market, code)
+        if start > end:
+            raise ValidationError(
+                f"起日 {start} 晚于止日 {end}：这是一个空区间，不是「这段时间没有行情」"
+            )
         today = self.clock.today()
         loaded = self.bars.load(market, [code], start=start, end=end)
         if loaded.height < 2:

@@ -10,6 +10,11 @@
   * 停用/删除不能把某个市场弄成**没有能取日线的源**：那样下次启动 registry 直接抛错，
     而现场看起来「刚才是好的」。要真撤干净，得先把备源加上。
     （只报公司行为的源不算数——它兜不住价格，见 D38。）
+
+市场名在进入这些校验之前先归一（D50 的第二重）：`_bars_sources_in` 比的是库里的大写行，
+`route`/`reorder`/`probe` 因为先过 `_require_routable` 侥幸没漏，而 `unroute` 是唯一一条
+直接进比较的——`sams source unroute a sina` 曾报「市场 a 摘掉 sina 就没有能取日线的源了」，
+一个劝你别敲的命令，而 A 股那时四个源都还在。
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from dataclasses import dataclass
 from datetime import date
 from time import monotonic
 
+from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import DatasourceError, SamsError, StorageError, ValidationError
 from sams.datasource.sources import SourceEntry, build, catalog, known
@@ -134,10 +140,12 @@ class SourceAdminService:
         self.repo.set_enabled(name, enabled)
 
     def route(self, market: str, name: str, priority: int) -> None:
+        market = canonical_market(market)
         self._require_routable(market, name)
         self.repo.set_route(market, name, priority)
 
     def unroute(self, market: str, name: str) -> bool:
+        market = canonical_market(market)
         dark = self._would_go_dark(market, dropping={name})
         if dark:
             raise ValidationError(
@@ -146,6 +154,7 @@ class SourceAdminService:
         return self.repo.remove_route(market, name)
 
     def reorder(self, market: str, names: list[str]) -> None:
+        market = canonical_market(market)
         if not names:
             raise ValidationError(f"市场 {market} 的重排列表为空：要清空请用 unroute")
         for name in names:
@@ -165,6 +174,7 @@ class SourceAdminService:
         row = self.repo.get(name)
         if row is None:
             raise ValidationError(f"数据源 {name} 不存在")
+        market = canonical_market(market)
         self._require_routable(market, name)
         began = monotonic()
         try:

@@ -404,6 +404,21 @@ def test_health_shows_chains_and_flags_a_single_source_market(config_path, capsy
     assert "yfinance  ⚠ 日线单源" in out, "每个源都健康 ≠ 有备源：这里必须看得见"
 
 
+def test_a_lowercase_market_echoes_the_shape_that_was_written(config_path, capsys):
+    """回显即归一（`calendar` 第四轮就定了这条规矩）：打印 `a` 的那一行会让人以为
+    动的是另一个市场的链，而路由表里只有一份大写形态。
+    """
+    assert cli.run(["source", "unroute", "a", "sina"]) == 0
+    out = capsys.readouterr().out
+    assert "A 链里已移除 sina" in out and "a 链" not in out
+
+    assert cli.run(["source", "route", "a", "sina", "--priority", "4"]) == 0
+    assert "已把 sina 排到 A 的第 4 位" in capsys.readouterr().out
+
+    assert cli.run(["source", "move", "a", "sina", "akshare", "eastmoney", "tencent"]) == 0
+    assert "A 链已重排" in capsys.readouterr().out
+
+
 def test_an_actions_only_source_is_not_counted_as_a_bars_backup(config_path, capsys):
     """akshare_hk 拉不到价格。把它当港股日线的第二个源，屏幕上就是「有两个源，正常」，
     而 ⚠ 日线单源永远不出现——D38 分能力记账就是为了这一屏不说假话。
