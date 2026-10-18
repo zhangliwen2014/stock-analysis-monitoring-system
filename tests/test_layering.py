@@ -153,7 +153,12 @@ SOLE_CONSUMER: dict[str, str] = {
 
 
 def _used_names(path: Path) -> set[str]:
-    """模块里出现过的标识符：调用、属性、`from x import y` 都算「用了这个名字」。"""
+    """模块里出现过的标识符：调用、属性、`from x import y` 都算「用了这个名字」。
+
+    字符串形式的动态取用也算：`getattr(adjust, "hfq_frame")` 里那个名字不是 Name 也不是
+    Attribute 节点，只扫标识符的话，绕过守卫的那条路连一行可疑代码都不留下——而守卫的意义
+    正是「这条链上没有第二个出数口」，它不该只挡写得直白的那一种。
+    """
     names: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Name):
@@ -162,6 +167,15 @@ def _used_names(path: Path) -> set[str]:
             names.add(node.attr)
         elif isinstance(node, ast.alias):
             names.add(node.name.split(".")[-1])
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            names.add(node.args[1].value.rsplit(".", 1)[-1])
     return names
 
 
@@ -178,6 +192,23 @@ def test_unguarded_primitives_have_only_their_declared_consumer(path: Path):
             f"{rel} 用了不过闸的裸原语 {symbol}：出数只能走 analysis.adjust.adjusted_series，"
             "它后面那三道闸（覆盖 / 未标记跳变 / 收盘价）才会生效"
         )
+
+
+def test_the_guard_notices_a_reach_that_is_not_written_as_a_name(tmp_path):
+    """守卫自己也得能验：一行 `getattr` 就绕过它，等于没有守卫。
+
+    起别名那条路（`import hfq_frame as f`）之所以挡得住，是因为 `ast.alias` 里记的还是
+    原名；字符串那条路不是——名字在 AST 里根本不作为标识符出现。
+    """
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "from sams.analysis import adjust\n"
+        "g = getattr(adjust, 'hfq_frame')\n"
+        "from sams.analysis.adjust import day_factors as d\n",
+        encoding="utf-8",
+    )
+    used = _used_names(probe)
+    assert {"hfq_frame", "day_factors"} <= used
 
 
 @pytest.mark.parametrize(

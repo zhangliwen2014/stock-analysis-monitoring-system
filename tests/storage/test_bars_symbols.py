@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 import support
 
-from sams.core.errors import StorageError
+from sams.core.errors import StorageError, ValidationError
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.symbols import SymbolRepo
 
@@ -289,3 +289,35 @@ def test_symbol_aliases_share_the_bar_key(symbols, db):
     )
     assert db.scalar("SELECT code FROM symbols") == "00700"
     assert symbols.get("HK", "700") is not None
+
+
+def test_both_repos_use_the_domain_rule_for_both_halves_of_the_key(bars, symbols, db):
+    """键的两半都只有一条规则（D51 的下一层）：`" hk "` 归一靠的是 `canonical_market`，
+    而不是 Polars 的 `strip_chars().to_uppercase()`——那是同一句话的第二个实现，
+    而两个实现对「空算什么」的回答不一样：`canonical_market` 抛，批量写过去是丢。
+    """
+    bars.upsert(support.sample_bars(market=" hk ", code="HK.700"))
+    symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": [" hk "],
+                "code": ["HK.700"],
+                "name": ["腾讯控股"],
+                "currency": ["HKD"],
+                "lot_size": [100],
+            }
+        )
+    )
+    stored = db.query("SELECT market, code FROM bars_daily").to_dicts()
+    assert (stored[0]["market"], stored[0]["code"]) == ("HK", "00700")
+    row = db.query("SELECT market, code FROM symbols").to_dicts()[0]
+    assert (row["market"], row["code"]) == ("HK", "00700"), "两个仓库不许给同一只票两个键"
+
+
+def test_count_without_a_market_and_with_a_code_is_refused(bars):
+    """没有市场就不知道该按哪种形态归一代码：蒙一种去查，是「读不到且不报错」换了半边。"""
+    bars.upsert(support.sample_bars(market="HK", code="00700"))
+    with pytest.raises(ValidationError, match="市场"):
+        bars.count(None, "00700")
+    assert bars.count("HK", "700") == 2, "给了市场，别名就算同一个键"
+

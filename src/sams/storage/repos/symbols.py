@@ -14,6 +14,7 @@ import polars as pl
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import StorageError
 from sams.storage.db import Database
+from sams.storage.repos._keys import normalize_keys
 
 logger = logging.getLogger("sams.storage.symbols")
 
@@ -42,38 +43,11 @@ def _prepare(df: pl.DataFrame) -> pl.DataFrame:
         if col not in out.columns:
             dtype = pl.Int64 if col == "lot_size" else pl.Utf8
             out = out.with_columns(pl.lit(_DEFAULTS.get(col), dtype=dtype).alias(col))
-    out = out.with_columns(
-        pl.col("market").cast(pl.Utf8).str.strip_chars().str.to_uppercase(),
-        pl.col("code").cast(pl.Utf8).str.strip_chars().str.to_uppercase(),
-    )
-    # 键的一半为空，这一行就谁也都读不到：与 bars 同一个处理（丢弃 + warn），
-    # 而不是让一条来路不明的空市场名占住主档的一行
-    keyed = out.filter(pl.col("market").str.len_chars() > 0)
-    if keyed.height < out.height:
-        logger.warning(
-            "symbols 丢弃 %d 行（市场名为空：那一行永远读不到）", out.height - keyed.height
-        )
+    out = normalize_keys(out, logger=logger, table="symbols")
     # 同一批里有人给了 list_status、有人没给时，缺的那个是 null 而不是默认值：
     # list_market 按 'L' 过滤，null 行会静默消失，所以在这里补平
-    keyed = keyed.with_columns(pl.col("list_status").fill_null(_DEFAULTS["list_status"]))
-    # 空代码与空市场同一回事：那一行谁也都读不到
-    coded = keyed.filter(pl.col("code").cast(pl.Utf8).str.len_chars() > 0)
-    if coded.height < keyed.height:
-        logger.warning(
-            "symbols 丢弃 %d 行（代码为空：那一行永远读不到）", keyed.height - coded.height
-        )
-    # code 的形态用 `canonical_code`，与 bars 同一个函数：各仓库自己 upper() 会让
-    # 主档存 `700`、K 线存 `00700`，主档与行情于是描述两只不同的票
-    coded = coded.with_columns(
-        pl.Series(
-            "code",
-            [
-                canonical_code(m, c)
-                for m, c in zip(coded["market"].to_list(), coded["code"].to_list(), strict=True)
-            ],
-        )
-    )
-    return coded.select(list(COLUMNS)).unique(subset=["market", "code"], keep="last")
+    out = out.with_columns(pl.col("list_status").fill_null(_DEFAULTS["list_status"]))
+    return out.select(list(COLUMNS)).unique(subset=["market", "code"], keep="last")
 
 
 class SymbolRepo:
