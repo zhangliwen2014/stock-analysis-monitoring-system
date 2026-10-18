@@ -1,0 +1,464 @@
+"""基本面、按日估值、资金流三张表的写入与读取。
+
+这一层管三件别人管不了的事：
+
+1. **键形态**（D50）。`market`/`code` 在入口归一，与 `bars_daily` 同一条规则。否则
+   同一只票在 `financials` 里是 `00700`、在 `valuation_daily` 里是 `700`，市赚率拿
+   「今天的 PE」去配「最近一期的 ROE」时配不上——症状是「这只票算不出 PR」，
+   而真相是两次采集用了两种写法。
+
+2. **PIT**（D61）。`load_as_of` 只认 `published_date <= as_of` 的行，**披露日为 NULL
+   的一律不采信**并单独计数交回调用方。把 NULL 当「早就披露了」等于往回开时间机器：
+   一个 3 月就「知道」4 月末才公开的 ROE 的选股结果，回测起来好看得没有意义。
+
+3. **单位**（D58）。比率列越出小数口径的可能范围时置空那一列、留下那一行，并 warn。
+   宁可 PR 拒绝出数，也不要一个短两个数量级的「便宜」。
+
+`financials.pe_ttm/pb` 这两列本层不写（D60）：按日的倍数走 `valuation_daily`，
+把某一天的 PE 写进某一期的行里，就是拿一个日期冒充一个期间。
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, timedelta
+from uuid import uuid4
+
+import polars as pl
+
+from sams.core.codes import canonical_code, canonical_market
+from sams.core.errors import StorageError, ValidationError
+from sams.core.fundamentals import (
+    FINANCIAL_COLUMNS,
+    FLOW_COLUMNS,
+    RATIO_BOUNDS,
+    VALUATION_COLUMNS,
+)
+from sams.storage.db import Database
+from sams.storage.repos._keys import normalize_keys
+
+logger = logging.getLogger("sams.storage.fundamentals")
+
+
+def _prepare(
+    df: pl.DataFrame,
+    *,
+    columns: tuple[str, ...],
+    required: tuple[str, ...],
+    date_columns: tuple[str, ...],
+    key: tuple[str, ...],
+    table: str,
+) -> pl.DataFrame:
+    """补齐缺列、定型、归一键、丢掉键不全的行——三张表共用这一段，理由见模块开头。"""
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise StorageError(f"{table} 缺少必需列: {missing}")
+    out = df
+    for column in columns:
+        if column not in out.columns:
+            out = out.with_columns(
+                pl.lit(None, dtype=_dtype(column, date_columns, key)).alias(column)
+            )
+    out = out.select(list(columns))
+    for column in date_columns:
+        if out.schema[column] != pl.Date:
+            # cast(pl.Date) 会把带时区的 datetime 一律取 UTC 日历日：A 股 00:30+08:00 存成前一天
+            raise StorageError(
+                f"{table}.{column} 必须是 pl.Date，收到 {out.schema[column]}；"
+                "带时刻请先按该市场时区取 date"
+            )
+    numeric = [c for c in columns if _dtype(c, date_columns, key) is pl.Float64]
+    out = out.with_columns(*[pl.col(c).cast(pl.Float64) for c in numeric]) if numeric else out
+    out = normalize_keys(out, logger=logger, table=table)
+    # NaN/Inf 挡不住 is_not_null，而它一旦入库就会覆盖上一期的好数（与 bars 同一条理由）
+    bad = out.select(
+        pl.sum_horizontal(
+            *[~pl.col(c).is_finite() & pl.col(c).is_not_null() for c in numeric]
+        ).sum()
+    ).item()
+    if bad:
+        logger.warning("%s 有 %d 个非有限数值（NaN/Inf）已置空", table, bad)
+    out = out.with_columns(
+        pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c)
+        for c in numeric
+    )
+    # 小数口径越界（多半是百分数没换算，D58）：置空那一列，留 warn 给人看
+    for column, bound in RATIO_BOUNDS.items():
+        if column not in out.columns:
+            continue
+        suspect = out.filter(pl.col(column).abs() > bound).height
+        if suspect:
+            logger.warning(
+                "%s 有 %d 行的 %s 越出小数口径的可能范围（>|%g|，疑似百分数未 ÷100）已置空",
+                table,
+                suspect,
+                column,
+                bound,
+            )
+            out = out.with_columns(
+                pl.when(pl.col(column).abs() > bound).then(None).otherwise(pl.col(column)).alias(
+                    column
+                )
+            )
+    return out.unique(subset=list(key), keep="last").sort(list(key))
+
+
+def _dtype(
+    column: str, date_columns: tuple[str, ...], key: tuple[str, ...]
+) -> pl.DataType:
+    """词表里每一列的类型：键与来源是文本，日期列是 Date，其余是数值。
+
+    缺列补 null 时也用这一个判据——补成 Utf8 会把「这一列没给」变成「这一列是文本」，
+    越界检查会在 `str` 上做 `abs()` 而当场炸掉。
+    """
+    if column in date_columns:
+        return pl.Date
+    if column in (*key, "source"):
+        return pl.Utf8
+    return pl.Float64
+
+
+def _empty(
+    columns: tuple[str, ...], date_columns: tuple[str, ...], key: tuple[str, ...]
+) -> pl.DataFrame:
+    """空批次的形状与真实读取一致：调用方不必为「一只票都没同步」写分支。"""
+    return pl.DataFrame(schema={c: _dtype(c, date_columns, key) for c in columns})
+
+
+def _as_date(value: object) -> date | None:
+    return value.date() if isinstance(value, datetime) else value  # type: ignore[return-value]
+
+
+class FinancialRepo:
+    """按报告期的财务指标。读取的唯一入口是 `load_as_of`（PIT），没有「取最新一行」这种捷径。"""
+
+    TABLE = "financials"
+    KEY = ("market", "code", "report_date")
+    DATE_COLUMNS = ("report_date", "published_date")
+    REQUIRED = ("market", "code", "report_date", "source")
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def upsert(self, df: pl.DataFrame) -> int:
+        """幂等：同 (market, code, report_date) 后写覆盖先写。
+
+        这里**不**做跨源冲突拒绝（D45 那一套只属于公司行为）：财务指标的修订是常态，
+        同一期报表被源改过一次不是两条互相矛盾的事实，而是同一个事实的两次报道——
+        谁写的记在 `source` 里，读的人查得到。
+        """
+        if df.is_empty():
+            return 0
+        borrowed = [c for c in ("pe_ttm", "pb") if c in df.columns]
+        if borrowed:
+            raise StorageError(
+                f"financials 不收 {borrowed}：这一行的粒度是报告期，而倍数是某一天的数"
+                "（D60）。按日的 PE/PB 写 `valuation_daily`——把它们塞进报告期，"
+                "市赚率会拿一个月前的 PE 配今天的价，而屏幕上看不出来"
+            )
+        prepared = _prepare(
+            df,
+            columns=FINANCIAL_COLUMNS,
+            required=self.REQUIRED,
+            date_columns=self.DATE_COLUMNS,
+            key=self.KEY,
+            table=self.TABLE,
+        )
+        if prepared.is_empty():
+            return 0
+        view = f"incoming_financials_{uuid4().hex[:8]}"
+        self.db.register(view, prepared)
+        try:
+            self.db.execute(
+                f"""
+                INSERT OR REPLACE INTO {self.TABLE}
+                    (market, code, report_date, roe, revenue_yoy, profit_yoy,
+                     dividend_yield, market_cap, published_date, source)
+                SELECT market, code, report_date, roe, revenue_yoy, profit_yoy,
+                       dividend_yield, market_cap, published_date, source
+                FROM {view}
+                """
+            )
+        finally:
+            self.db.unregister(view)
+        return prepared.height
+
+    def load_as_of(
+        self, market: str, codes: list[str], as_of: date
+    ) -> tuple[pl.DataFrame, int]:
+        """每只票取「`as_of` 那天已经披露的最新一期」，另带回被 NULL 披露日挡掉的行数。
+
+        返回的是两个数不是一个：`dropped` 那一句必须由调用方打印（D61）。只说
+        「最新一期是 2024-03-31」而不说「另有 3 期因为没有披露日未被采信」，
+        读的人会以为那 3 期不存在，而不是以为我们不知道它们何时公开。
+        """
+        market = canonical_market(market)
+        if as_of is None:
+            raise ValidationError("load_as_of 必须给截至日：PIT 读取没有『默认今天』这条路")
+        if not codes:
+            return _empty(FINANCIAL_COLUMNS, self.DATE_COLUMNS, self.KEY), 0
+        wanted = [canonical_code(market, c) for c in codes]
+        frame = self.db.query(
+            """
+            SELECT * EXCLUDE (rnk) FROM (
+                SELECT *,
+                       rank() OVER (PARTITION BY code ORDER BY report_date DESC) AS rnk
+                FROM financials
+                WHERE market = ? AND code = ANY(?)
+                  AND published_date IS NOT NULL AND published_date <= ?
+            ) WHERE rnk = 1
+            ORDER BY code
+            """,
+            [market, wanted, as_of],
+        )
+        dropped = int(
+            self.db.scalar(
+                "SELECT count(*) FROM financials"
+                " WHERE market = ? AND code = ANY(?) AND published_date IS NULL",
+                [market, wanted],
+            )
+            or 0
+        )
+        return frame, dropped
+
+    def history(
+        self, market: str, code: str, *, as_of: date | None = None, limit: int | None = None
+    ) -> pl.DataFrame:
+        """已披露的各期，报告期倒序。M2-D 的「ROE 趋势」与屏上那几行补充期数用这个。"""
+        sql = [
+            "SELECT * FROM financials WHERE market = ? AND code = ?"
+            " AND published_date IS NOT NULL"
+        ]
+        params: list = [canonical_market(market), canonical_code(market, code)]
+        if as_of is not None:
+            sql.append("AND published_date <= ?")
+            params.append(as_of)
+        sql.append("ORDER BY report_date DESC")
+        if limit is not None:
+            sql.append(f"LIMIT {int(limit)}")
+        return self.db.query(" ".join(sql), params)
+
+    def covered_codes(self, market: str, *, as_of: date) -> list[str]:
+        """这个市场里至少有一期**已披露**财务数据的代码：按 PR 选股的 universe 的一半。"""
+        rows = self.db.query(
+            "SELECT DISTINCT code FROM financials"
+            " WHERE market = ? AND published_date IS NOT NULL AND published_date <= ?"
+            " ORDER BY code",
+            [canonical_market(market), as_of],
+        )
+        return list(rows["code"].to_list())
+
+    def count(self, market: str | None = None) -> int:
+        sql = "SELECT count(*) FROM financials"
+        params: list = []
+        if market:
+            sql += " WHERE market = ?"
+            params.append(canonical_market(market))
+        return int(self.db.scalar(sql, params) or 0)
+
+    def distinct_codes(self, market: str) -> int:
+        return int(
+            self.db.scalar(
+                "SELECT count(DISTINCT code) FROM financials WHERE market = ?",
+                [canonical_market(market)],
+            )
+            or 0
+        )
+
+    def latest_published(self, market: str) -> date | None:
+        """这个市场最近一次「某只票的某一期被公开」的日期——健康页问的就是这个。"""
+        return _as_date(
+            self.db.scalar(
+                "SELECT max(published_date) FROM financials WHERE market = ?",
+                [canonical_market(market)],
+            )
+        )
+
+
+class ValuationRepo:
+    """按交易日的估值倍数（PE/PB/股息率/市值）。市赚率里「今天的 PE」只能来自这里（D60）。"""
+
+    TABLE = "valuation_daily"
+    KEY = ("market", "code", "date")
+    DATE_COLUMNS = ("date",)
+    REQUIRED = ("market", "code", "date", "source")
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def upsert(self, df: pl.DataFrame) -> int:
+        if df.is_empty():
+            return 0
+        prepared = _prepare(
+            df,
+            columns=VALUATION_COLUMNS,
+            required=self.REQUIRED,
+            date_columns=self.DATE_COLUMNS,
+            key=self.KEY,
+            table=self.TABLE,
+        )
+        if prepared.is_empty():
+            return 0
+        view = f"incoming_valuation_{uuid4().hex[:8]}"
+        self.db.register(view, prepared)
+        try:
+            self.db.execute(
+                f"""
+                INSERT OR REPLACE INTO {self.TABLE}
+                    (market, code, date, pe_ttm, pb, dividend_yield, market_cap, source,
+                     updated_at)
+                SELECT market, code, date, pe_ttm, pb, dividend_yield, market_cap, source,
+                       now()
+                FROM {view}
+                """
+            )
+        finally:
+            self.db.unregister(view)
+        return prepared.height
+
+    def latest(
+        self, market: str, codes: list[str], as_of: date, *, within_days: int | None = None
+    ) -> pl.DataFrame:
+        """每只票 `date <= as_of` 里最新的一行。
+
+        `within_days` 是给选股用的：一只停牌两个月的票仍然「有 PE」，但那个 PE 属于
+        两个月前的那一天，拿它去和今天的价比出来的 PR 不是同一天的一篮子。给了它就
+        只要 `as_of - within_days` 之内还有行的票——被排除的票数由调用方说出口。
+        """
+        market = canonical_market(market)
+        if not codes:
+            return _empty(VALUATION_COLUMNS, self.DATE_COLUMNS, self.KEY)
+        wanted = [canonical_code(market, c) for c in codes]
+        sql = """
+            SELECT * EXCLUDE (rnk) FROM (
+                SELECT *, rank() OVER (PARTITION BY code ORDER BY date DESC) AS rnk
+                FROM valuation_daily
+                WHERE market = ? AND code = ANY(?) AND date <= ?
+        """
+        params: list = [market, wanted, as_of]
+        if within_days is not None:
+            sql += " AND date >= ?"
+            params.append(_days_before(as_of, within_days))
+        sql += "            ) WHERE rnk = 1 ORDER BY code"
+        return self.db.query(sql, params)
+
+    def series(
+        self, market: str, code: str, start: date | None = None, end: date | None = None
+    ) -> pl.DataFrame:
+        """按日的倍数序列。M2-D 的「PE-PB 历史分位」问的就是这个。"""
+        sql = ["SELECT * FROM valuation_daily WHERE market = ? AND code = ?"]
+        params: list = [canonical_market(market), canonical_code(market, code)]
+        if start is not None:
+            sql.append("AND date >= ?")
+            params.append(start)
+        if end is not None:
+            sql.append("AND date <= ?")
+            params.append(end)
+        return self.db.query(" ".join(sql) + " ORDER BY date", params)
+
+    def covered_codes(self, market: str, *, as_of: date, within_days: int = 7) -> list[str]:
+        rows = self.db.query(
+            """
+            SELECT code FROM valuation_daily
+            WHERE market = ? AND date <= ? AND date >= ?
+            GROUP BY code ORDER BY code
+            """,
+            [canonical_market(market), as_of, _days_before(as_of, within_days)],
+        )
+        return list(rows["code"].to_list())
+
+    def latest_date(self, market: str, code: str) -> date | None:
+        return _as_date(
+            self.db.scalar(
+                "SELECT max(date) FROM valuation_daily WHERE market = ? AND code = ?",
+                [canonical_market(market), canonical_code(market, code)],
+            )
+        )
+
+    def count(self, market: str | None = None) -> int:
+        sql = "SELECT count(*) FROM valuation_daily"
+        params: list = []
+        if market:
+            sql += " WHERE market = ?"
+            params.append(canonical_market(market))
+        return int(self.db.scalar(sql, params) or 0)
+
+    def distinct_codes(self, market: str) -> int:
+        return int(
+            self.db.scalar(
+                "SELECT count(DISTINCT code) FROM valuation_daily WHERE market = ?",
+                [canonical_market(market)],
+            )
+            or 0
+        )
+
+
+class FundingFlowRepo:
+    """按日的资金流（主力净流入、北向、融资余额）。港美股没有这一列的可靠免费源：缺就是缺。"""
+
+    TABLE = "funding_flow"
+    KEY = ("market", "code", "date")
+    DATE_COLUMNS = ("date",)
+    REQUIRED = ("market", "code", "date", "source")
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def upsert(self, df: pl.DataFrame) -> int:
+        """列名单里没有 `updated_at`：`funding_flow` 建表时就没有这一列（0001），
+        而资金流的读取只问「哪一天」，不问「这行是什么时候写的」。"""
+        if df.is_empty():
+            return 0
+        prepared = _prepare(
+            df,
+            columns=FLOW_COLUMNS,
+            required=self.REQUIRED,
+            date_columns=self.DATE_COLUMNS,
+            key=self.KEY,
+            table=self.TABLE,
+        )
+        if prepared.is_empty():
+            return 0
+        view = f"incoming_flow_{uuid4().hex[:8]}"
+        self.db.register(view, prepared)
+        try:
+            self.db.execute(
+                f"""
+                INSERT OR REPLACE INTO {self.TABLE}
+                    (market, code, date, main_net_in, north_net, north_hold, margin_bal,
+                     source)
+                SELECT market, code, date, main_net_in, north_net, north_hold, margin_bal,
+                       source
+                FROM {view}
+                """
+            )
+        finally:
+            self.db.unregister(view)
+        return prepared.height
+
+    def load_range(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+        return self.db.query(
+            "SELECT * FROM funding_flow WHERE market = ? AND code = ?"
+            " AND date >= ? AND date <= ? ORDER BY date",
+            [canonical_market(market), canonical_code(market, code), start, end],
+        )
+
+    def latest_date(self, market: str, code: str) -> date | None:
+        return _as_date(
+            self.db.scalar(
+                "SELECT max(date) FROM funding_flow WHERE market = ? AND code = ?",
+                [canonical_market(market), canonical_code(market, code)],
+            )
+        )
+
+    def count(self, market: str | None = None) -> int:
+        sql = "SELECT count(*) FROM funding_flow"
+        params: list = []
+        if market:
+            sql += " WHERE market = ?"
+            params.append(canonical_market(market))
+        return int(self.db.scalar(sql, params) or 0)
+
+
+def _days_before(day: date, days: int) -> date:
+    return day - timedelta(days=days)
