@@ -25,6 +25,7 @@ from sams.cli.common import group, iso_date
 from sams.core.codes import exchange_folds_dividend_into_daily_change
 from sams.core.errors import NotAdjustable
 from sams.core.timeutil import gap_days
+from sams.services.analysis import PERIODS, default_indicators, indicator_names
 from sams.services.calendar import GapKinds
 
 
@@ -49,6 +50,35 @@ def add_to(subparsers) -> None:
         help="机器可读输出（管道里退出码会被下游命令覆盖，脚本用这个）",
     )
     ret.set_defaults(handler=run_return)
+
+    ser = analysis.add_parser(
+        "series",
+        help="复权序列 + 指标：与 `return` 同一条取数路径、同一道闸（U20 / spec §8.2）",
+    )
+    ser.add_argument("--market", required=True, help="A / HK / US")
+    ser.add_argument("--code", required=True, help="如 601088")
+    ser.add_argument("--start", required=True, help="YYYY-MM-DD")
+    ser.add_argument("--end", required=True, help="YYYY-MM-DD")
+    ser.add_argument(
+        "--period",
+        default="day",
+        choices=list(PERIODS),
+        help="K 线周期：周与月由日线现算，不入库（spec §8.2）",
+    )
+    ser.add_argument(
+        "--indicators",
+        help=(
+            f"逗号分隔的指标组，可选 {', '.join(indicator_names())}"
+            f"（默认 {', '.join(default_indicators())}）"
+        ),
+    )
+    ser.add_argument("--tail", type=int, default=10, help="打印最后几行（0 = 全部）")
+    ser.add_argument(
+        "--listed-on",
+        help="上市首日：豁免它起 10 个日历日内的跳变检查（D37），用了会跟着数打印",
+    )
+    ser.add_argument("--json", action="store_true", help="机器可读输出（含整张表）")
+    ser.set_defaults(handler=run_series)
 
 
 def run_return(container: Container, args: argparse.Namespace) -> int:
@@ -267,3 +297,150 @@ def _gap_phrase(kinds: GapKinds) -> str:
 def _days(days: Sequence[date]) -> str:
     shown = "、".join(str(d) for d in days[:3])
     return shown + (f" 等 {len(days)} 天" if len(days) > 3 else "")
+
+
+# --- series：一条过闸序列 + 指标 -------------------------------------------------------
+
+
+def run_series(container: Container, args: argparse.Namespace) -> int:
+    start, end = iso_date(args.start), iso_date(args.end)
+    listed_on = iso_date(args.listed_on) if args.listed_on else None
+    names = (
+        [name.strip() for name in args.indicators.split(",") if name.strip()]
+        if args.indicators
+        else None
+    )
+    try:
+        read = container.analysis.series(
+            args.market,
+            args.code,
+            start=start,
+            end=end,
+            period=args.period,
+            indicators=names,
+            listed_on=listed_on,
+        )
+    except NotAdjustable as exc:
+        # 与 `return` 同一条拒绝路：这道闸拒的原因、下一步命令，都是同一套文案在说的事
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "exit": 1})
+        else:
+            print(f"拒绝出数：{exc}")
+        return 1
+    if args.json:
+        _emit(_series_payload(read))
+        return 0
+    return _print_series(read, tail=args.tail)
+
+
+def _print_series(read, *, tail: int) -> int:
+    print(
+        f"{read.market}/{read.code}  {read.period}  "
+        f"{read.requested_from} ~ {read.requested_to}  表里 {read.rows} 行"
+    )
+    print(
+        f"  采信  覆盖确认：{read.covered_by}，记录截至 {read.covered_through}"
+        f"；读取窗口内 {read.ex_dates} 个除权日已折进因子"
+    )
+    print(
+        f"  预热  往回多读 {read.warmup_bars} 根；后复权倍数锚在 {read.anchored_on}——"
+        "绝对价位只在这个锚以下可比，跨锚比请看比值"
+    )
+    print(f"  指标  {', '.join(read.indicators)}（`–` = 样本不足，不是 0）")
+    for line in _table_lines(read.table, tail=tail):
+        print(f"  {line}")
+    for line in _series_warnings(read):
+        print(f"  {line}")
+    return 0
+
+
+def _table_lines(table, *, tail: int) -> list[str]:
+    """列宽按内容算，不假设日期 10 位、价格 6 位：A 股几分钱的票与美股几百的票同居一表。"""
+    shown = table.tail(tail) if tail > 0 else table
+    columns = table.columns
+    rows = [[_cell(c, v) for c, v in zip(columns, row, strict=True)] for row in shown.iter_rows()]
+    widths = [
+        max(len(header), *(len(r[i]) for r in rows)) if rows else len(header)
+        for i, header in enumerate(columns)
+    ]
+    lines = ["  ".join(h.ljust(w) for h, w in zip(columns, widths, strict=True))]
+    lines += ["  ".join(v.rjust(w) for v, w in zip(r, widths, strict=True)) for r in rows]
+    if shown.height < table.height:
+        hidden = table.height - shown.height
+        lines.append(f"…… 上面只打最后 {shown.height} 行，还有 {hidden} 行（`--tail 0` 全打）")
+    return lines
+
+
+def _cell(column: str, value) -> str:
+    if value is None:
+        return "–"
+    if column in ("date", "first", "last"):
+        return str(value)
+    if column == "pending":
+        # 「收盘」而不是 `False`：这一列说的是一根 K 是不是定型的，写 False 得让人先猜列的含义
+        return "未走完" if value else "已收市"
+    if column == "bars":
+        return str(value)
+    if column in ("volume", "amount"):
+        return f"{value:,.0f}"
+    return f"{value:.2f}"
+
+
+def _series_warnings(read) -> list[str]:
+    out = []
+    if read.warmup_floor is not None:
+        out.append(
+            f"⚠ 预热只退到 {read.warmup_floor}：库里更早的 K 线落在那条覆盖确认之外，"
+            "没有拿来递推（D36）。表头那几行的长窗口指标因此可能给不出值——那不是漏算"
+        )
+    elif read.warmup_bars == 0:
+        out.append(
+            "⚠ 没有预热根数：第一个指标值就从请求起日自己起算。EMA/MACD/KDJ 这类递推指标的"
+            "种子就是这一天，与预热更长的稳定值会有出入（`ma` 那种样本不足给 `–` 的不受影响）"
+        )
+    pending = read.pending_periods
+    if pending:
+        out.append(
+            f"⚠ 未走完的周期：{_days(pending)}。它在表里与一根定型的周/月 K 同形，"
+            "别当收盘结论用"
+        )
+    if read.listed_on is not None:
+        out.append(
+            f"⚠ 按你给的上市日 {read.listed_on} 豁免了它起 10 个日历日内的跳变检查："
+            "这条序列没有 D37 那条「不可能跳变」的证据"
+        )
+    return out
+
+
+def _series_payload(read) -> dict:
+    columns = read.table.columns
+    return {
+        "status": "ok",
+        "exit": 0,
+        "market": read.market,
+        "code": read.code,
+        "period": read.period,
+        "requested_start": str(read.requested_from),
+        "requested_end": str(read.requested_to),
+        "rows": read.rows,
+        "last_row": str(read.last_row) if read.last_row else None,
+        "warmup_bars": read.warmup_bars,
+        "warmup_floor": str(read.warmup_floor) if read.warmup_floor else None,
+        "anchored_on": str(read.anchored_on),
+        "covered_by": read.covered_by,
+        "covered_through": str(read.covered_through),
+        "ex_dates": read.ex_dates,
+        "listed_on": str(read.listed_on) if read.listed_on else None,
+        "indicators": list(read.indicators),
+        "pending_periods": [str(d) for d in read.pending_periods],
+        "columns": columns,
+        "table": [
+            {c: _json_cell(v) for c, v in zip(columns, row, strict=True)}
+            for row in read.table.iter_rows()
+        ],
+    }
+
+
+def _json_cell(value) -> object:
+    """`date`/`datetime` 不能直接进 JSON，其余原样（`None` 保持 `null`，别涂成 0）。"""
+    return str(value) if isinstance(value, date) else value
