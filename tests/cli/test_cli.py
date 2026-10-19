@@ -994,7 +994,55 @@ def test_the_listing_date_exemption_the_guard_offers_is_actually_a_flag(containe
     out = capsys.readouterr().out
     assert "-30.00%" in out
     assert "豁免了它起 10 个日历日内的跳变检查" in out
+    assert "你传的" in out
     assert "没有 D37 那条" in out
+
+
+def seed_master_listing_date(container, code="601999", *, listed_on=date(2024, 7, 1)):
+    """把上市日写进主档：U18 之后这是「采集时填的」那一格，读数不再要求人重敲一遍。"""
+    SymbolRepo(container.db).upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "A",
+                    "code": code,
+                    "name": "某新股",
+                    "currency": "CNY",
+                    "listed_on": listed_on,
+                }
+            ]
+        )
+    )
+
+
+def test_the_masters_listing_date_exempts_without_any_flag(container, capsys):
+    seed_ipo_jump(container)
+    seed_master_listing_date(container)
+    assert cli_run_on(container, analysis_argv(code="601999")) == 0
+    out = capsys.readouterr().out
+    assert "-30.00%" in out
+    assert "主档里那格" in out
+    assert "--listed-on" not in out, "没说「你给的」就别让人以为自己传过参数"
+
+
+def test_the_listing_date_origin_travels_into_the_json(container, capsys):
+    """`--json` 里那个日期得连来源一起给：豁免掉 D37 这件事在机器读的那一屏也是口径变更。"""
+    seed_ipo_jump(container)
+    seed_master_listing_date(container)
+    assert cli_run_on(container, analysis_argv(code="601999") + ["--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert (payload["listed_on"], payload["listed_on_source"]) == ("2024-07-01", "master")
+
+
+def test_the_series_command_names_the_listing_date_origin(container, capsys):
+    """两条出口同一个来源标记：只有区间那头说清，series 那头就是暗改口径。"""
+    seed_crossing_ex_date(container)
+    seed_master_listing_date(container, "601088")
+    # 只点 `ma`：那 11 根没有 high/low，默认那套指标会先因缺列被拒（本用例测的是豁免的来源）
+    argv = analysis_series_argv(extra=["--indicators", "ma", "--json"])
+    assert cli_run_on(container, argv) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert (payload["listed_on"], payload["listed_on_source"]) == ("2024-07-01", "master")
 
 
 def test_a_malformed_date_is_a_message_not_a_trace(config_path, capsys):

@@ -17,7 +17,11 @@ import pytest
 from support import FrozenClock
 
 from sams.core.errors import NotAdjustable, ValidationError
-from sams.services.analysis import AnalysisService
+from sams.services.analysis import (
+    LISTED_ON_FROM_CLI,
+    LISTED_ON_FROM_MASTER,
+    AnalysisService,
+)
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
@@ -237,3 +241,103 @@ def test_a_window_the_bars_do_not_really_cover_is_refused(db):
     service = seeded(db)
     with pytest.raises(NotAdjustable, match="只覆盖"):
         service.interval_return("A", CODE, START, date(2024, 12, 31))
+
+
+# ---------- 上市日从哪来（U18） -----------------------------------------------
+
+IPO_CODE = "601999"
+
+
+def seed_ipo_jump(db, *, listed_on: date | None = None) -> AnalysisService:
+    """上市第二天 −30%：主板不可能，D37 因此拒绝——除非知道上市首日。
+
+    主档那一格有没有日子，就是这只票的数能不能出的一句话，所以这里把「库里有日子」
+    与「命令行传了日子」做成同一条数据路径上的两个来源，各自都要当场数得出来。
+    """
+    days = [START + timedelta(days=i) for i in range(11)]
+    BarRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * 11,
+                "code": [IPO_CODE] * 11,
+                "date": days,
+                "close": [10.0, 7.0] + [7.0] * 9,
+                "source": ["akshare"] * 11,
+            }
+        )
+    )
+    CorpActionsCoverageRepo(db).record(
+        "A",
+        IPO_CODE,
+        covered_from=days[0],
+        covered_to=days[10],
+        full_history=True,
+        src="akshare",
+    )
+    if listed_on is not None:
+        SymbolRepo(db).upsert(
+            pl.DataFrame(
+                [
+                    {
+                        "market": "A",
+                        "code": IPO_CODE,
+                        "name": "某新股",
+                        "currency": "CNY",
+                        "listed_on": listed_on,
+                    }
+                ]
+            )
+        )
+    return make_service(db)[0]
+
+
+def test_the_masters_listing_date_buys_the_exemption_without_a_flag(db):
+    """U18 闭合的判据：采集时填进主档的那天，读数时不用再让人敲一遍。
+
+    以前只有 `--listed-on` 这一条路，于是每次查一只新股都要人先去别处查它的上市日；
+    库里明明已经有这一格，却没人读它。
+    """
+    service = seed_ipo_jump(db, listed_on=START)
+    result = service.interval_return("A", IPO_CODE, START, END)
+    assert result.raw == pytest.approx(7.0 / 10.0 - 1)
+    assert (result.listed_on, result.listed_on_source) == (START, LISTED_ON_FROM_MASTER)
+
+
+def test_a_listing_date_nowhere_in_the_library_is_still_refused(db):
+    """主档没有、调用方也没给 ⇒ 照 D56 拒绝，不静默放宽 D37。
+
+    「拿库里最早那根 K 线当上市日」看着能救回这类票，其实把采集起点当成了上市事实：
+    一只 2007 年上市、2024 年才开始采集的老票，会因为一次窄窗口拿到豁免。
+    """
+    service = seed_ipo_jump(db)
+    with pytest.raises(NotAdjustable, match="未记录的公司行为"):
+        service.interval_return("A", IPO_CODE, START, END)
+
+
+def test_an_explicit_listing_date_wins_and_says_it_was_given(db):
+    """两处都有日子时按显式的那个算，并说出它是「你给的」：主档那格可能属于另一只票。
+
+    主档这里是 2000-01-04（一只老票），传进来的才是上市首日，只有传进来的那个
+    能把第二根 −30% 落在 10 个日历日的豁免窗内。
+    """
+    service = seed_ipo_jump(db, listed_on=date(2000, 1, 4))
+    result = service.interval_return("A", IPO_CODE, START, END, listed_on=START)
+    assert result.raw == pytest.approx(7.0 / 10.0 - 1)
+    assert (result.listed_on, result.listed_on_source) == (START, LISTED_ON_FROM_CLI)
+
+
+def test_a_master_listing_date_decades_earlier_grants_no_exemption(db):
+    """自动取主档那一格不许改掉豁免的锚：它仍跟着「距上市第几根」走（D37）。
+
+    主档写的是 2000 年，请求的却是 2024 年那段 −30%——那是二十四年后的不可能跳变，
+    谁来读都不该因为库里有个日期就放行。
+    """
+    service = seed_ipo_jump(db, listed_on=date(2000, 1, 4))
+    with pytest.raises(NotAdjustable, match="未记录的公司行为"):
+        service.interval_return("A", IPO_CODE, START, END)
+
+
+def test_a_stock_with_no_master_row_reports_no_listing_date(db):
+    service = seeded(db)
+    result = service.interval_return("A", CODE, START, END)
+    assert (result.listed_on, result.listed_on_source) == (None, None)

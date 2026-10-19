@@ -24,6 +24,7 @@ class StubFundamentalsAdapter:
         financials=None,
         valuation=None,
         flow=None,
+        listing: date | None = None,
         fail: Exception | None = None,
     ) -> None:
         self.markets = frozenset(markets)
@@ -32,6 +33,15 @@ class StubFundamentalsAdapter:
         self._flow = flow if flow is not None else empty_flow()
         self._fail = fail
         self.calls: list[str] = []
+        self.listing_calls: list[tuple[str, str]] = []
+        if listing is not None:
+            # 「这个源能不能答上市日期」判的是有没有这个方法，不是它返回什么：
+            # 没给 `listing` 的桩连方法都不长，和真实的 `eastmoney` 一样被 `chain_for` 跳过
+            def listed_date(market: str, code: str) -> date:
+                self.listing_calls.append((market, code))
+                return listing
+
+            self.listed_date = listed_date
 
     def financials(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         return self._answer("financials", self._financials, market, code)

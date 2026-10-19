@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
 
@@ -28,8 +28,19 @@ from sams.core.codes import canonical_code, canonical_market
 from sams.core.fundamentals import ROE_BASIS_ANNUAL, ROE_BASIS_LATEST
 from sams.datasource.registry import AdapterRegistry, Attempt
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.symbols import SymbolRepo
 
 logger = logging.getLogger("sams.services.fundamentals")
+
+#: 上市日期那一格问的是哪条能力链（D38 的那份判据，不在这里另列谁能给）
+_LISTED_KIND = "listed_date"
+#: 三种「这一格还是空的」，各自的下一步不同（与 `_missing_roe_reason` 同一规矩）
+NO_MASTER_ROW = (
+    "上市日期没填上：主档里还没有 {market} {code} 这一行，无处可写——"
+    "先 `sams sync daily --market {market} --code {code} --start … --end …`"
+)
+NO_CAPABLE_SOURCE = "上市日期没填上：{market} 的链上没有能给上市日期的源"
+NO_ANSWER = "上市日期没填上：{detail}"
 
 
 @dataclass(frozen=True)
@@ -47,6 +58,10 @@ class FundamentalSyncSummary:
     skipped: tuple[tuple[str, str], ...] = ()
     attempts: tuple[Attempt, ...] = ()
     confirmed_empty_by: tuple[str, ...] = ()
+    #: 这次**填上**的上市日（U18）。库里本来就有值时这里是 None：没填就不说「填了」
+    listed_on: date | None = None
+    #: 没填上时的原因与下一步；填上了就是空串
+    listed_on_note: str = ""
 
 
 class FundamentalSyncService:
@@ -56,15 +71,27 @@ class FundamentalSyncService:
         financials: FinancialRepo,
         valuation: ValuationRepo,
         flow: FundingFlowRepo,
+        symbols: SymbolRepo,
     ) -> None:
         self.registry = registry
         self.financials = financials
         self.valuation = valuation
         self.flow = flow
+        #: 上市日期落在主档那一格（U18）：没有这个仓库，D37 的豁免就只能靠人每次手传
+        self.symbols = symbols
 
     def sync_financials(self, market: str, code: str, start: date, end: date):
-        """按报告期的财务指标（ROE、增速、股息率、披露日）。"""
-        return self._sync(market, code, start, end, method="financials", repo=self.financials)
+        """按报告期的财务指标（ROE、增速、股息率、披露日）。
+
+        顺手把上市日期也填一次（U18）：这一问挂在基本面这条链上而不是新加一条命令，
+        因为漏敲一条命令的后果是「豁免静默不生效」，而屏幕上看不出来。
+        """
+        summary = self._sync(market, code, start, end, method="financials", repo=self.financials)
+        if summary.empty:
+            # 「这几家都没有这只票的财务记录」时不去问上市日：同一个源的答复已经在了
+            return summary
+        listed_on, note = self._fill_listed_on(summary.market, summary.code)
+        return replace(summary, listed_on=listed_on, listed_on_note=note)
 
     def sync_valuation(self, market: str, code: str, start: date, end: date):
         """按交易日的估值倍数——PR 公式里那个「今天的 PE」的唯一来源（D60）。"""
@@ -112,6 +139,42 @@ class FundamentalSyncService:
             skipped=result.skipped,
             attempts=result.attempts,
         )
+
+    def _fill_listed_on(self, market: str, code: str) -> tuple[date | None, str]:
+        """问一次上市日、填进主档那一格，返回「填上了哪天」与「没填上时怎么说」。
+
+        三处刻意的设计：
+
+        * **已有值就不问**（`SymbolRepo.fill_listed_on` 同一条规矩的读侧）：换一家源就可能
+          换一天，而 D37 的豁免窗口跟着这个日子走。
+        * **不走降级链的机器**（`registry._walk`）：这一问没有窗口、也不该记进源健康——
+          上市日期取不到不是「akshare 挂了」，把它算进去会让一次主档元数据的失败
+          烧掉那只票真正要用的那条链的预算。用的仍是同一份能力判据（`chain_for`）。
+        * **任何答复都不打断已经到手的基本面入库**：它是主档的一格，不是那条链的一半。
+        """
+        symbol = self.symbols.get(market, code)
+        if symbol is None:
+            return None, NO_MASTER_ROW.format(market=market, code=code)
+        if symbol.get("listed_on") is not None:
+            return None, ""
+        chain = self.registry.chain_for(market, _LISTED_KIND)
+        if not chain:
+            return None, NO_CAPABLE_SOURCE.format(market=market)
+        said_no: list[str] = []
+        failed: list[str] = []
+        for name in chain:
+            try:
+                day = self.registry.adapter(name).listed_date(market, code)
+            except Exception as exc:  # noqa: BLE001 — 这一问不能让一次成功的同步变成失败
+                failed.append(f"{name} 报错（{type(exc).__name__}: {exc}）")
+                continue
+            if day is None:
+                said_no.append(f"{name} 说查无记录")
+                continue
+            self.symbols.fill_listed_on(market, code, day)
+            logger.info("%s %s 上市日期 %s（源 %s）", market, code, day, name)
+            return day, ""
+        return None, NO_ANSWER.format(detail="；".join([*said_no, *failed]) or "（无）")
 
 
 @dataclass(frozen=True)

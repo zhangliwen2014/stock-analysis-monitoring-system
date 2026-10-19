@@ -48,6 +48,10 @@ class IntervalReturn:
     #: 用了上市日豁免（D37 的那条形证据在这段没生效）。它必须跟着数出门：
     #: 「过闸的数」这句话在传了 `--listed-on` 时说的不是原来那件事
     listed_on: date | None = None
+    #: 那个豁免日期从哪来（`"cli"` / `"master"` / None）。分析层只知道收到的那个日子，
+    #: 而「库里本来就写着」与「有人今天敲了一遍」是两句不同的话：前一句的下一步是
+    #: 去修采集，后一句的下一步是记住下次还要敲。由读取用例填（`services/analysis.py`）
+    listed_on_source: str | None = None
 
     @property
     def ex_dates(self) -> int:

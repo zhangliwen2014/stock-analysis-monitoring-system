@@ -321,3 +321,60 @@ def test_count_without_a_market_and_with_a_code_is_refused(bars):
         bars.count(None, "00700")
     assert bars.count("HK", "700") == 2, "给了市场，别名就算同一个键"
 
+
+
+# ---------- 上市日期（U18：D37 那条豁免终于有了机器来源） ----------
+
+LISTED = date(2007, 10, 9)
+
+
+def _shenhua(**over) -> dict:
+    row = {"market": "A", "code": "601088", "currency": "CNY", "name": "中国神华"}
+    row.update(over)
+    return row
+
+
+def test_a_resync_does_not_erase_the_listing_date(symbols):
+    """`listed_on` 由基本面源填一次，而主档在每次日线采集里都会被写。
+
+    原来的 `INSERT OR REPLACE` 是「删了再插」：不在插入列表里的那一列一律回默认值，
+    于是每次 `sams sync daily` 都把上市日抹回 NULL——U18 每天早晨被重新打开一次，
+    而屏幕上没有任何一处说豁免失效了。
+    """
+    symbols.upsert(pl.DataFrame([_shenhua()]))
+    assert symbols.fill_listed_on("A", "601088", LISTED)
+    symbols.upsert(pl.DataFrame([{"market": "A", "code": "601088", "currency": "CNY"}]))
+    row = symbols.get("A", "601088")
+    assert row["listed_on"] == LISTED
+    # 同一条规则的另一半：一次只带键的采集不该把名称也问走
+    assert row["name"] == "中国神华"
+
+
+def test_a_frame_may_carry_the_listing_date(symbols):
+    """别的写入方（未来的主档源）直接带这一列时也落库，不必走 `fill_listed_on`。"""
+    symbols.upsert(pl.DataFrame([_shenhua(listed_on=LISTED)]))
+    assert symbols.get("A", "601088")["listed_on"] == LISTED
+
+
+def test_fill_listed_on_is_fill_once(symbols):
+    """已有值就是已有的答案：采集不许每天重新猜一次。
+
+    换一次源就可能换一天（有的给申购日、有的给上市日），而豁免的日子跟着漂——
+    D37 的放行就变成取决于今天问了哪一家。
+    """
+    symbols.upsert(pl.DataFrame([_shenhua(listed_on=LISTED)]))
+    assert not symbols.fill_listed_on("A", "601088", date(1990, 1, 1))
+    assert symbols.get("A", "601088")["listed_on"] == LISTED
+
+
+def test_fill_listed_on_needs_the_master_row(symbols):
+    """主档没有这一行时不硬造：`currency` 是 NOT NULL，猜一个币种比留着不填更坏。"""
+    assert not symbols.fill_listed_on("A", "601088", LISTED)
+    assert symbols.get("A", "601088") is None
+
+
+def test_fill_listed_on_lands_on_the_canonical_key(symbols):
+    """`sh601088` 与 `601088` 是同一只票：按别名写、按裸代码读，必须读到同一天。"""
+    symbols.upsert(pl.DataFrame([_shenhua()]))
+    assert symbols.fill_listed_on("A", "sh601088", LISTED)
+    assert symbols.get("A", "601088")["listed_on"] == LISTED

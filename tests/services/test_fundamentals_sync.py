@@ -25,6 +25,7 @@ from sams.datasource.fundamentals import empty_financials, empty_flow, empty_val
 from sams.datasource.registry import Attempt, FrameResult
 from sams.services.fundamentals import FundamentalSyncService
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.symbols import SymbolRepo
 
 D1, D2 = date(2024, 1, 2), date(2024, 6, 28)
 Q1 = date(2024, 3, 31)
@@ -80,11 +81,17 @@ def flow_frame(**over) -> pl.DataFrame:
 
 
 class StubRegistry:
-    """只回答三条链各自的结果；降级、跳过、重试都在 `tests/datasource` 里测。"""
+    """只回答三条链各自的结果；降级、跳过、重试都在 `tests/datasource` 里测。
 
-    def __init__(self, **results) -> None:
+    `chain_for` / `adapter` 是上市日期那一格要的（U18）：它不走降级链，但要按同一份
+    能力判据问「链上谁能给上市日」，所以这里连这两个也一起 stub。
+    """
+
+    def __init__(self, *, listing_chain=(), listing_adapters=None, **results) -> None:
         self.results = results
         self.calls: list[tuple[str, tuple]] = []
+        self.listing_chain = listing_chain
+        self.listing_adapters = listing_adapters or {}
 
     def _fetch(self, method: str, market: str, code: str, start: date, end: date) -> FrameResult:
         self.calls.append((method, (market, code, start, end)))
@@ -102,16 +109,50 @@ class StubRegistry:
     def fetch_funding_flow(self, market, code, start, end):
         return self._fetch("funding_flow", market, code, start, end)
 
+    def chain_for(self, market: str, method: str):
+        assert method == "listed_date", f"这个 stub 只登记了上市日期一条链，收到 {method}"
+        return tuple(self.listing_chain)
 
-def make_service(db, **results):
+    def adapter(self, name: str):
+        return self.listing_adapters[name]
+
+
+class StubListing:
+    """一个「能给上市日期」的源：`None` 是查无记录，异常是答不上来（两者下一步相反）。"""
+
+    def __init__(self, name: str, answer=None, *, raises=None) -> None:
+        self.name = name
+        self.answer = answer
+        self.raises = raises
+        self.calls: list[tuple[str, str]] = []
+
+    def listed_date(self, market: str, code: str):
+        self.calls.append((market, code))
+        if self.raises is not None:
+            raise self.raises
+        return self.answer
+
+
+def master(db, **over) -> None:
+    """主档里放一行：上市日期的那一格要有地方写（`symbols.currency` 是 NOT NULL）。"""
+    row = {"market": "A", "code": "601088", "currency": "CNY"}
+    row.update(over)
+    SymbolRepo(db).upsert(pl.DataFrame([row]))
+
+
+def make_service(db, *, symbols=None, **results):
     repos = {
         "financials": FinancialRepo(db),
         "valuation": ValuationRepo(db),
         "funding_flow": FundingFlowRepo(db),
     }
-    registry = StubRegistry(**results)
+    registry = results.pop("registry", None) or StubRegistry(**results)
     service = FundamentalSyncService(
-        registry, repos["financials"], repos["valuation"], repos["funding_flow"]
+        registry,
+        repos["financials"],
+        repos["valuation"],
+        repos["funding_flow"],
+        symbols or SymbolRepo(db),
     )
     return service, registry, repos
 
@@ -216,6 +257,7 @@ def test_a_broken_chain_writes_nothing_and_leaves_the_table_alone(db):
         repos["financials"],
         repos["valuation"],
         repos["funding_flow"],
+        SymbolRepo(db),
     )
     with pytest.raises(DatasourceError, match="503"):
         broken.sync_financials("A", "601088", D1, D2)
@@ -254,3 +296,123 @@ def test_the_degradation_and_the_skips_travel_with_the_summary(db):
     summary = service.sync_financials("A", "601088", D1, D2)
     assert summary.degraded and summary.skipped == (("tencent", "不提供基本面"),)
     assert [a.source for a in summary.attempts] == ["sina", "akshare"]
+
+
+# ---------- 上市日期回填（U18：D37 那条豁免的机器来源） ----------
+
+LISTED = date(2007, 10, 9)
+
+
+def listing_service(db, *, chain, adapters, **results):
+    """一条带「上市日期」能力的链：财务链照常走，链上谁能给上市日由 stub 说了算。"""
+    registry = StubRegistry(listing_chain=chain, listing_adapters=adapters, **results)
+    service = FundamentalSyncService(
+        registry,
+        FinancialRepo(db),
+        ValuationRepo(db),
+        FundingFlowRepo(db),
+        SymbolRepo(db),
+    )
+    return service, registry
+
+
+def sync_financials(db, *, chain, adapters, **kw):
+    service, registry = listing_service(
+        db, chain=chain, adapters=adapters, financials=result("financials", financials_frame())
+    )
+    return service.sync_financials("A", "601088", D1, D2), registry
+
+
+def test_syncing_financials_fills_the_master_listing_date(db):
+    """基本面同步顺手把上市日填一次：那一格是豁免的唯一机器来源。
+
+    填在 `sync_financials` 而不是新加一条命令：用户要的下一步是「这只票的数据齐了」，
+    而多一个命令名就多一处「忘了敲」——漏敲的后果是豁免静默不生效，屏幕上看不出来。
+    """
+    master(db)
+    ak = StubListing("akshare", LISTED)
+    summary, registry = sync_financials(db, chain=("akshare",), adapters={"akshare": ak})
+    assert summary.listed_on == LISTED
+    assert SymbolRepo(db).get("A", "601088")["listed_on"] == LISTED
+    assert ak.calls == [("A", "601088")], "问的是归一后的键"
+
+
+def test_a_master_row_that_already_knows_is_not_asked_again(db):
+    """已有值就是已有答案：填一次之后每次同步都不再花一个请求，也不再可能换一天。"""
+    master(db, listed_on=LISTED)
+    ak = StubListing("akshare", date(1990, 1, 1))
+    summary, _ = sync_financials(db, chain=("akshare",), adapters={"akshare": ak})
+    assert ak.calls == []
+    assert summary.listed_on is None, "这次没填，就不说「填了」"
+    assert SymbolRepo(db).get("A", "601088")["listed_on"] == LISTED
+
+
+def test_the_fill_needs_a_master_row_and_says_so(db):
+    """主档没这一行时不硬造（`currency` 是 NOT NULL），也不去问那一个请求。
+
+    这句必须出声：否则「同步了基本面」会被读成「豁免那格有值了」。
+    """
+    ak = StubListing("akshare", LISTED)
+    summary, _ = sync_financials(db, chain=("akshare",), adapters={"akshare": ak})
+    assert ak.calls == []
+    assert summary.listed_on is None
+    assert "sams sync daily" in summary.listed_on_note
+
+
+def test_no_capable_source_is_reported_as_a_gap(db):
+    """链上没人能给上市日期是一句要出身的缺（D38 同一条规矩），不是「这只票没有」。"""
+    master(db)
+    summary, _ = sync_financials(db, chain=(), adapters={})
+    assert summary.listed_on is None
+    assert "链上没有" in summary.listed_on_note
+
+
+def test_a_source_that_says_it_does_not_know_leaves_the_cell_empty(db):
+    master(db)
+    ak = StubListing("akshare", None)
+    summary, _ = sync_financials(db, chain=("akshare",), adapters={"akshare": ak})
+    assert summary.listed_on is None
+    assert "查无记录" in summary.listed_on_note
+    assert SymbolRepo(db).get("A", "601088")["listed_on"] is None
+
+
+def test_a_broken_listing_source_does_not_break_the_financials_sync(db):
+    """上市日期问不到，不该让已经到手的基本面数据一起失败：它是主档的一格，不是那条链。
+
+    但它也不能咽下来——屏幕上要说「这一格还是空的，因为 akshare 报了 503」，
+    否则下一次 `analysis return` 撞 D37 时没人知道为什么没被豁免。
+    """
+    master(db)
+    ak = StubListing("akshare", raises=DatasourceError("akshare", "503"))
+    summary, _ = sync_financials(db, chain=("akshare",), adapters={"akshare": ak})
+    assert summary.written == 1, "基本面照旧入库"
+    assert summary.listed_on is None
+    assert "503" in summary.listed_on_note
+
+
+def test_the_first_source_that_answers_wins_and_the_rest_are_not_asked(db):
+    master(db)
+    first = StubListing("sina", None)
+    second = StubListing("akshare", LISTED)
+    third = StubListing("eastmoney", date(2020, 1, 1))
+    summary, _ = sync_financials(
+        db,
+        chain=("sina", "akshare", "eastmoney"),
+        adapters={"sina": first, "akshare": second, "eastmoney": third},
+    )
+    assert summary.listed_on == LISTED
+    assert third.calls == [], "问到了就不再多花一个请求"
+
+
+def test_valuation_and_flow_never_ask_for_the_listing_date(db):
+    """回填只挂在基本面那一条上：另外两条链的源本来就不给上市日，问了也是白问。"""
+    master(db)
+    ak = StubListing("akshare", LISTED)
+    service, registry = listing_service(
+        db,
+        chain=("akshare",),
+        adapters={"akshare": ak},
+        valuation=result("valuation", valuation_frame()),
+    )
+    summary = service.sync_valuation("A", "601088", D1, D2)
+    assert (ak.calls, summary.listed_on) == ([], None)

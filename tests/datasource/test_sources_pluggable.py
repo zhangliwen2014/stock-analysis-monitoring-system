@@ -77,7 +77,8 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
         "financials",
         "valuation",
         "funding_flow",
-    ), "A 股主源现在是五种数据都能给：加一个方法就多一种能力，这里跟着动，别处不用改"
+        "listed_date",
+    ), "A 股主源现在是六种数据都能给：加一个方法就多一种能力，这里跟着动，别处不用改"
 
 
 def test_registering_exposes_the_implementations_own_markets():

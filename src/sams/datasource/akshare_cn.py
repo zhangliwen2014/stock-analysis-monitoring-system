@@ -264,6 +264,57 @@ def akshare_valuation(symbol: str) -> pl.DataFrame:
     return pl.from_pandas(frame)
 
 
+#: 上市日期（U18）：东财 F10 的公司概况里有 `LISTING_DATE`，而 akshare 把同一件事包在
+#: `stock_individual_info_em` 里——那个接口打 `push2.eastmoney.com` 的行情快照，本环境实测
+#: 不可达（`ConnectionError: Remote end closed connection without response`）。报告接口
+#: （`datacenter.eastmoney.com/securities`，与 `eastmoney_says_no_records` 同一族）给的是
+#: 同一个日子：实测 601088 → 2007-10-09。
+LISTING_REQUIRED = ("LISTING_DATE",)
+#: 东财报告接口里「这张表里没有这条记录」的那个码（与分红送配表同一个约定）。
+#: 别的 `success: false` 是接口在抱怨（`9501 报表配置不存在`），不能当成一句答复
+_NO_RECORD_CODE = 9201
+
+
+def parse_listing_response(body: dict, *, symbol: str) -> pl.DataFrame:
+    """报告接口的两种「没有数据」分开处理：查无记录是答复，报表不存在是改版。
+
+    把后者也咽成空帧，主档那一格就永远停在「没有」而屏幕上不说为什么——
+    D43 在基本面三链上分的那一刀，在这里同样要分。
+    """
+    if not body.get("success", True):
+        code = body.get("code")
+        if code == _NO_RECORD_CODE:
+            return pl.DataFrame()
+        raise FieldDrift(
+            "akshare",
+            f"{symbol} 的公司概况被报告接口拒绝了：code={code} message={body.get('message')}",
+        )
+    rows = (body.get("result") or {}).get("data") or []
+    if not rows:
+        return pl.DataFrame()
+    return pl.DataFrame(rows)
+
+
+def akshare_listing_info(symbol: str) -> pl.DataFrame:
+    """真实网络调用：某只 A 股的公司概况（只要上市日期那一列）。`symbol` 是 `601088.SH`。"""
+    import requests
+
+    response = requests.get(
+        "https://datacenter.eastmoney.com/securities/api/data/v1/get",
+        params={
+            "reportName": "RPT_F10_BASIC_ORGINFO",
+            "columns": "SECUCODE,LISTING_DATE",
+            "filter": f'(SECUCODE="{symbol}")',
+            "pageNumber": "1",
+            "pageSize": "1",
+            "source": "F10",
+            "client": "PC",
+        },
+        timeout=15,
+    )
+    return parse_listing_response(response.json(), symbol=symbol)
+
+
 def akshare_flow(symbol: str, market_tag: str) -> pl.DataFrame:
     """真实网络调用：某只 A 股的按日资金流。`market_tag` 取自 `fund_flow_market`。"""
     import akshare as ak
@@ -321,12 +372,14 @@ class AkshareAdapter:
         financials_fetch: Callable[[str], pl.DataFrame] = akshare_financials_indicator,
         valuation_fetch: Callable[[str], pl.DataFrame] = akshare_valuation,
         flow_fetch: Callable[[str, str], pl.DataFrame] = akshare_flow,
+        listing_fetch: Callable[[str], pl.DataFrame] = akshare_listing_info,
     ) -> None:
         self._fetch = fetch
         self._fhps_fetch = fhps_fetch
         self._financials_fetch = financials_fetch
         self._valuation_fetch = valuation_fetch
         self._flow_fetch = flow_fetch
+        self._listing_fetch = listing_fetch
 
     def corp_actions(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         """A 股分红送配。源没有日期参数，一次给全史——那就把全史都交回去，**不按窗口切**。
@@ -453,6 +506,28 @@ class AkshareAdapter:
             raise classify_error(self.name, exc) from exc
         return _in_window(out, "date", start, end)
 
+    def listed_date(self, market: str, code: str) -> date | None:
+        """上市首日（U18）：D37 那条上市豁免的机器来源。
+
+        `None` 是「这个源没有这只票的上市日」，不是故障——抛出去的那句才是「答不上来」，
+        两者在主档那一格上的下一步相反（见 `datasource/listed_date.py` 的文件头）。
+        也不拿「库里最早那根 K 线」冒充：那是采集起点，不是上市日。
+        """
+        _require_market(self.name, self.markets, market)
+        try:
+            raw = _as_polars(self._listing_fetch(secucode(market, code)))
+            if raw.is_empty():
+                return None
+            _require_columns(LISTING_REQUIRED, raw, table="公司概况的上市日期")
+            day = raw.select(to_date_expr(pl.col("LISTING_DATE")).alias("listed_on"))[
+                "listed_on"
+            ][0]
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+        return day
+
 
 def _as_polars(frame) -> pl.DataFrame:
     if isinstance(frame, pl.DataFrame):
@@ -463,5 +538,8 @@ def _as_polars(frame) -> pl.DataFrame:
 # 注册进 datasource.sources：加源只改自己这一行，不动 registry / bootstrap / CLI
 source(
     "akshare",
-    note="akshare A 股主源（日线 + 分红送配 + 基本面 + 按日估值 + 资金流，底层都是东财）",
+    note=(
+        "akshare A 股主源（日线 + 分红送配 + 基本面 + 按日估值 + 资金流 + 上市日期，"
+        "底层都是东财）"
+    ),
 )(AkshareAdapter)

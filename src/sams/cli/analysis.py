@@ -33,8 +33,28 @@ from sams.core.fundamentals import (
     roe_basis_note,
 )
 from sams.core.timeutil import gap_days
-from sams.services.analysis import PERIODS, default_indicators, indicator_names
+from sams.services.analysis import (
+    LISTED_ON_FROM_CLI,
+    LISTED_ON_FROM_MASTER,
+    PERIODS,
+    default_indicators,
+    indicator_names,
+)
 from sams.services.calendar import GapKinds
+
+#: 豁免日期的来源 → 括号里那句怎么说（U18）。两个来源的下一步完全不同：
+#: 「你传的」下次还得传，「主档里那格」是采集时填进去的，谁读都不用再传一遍
+_LISTED_ON_ORIGIN = {
+    LISTED_ON_FROM_CLI: "你传的 --listed-on",
+    LISTED_ON_FROM_MASTER: "主档里那格，同步基本面时填的",
+}
+
+
+def _listed_on_note(result, tail: str) -> str:
+    return (
+        f"⚠ 按上市日 {result.listed_on}（{_LISTED_ON_ORIGIN[result.listed_on_source]}）"
+        f"豁免了它起 10 个日历日内的跳变检查：{tail}"
+    )
 
 # --- fundamentals：基本面 + 市赚率 PR --------------------------------------------------
 
@@ -235,7 +255,10 @@ def add_to(subparsers) -> None:
     ret.add_argument("--end", required=True, help="YYYY-MM-DD")
     ret.add_argument(
         "--listed-on",
-        help="上市首日：豁免它起 10 个日历日内的跳变检查（D37），用了就会跟着数打印",
+        help=(
+            "上市首日：豁免它起 10 个日历日内的跳变检查（D37）。不传就用主档里那格"
+            "（`sams sync financials` 采集时填的）；用了谁的那一天都跟着数打印"
+        ),
     )
     ret.add_argument(
         "--json",
@@ -268,7 +291,10 @@ def add_to(subparsers) -> None:
     ser.add_argument("--tail", type=int, default=10, help="打印最后几行（0 = 全部）")
     ser.add_argument(
         "--listed-on",
-        help="上市首日：豁免它起 10 个日历日内的跳变检查（D37），用了会跟着数打印",
+        help=(
+            "上市首日：豁免它起 10 个日历日内的跳变检查（D37）。不传就用主档里那格"
+            "（`sams sync financials` 采集时填的）；用了谁的那一天都跟着数打印"
+        ),
     )
     ser.add_argument("--json", action="store_true", help="机器可读输出（含整张表）")
     ser.set_defaults(handler=run_series)
@@ -413,10 +439,7 @@ def _warnings(result) -> list[str]:
             "这段给得出数，把止日挪到它当天或之后就给不出了"
         )
     if result.listed_on is not None:
-        out.append(
-            f"⚠ 按你给的上市日 {result.listed_on} 豁免了它起 10 个日历日内的跳变检查："
-            "这个数没有 D37 那条「不可能跳变」的证据"
-        )
+        out.append(_listed_on_note(result, "这个数没有 D37 那条「不可能跳变」的证据"))
     return out
 
 
@@ -450,6 +473,7 @@ def _payload(result, start: date, end: date, kinds: GapKinds | None, code: int) 
         "covered_by": result.covered_by,
         "covered_through": str(result.covered_through),
         "listed_on": str(result.listed_on) if result.listed_on else None,
+        "listed_on_source": result.listed_on_source,
         "exchange_folds_dividend": exchange_folds_dividend_into_daily_change(result.market),
         "gap": None if kinds is None else _gap_payload(kinds),
     }
@@ -608,10 +632,7 @@ def _series_warnings(read) -> list[str]:
             "别当收盘结论用"
         )
     if read.listed_on is not None:
-        out.append(
-            f"⚠ 按你给的上市日 {read.listed_on} 豁免了它起 10 个日历日内的跳变检查："
-            "这条序列没有 D37 那条「不可能跳变」的证据"
-        )
+        out.append(_listed_on_note(read, "这条序列没有 D37 那条「不可能跳变」的证据"))
     return out
 
 
@@ -634,6 +655,7 @@ def _series_payload(read) -> dict:
         "covered_through": str(read.covered_through),
         "ex_dates": read.ex_dates,
         "listed_on": str(read.listed_on) if read.listed_on else None,
+        "listed_on_source": read.listed_on_source,
         "indicators": list(read.indicators),
         "pending_periods": [str(d) for d in read.pending_periods],
         "columns": columns,

@@ -20,6 +20,7 @@ from support import FrozenClock
 
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.services.analysis import (
+    LISTED_ON_FROM_MASTER,
     AnalysisService,
     SeriesRead,
     default_indicators,
@@ -499,3 +500,27 @@ def test_a_window_with_no_bars_says_where_the_bars_are(db):
     with pytest.raises(NotAdjustable, match="最新到") as exc:
         service.series("A", CODE, start=date(2025, 1, 1), end=date(2025, 1, 31))
     assert str(TODAY) in str(exc.value)
+
+
+def test_the_series_read_says_where_the_listing_date_came_from(db):
+    """两条出口对「豁免从哪来」必须同样出声：只有一头说，另一头就是暗改口径。
+
+    `series` 的表头那行可以是复权后的极值，而它过闸时少了一道 D37 证据——这句话
+    在区间那条路上已经要说清了，换一条出口不能换个说法，更不能干脆不说。
+    """
+    SymbolRepo(db).upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "A",
+                    "code": CODE,
+                    "name": "中国神华",
+                    "currency": "CNY",
+                    "listed_on": DAYS[0],
+                }
+            ]
+        )
+    )
+    read = make(db).series("A", CODE, start=DAYS[-6], end=TODAY)
+    assert read.listed_on == DAYS[0]
+    assert read.listed_on_source == LISTED_ON_FROM_MASTER

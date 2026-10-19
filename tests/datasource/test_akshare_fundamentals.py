@@ -287,7 +287,11 @@ def test_an_unsupported_market_is_refused_before_the_network():
 
 
 def test_the_adapter_now_declares_three_more_kinds():
-    """能力按方法推导（D38）：这三行断言的是「注册表看到的形状」，不是类自己写的声明。"""
+    """能力按方法推导（D38）：这几行断言的是「注册表看到的形状」，不是类自己写的声明。
+
+    `listed_date` 也在内：A 股主源顺手把上市日期 surfaced（U18），
+    而这一格是 D37 那条豁免唯一的机器来源。
+    """
     from sams.datasource.sources import known
 
     assert known()["akshare"].capabilities == (
@@ -296,6 +300,7 @@ def test_the_adapter_now_declares_three_more_kinds():
         "financials",
         "valuation",
         "funding_flow",
+        "listed_date",
     )
 
 

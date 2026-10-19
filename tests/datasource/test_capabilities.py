@@ -16,13 +16,18 @@ from sams.datasource.sources import build, catalog, known
 
 
 def test_the_kind_name_is_the_adapter_method_name():
-    """种类名 = 方法名 = `fetch_<方法名>`：没有第二套词，也就没有「两处叫法漂移」这件事。"""
+    """种类名 = 方法名 = `fetch_<方法名>`：没有第二套词，也就没有「两处叫法漂移」这件事。
+
+    `listed_date` 是唯一一个不走降级链的种类（它问的是主档的一格，不是一类数据），
+    但它同样登记在这张表里：谁能填上市日期，判据仍然只有这一份。
+    """
     assert set(CAPABILITIES) == {
         "daily_bars",
         "corp_actions",
         "financials",
         "valuation",
         "funding_flow",
+        "listed_date",
     }
 
 

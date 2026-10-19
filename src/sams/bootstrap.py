@@ -206,7 +206,7 @@ def build_container(
             registry, corp_actions, corp_actions_coverage, clock=clock
         ),
         fundamental_sync=FundamentalSyncService(
-            registry, financials_store, valuation_store, flow_store
+            registry, financials_store, valuation_store, flow_store, symbols
         ),
         fundamentals=FundamentalService(financials_store, valuation_store, clock=clock),
         screen=ScreenService(

@@ -81,6 +81,12 @@ def run_fundamental(container: Container, args: argparse.Namespace) -> int:
         if summary.degraded:
             line += f" [降级: {_trail(summary.attempts)}]"
         print(line)
+        # 上市日期是主档的一格（U18）：填上了读的人少敲一次 `--listed-on`，
+        # 没填上要说清为什么——它不是基本面失败的那一半，所以不打断上面那一行
+        if summary.listed_on is not None:
+            print(f"           主档上市日期={summary.listed_on}（下次读数不用再传 --listed-on）")
+        elif summary.listed_on_note:
+            print(f"           {summary.listed_on_note}")
         for name, reason in summary.skipped:
             print(f"           跳过 {name}：{reason}")
     return 0

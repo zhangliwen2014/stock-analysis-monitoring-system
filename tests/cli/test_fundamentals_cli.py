@@ -25,6 +25,7 @@ from support_fundamentals import StubFundamentalsAdapter
 
 import sams.cli as cli
 from sams.bootstrap import build_container
+from sams.storage.repos.symbols import SymbolRepo
 
 FY = date(2023, 12, 31)
 FY_PUBLISHED = date(2024, 3, 20)
@@ -120,14 +121,16 @@ def sync(container, kind: str, code: str = "601088") -> int:
     return run(container, ["sync", kind, "--market", "A", "--code", code])
 
 
-def seeded(db, settings, *, financials=None, valuation=None, flow=None, eastmoney=None):
+def seeded(
+    db, settings, *, financials=None, valuation=None, flow=None, eastmoney=None, listing=None
+):
     """一个装好基本面替身的容器；`eastmoney` 用来在链上放一个「没有这个能力」的源。
 
     HK/US 链上的 `yfinance` 用普通桩填上：本文件只测 A 股基本面，但注册表要求
     配置里每个市场的源都能解析，缺一家是构造容器时就抛错，轮不到断言。
     """
     adapter = StubFundamentalsAdapter(
-        ["A"], financials=financials, valuation=valuation, flow=flow
+        ["A"], financials=financials, valuation=valuation, flow=flow, listing=listing
     )
     return make_container(
         db,
@@ -179,6 +182,39 @@ def test_sync_financials_reports_rows_written(db, settings, capsys):
     out = capsys.readouterr().out
     assert "取回=1" in out and "入库=1" in out
     assert container.financials_store.count("A") == 1
+
+
+def test_sync_financials_fills_the_masters_listing_date(db, settings, capsys):
+    """U18：上市日是主档的一格，同步基本面时顺手填上，并把填没填打在屏幕上。
+
+    这一格不是装饰：`analysis return` 的 D37 豁免读的就是它。没填上，那只新股的上市
+    首日永远过不了闸，而屏幕上原来只有一行「入库=1」。
+    """
+    container = seeded(
+        db, settings, financials=financials_rows(), listing=date(2007, 10, 9)
+    )
+    SymbolRepo(container.db).upsert(
+        pl.DataFrame(
+            [{"market": "A", "code": "601088", "name": "中国神华", "currency": "CNY"}]
+        )
+    )
+    capsys.readouterr()
+    assert sync(container, "financials") == 0
+    assert "上市日期=2007-10-09" in capsys.readouterr().out
+    assert SymbolRepo(container.db).get("A", "601088")["listed_on"] == date(2007, 10, 9)
+
+
+def test_a_missing_master_row_says_the_command_that_would_create_it(db, settings, capsys):
+    """主档没这一行：基本面照样入库（那一半是成功的），但下一步要说得能跑。"""
+    container = seeded(
+        db, settings, financials=financials_rows(), listing=date(2007, 10, 9)
+    )
+    capsys.readouterr()
+    assert sync(container, "financials") == 0
+    out = capsys.readouterr().out
+    assert "入库=1" in out
+    assert "sams sync daily" in out
+    assert "上市日期" in out
 
 
 def test_sync_valuation_and_flow_each_land_in_their_own_table(db, settings, capsys):

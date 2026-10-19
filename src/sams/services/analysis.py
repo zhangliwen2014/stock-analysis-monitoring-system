@@ -19,16 +19,18 @@ D37 那道闸要的是「这个市场有没有涨跌幅证据」：拼写走不�
 「今天看到的库里有什么」这件事的函数，让调用方用一次窄窗口买到一张免检票，
 守卫就成了装饰。
 
-`listed_on`（上市首日）透传给守卫：库里没有这一列，所以调用方不传就是「不豁免」，
-守卫对上市初期的不可能跳变因此多拒一次上市首日的暴涨。要豁免只有 `sams analysis return
---listed-on` 这一条显式的路（D56）——它换掉的是 D37 那条形证据，所以必须跟着数一起打印。
+上市首日（`listed_on`）按「显式给的 > 主档里那格 > 没有」取：它是 D37 那条「不可能
+跳变」证据的替代品，所以**谁给的**必须跟着数一起出门（`listed_on_source`）——「库里
+本来就写着」与「有人今天敲了一遍」的下一步完全不同。三处都没有就照 D56 拒绝，
+不静默放宽那道闸。
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
+from typing import Literal
 
 import polars as pl
 
@@ -49,6 +51,11 @@ from sams.storage.repos.symbols import SymbolRepo
 #: 公开给命令行做 `--period` 的取值表（`cli` 不许 import 分析层，名单只能从这里转一道）
 _DAY = "day"
 PERIODS: tuple[str, ...] = (_DAY, WEEK, MONTH)
+
+#: 豁免日期从哪来：命令行 `--listed-on` 传的，还是采集时填进主档的那一格（U18）。
+#: 命令行不许 import 分析层，这两个名字与上面的 `PERIODS` 一样从服务层转一道
+LISTED_ON_FROM_CLI: Literal["cli"] = "cli"
+LISTED_ON_FROM_MASTER: Literal["master"] = "master"
 
 
 @dataclass(frozen=True)
@@ -91,6 +98,10 @@ class SeriesRead:
     #: 命令行不许 import 分析层（`tests/test_layering.py`），所以能用哪些名字由这里转一道：
     #: `sams analysis series --indicators` 的取值表与报错时列的那份名单，来源都是这一个字段
     indicators: tuple[str, ...]
+
+    #: 上面那个豁免日期的来源（`LISTED_ON_FROM_*`）。与 `listed_on` 同进同出：
+    #: 「库里本来就写着」与「有人今天敲了一遍」是两句不同的话
+    listed_on_source: str | None = None
 
     @property
     def rows(self) -> int:
@@ -137,18 +148,19 @@ class AnalysisService:
         代码先归一：`sh601088` 与 `601088` 是同一只票，而库里的键只有一个形态——
         拿别名查出来的空区间，在报告上长得和「这只票这段时间没行情」一模一样。
 
-        `listed_on`（上市首日）由调用方显式给（`sams analysis return --listed-on`，D56）：
-        库里还没有这一列，所以不传就是「不豁免」。传了要跟着数一起打印——豁免掉的正是
-        D37 那条形证据，一句「过了闸」在这种数上说的不是原来那件事。
+        `listed_on`（上市首日）按「显式给的 > 主档里那格 > 没有」取（U18）：它豁免掉的
+        正是 D37 那条形证据，所以用了谁的那个数要跟着数一起打印。取不到仍然拒绝，
+        不静默放宽那道闸（D56）。
         """
         market = canonical_market(market)
         code = canonical_code(market, code)
         self._require_ordered(start, end)
         today = self.clock.today()
+        listed_on, listed_on_source = self._resolve_listed_on(market, code, listed_on)
         loaded = self.bars.load(market, [code], start=start, end=end)
         if loaded.height < 2:
             raise NotAdjustable(self._why_no_bars(market, code, start, end, loaded.height))
-        return interval_return(
+        result = interval_return(
             loaded,
             # PIT：晚于今天的除权日是还没发生的事，不能乘进今天看到的序列
             self.actions.list_for(market, code, until=today),
@@ -160,6 +172,7 @@ class AnalysisService:
             today=today,
             listed_on=listed_on,
         )
+        return replace(result, listed_on_source=listed_on_source)
 
     def series(
         self,
@@ -200,6 +213,7 @@ class AnalysisService:
                 f"不认识的指标名 {unknown}：可选的是 {', '.join(sorted(INDICATORS))}"
             )
         today = self.clock.today()
+        listed_on, listed_on_source = self._resolve_listed_on(market, code, listed_on)
         loaded = self.bars.load(market, [code], end=end)
         in_window = loaded.filter(pl.col("date") >= start).height
         if in_window < 1:
@@ -267,8 +281,26 @@ class AnalysisService:
             covered_through=series.covered_through,
             ex_dates=series.ex_dates,
             listed_on=listed_on,
+            listed_on_source=listed_on_source,
             last_row=rows["date"].max() if rows.height else None,
         )
+
+    def _resolve_listed_on(
+        self, market: str, code: str, given: date | None
+    ) -> tuple[date | None, str | None]:
+        """豁免日期从哪来：你给的 > 主档里那格 > 没有（U18）。
+
+        * **显式的赢**：主档那一格可能是别的源填的、也可能属于一次敲错的代码，
+          而 `--listed-on` 是这个人此刻对这只票说的一句话。
+        * **主档已有就不再问源**：D37 的豁免窗口跟着这个日子走，换一家源就可能换一天。
+        * **两处都没有 ⇒ 传 None**：守卫按「不豁免」处理，那条不可能跳变照样被拦下来。
+          自动填的意义是少让人敲一遍，不是把那道闸改成默认敞开。
+        """
+        if given is not None:
+            return given, LISTED_ON_FROM_CLI
+        symbol = self.symbols.get(market, code)
+        day = symbol.get("listed_on") if symbol is not None else None
+        return (day, LISTED_ON_FROM_MASTER) if day is not None else (None, None)
 
     @staticmethod
     def _require_ordered(start: date, end: date) -> None:

@@ -258,6 +258,8 @@ def test_the_three_new_kinds_are_registered_as_capabilities():
         "基本面",
         "按日估值",
         "资金流",
+        # 主档的一格，不是第四类数据：它不走降级链，但「谁能给」仍只有这一份判据（U18）
+        "上市日期",
     ]
 
 
