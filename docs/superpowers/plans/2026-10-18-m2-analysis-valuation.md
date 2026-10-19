@@ -433,10 +433,10 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 
 ### E 块：thesis 生命周期 + `sams thesis show`（§9.1，M2 验收项）
 
-- [ ] `repos/theses.py`：状态机合法跳转表在 storage 层强制，非法跳转拒绝；`thesis_events` 每次变更写一条；用户隔离同 watchlists
-- [ ] `services/theses.py`：创建（observing）、提出（proposed）、建仓（opened，校验止损/目标/赔率齐备）、归档拒绝
-- [ ] `sams thesis show` 文本报告：合理区间、买入区、止损、目标、赔率 + 分项打分与 evidence 展开
-- [ ] 验收：任一自选股输出估值报告，每个分数能点开看到数据来源
+- [x] `repos/theses.py`：状态机合法跳转表在 storage 层强制，非法跳转拒绝；`thesis_events` 每次变更写一条；用户隔离同 watchlists（T-18，D77；时间线次序见 D80）
+- [x] `services/theses.py`：创建（observing）、提出（proposed）、建仓（opened，校验止损/目标/赔率齐备）、归档拒绝（T-19；价位只落算得出的那一栏，D78）
+- [x] `sams thesis show` 文本报告：合理区间、买入区、止损、目标、赔率 + 分项打分与 evidence 展开（`show` 并排列「库里那次 / 当前这次」两次测量并明说不判漂移，D79；完整 evidence 出口在 `sams analysis valuation`，屏幕上那条命令带着 market/code/style 可直接敲）
+- [x] 验收：任一自选股输出估值报告，每个分数能点开看到数据来源
 - [ ] 三道闸 + 提交
 
 ---
@@ -444,10 +444,10 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 ## 验收清单（spec §14 M2）
 
 1. ✅（M2-A）`sams sync actions --market A --code 601088` 后，跨 2024-07-08 的区间收益与交易所公布值一致；未采集该股时同样调用被拒绝并说明原因。
-2. `sams sync --market A --code 600519` 后 `sams thesis show` 输出估值报告：fair/entry/stop/target/reward_risk + 分项打分，每项带 evidence。
+2. ✅（M2-E）`sams sync --market A --code 600519` 后 `sams thesis show` 输出估值报告：fair/entry/stop/target/reward_risk + 分项打分，每项带 evidence。屏幕上那四栏是「库里那次 / 当前这次」两次测量并排（D78、D79），合成分与 PR 在同一行；逐项 evidence 的完整出口是这一屏末尾那条 `sams analysis valuation --market … --code … --style …`（D75），它当场可敲、不需要用户再拼参数。
 3. ✅指标那一半（M2-B）+ ✅估值那一半（M2-D T-17）：篡改 T+1 之后的日线，T 日全部指标逐位不变（两条参数化用例）；把 T 之后改写成另一段行情（PE 掉到 1、价格上坡、一期尚未披露的年报、一笔资金流），T 日那份估值读数逐位不变（`test_a_read_at_t_does_not_look_at_anything_after_t`），且同一段数在 `as_of` 挪过去之后第一次被读到。
 4. ✅（M2-B）周线指标由日线现算，库里没有 `bars_weekly` 之类的新表。
-5. 非法状态跳转（未建仓直接归档）在仓库层被拒；每次合法跳转都有 `thesis_events`。
+5. ✅（M2-E）非法状态跳转（未建仓直接归档）在仓库层被拒（`StorageError` ⇒ 退出码 1，认不出的状态名 ⇒ `ValidationError` ⇒ 2）；每次合法跳转都有 `thesis_events`，开局那条 `from_status` 为 NULL，次序按 `ts, rowid`（D77、D80）。
 6. `uv run pytest -q` 全绿；`uv run ruff check .` 干净；分层守卫不因新层放宽。
 7. ✅（M2-C，用户要的第三条与第四条）`PR = PE ÷ ROE ÷ 100`（PE 不为正时 `PB ÷ ROE ÷ ROE ÷ 100`）在 `sams analysis fundamentals` 里有出口，`sams screen pr --pr-max 0.4` 出一篮子并按 PR 升序；单位自检（`PE=20 / ROE=0.20 ⇒ 1.00`）与「把 `--as-of` 挪到披露日之前，那一期的 ROE 与由它算出的 PR 一起消失」都有用例钉住。
 
