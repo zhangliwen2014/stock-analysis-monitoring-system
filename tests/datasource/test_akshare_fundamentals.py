@@ -357,12 +357,12 @@ def test_live_valuation_has_a_real_pe_and_no_dividend_yield():
 
 
 @pytest.mark.live
-@pytest.mark.xfail(
-    reason="东财资金流接口（push2his…fflow/daykline）在本机网络不可达，真实形状未经证实"
-    "（spec §18 记为 U25）：接口通了这条会转成 XPASS，别把它当已验证",
-    strict=False,
-)
 def test_live_flow_gives_main_net_in_and_leaves_north_bound_unknown():
+    """A 股资金流端点已连通（2026-10-19 两次 `-m live` 连续通过，原来挂的 xfail 去掉）。
+
+    留在这里的那三句断言是这份契约的全部形状知识：`main_net_in` 有数、`north_net` 全 NULL
+    （这个端点不给北向，缺字段存 null 而不是 0，D58），而 U25 剩下的缺口是 HK/US 没有源。
+    """
     real = AkshareAdapter()
     out = real.funding_flow("A", "601088", date(2026, 9, 1), date(2026, 10, 17))
     assert out.height > 0

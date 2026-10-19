@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from support import FrozenClock, StubAdapter, sample_bars
@@ -199,6 +199,15 @@ def test_sina_says_no_data_and_the_registry_asks_the_next_source():
 
 @pytest.mark.live
 def test_live_sina_returns_the_recent_window():
+    """要证明的是「新浪给得出最近的日线」，不是「此刻正在交易」。
+
+    原来请求 `today~today`：盘前、周末、假期跑都会拿 0 根，而那 0 根是真话（那天的行情
+    还不存在），失败的是用例自己的假设——一个每次停机都要重新解释的失败，等于没有断言。
+    """
     today = date.today()
-    frame = SinaAdapter().daily_bars("A", "600519", today, today)
-    assert frame.height >= 1 and frame["volume"][0] > 0
+    since = today - timedelta(days=14)
+    frame = SinaAdapter().daily_bars("A", "600519", since, today)
+    assert frame.height >= 1, "最近两周里总该有交易日"
+    days = frame["date"].to_list()
+    assert min(days) >= since and max(days) <= today, "窗口外的根数不该混进来"
+    assert min(frame["volume"].to_list()) > 0, "真实成交的那几根不该带 0 量"

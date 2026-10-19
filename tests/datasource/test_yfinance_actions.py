@@ -11,7 +11,7 @@ from datetime import date
 import polars as pl
 import pytest
 
-from sams.core.errors import FieldDrift
+from sams.core.errors import FieldDrift, RateLimited
 from sams.datasource.yfinance_us import YfinanceAdapter, expand_actions
 
 
@@ -153,8 +153,16 @@ def test_live_apple_dividends_are_dated_inside_the_requested_window():
 
     它是唯一能证明「除息日取交易所本地日」这条路对的方法：录制帧的索引是我们自己造的，
     它对错位不敏感。
+
+    限流时**跳过而不是失败**：429 说的是 Yahoo 此刻不理这台机器，不是契约破了，
+    而把一种每次都复现的环境噪声留成红色，教出来的是「红色的 live 不用看」。
+    归类本身由桩测守着（`test_yfinance_valuation.py` / `test_akshare_yfinance.py` 都断言
+    429 → `RateLimited`），所以这里跳过不会漏掉那一层。其他任何异常照旧红。
     """
-    out = YfinanceAdapter().corp_actions("US", "AAPL", date(2024, 1, 1), date(2024, 12, 31))
+    try:
+        out = YfinanceAdapter().corp_actions("US", "AAPL", date(2024, 1, 1), date(2024, 12, 31))
+    except RateLimited as exc:
+        pytest.skip(f"Yahoo 限流，这条真实网络用例无法验证：{exc}")
     assert out.filter(pl.col("cash_per_share") <= 0).is_empty()
     # 全历史源不切窗口：问的是 2024，答的是上市以来的全部记录（苹果 2005/2014 的拆股也在里面）
     assert out.height > 100, f"期望全历史上百笔，实际 {out.height} 笔"

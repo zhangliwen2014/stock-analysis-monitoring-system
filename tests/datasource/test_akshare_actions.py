@@ -256,7 +256,12 @@ def test_live_derived_reference_price_matches_the_open_on_ex_date():
 
     adapter = AkshareAdapter()
     actions = adapter.corp_actions("A", "601088", date(2024, 7, 1), date(2024, 7, 31))
-    cash = actions["cash_per_share"][0]
+    # 这个接口给的是全史（覆盖标记按全史写，D36），`[0]` 是上市初期那一摊而不是窗口内那期。
+    # 位置取出来的那一行照样过 ÷10，所以单位口径没被证伪——被证伪的是那个 2.26，
+    # 而一个只能靠「数字对不对」发现的错，下次会连数字一起骗过去。
+    in_window = actions.filter(pl.col("ex_date").is_between(date(2024, 7, 1), date(2024, 7, 31)))
+    assert in_window.height == 1, f"神华 2024 年 7 月只有一次除息，读到 {in_window.height} 次"
+    cash = in_window["cash_per_share"][0]
     assert abs(cash - 2.26) < 0.01, f"神华 2024 年方案是 10派22.60元，读出每股 {cash} 元"
 
     bars = TencentAdapter().daily_bars("A", "601088", date(2024, 7, 1), date(2024, 7, 12))
