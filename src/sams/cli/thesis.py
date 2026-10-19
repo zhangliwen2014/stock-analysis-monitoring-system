@@ -1,0 +1,507 @@
+"""`sams thesis`：一条观点从立论到归档的那条链（spec §9.1，M2-E）。
+
+命令层只干三件事：把 `--user` 后面那个用户名交给服务、把结论排成一屏、在每个出口都给出
+`--json`（D57）。状态机与价位闸都在下面两层，这里一份都不重写——重写的那份会先失效，
+而失效的样子是「命令放行了一个仓库会拒的跳转」或者反过来。
+
+退出码沿用估值那一屏的规矩：0 是给出一条完整的结论，1 是没给出来（数据缺失、业务拒绝、
+写了一半），2 是参数本身不对。区分 1 与 2 是因为脚本对两者的处置不同：前者补数据再来一次，
+后者是命令行敲错了，重来多少次都一样。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import UTC
+
+from sams.bootstrap import Container
+from sams.cli.common import group, iso_date, ratio_arg
+from sams.core.errors import StorageError, ValidationError
+from sams.core.fundamentals import ROE_BASIS, ROE_BASIS_ANNUAL
+from sams.services.theses import STATUS_NAMES, ThesisReport
+from sams.services.valuation import STYLE_NAMES
+
+#: 每栏在屏幕上的列宽：数字对齐了，「库里那次」与「当前这次」才看得出是不是一样
+_LABEL_WIDTH = 8
+
+
+def add_to(subparsers) -> None:
+    """`sams thesis <action>`：add / list / show / advance / revise。"""
+    actions = group(subparsers, "thesis", "投资观点：立论、走完那条链、回看当时为什么买")
+    _add_parser(actions)
+    _list_parser(actions)
+    _show_parser(actions)
+    _advance_parser(actions)
+    _revise_parser(actions)
+
+
+def _add_parser(actions) -> None:
+    add = actions.add_parser(
+        "add",
+        help="立一条观点：当场算一次估值，把算得出的买入区/止损/目标/赔率落成那几列",
+    )
+    add.add_argument("--user", required=True, help="归属的用户名（不是 id）")
+    add.add_argument("--market", required=True, help="A / HK / US")
+    add.add_argument("--code", required=True, help="如 601088")
+    add.add_argument(
+        "--style",
+        default="value",
+        help=f"打分模板，可选 {', '.join(STYLE_NAMES)}（默认 value）：这一列决定以后按哪套权重读",
+    )
+    add.add_argument(
+        "--status",
+        default="observing",
+        help=f"开局状态，只能用 {'、'.join(STATUS_NAMES[:2])} 那两个（其余要走 `advance`）",
+    )
+    _as_of_arg(add)
+    _caliber_args(add)
+    add.add_argument("--note", help="写进第一条事件里的那句话：当时为什么立这条论")
+    add.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    add.set_defaults(handler=run_add)
+
+
+def _list_parser(actions) -> None:
+    show = actions.add_parser("list", help="名下的 thesis：一行一条，带状态与那四个价位")
+    show.add_argument("--user", required=True)
+    show.add_argument("--status", help=f"只看这一个状态（{'、'.join(STATUS_NAMES)}）")
+    show.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    show.set_defaults(handler=run_list)
+
+
+def _show_parser(actions) -> None:
+    show = actions.add_parser(
+        "show",
+        help="一条 thesis 的全貌：记录、时间线、当前那份估值，以及两栏价位怎么对上",
+    )
+    show.add_argument("thesis_id", help="`add`/`list` 屏幕上那个 id")
+    show.add_argument("--user", required=True)
+    _as_of_arg(show)
+    _caliber_args(show)
+    show.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    show.set_defaults(handler=run_show)
+
+
+def _advance_parser(actions) -> None:
+    move = actions.add_parser(
+        "advance",
+        help=f"沿那条链走一跳：{' → '.join(STATUS_NAMES)}",
+    )
+    move.add_argument("thesis_id")
+    move.add_argument("--user", required=True)
+    move.add_argument(
+        "--to",
+        required=True,
+        help=f"走到哪一个状态（{'、'.join(STATUS_NAMES)}）；能不能走由仓库那张表说了算",
+    )
+    move.add_argument("--note", help="这一跳的理由（进时间线，回看时用的就是它）")
+    move.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    move.set_defaults(handler=run_advance)
+
+
+def _revise_parser(actions) -> None:
+    fix = actions.add_parser("revise", help="改那几列价量（不改状态，因此不留事件）")
+    fix.add_argument("thesis_id")
+    fix.add_argument("--user", required=True)
+    fix.add_argument("--entry-low", help="买入区下限")
+    fix.add_argument("--entry-high", help="买入区上限")
+    fix.add_argument("--stop", help="止损价")
+    fix.add_argument("--target", help="目标价")
+    fix.add_argument("--odds", help="赔率：(目标-现价) ÷ (现价-止损)，要正的有限数")
+    fix.add_argument(
+        "--from-plan",
+        action="store_true",
+        help="按现在的库重算一次再落；只覆盖这条结论给得出的那几栏，算不出的原样留着",
+    )
+    _as_of_arg(fix)
+    _caliber_args(fix)
+    fix.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    fix.set_defaults(handler=run_revise)
+
+
+def _as_of_arg(parser) -> None:
+    parser.add_argument(
+        "--as-of",
+        help=(
+            "YYYY-MM-DD，默认今天：现价、分位窗口、PIT 闸门、资金流窗口一起回到那一天"
+            "（价位是从那一刻算出来的，所以这个参数决定落库的那几列）"
+        ),
+    )
+
+
+def _caliber_args(parser) -> None:
+    parser.add_argument(
+        "--roe-basis",
+        default=ROE_BASIS_ANNUAL,
+        choices=list(ROE_BASIS),
+        help=f"PR 分母用哪一期 ROE：annual=最新已披露**年报**（默认 {ROE_BASIS_ANNUAL}）",
+    )
+    parser.add_argument(
+        "--roe-estimate",
+        help="预估 ROE，小数口径（15%% 要写 0.15）：PE 不为正时那一支要用它",
+    )
+
+
+# --- 命令 ----------------------------------------------------------------------------------
+
+
+def run_add(container: Container, args: argparse.Namespace) -> int:
+    try:
+        report = container.theses.add(
+            args.user,
+            args.market,
+            args.code,
+            style=args.style,
+            status=args.status,
+            note=args.note,
+            as_of=iso_date(args.as_of) if args.as_of else None,
+            roe_estimate=_ratio(args.roe_estimate),
+            roe_basis=args.roe_basis,
+        )
+    except ValidationError as exc:
+        return _refused(args, exc, 2)
+    code = 0 if report.complete else 1
+    nxt = container.theses.next_steps(report.thesis.status)
+    if args.json:
+        _emit(_report_payload(report, code, nxt))
+        return code
+    return _print_report(report, code, next_steps=nxt)
+
+
+def run_list(container: Container, args: argparse.Namespace) -> int:
+    try:
+        rows = container.theses.list(args.user, status=args.status)
+    except ValidationError as exc:
+        return _refused(args, exc, 2)
+    if args.json:
+        _emit(
+            {
+                "status": "ok",
+                "exit": 0,
+                "user": args.user,
+                "count": len(rows),
+                "theses": [_thesis_payload(row) for row in rows],
+            }
+        )
+        return 0
+    if not rows:
+        wanted = f"状态为 {args.status} 的" if args.status else "任何"
+        print(f"{args.user} 名下没有{wanted} thesis：下一步 `sams thesis add --user {args.user} …`")
+        return 0
+    print(f"{args.user} 名下 {len(rows)} 条 thesis")
+    for row in rows:
+        print(
+            f"  {row.market}/{row.code}  {row.status:<12} 模板 {row.style:<6}"
+            f"  买入区 {_range(row.entry_low, row.entry_high)}"
+            f"  止损 {_money(row.stop_price)}  目标 {_money(row.target_price)}"
+            f"  赔率 {_money(row.reward_risk)}  id {row.id}"
+        )
+    return 0
+
+
+def run_show(container: Container, args: argparse.Namespace) -> int:
+    try:
+        report = container.theses.show(
+            args.user,
+            args.thesis_id,
+            as_of=iso_date(args.as_of) if args.as_of else None,
+            roe_estimate=_ratio(args.roe_estimate),
+            roe_basis=args.roe_basis,
+        )
+    except (ValidationError, StorageError) as exc:
+        return _refused(args, exc, 2 if isinstance(exc, ValidationError) else 1)
+    code = 0 if report.complete else 1
+    nxt = container.theses.next_steps(report.thesis.status)
+    if args.json:
+        _emit(_report_payload(report, code, nxt))
+        return code
+    return _print_report(report, code, next_steps=nxt)
+
+
+def run_advance(container: Container, args: argparse.Namespace) -> int:
+    try:
+        thesis = container.theses.advance(
+            args.user, args.thesis_id, args.to, note=args.note
+        )
+    except (ValidationError, StorageError) as exc:
+        return _refused(args, exc, 2 if isinstance(exc, ValidationError) else 1)
+    nxt = container.theses.next_steps(thesis.status)
+    if args.json:
+        _emit(
+            {
+                "status": "ok",
+                "exit": 0,
+                "thesis": _thesis_payload(thesis),
+                "next_steps": list(nxt),
+            }
+        )
+        return 0
+    print(f"{thesis.market}/{thesis.code}  →  {thesis.status}")
+    print(
+        "  接下来可走："
+        + ("、".join(nxt) if nxt else "没有（`archived` 是终点，要再看这只票就另开一条）")
+    )
+    print(f"  下一步：sams thesis show {thesis.id} --user {args.user}")
+    return 0
+
+
+def run_revise(container: Container, args: argparse.Namespace) -> int:
+    levels = {
+        "entry_low": _money_arg("--entry-low", args.entry_low),
+        "entry_high": _money_arg("--entry-high", args.entry_high),
+        "stop_price": _money_arg("--stop", args.stop),
+        "target_price": _money_arg("--target", args.target),
+        "reward_risk": _money_arg("--odds", args.odds),
+    }
+    given = {key: value for key, value in levels.items() if value is not None}
+    if not given and not args.from_plan:
+        return _refused(
+            args,
+            ValidationError(
+                "没有要改的栏：给一两个价位（`--stop/--target/--odds/--entry-low/--entry-high`）"
+                "或说「按现在的库重算」（`--from-plan`）"
+            ),
+            2,
+        )
+    try:
+        report = container.theses.revise(
+            args.user,
+            args.thesis_id,
+            from_plan=args.from_plan,
+            as_of=iso_date(args.as_of) if args.as_of else None,
+            roe_estimate=_ratio(args.roe_estimate),
+            roe_basis=args.roe_basis,
+            **given,
+        )
+    except (ValidationError, StorageError) as exc:
+        return _refused(args, exc, 2 if isinstance(exc, ValidationError) else 1)
+    # 要求重算而一栏都没落下来 ⇒ 这次没算出任何可写的数（退出码 1），不是「改好了」
+    code = 1 if not report.complete or (args.from_plan and not report.written) else 0
+    nxt = container.theses.next_steps(report.thesis.status)
+    if args.json:
+        _emit(_report_payload(report, code, nxt))
+        return code
+    return _print_report(report, code, next_steps=nxt)
+
+
+# --- 输出 ----------------------------------------------------------------------------------
+
+
+def _print_report(report: ThesisReport, code: int, *, next_steps: tuple[str, ...]) -> int:
+    thesis = report.thesis
+    print(f"{thesis.market}/{thesis.code}  模板 {thesis.style}  状态 {thesis.status}")
+    print(f"  id    {thesis.id}")
+    print(
+        f"  归属  {report.username}"
+        f"  立论 {_stamp(thesis.created_at)}  更新 {_stamp(thesis.updated_at)}"
+        + (f"  归档 {_stamp(thesis.archived_at)}" if thesis.archived_at else "")
+    )
+    if not any(row.stored[0] is not None for row in report.rows):
+        print("  价位    空着（建仓那一步会被拒：止损/目标/赔率三列都得有数）")
+    print("  ── 对照：库里那次 vs 当前这次 ──")
+    for row in report.rows:
+        print(
+            f"    {row.label:<{_LABEL_WIDTH}}  库里 {_range(*row.stored):<16}"
+            f"  当前 {_range(*row.current):<16}  {row.note}"
+        )
+    print(f"  现价    {_price_line(report)}")
+    print(f"  {report.placement}")
+    for note in report.notes:
+        print(f"    · {note}")
+    print("  ── 时间线 ──")
+    for event in report.events:
+        print(
+            f"    {_stamp(event.ts)}  {_jump(event.from_status, event.to_status)}"
+            f"  {_who(event, thesis, report.username)}"
+            + (f"  {event.note}" if event.note else "")
+        )
+    print(_next_line(thesis, report.username, next_steps))
+    print(
+        f"  每个分数的来源：sams analysis valuation --market {thesis.market}"
+        f" --code {thesis.code} --style {thesis.style}"
+    )
+    if code == 1:
+        print(
+            "    ⇒ 这一屏没给出一条完整的结论（退出码 1）：`--json` 里 exit 同值，"
+            "缺的那一栏带着自己的原因"
+        )
+    return code
+
+
+def _jump(former: str | None, latter: str | None) -> str:
+    """时间线里那一跳：起点为空的是「立论」那一条，不是从某个状态走过来的。"""
+    return f"（立论）→ {latter}" if former is None else f"{former} → {latter}"
+
+
+def _who(event, thesis, username: str) -> str:
+    """时间线上那一行的主语：归属者本人报名字，别人（M3 的触发器）留着 id。
+
+    库里存的是 `actor_id`，一屏 hex 没人读得动；而把非本人的 actor 也翻成 `username`
+    更糟——那会把「谁走的这一步」说成「谁拥有这条记录」。
+    """
+    if not event.actor_id:
+        return "–"
+    return username if event.actor_id == thesis.user_id else event.actor_id
+
+
+def _next_line(thesis, username: str, next_steps: tuple[str, ...]) -> str:
+    """下一步要能当场敲通：整条命令带上 id 与 `--to`，不给「参见帮助」这种半成品。"""
+    if not next_steps:
+        return "  接下来可走：没有（`archived` 是终点，要再看这只票就另开一条）"
+    lines = [
+        f"    sams thesis advance {thesis.id} --user {username} --to {to}"
+        for to in next_steps
+    ]
+    return "  接下来可走：\n" + "\n".join(lines)
+
+
+def _price_line(report: ThesisReport) -> str:
+    read = report.valuation
+    if read is None:
+        return f"无 ← 当前这次算不出：{report.unavailable}"
+    age = "距今 unknown" if read.price_age_days is None else f"距今 {read.price_age_days} 天"
+    score = "–" if not read.composite.ok else f"{read.composite.score:.1f}"
+    pr = read.fundamental.pr
+    pr_text = "–" if not pr.ok else f"{pr.value:.4f}"
+    return (
+        f"{read.price:g} ({read.price_on}，{age})  "
+        f"合成分 {score}  PR {pr_text}  截至 {read.as_of}"
+    )
+
+
+def _report_payload(report: ThesisReport, code: int, next_steps: tuple[str, ...]) -> dict:
+    return {
+        "status": "ok" if code == 0 else "incomplete",
+        "exit": code,
+        "thesis": _thesis_payload(report.thesis),
+        "events": [
+            {
+                "from": event.from_status,
+                "to": event.to_status,
+                "actor": event.actor_id,
+                "note": event.note,
+                "ts": event.ts.isoformat() if event.ts else None,
+            }
+            for event in report.events
+        ],
+        "comparison": [
+            {
+                "key": row.key,
+                "label": row.label,
+                "stored": list(row.stored),
+                "current": list(row.current),
+                "note": row.note,
+            }
+            for row in report.rows
+        ],
+        "placement": report.placement,
+        "notes": list(report.notes),
+        "written": list(report.written),
+        "next_steps": list(next_steps),
+        "unavailable": report.unavailable,
+        "valuation": None if report.valuation is None else _valuation_payload(report),
+    }
+
+
+def _valuation_payload(report: ThesisReport) -> dict:
+    """当前那一份的摘要：完整分项表与式子在 `sams analysis valuation --json` 里。"""
+    read = report.valuation
+    assert read is not None
+    plan = read.plan
+    return {
+        "as_of": str(read.as_of),
+        "price": read.price,
+        "price_on": str(read.price_on) if read.price_on else None,
+        "pr": read.fundamental.pr.value,
+        "composite": {
+            "ok": read.composite.ok,
+            "score": read.composite.score,
+            "covered_weight": read.composite.covered_weight,
+            "missing": list(read.composite.missing),
+            "reason": read.composite.reason,
+        },
+        "plan": {
+            "ok": plan.ok,
+            "fair": [plan.fair.low, plan.fair.high],
+            "entry": [plan.entry.low, plan.entry.high],
+            "stop": [plan.stop.low, plan.stop.high],
+            "target": [plan.target.low, plan.target.high],
+            "odds": plan.odds.value,
+            "notes": list(plan.notes),
+        },
+    }
+
+
+def _thesis_payload(thesis) -> dict:
+    return {
+        "id": thesis.id,
+        "user_id": thesis.user_id,
+        "market": thesis.market,
+        "code": thesis.code,
+        "style": thesis.style,
+        "status": thesis.status,
+        "entry_low": thesis.entry_low,
+        "entry_high": thesis.entry_high,
+        "stop_price": thesis.stop_price,
+        "target_price": thesis.target_price,
+        "reward_risk": thesis.reward_risk,
+        "win_rate": thesis.win_rate,
+        "win_rate_samples": thesis.win_rate_samples,
+        "created_at": thesis.created_at.isoformat() if thesis.created_at else None,
+        "updated_at": thesis.updated_at.isoformat() if thesis.updated_at else None,
+        "archived_at": thesis.archived_at.isoformat() if thesis.archived_at else None,
+    }
+
+
+def _refused(args: argparse.Namespace, exc: Exception, code: int) -> int:
+    """拒绝也要有 JSON（D57）：管道里读的人拿到的是一句原因加一个码，不是一个空 stdin。"""
+    if args.json:
+        _emit({"status": "refused", "reason": str(exc), "exit": code})
+    else:
+        print(f"{exc}")
+    return code
+
+
+def _emit(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def _ratio(value: str | None) -> float | None:
+    return None if value is None else ratio_arg("--roe-estimate", value)
+
+
+def _money_arg(name: str, value: str | None) -> float | None:
+    """价位类参数：这里只把「不是一个数」变成一句人话，正负与区间的顺序归仓库管（D66 同族）。"""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise ValidationError(f"{name} 要的是一个数，收到 {value!r}") from None
+
+
+def _money(value: float | None) -> str:
+    return "–" if value is None else f"{value:.4g}"
+
+
+def _range(low: float | None, high: float | None) -> str:
+    if low is None and high is None:
+        return "–"
+    if low == high:
+        return _money(low)
+    return f"{_money(low)}~{_money(high)}"
+
+
+def _stamp(value) -> str:
+    """时间戳统一到 UTC 再落屏，并把时区说出来。
+
+    DuckDB 对 `TIMESTAMPTZ` 的回读不稳定：`theses.created_at` 回来是 UTC，
+    `thesis_events.ts` 回来是会话本地时区（Asia/Shanghai）。两者是同一个瞬间，但按
+    原样 `strftime` 会在同一屏上印出「立论 15:00 / 时间线 23:00」——看着像事件比记录晚
+    八小时，而这一屏的用意正是回看「什么时候走了哪一步」。
+    """
+    if value is None:
+        return "–"
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC)
+    return f"{value:%Y-%m-%d %H:%M} UTC"

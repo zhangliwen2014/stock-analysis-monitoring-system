@@ -1,5 +1,8 @@
 """估值合成的样本数据：一份「库里铺了 300 天」的最小世界，读数用例与命令行用例共用。
 
+`make_container` 把这份世界接到一个冻了时钟的容器上——命令行与服务用例都要对着
+同一个世界跑，两份装配分开写，改了一边的数就再也对不上另一边说的话。
+
 放这里而不是各自抄一份，是因为两边要验的是同一件事的两端（取哪些数 / 那句话怎么说），
 而样本一旦分叉，两边就各自对着自己的数点头。形状与出处：
 
@@ -13,10 +16,13 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
+import support
+from support_fundamentals import StubFundamentalsAdapter
 
+from sams.bootstrap import build_container
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
@@ -143,6 +149,30 @@ def flow_rows(
             "source": ["akshare"] * len(days),
         }
     )
+
+
+def make_container(db, settings, *, today: date = TODAY, **seeded):
+    """一个铺好样本库、时钟冻在 `today` 的容器：命令行与服务用例都对着同一个世界跑。
+
+    放这里而不是各测试文件里抄一份，是因为两边要验的是同一条链的两端（服务给的数 /
+    屏幕上那句怎么说）；两份装配一旦分叉，一边改的数就再也对不上另一边说的话。
+    """
+    adapter = StubFundamentalsAdapter(["A"])
+    container = build_container(
+        settings,
+        db=db,
+        adapters={
+            "akshare": adapter,
+            "eastmoney": adapter,
+            "yfinance": support.StubAdapter(
+                "yfinance", ["HK", "US"], support.sample_bars(source="yfinance")
+            ),
+        },
+        clock=support.FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC)),
+    )
+    container.registry.sleep = lambda _seconds: None
+    seed(db, **seeded)
+    return container
 
 
 def seed(

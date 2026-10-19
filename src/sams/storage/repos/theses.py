@@ -284,11 +284,15 @@ class ThesisRepo:
         )
 
     def events(self, user_id: str, thesis_id: str) -> list[ThesisEvent]:
-        """时间线按发生顺序返回；归属先查（别人的 thesis 连事件都读不到）。"""
-        self._require(user_id, thesis_id)
+        """时间线按发生顺序返回；归属先查（别人的 thesis 连事件都读不到）。
+
+        次序是 `ts` 再用物理行号兜：两步落在同一个瞬间时（冻住的时钟、脚本、M3 的触发器），
+        按 `id` 排就是按 uuid4 排，时间线会把自己说反。
+        """
+        self.require(user_id, thesis_id)
         rows = self.db.query(
             "SELECT id, thesis_id, from_status, to_status, actor_id, note, ts "
-            "FROM thesis_events WHERE thesis_id = ? ORDER BY ts, id",
+            "FROM thesis_events WHERE thesis_id = ? ORDER BY ts, rowid",
             [thesis_id],
         )
         return [
@@ -317,7 +321,7 @@ class ThesisRepo:
         一次没有状态变化的写入要么伪造一条跳转、要么什么都留不下——留不下是对的，
         这条表要回答的是「我当时为什么买」，不是每个字段的修订史。"""
         _require_user(actor_id, what="actor_id")
-        current = self._require(user_id, thesis_id)
+        current = self.require(user_id, thesis_id)
         unknown = sorted(set(levels) - set(LEVEL_COLUMNS))
         if unknown:
             raise ValidationError(
@@ -358,7 +362,7 @@ class ThesisRepo:
     ) -> Thesis:
         """走一跳；不在跳转表上的那一步当场拒，且**不改状态**（拒绝不能留下半个变更）。"""
         _require_user(actor_id, what="actor_id")
-        current = self._require(user_id, thesis_id)
+        current = self.require(user_id, thesis_id)
         target = _status(to)
         allowed = TRANSITIONS[current.status]
         if target == current.status:
@@ -370,15 +374,14 @@ class ThesisRepo:
             raise StorageError(self._why_blocked(current, target, allowed))
         if target == OPENED:
             missing = [
-                label
-                for column, label in OPENED_REQUIRED
-                if getattr(current, column) is None
+                label for column, label in OPENED_REQUIRED if getattr(current, column) is None
             ]
             if missing:
                 raise ValidationError(
                     f"建仓前要先给齐：{'、'.join(missing)}"
-                    f"（{'、'.join(column for column, _ in OPENED_REQUIRED)} 三列现在是空的；"
-                    f"先用 `set_levels` 落进来，或用 `sams analysis valuation` 算出这三个数）"
+                    f"（{'、'.join(column for column, _ in OPENED_REQUIRED)} 三列现在是空的）。"
+                    "落进来有两条路：`sams thesis revise <id> --stop .. --target .. --odds ..` "
+                    "手填，或 `sams thesis revise <id> --from-plan` 按现在的库重算一次"
                 )
         archived = target == ARCHIVED
         self.db.execute(
@@ -413,7 +416,7 @@ class ThesisRepo:
             [new_id(), thesis_id, from_status, to_status, actor_id, note, ts],
         )
 
-    def _require(self, user_id: str, thesis_id: str) -> Thesis:
+    def require(self, user_id: str, thesis_id: str) -> Thesis:
         """按用户取，取不到就说取不到：不存在与不是你的，在这一层是同一种回答。"""
         found = self.get(user_id, thesis_id)
         if found is None:

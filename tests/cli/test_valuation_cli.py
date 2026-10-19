@@ -14,39 +14,17 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import date
 
 import pytest
-import support
-from support import StubAdapter, sample_bars
-from support_fundamentals import StubFundamentalsAdapter
-from support_valuation import CLOSES, CODE, DAYS, PE, PR_NOW, TODAY, seed
+from support_valuation import CLOSES, CODE, DAYS, PE, PR_NOW, TODAY, make_container
 
 import sams.cli as cli
 from sams.analysis.valuation.styles import get_style
-from sams.bootstrap import build_container
 
 HEAD = ["analysis", "valuation", "--market", "A", "--code", CODE]
 #: 样本库铺 300 个日历日，`--as-of` 那一组用例取中段的一天
 BACK = date(2024, 6, 30)
-
-
-def make_container(db, settings, *, today: date = TODAY, **seeded) -> object:
-    """一个铺好样本库的容器：时钟冻在 `today`，命令不传 `--as-of` 时默认就是那天。"""
-    adapter = StubFundamentalsAdapter(["A"])
-    container = build_container(
-        settings,
-        db=db,
-        adapters={
-            "akshare": adapter,
-            "eastmoney": adapter,
-            "yfinance": StubAdapter("yfinance", ["HK", "US"], sample_bars(source="yfinance")),
-        },
-        clock=support.FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC)),
-    )
-    container.registry.sleep = lambda _seconds: None
-    seed(db, **seeded)
-    return container
 
 
 def invoke(container, *extra: str) -> int:

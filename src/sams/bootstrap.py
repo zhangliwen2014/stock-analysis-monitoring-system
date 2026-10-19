@@ -27,6 +27,7 @@ from sams.services.health import HealthService
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
+from sams.services.theses import ThesisService
 from sams.services.valuation import ValuationService
 from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
@@ -40,6 +41,7 @@ from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
 from sams.storage.repos.symbols import SymbolRepo
+from sams.storage.repos.theses import ThesisRepo
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
 
@@ -79,6 +81,8 @@ class Container:
     flow_store: FundingFlowRepo
     scan_store: ScanResultRepo
     watchlists: WatchlistRepo
+    #: thesis 的仓库带 `_store`：`container.theses` 是那个读取用例（写入口只有一个）
+    theses_store: ThesisRepo
     calendar_store: CalendarRepo
     source_health: SourceHealthRepo
     data_sources: DataSourceRepo
@@ -93,6 +97,8 @@ class Container:
     analysis: AnalysisService
     #: 估值合成（spec §8.3）：它吃上面那两个读数用例，不是并列的第三路取数
     valuation: ValuationService
+    #: 观点的生命周期：它吃上面那个仓库与那份估值读数（spec §9.1）
+    theses: ThesisService
     health: HealthService
     source_admin: SourceAdminService
 
@@ -174,6 +180,7 @@ def build_container(
     valuation_store = ValuationRepo(database)
     flow_store = FundingFlowRepo(database)
     scan_store = ScanResultRepo(database)
+    theses_store = ThesisRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
 
@@ -182,6 +189,9 @@ def build_container(
     calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
     fundamentals = FundamentalService(financials_store, valuation_store, clock=clock)
     analysis = AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock)
+    valuation = ValuationService(
+        fundamentals, analysis, financials_store, valuation_store, flow_store, clock=clock
+    )
 
     return Container(
         settings=cfg,
@@ -198,6 +208,7 @@ def build_container(
         valuation_store=valuation_store,
         flow_store=flow_store,
         scan_store=scan_store,
+        theses_store=theses_store,
         watchlists=WatchlistRepo(database),
         calendar_store=calendar_store,
         source_health=source_health,
@@ -218,8 +229,7 @@ def build_container(
             financials_store, valuation_store, symbols, scan_store, clock=clock
         ),
         analysis=analysis,
-        valuation=ValuationService(
-            fundamentals, analysis, financials_store, valuation_store, flow_store, clock=clock
-        ),
+        valuation=valuation,
+        theses=ThesisService(theses_store, users, valuation, clock=clock),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )

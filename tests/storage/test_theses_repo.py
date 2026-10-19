@@ -80,6 +80,24 @@ def test_a_new_thesis_starts_as_observing_and_writes_the_first_event(db):
     assert events[0].ts == T0
 
 
+def test_two_jumps_in_the_same_instant_stay_in_the_order_they_happened(db):
+    """两步落在同一个瞬间（脚本、M3 的触发器都会这样）：时间线得按落库的先后说。
+
+    `ts` 相同而 id 是 uuid4，按 id 排就是按随机数排——一条把「(开局)」排在「→ opened」之后的
+    时间线，读的人只会当成数据坏了，而它其实是查的方式错了。
+    """
+    repo = ThesisRepo(db)
+    thesis = make(db)
+    repo.set_levels(
+        USER, thesis.id, actor_id=USER, now=T0, stop_price=10.0, target_price=20.0, reward_risk=2.0
+    )
+    for to in (PROPOSED, OPENED):
+        repo.advance(USER, thesis.id, to, actor_id=USER, now=T0)
+    events = repo.events(USER, thesis.id)
+    assert [e.to_status for e in events] == [OBSERVING, PROPOSED, OPENED]
+    assert {e.ts for e in events} == {T0}
+
+
 def test_create_refuses_to_start_in_the_middle_of_the_chain(db):
     """直接从 `opened` 开局等于跳过「这条观点是怎么来的」，而那是这整张表的意义。"""
     with pytest.raises(ValidationError, match="observing|proposed"):
