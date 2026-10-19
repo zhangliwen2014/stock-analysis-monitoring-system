@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ class Database:
         self.conn = conn
         #: 记住来源，健康报告与日志要显示「这个库是哪个文件」
         self.path = path
+        self._tx_depth = 0
 
     @classmethod
     def open(cls, path: str | Path) -> Database:
@@ -32,6 +35,37 @@ class Database:
             return cls(duckdb.connect(target), target)
         except duckdb.Error as exc:
             raise StorageError(f"无法打开数据库 {target}: {exc}") from exc
+
+    @property
+    def in_transaction(self) -> bool:
+        """是否已经在一个事务块里（重入计数大于 0）。仓库层用它决定要不要自己开。"""
+        return self._tx_depth > 0
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """一个原子写单元：块内任何异常都整段回滚，包括调用方没接住的。
+
+        账本的一笔卖出同时写 `sim_orders`、`sim_positions`、`sim_cash_balances`、
+        `sim_cash_moves`：中途失败留下的「现金已扣、持仓未减」不是待修的脏数据，
+        是整本账失去意义。重入时内层只是加入外层那个事务（DuckDB 不支持嵌套 BEGIN），
+        所以任何一层抛异常，最外层统一回滚——「谁负责原子性」由第一个开块的人定，
+        不由谁碰巧写了 BEGIN 定。迁移有自己的 BEGIN/COMMIT（`migrate.py`），
+        那是 DDL 的引导路径，不需要也不该走这里。
+        """
+        if self._tx_depth == 0:
+            self._run("BEGIN TRANSACTION", None)
+        self._tx_depth += 1
+        try:
+            yield
+        except Exception:
+            if self._tx_depth == 1:
+                self._run("ROLLBACK", None)
+            raise
+        else:
+            if self._tx_depth == 1:
+                self._run("COMMIT", None)
+        finally:
+            self._tx_depth -= 1
 
     def execute(self, sql: str, params: list[Any] | None = None) -> None:
         self._run(sql, params)

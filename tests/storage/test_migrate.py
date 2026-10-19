@@ -43,6 +43,7 @@ EXPECTED_TABLES = {
     "annotation_revisions",
     "sim_accounts",
     "sim_cash_balances",
+    "sim_cash_moves",
     "sim_orders",
     "sim_positions",
     "fx_trades",
@@ -258,3 +259,22 @@ def test_upgrade_from_a_financials_database_keeps_existing_rows(tmp_path):
     finally:
         if path.exists():
             path.unlink()
+
+
+def test_0014_gives_the_ledger_its_audit_trail(db) -> None:
+    """§5.4 规则 4 在 M3 的形状：每一分钱的变动都得有一行理由。
+
+    `sim_cash_moves` 不是「现金余额的历史快照」——那种表能被事后编出来。它记的是
+    delta + reason + actor，所以「谁在什么时候凭什么动了 5 万」是可证的。
+    """
+    assert "sim_cash_moves" in db.table_names()
+    cols = columns_of(db, "sim_cash_moves")
+    assert {"account_id", "currency", "delta", "reason", "actor_id", "ts"} <= cols
+
+
+def test_0014_remembers_which_day_the_order_s_rate_is(db) -> None:
+    """`fx_pnl` 要「下单那天的汇率」，不是「今天的汇率减今天的汇率」。
+
+    没有 `fx_rate_ref` 时两段拆分只能整段报成价格盈亏，换汇的影响会被读成股价涨了。
+    """
+    assert "fx_rate_ref" in columns_of(db, "sim_orders")
