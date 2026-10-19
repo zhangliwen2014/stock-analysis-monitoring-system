@@ -43,6 +43,7 @@ from sams.services.analysis import (
     indicator_names,
 )
 from sams.services.calendar import GapKinds
+from sams.services.valuation import FLOW_WINDOW_DAYS, STYLE_NAMES
 
 #: 豁免日期的来源 → 括号里那句怎么说（U18）。两个来源的下一步完全不同：
 #: 「你传的」下次还得传，「主档里那格」是采集时填进去的，谁读都不用再传一遍
@@ -322,6 +323,7 @@ def add_to(subparsers) -> None:
     ser.set_defaults(handler=run_series)
 
     add_fundamentals(analysis)
+    add_valuation(analysis)
 
 
 def run_return(container: Container, args: argparse.Namespace) -> int:
@@ -691,3 +693,327 @@ def _series_payload(read) -> dict:
 def _json_cell(value) -> object:
     """`date`/`datetime` 不能直接进 JSON，其余原样（`None` 保持 `null`，别涂成 0）。"""
     return str(value) if isinstance(value, date) else value
+
+
+# --- valuation：估值合成（分项表 + 五个价位） -----------------------------------------------
+
+
+def add_valuation(subparsers) -> None:
+    val = subparsers.add_parser(
+        "valuation",
+        help="估值合成：每个分项的分与权重、五个价位各自的式子（可解释，非黑盒）",
+    )
+    val.add_argument("--market", required=True, help="A / HK / US")
+    val.add_argument("--code", required=True, help="如 601088")
+    val.add_argument(
+        "--as-of",
+        help=(
+            "YYYY-MM-DD，默认今天：现价、分位窗口、PIT 闸门、资金流窗口一起回到那一天"
+            "（回看时最贵的一课是拿今天的库算昨天的数）"
+        ),
+    )
+    val.add_argument(
+        "--style",
+        default="value",
+        help=(
+            f"打分模板，可选 {', '.join(STYLE_NAMES)}（默认 value）："
+            "同一只票两套模板给两个分是正常的，屏幕上会点名用的是哪一套"
+        ),
+    )
+    val.add_argument(
+        "--roe-basis",
+        default=ROE_BASIS_ANNUAL,
+        choices=list(ROE_BASIS),
+        help=f"PR 分母用哪一期 ROE：annual=最新已披露**年报**（默认 {ROE_BASIS_ANNUAL}）",
+    )
+    val.add_argument(
+        "--roe-estimate",
+        help="预估 ROE，小数口径（15%% 要写 0.15）：PE 不为正时那一支要用它",
+    )
+    val.add_argument("--json", action="store_true", help="机器可读输出（含分项表与 exit）")
+    val.set_defaults(handler=run_valuation)
+
+
+def run_valuation(container: Container, args: argparse.Namespace) -> int:
+    try:
+        as_of = iso_date(args.as_of) if args.as_of else None
+        estimate = ratio_arg("--roe-estimate", args.roe_estimate) if args.roe_estimate else None
+        read = container.valuation.read(
+            args.market,
+            args.code,
+            as_of=as_of,
+            style=args.style,
+            roe_estimate=estimate,
+            roe_basis=args.roe_basis,
+        )
+    except ValidationError as exc:
+        # 参数错也是 JSON（D57）：让它冒到顶层就是 stderr 上一段纯文本 + 管道里一个空 stdin
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "exit": 2})
+        else:
+            print(f"参数有误：{exc}")
+        return 2
+    except NotAdjustable as exc:
+        # 没有日线就没有现价，而现价是那条式子的左边：不给一条「只有分、没有价位」的半条结论
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "exit": 1})
+        else:
+            print(f"拒绝出数：{exc}")
+        return 1
+    code = 0 if (read.composite.ok and read.plan.ok) else 1
+    if args.json:
+        _emit(_valuation_payload(read, code))
+        return code
+    return _print_valuation(read, code)
+
+
+def _print_valuation(read, code: int) -> int:
+    style = read.style
+    print(f"{read.market}/{read.code}  模板 {style.name}（{style.label}）  截至 {read.as_of}")
+    print(f"  现价    {_price_line(read)}")
+    print(f"  市赚率  {_pr_line(read)}")
+    for row in read.percentiles:
+        print(f"  分位    {_percentile_line(row)}")
+    print(f"  合成分  {_composite_line(read)}")
+    for item_line in _item_lines(read):
+        print(f"    {item_line}")
+    plan = read.plan
+    print("  ── 价位（每一个都带着自己的式子）─────────────────────────")
+    print(f"  合理区间  {_level(plan.fair)}")
+    print(f"  买入区    {_entry_line(plan.entry)}")
+    print(f"  止损      {_level(plan.stop)}")
+    print(f"  目标      {_level(plan.target)}")
+    odds = plan.odds
+    print(
+        f"  赔率      {'–' if odds.value is None else f'{odds.value:.2f}'}"
+        f"{'  ← ' + odds.evidence if odds.ok else '  ← ' + odds.reason}"
+    )
+    for note in plan.notes:
+        print(f"      · {note}")
+    for line in _valuation_warnings(read):
+        print(f"  {line}")
+    if code == 1:
+        print(
+            "    ⇒ 这次没给出一条完整的结论（退出码 1）：`--json` 里 exit 同值，"
+            "缺的那几路各自带着原因"
+        )
+    return code
+
+
+def _price_line(read) -> str:
+    """现价那句要说它是**哪天**的收盘：库里最新一根与截至日之间可以隔着几天。"""
+    if read.price is None:
+        return "无 ← 过闸的日线里没有一根可用收盘"
+    age = "距今 unknown" if read.price_age_days is None else f"距今 {read.price_age_days} 天"
+    return f"{read.price:g} ({read.price_on}，{age})  ← 过闸日线那根的裸收盘"
+
+
+def _pr_line(read) -> str:
+    pr = read.fundamental.pr
+    if not pr.ok:
+        return f"PR = 无 ← {pr.reason or pr.explain()}"
+    return f"PR = {pr.value:.4f} ← {pr.explain()}"
+
+
+def _percentile_line(row) -> str:
+    """一行分位要能验算：排第几、跟多少天比、窗口到哪、今天那个数是多少。"""
+    head = (
+        f"{row.metric} 分位 {row.value:.0f}%"
+        if row.ok
+        else f"{row.metric} 分位 –（{row.reason}）"
+    )
+    tail = (
+        f"样本 {row.samples} 天，窗口 {row.window_from}~{row.window_to}，"
+        f"今天 {_fmt(row.current)}"
+    )
+    if row.unpublished_periods:
+        tail += f"；另有 {row.unpublished_periods} 期因无披露日未参与（D61）"
+    return f"{head}  ← {tail}"
+
+
+def _composite_line(read) -> str:
+    comp = read.composite
+    asked = len(read.style.asked())
+    got = sum(1 for item in comp.items if item.ok)
+    if not comp.ok:
+        return f"–（{asked} 项里 {got} 项有数，覆盖权重 {comp.covered_weight:.2f}）← {comp.reason}"
+    return (
+        f"{comp.score:.1f}（{asked} 项里 {got} 项有数，覆盖权重 {comp.covered_weight:.2f}）"
+        f" ← {comp.evidence}"
+    )
+
+
+def _item_lines(read) -> list[str]:
+    """模板问到的每一项都要有一行，**包括一项都没被算出来的那一项**。
+
+    屏幕上少一行与那一行写着「–」是两种不同的误导：前者让人以为这项很好或根本没有这项。
+    """
+    produced = {item.key: item for item in read.composite.items}
+    out = []
+    for key in read.style.asked():
+        weight = read.style.weights[key]
+        item = produced.get(key)
+        if item is None:
+            body = f"–  权重 {weight:.0%}  ← 这一项没有被算出来（读取侧没给出它的输入）"
+        else:
+            score = f"{item.value:.1f}" if item.ok else "–"
+            body = (
+                f"{score}  权重 {weight:.0%}  ← {item.evidence if item.ok else item.reason}"
+            )
+        out.append(f"{key:<16}{body}")
+    return out
+
+
+def _level(leg) -> str:
+    if not leg.ok:
+        return f"– ← {leg.reason or leg.evidence}"
+    span = f"{leg.low:g}" if leg.low == leg.high else f"{leg.low:g} ~ {leg.high:g}"
+    return f"{span}  ← {leg.evidence}"
+
+
+def _entry_line(entry) -> str:
+    """买入区那句要把「闸门过没过」与「现价到没到这一段」分开说：它们是两条独立的规则。"""
+    if not entry.ok:
+        return f"– ← {entry.reason or entry.evidence}"
+    state = {True: "已到", False: "未到", None: "未判"}[entry.ready]
+    tail = entry.evidence if entry.ready else f"{entry.evidence}；{entry.reason}"
+    return f"{entry.low:g} ~ {entry.high:g}（{state}买入区）  ← {tail}"
+
+
+def _valuation_warnings(read) -> list[str]:
+    out = []
+    if read.price_age_days is not None and read.price_age_days > STALE_VALUATION_DAYS:
+        out.append(
+            f"⚠ 现价是 {read.price_age_days} 天前（{read.price_on}）那根收盘，"
+            f"旧过 {STALE_VALUATION_DAYS} 天：那几天的行情没有进过这条式子——"
+            f"先 `sams sync daily --market {read.market} --code {read.code}`"
+        )
+    out.extend(f"⚠ {note}" for note in read.notes)
+    return out
+
+
+def _valuation_payload(read, code: int) -> dict:
+    fun = read.fundamental
+    plan = read.plan
+    return {
+        "status": "ok" if code == 0 else "refused",
+        "exit": code,
+        "market": read.market,
+        "code": read.code,
+        "as_of": str(read.as_of),
+        "style": read.style.name,
+        "style_label": read.style.label,
+        "price": read.price,
+        "price_on": str(read.price_on) if read.price_on else None,
+        "price_age_days": read.price_age_days,
+        "fundamental": {
+            "period": str(fun.period) if fun.period else None,
+            "published_on": str(fun.published_on) if fun.published_on else None,
+            "roe": fun.roe,
+            "revenue_yoy": fun.revenue_yoy,
+            "profit_yoy": fun.profit_yoy,
+            "dividend_yield": fun.dividend_yield,
+            "pe_ttm": fun.pe_ttm,
+            "pb": fun.pb,
+            "market_cap": fun.market_cap,
+            "valuation_on": str(fun.valuation_on) if fun.valuation_on else None,
+            "valuation_age_days": fun.valuation_age_days,
+            "dropped_unpublished": fun.dropped_unpublished,
+            "roe_basis": fun.roe_basis,
+            "source": fun.source,
+            "valuation_source": fun.valuation_source,
+            "pr": {
+                "value": fun.pr.value,
+                "basis": fun.pr.basis,
+                "roe_used": fun.pr.roe_used,
+                "estimated": fun.pr.estimated,
+                "ok": fun.pr.ok,
+                "reason": fun.pr.reason or fun.pr.explain(),
+            },
+        },
+        "percentiles": [_percentile_payload(row) for row in read.percentiles],
+        "composite": {
+            "score": read.composite.score,
+            "covered_weight": read.composite.covered_weight,
+            "missing": list(read.composite.missing),
+            "win_rate": read.composite.win_rate,
+            "win_rate_samples": read.composite.win_rate_samples,
+            "evidence": read.composite.evidence,
+            "reason": read.composite.reason,
+            "items": [
+                {
+                    "key": item.key,
+                    "label": item.label,
+                    "value": item.value,
+                    "ok": item.ok,
+                    "weight": read.style.weights[item.key],
+                    "evidence": item.evidence,
+                    "reason": item.reason,
+                }
+                for item in read.composite.items
+            ],
+        },
+        "plan": {
+            "fair": _level_payload(plan.fair),
+            "entry": {**_level_payload(plan.entry), "ready": plan.entry.ready},
+            "stop": _level_payload(plan.stop),
+            "target": _level_payload(plan.target),
+            "odds": {
+                "value": plan.odds.value,
+                "ok": plan.odds.ok,
+                "evidence": plan.odds.evidence,
+                "reason": plan.odds.reason,
+            },
+            "notes": list(plan.notes),
+        },
+        "technical": {
+            "weekly_ma20": read.weekly_ma20,
+            "atr": read.atr,
+            "recent_high": read.recent_high,
+            "open_weekly_period": (
+                str(read.open_weekly_period) if read.open_weekly_period else None
+            ),
+        },
+        "flow": {
+            "window_days": FLOW_WINDOW_DAYS,
+            "days": [str(d) for d in read.flow_days],
+        },
+        "notes": list(read.notes),
+        "warnings": _valuation_warnings(read),
+        "caliber": caliber_note(),
+        "basis_note": roe_basis_note(fun.roe_basis),
+    }
+
+
+def _percentile_payload(row) -> dict:
+    return {
+        "metric": row.metric,
+        "value": row.value,
+        "ok": row.ok,
+        "current": row.current,
+        "samples": row.samples,
+        "window_from": str(row.window_from),
+        "window_to": str(row.window_to),
+        "current_day": str(row.current_day) if row.current_day else None,
+        "roe_period": str(row.roe_period) if row.roe_period else None,
+        "unpublished_periods": row.unpublished_periods,
+        "skipped_no_pe": row.skipped_no_pe,
+        "skipped_no_roe": row.skipped_no_roe,
+        "skipped_caliber": row.skipped_caliber,
+        "reason": row.reason,
+        "evidence": row.evidence,
+    }
+
+
+def _level_payload(leg) -> dict:
+    return {
+        "low": leg.low,
+        "high": leg.high,
+        "ok": leg.ok,
+        "evidence": leg.evidence,
+        "reason": leg.reason,
+    }
+
+
+def _fmt(value) -> str:
+    return "–" if value is None else f"{value:.4f}"

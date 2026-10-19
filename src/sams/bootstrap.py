@@ -27,6 +27,7 @@ from sams.services.health import HealthService
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
+from sams.services.valuation import ValuationService
 from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.bars import BarRepo
@@ -90,6 +91,8 @@ class Container:
     fundamentals: FundamentalService
     screen: ScreenService
     analysis: AnalysisService
+    #: 估值合成（spec §8.3）：它吃上面那两个读数用例，不是并列的第三路取数
+    valuation: ValuationService
     health: HealthService
     source_admin: SourceAdminService
 
@@ -177,6 +180,8 @@ def build_container(
     registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
     providers = providers if providers is not None else default_providers()
     calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
+    fundamentals = FundamentalService(financials_store, valuation_store, clock=clock)
+    analysis = AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock)
 
     return Container(
         settings=cfg,
@@ -208,10 +213,13 @@ def build_container(
         fundamental_sync=FundamentalSyncService(
             registry, financials_store, valuation_store, flow_store, symbols
         ),
-        fundamentals=FundamentalService(financials_store, valuation_store, clock=clock),
+        fundamentals=fundamentals,
         screen=ScreenService(
             financials_store, valuation_store, symbols, scan_store, clock=clock
         ),
-        analysis=AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock),
+        analysis=analysis,
+        valuation=ValuationService(
+            fundamentals, analysis, financials_store, valuation_store, flow_store, clock=clock
+        ),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )

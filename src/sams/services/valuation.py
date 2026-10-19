@@ -51,7 +51,7 @@ from sams.analysis.valuation.scoring import (
     volume_follow,
     weekly_trend,
 )
-from sams.analysis.valuation.styles import Style, get_style
+from sams.analysis.valuation.styles import Style, get_style, style_names
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
@@ -68,6 +68,10 @@ _TRADING_DAYS_PER_WEEK = 5
 _TRADING_DAYS_PER_YEAR = 244
 #: 资金流合计的天数。拉到 10 天会让分数翻倍，而那是一段没人问过的日子
 FLOW_WINDOW_DAYS = 5
+
+#: 能打分的模板名。`cli` 不许 import 分析层（`tests/test_layering.py`），所以这份名单
+#: 从这里转一道：`--style` 的帮助文本与报错时列的那份名单，来源都是 `get_style` 那一张表
+STYLE_NAMES = style_names()
 
 #: 折回现价口径时要出声的那三个数（它们的绝对值与现价比大小，不是彼此比大小）
 _FOLDED_KEYS = ("周MA20", "ATR", "前高")

@@ -19,11 +19,27 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 
 import polars as pl
 import pytest
 import support
+from support_valuation import (
+    CLOSES,
+    CODE,
+    DAYS,
+    FY22,
+    FY23,
+    MARKET_CAP,
+    PE,
+    PR_NOW,
+    PRICE,
+    TODAY,
+    dividend,
+    financial_rows,
+    flow_rows,
+    seed,
+)
 
 from sams.analysis.valuation.percentile import MIN_SAMPLES
 from sams.analysis.valuation.styles import TREND, VALUE
@@ -37,128 +53,8 @@ from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.symbols import SymbolRepo
 
-CODE = "601088"
-#: 三百根按日历日排开的日线（交易日历不在这条路上）：够 PR 分位过 250 天的样本地板，
-#: 也够把「前高」那段窗口整个铺在请求段里
-DAYS = [date(2024, 1, 1) + timedelta(days=i) for i in range(300)]
-TODAY = DAYS[-1]
-#: 先涨后跌：末根收盘 17.0，窗口内最高收盘是第 201 根的 19.97。
-#: 单调上涨的序列里「前高 == 现价」，`pick_target` 会把那一路直接排除，
-#: 于是「二者取近」这句话永远测不到
-RISE, FALL = 200, 100
-CLOSES = [10.0 + 0.05 * i for i in range(RISE)] + [20.0 - 0.03 * i for i in range(1, FALL + 1)]
-PRICE = CLOSES[-1]
-PE = [30.0 - 0.03 * i for i in range(len(DAYS))]
-PB = [3.0 - 0.003 * i for i in range(len(DAYS))]
-MARKET_CAP = 6.0e11
-FY22 = date(2022, 12, 31)
-FY22_PUBLISHED = date(2023, 3, 20)
-FY23 = date(2023, 12, 31)
-FY23_PUBLISHED = date(2024, 3, 20)
-ROE_NOW = 0.20
-#: PE 一路走低、ROE 在窗口中段抬到 0.20 ⇒ 现在这一天是整段的最小值 ⇒ 分位 0，
-#: 入场闸门（< 20%）过
-PR_NOW = PE[-1] / ROE_NOW / 100.0
-
-
-def bars(days: list[date], closes: list[float], *, market: str = "A", code: str = CODE):
-    return pl.DataFrame(
-        {
-            "market": [market] * len(days),
-            "code": [code] * len(days),
-            "date": days,
-            "open": closes,
-            "high": [c + 0.10 for c in closes],
-            "low": [c - 0.10 for c in closes],
-            "close": closes,
-            "volume": [1000.0] * len(days),
-            "amount": [c * 1000.0 for c in closes],
-            "source": ["akshare"] * len(days),
-        }
-    )
-
-
-def valuation(days: list[date], *, market: str = "A", code: str = CODE):
-    return pl.DataFrame(
-        {
-            "market": [market] * len(days),
-            "code": [code] * len(days),
-            "date": days,
-            "pe_ttm": PE[: len(days)],
-            "pb": PB[: len(days)],
-            "dividend_yield": [None] * len(days),
-            "market_cap": [MARKET_CAP] * len(days),
-            "source": ["akshare"] * len(days),
-        }
-    )
-
-
-def financial_rows(*, market: str = "A", code: str = CODE) -> pl.DataFrame:
-    """两期**年报**：2022 年那期在窗口开始之前就公开了，所以曲线上的每一天都有分母。
-
-    只播一期（2023 年报，2024-03-20 公开）的话，窗口前三分之二没有可采信的 ROE，可比样本
-    掉到地板以下，分位用例测的就不是「排第几」而是「够不够格排」。
-    """
-    return pl.DataFrame(
-        [
-            {
-                "market": market,
-                "code": code,
-                "report_date": FY22,
-                "published_date": FY22_PUBLISHED,
-                "roe": 0.18,
-                "revenue_yoy": 0.10,
-                "profit_yoy": 0.10,
-                "dividend_yield": 0.04,
-                "market_cap": 5.0e11,
-                "source": "akshare",
-            },
-            {
-                "market": market,
-                "code": code,
-                "report_date": FY23,
-                "published_date": FY23_PUBLISHED,
-                "roe": ROE_NOW,
-                "revenue_yoy": 0.10,
-                "profit_yoy": 0.10,
-                "dividend_yield": 0.04,
-                "market_cap": MARKET_CAP,
-                "source": "akshare",
-            },
-        ]
-    )
-
-
-def dividend(day: date, cash: float = 1.0, *, market: str = "A", code: str = CODE):
-    return pl.DataFrame(
-        {
-            "market": [market],
-            "code": [code],
-            "ex_date": [day],
-            "kind": ["dividend"],
-            "cash_per_share": [cash],
-            "ratio": [None],
-            "price": [None],
-            "src": ["akshare"],
-            "note": [f"10派{cash * 10:.2f}元(含税)"],
-        }
-    )
-
-
-def flow_rows(days: list[date], *, net: float, north: float | None = None, market: str = "A",
-              code: str = CODE) -> pl.DataFrame:
-    return pl.DataFrame(
-        {
-            "market": [market] * len(days),
-            "code": [code] * len(days),
-            "date": days,
-            "main_net_in": [net] * len(days),
-            "north_net": [north] * len(days),
-            "north_hold": [None] * len(days),
-            "margin_bal": [None] * len(days),
-            "source": ["akshare"] * len(days),
-        }
-    )
+#: 样本数据（300 天 K 线、两期年报、逐日估值）在 `tests/support_valuation.py`：
+#: 命令行那一侧要对着同一批数验屏幕上的话，两份样本分叉就是各自对自己的数点头
 
 
 def build(
@@ -174,26 +70,18 @@ def build(
     with_fundamentals: bool = True,
     today: date = TODAY,
 ) -> ValuationService:
-    """一份读得动的库：日线 + 覆盖确认 + 两期年报 + 逐日估值（+ 可选资金流、除权）。"""
-    days = DAYS if days is None else days
-    closes = CLOSES if closes is None else closes
-    if with_bars:
-        BarRepo(db).upsert(bars(days, closes, market=market, code=code))
-        CorpActionsCoverageRepo(db).record(
-            market,
-            code,
-            covered_from=days[0],
-            covered_to=days[-1],
-            full_history=True,
-            src="akshare",
-        )
-    if actions is not None:
-        CorpActionRepo(db).upsert_many(actions)
-    if with_fundamentals:
-        FinancialRepo(db).upsert(financial_rows(market=market, code=code))
-        ValuationRepo(db).upsert(valuation(days, market=market, code=code))
-    if flow is not None:
-        FundingFlowRepo(db).upsert(flow)
+    """一份读得动的库（`support_valuation.seed`）+ 只连着它的三个读数用例。"""
+    seed(
+        db,
+        market=market,
+        code=code,
+        days=days,
+        closes=closes,
+        actions=actions,
+        flow=flow,
+        with_bars=with_bars,
+        with_fundamentals=with_fundamentals,
+    )
     clock = support.FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC))
     analysis = AnalysisService(
         BarRepo(db),
@@ -211,6 +99,7 @@ def build(
         FundingFlowRepo(db),
         clock=clock,
     )
+
 
 
 def lean_value(drop: str):
