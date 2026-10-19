@@ -17,23 +17,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date
+from datetime import date
 
 from sams.analysis.valuation.compose import Plan
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.codes import canonical_code, canonical_market
+from sams.core.codes import canonical_market
+from sams.core.config import Settings
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
 from sams.services.valuation import STYLE_NAMES, ValuationRead, ValuationService
 from sams.storage.repos.theses import (
-    ARCHIVED,
+    HIT_STOP,
+    HIT_TARGET,
     OBSERVING,
-    OPENED_REQUIRED,
     STATUSES,
     TRANSITIONS,
     Thesis,
     ThesisEvent,
     ThesisRepo,
+    missing_levels_for_opened,
 )
 from sams.storage.repos.users import ACTIVE, User, UserRepo
 
@@ -48,6 +50,12 @@ _ROWS = (
     ("target", "目标", ("target_price", "target_price")),
     ("odds", "赔率", ("reward_risk", "reward_risk")),
 )
+
+
+#: 对照表实际读的那几列（`_ROWS` 的展开，去重）：判「库里到底有没有价位」要用它，
+#: 不能用仓库那一张 `LEVEL_COLUMNS`——里面还挂着 M5 才回填的 `win_rate`，
+#: 那条有数而价位全空，会被读成「价位填过了」。
+_LEVEL_COLUMNS = tuple(dict.fromkeys(col for _, _, cols in _ROWS for col in cols))
 
 
 def levels_from_plan(plan: Plan) -> dict:
@@ -70,15 +78,13 @@ def levels_from_plan(plan: Plan) -> dict:
 
 @dataclass(frozen=True)
 class LevelRow:
-    """对照表里的一栏：库里那次、当前那次，以及两者差多少。"""
+    """对照表里的一栏：库里那次、当前那次，以及为什么这一栏这么读。"""
 
     key: str
     label: str
     stored: tuple[float | None, float | None]
     current: tuple[float | None, float | None]
     note: str
-    #: 这一栏在库里的列名（单值的两列同名）：那道「建仓前要先给齐」的闸要按列名来找这一栏
-    columns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -100,20 +106,44 @@ class ThesisReport:
         return None if self.valuation is None else self.valuation.price
 
     @property
+    def has_levels(self) -> bool:
+        """库里到底有没有一列价位。没有的话，「库里那次」这个说法本身就不成立。"""
+        return any(getattr(self.thesis, column) is not None for column in _LEVEL_COLUMNS)
+
+    @property
+    def stored_axis(self) -> str:
+        """对照表左边那一句话：库里那次是哪一次，或者库里根本还没有价位。
+
+        「没有测量日」只有一种解释：那一栏是人填的。立论时估值给不出，于是那一栏**不存在**，
+        把它说成手填等于给用户安一个他没做过的动作，也等于让屏幕替一片空白背一句出处。
+        """
+        if not self.has_levels:
+            return "库里还没有价位"
+        return f"库里那次（{self.stored_on}）"
+
+    @property
+    def stored_on(self) -> str:
+        """库里那几列属于哪一次读数（0013 的 `levels_on`）。
+
+        NULL 不是「忘了填」而是「这一栏不是量出来的」：手填的数没有读数日，
+        把它标成写库那一刻，等于让屏幕替一个没有式子的数编一个出处。
+        """
+        return (
+            f"截至 {self.thesis.levels_on}"
+            if self.thesis.levels_on is not None
+            else "没有测量日（手填）"
+        )
+
+    @property
     def complete(self) -> bool:
         """这一屏是否读出一条**可用**的结论：当前估值可得，且建仓那一步要的三列都在库里。
 
         齐不齐不是拿 `plan.ok` 说的——`plan.ok` 还要求买入区，而买入区依赖基本面：
         一只没有基本面的票，止损/目标/赔率照样算得出也照样能建仓，把它判成「没给出结论」
-        等于让退出码替数据缺失背锅。三列的名单与仓库那道闸共用同一个来源。
+        等于让退出码替数据缺失背锅。三列的名单读的是仓库那道闸的同一个谓词（D82）：
+        两处各抄一份时，「屏幕上说完整」与「`--to opened` 照样拒」迟早分叉。
         """
-        if self.valuation is None:
-            return False
-        values: dict[str, float | None] = {}
-        for row in self.rows:
-            for column, value in zip(row.columns, row.stored, strict=True):
-                values[column] = value
-        return all(values.get(column) is not None for column, _ in OPENED_REQUIRED)
+        return self.valuation is not None and not missing_levels_for_opened(self.thesis)
 
 
 class ThesisService:
@@ -122,11 +152,14 @@ class ThesisService:
         theses: ThesisRepo,
         users: UserRepo,
         valuation: ValuationService,
+        settings: Settings,
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self.theses = theses
         self.users = users
         self.valuation = valuation
+        #: 已知市场只有配置里那几个：`market_cfg` 是「系统能不能在这个市场读到数」的出处
+        self.settings = settings
         self.clock = clock
 
     # --- 写 --------------------------------------------------------------------------------
@@ -155,7 +188,7 @@ class ThesisService:
                 f"没有叫 {style!r} 的打分模板：能用的是 {'、'.join(STYLE_NAMES)}。"
                 "这一列决定以后每次 `show` 按哪套权重读，存一个读不出来的名字等于没存"
             )
-        self._slot_is_free(user, market, code, style)
+        self._known_market(market)
         read, unavailable = self._read(
             market,
             code,
@@ -174,6 +207,8 @@ class ThesisService:
             actor_id=user.id,
             now=self.clock.now_utc(),
             note=note,
+            # 那几列价位属于哪一天的读数——不是「哪一秒写进库」（0013）
+            levels_on=None if read is None else read.as_of,
             **levels,
         )
         return self._report(
@@ -205,7 +240,7 @@ class ThesisService:
         roe_basis: str = ROE_BASIS_ANNUAL,
         **levels: float | None,
     ) -> ThesisReport:
-        """改那几列价量，不改状态（因此不留事件：时间线记的是跳转，不是字段修订史）。
+        """改那几列价位，不改状态（因此不留事件：时间线记的是跳转，不是字段修订史）。
 
         `from_plan` 是「按现在的库重算一遍再落」：它只覆盖这条结论**给得出**的那几栏。
         手填的键排在它前面合并，所以两者同时出现时以库里重算出来的那个为准。
@@ -223,7 +258,13 @@ class ThesisService:
         recomputed = {} if read is None or not from_plan else levels_from_plan(read.plan)
         merged = {**levels, **recomputed}
         thesis = self.theses.set_levels(
-            user.id, thesis_id, actor_id=user.id, now=self.clock.now_utc(), **merged
+            user.id,
+            thesis_id,
+            actor_id=user.id,
+            now=self.clock.now_utc(),
+            # 只有从这条结论里取出来的那几个数有读数日；手填的那些没有（0013）
+            levels_on=None if read is None or not recomputed else read.as_of,
+            **merged,
         )
         return self._report(
             user.username,
@@ -289,26 +330,15 @@ class ThesisService:
             )
         return user
 
-    def _slot_is_free(self, user: User, market: str, code: str, style: str) -> None:
-        """同一只票、同一套模板，同时只留一条没走完的。
+    def _known_market(self, market: str) -> None:
+        """市场要在配置里，否则这条 thesis 永远读不到行情（D84）。
 
-        键的形态要先归一再比：`hk/700` 与 `HK/00700` 是同一只票，不归一的话这条闸只对
-        敲得标准的人生效，而重复记录恰恰是不标准那一次留下的。
+        市场名先归一再比（D38）：`--market a` 是同一条论，配置里的键只是大写。
+
+        「同一只票只留一条活的」不在这里查——那道约束在仓库（D81），因为写入口会有第二个：
+        M3 的规则命中与周复检都不走这个服务，一个绕得过的约束等于没有。
         """
-        try:
-            cleaned = canonical_market(market)
-            key = (cleaned, canonical_code(cleaned, code), style)
-        except ValueError as exc:
-            raise ValidationError(str(exc)) from exc
-        for existing in self.theses.list(user.id):
-            if existing.status == ARCHIVED:
-                continue
-            if (existing.market, existing.code, existing.style) == key:
-                raise ValidationError(
-                    f"这只票已经有一条没走完的 thesis（{existing.id}，状态 {existing.status}）："
-                    "同一套模板留两条活的，M3 的派生规则会翻倍，回看时也分不清哪条才是当时的决定。"
-                    "要重开请先走完那一条（`sams thesis advance`），或者换一套模板（`--style`）"
-                )
+        self.settings.market_cfg(canonical_market(market))
 
     def _read(
         self,
@@ -416,9 +446,7 @@ def _row(
     else:
         delta = "" if not stored[0] else f"（{current[0] / stored[0] - 1:+.1%}）"
         note = f"从 {_fmt(stored[0])} 到 {_fmt(current[0])}{delta}"
-    return LevelRow(
-        key=key, label=label, stored=stored, current=current, note=note, columns=columns
-    )
+    return LevelRow(key=key, label=label, stored=stored, current=current, note=note)
 
 
 def _notes(
@@ -432,12 +460,7 @@ def _notes(
     if unavailable:
         found.append(f"当前这次给不出：{unavailable}")
     if read is not None:
-        found.append(
-            f"两栏是两次测量：库里那次写于 {_utc(thesis.created_at)}"
-            f"（那一次用的输入没有存档），当前这次按 {read.as_of} 的库、"
-            f"ROE 口径 {read.fundamental.roe_basis} 重算。它们不等不代表观点变了——"
-            "漂移的判定要拿建仓时那份快照来比，而快照还没有写入方（D76）"
-        )
+        found.append(_measurement_note(thesis, read))
         # 计划里那些「依附项没过条件」的话要说出来：它们不给任何一栏定价，只解释为什么
         # 那一栏是空的（分位样本掉到地板以下就是这一类），少了它们屏幕上只剩一个 –
         found.extend(read.plan.notes)
@@ -446,26 +469,46 @@ def _notes(
     return tuple(found)
 
 
-def _utc(value) -> str:
-    """落库的一刻统一按 UTC 说，并把时区写出来。
+def _measurement_note(thesis: Thesis, read: ValuationRead) -> str:
+    """两栏到底是不是一次测量，只能问 `levels_on`，不能问 `created_at`（D83）。
 
-    DuckDB 回读 `TIMESTAMPTZ` 的偏移不稳定（`theses.created_at` 给 UTC、
-    `thesis_events.ts` 给会话本地时区），按原样格式化会让同一屏上两个数看着差八小时，
-    而这一屏要回答的正是「库里那次是什么时候的事」。
+    立论那一屏上，库里那几列就是眼前这次读数的结果——把它们说成「两次测量」，
+    屏幕就凭空多出一个「有没有漂移」的问题，而这个问题这里没有数据可答（快照还没有
+    写入方，D76）。反过来说也一样：`levels_on` 为空是手填的数，它没有读数日，
+    拿它跟当前那次并排比差值，比的是「一个人填的数」与「一条式子算出的数」。
     """
-    if value is None:
-        return "未知"
-    moment = value.astimezone(UTC) if value.tzinfo is not None else value
-    return f"{moment:%Y-%m-%d %H:%M} UTC"
+    if thesis.levels_on is None:
+        if not any(getattr(thesis, column) is not None for column in _LEVEL_COLUMNS):
+            return (
+                f"库里那一侧还没有价位（既不是某一次读数，也不是手填的数）；"
+                f"当前这次按 {read.as_of} 的库、ROE 口径 {read.fundamental.roe_basis} 算得出"
+            )
+        return (
+            f"库里那几列没有测量日（手填的数），当前这次按 {read.as_of} 的库、"
+            f"ROE 口径 {read.fundamental.roe_basis} 算出：两栏并排给出来是为了让你看见差，"
+            "而不是说它们可比"
+        )
+    if thesis.levels_on == read.as_of:
+        return (
+            f"两栏是同一次测量：库里那几列就是 {read.as_of} 那份读数的结果"
+            "（ROE 口径 "
+            f"{read.fundamental.roe_basis}），所以它们现在相等不说明观点没变"
+        )
+    return (
+        f"两栏是两次测量：库里那几列属于 {thesis.levels_on} 那份读数，"
+        f"当前这次按 {read.as_of} 的库、ROE 口径 {read.fundamental.roe_basis} 重算。"
+        "它们不等不代表观点变了——漂移的判定要拿建仓时那份快照来比，而快照还没有写入方（D76）"
+    )
 
 
 def _placement(username: str, thesis: Thesis, price: float | None) -> str:
     """现价落在计划的哪一段：只说库里那几列与现价的几何关系，不替用户决定要不要动手。
 
-    给出的那两条 `advance` 命令带着 `--user`：屏幕上写一条当场敲不通的命令，
-    等于让用户再回去读一遍帮助（同一条红线在 M2-A/C 被踩过好几次）。
+    给出的那两条 `advance` 命令要**这一刻真能敲通**（同一条红线在 M2-A/C 被踩过好几次）：
+    能不能走由仓库那张跳转表说了算，走不了就不能印成命令。`observing` 的观点破位时，
+    屏幕上要说的是「这一跳现在走不了，先走到哪一步」——一条会被仓库拒的命令，
+    用户读到的第一个怀疑是数据坏了。
     """
-    back = f"`sams thesis advance {thesis.id} --user {username}`"
     columns = (thesis.entry_low, thesis.entry_high, thesis.stop_price, thesis.target_price)
     if all(value is None for value in columns):
         return (
@@ -478,12 +521,12 @@ def _placement(username: str, thesis: Thesis, price: float | None) -> str:
     if thesis.stop_price is not None and price <= thesis.stop_price:
         return (
             f"现价 {_fmt(price)} 已在止损 {_fmt(thesis.stop_price)} 之下："
-            f"按计划这一笔该了结了（{back} --to hit_stop）"
+            f"按计划这一笔该了结了（{_jump(username, thesis, HIT_STOP)}）"
         )
     if thesis.target_price is not None and price >= thesis.target_price:
         return (
             f"现价 {_fmt(price)} 已到或超过目标价 {_fmt(thesis.target_price)}："
-            f"分批止盈提醒（{back} --to hit_target）"
+            f"分批止盈提醒（{_jump(username, thesis, HIT_TARGET)}）"
         )
     low, high = thesis.entry_low, thesis.entry_high
     if low is None and high is None:
@@ -503,4 +546,20 @@ def _placement(username: str, thesis: Thesis, price: float | None) -> str:
     return (
         f"现价 {_fmt(price)} 已低于买入区{phrase} {_fmt(anchor)}（{gap:+.1%}）："
         "先确认是数据或口径变了，而不是「更便宜所以更该买」"
+    )
+
+
+def _jump(username: str, thesis: Thesis, to: str) -> str:
+    """那一步现在走得了吗：能走就给一条整段都能敲的命令，不能走就说不去哪儿。
+
+    命令要连 `--to` 一起放在同一个 code span 里——把 `--to hit_stop` 写在反引号外面，
+    复制粘贴的人拿到是一条少了参数的命令。
+    """
+    allowed = TRANSITIONS[thesis.status]
+    if to in allowed:
+        return f"`sams thesis advance {thesis.id} --user {username} --to {to}`"
+    reachable = "、".join(allowed) if allowed else "没有（这是终点）"
+    return (
+        f"这一跳现在走不了：{thesis.status} 不能直接到 {to}"
+        f"（现在只能走到 {reachable}，建仓那一步还要价位齐备）"
     )

@@ -26,6 +26,7 @@ from sams.storage.repos.theses import (
     PROPOSED,
     TRACKING,
     ThesisRepo,
+    missing_levels_for_opened,
 )
 
 T0 = datetime(2024, 7, 1, 9, 30, tzinfo=UTC)
@@ -172,12 +173,17 @@ def test_archiving_an_unopened_thesis_is_refused(db):
 
 
 def test_opened_requires_stop_target_and_odds(db):
-    """建仓那一步是这条链上唯一要求「价位齐备」的：缺哪几个就点名哪几个。"""
+    """建仓那一步是这条链上唯一要求「价位齐备」的：缺哪几个就点名哪几个。
+
+    拒的是状态前置条件而不是参数（D81）：命令没打错，是这一条还没走到能建仓的样子，
+    所以它是退出码 1（补上价位就能重来），不是 2（重来多少次都一样）。
+    """
     repo = ThesisRepo(db)
     thesis = make(db)
     thesis = repo.advance(USER, thesis.id, PROPOSED, actor_id=USER, now=T1)
-    with pytest.raises(ValidationError, match="止损.*目标.*赔率"):
+    with pytest.raises(StorageError, match="止损.*目标.*赔率"):
         repo.advance(USER, thesis.id, OPENED, actor_id=USER, now=T2)
+    assert repo.get(USER, thesis.id).status == PROPOSED
 
 
 def test_a_terminal_archived_thesis_cannot_be_reopened(db):
@@ -328,3 +334,120 @@ def test_a_thesis_with_no_actor_is_refused(db):
         ThesisRepo(db).create(
             user_id=USER, market="A", code="601088", style="value", actor_id="", now=T0
         )
+
+
+def test_create_refuses_a_column_that_is_not_a_level(db):
+    """写入口对列名要一样严格：`create` 咽下 `stop_pirce` 等于立论时白填一次止损。
+
+    `set_levels` 有这道闸（上面那条用例守着），而 `create` 收同样的 kwargs——差别只在
+    它更容易被忽略，因为报错的是「什么都没写进去」而不是「改错了」。
+    """
+    with pytest.raises(ValidationError, match="stop_pirce"):
+        make(db, stop_pirce=1.0)
+
+
+def test_a_stop_at_or_above_the_target_is_refused(db):
+    """止损 999、目标 1 这种一反常态的配对不能落库：赔率是负数，而屏幕上它照样是四个数。
+
+    这一对在下游不是「算不出」而是「算得出一个反的」——现价永远同时满足
+    「已在止损之下」与「已到目标价」，于是 `hit_stop` 与 `hit_target` 两条了结路都被背书。
+    """
+    with pytest.raises(ValidationError, match="止损"):
+        make(db, stop_price=999.0, target_price=1.0)
+
+
+def test_reversing_the_stop_on_an_edit_is_refused(db):
+    """合并后的那一对照样要过闸：只查本次给的 kwargs，改一栏就能把顺序写反。"""
+    repo = ThesisRepo(db)
+    thesis = make(db, stop_price=27.0, target_price=40.0)
+    with pytest.raises(ValidationError, match="止损"):
+        repo.set_levels(USER, thesis.id, actor_id=USER, now=T1, stop_price=999.0)
+    assert repo.get(USER, thesis.id).stop_price == 27.0, "拒绝不能改掉库里那一个"
+
+
+def test_levels_cannot_be_edited_on_an_archived_thesis(db):
+    """归档是终点，`revise` 不能绕过状态机把历史结论改掉（改完 `updated_at` 会往前跳）。
+
+    这里没有「改一下已了结的那条」的合法用法：要修正就另开一条，两条各自带时间线。
+    """
+    repo = ThesisRepo(db)
+    thesis = make(db)
+    thesis = walk(
+        repo,
+        thesis,
+        PROPOSED,
+        OPENED,
+        TRACKING,
+        HIT_TARGET,
+        ARCHIVED,
+        stop_price=27.0,
+        target_price=40.0,
+        reward_risk=2.5,
+    )
+    with pytest.raises(StorageError, match="归档"):
+        repo.set_levels(USER, thesis.id, actor_id=USER, now=T2, stop_price=12.0)
+
+
+def test_a_second_live_thesis_on_the_same_key_is_refused(db):
+    """「同一只票同一套模板只留一条活的」是仓库的约束，不是某个调用方的自觉（D81）。
+
+    放在服务层时，M3 的写入方（规则命中、周复检）只要不走那个服务就能开出第二条，
+    症状是派生规则把同一个观点算两遍——而两条都「看起来正常」。
+    """
+    repo = ThesisRepo(db)
+    first = make(db)
+    with pytest.raises(StorageError, match=first.id):
+        make(db)
+    assert len(repo.list(USER)) == 1
+
+
+def test_the_duplicate_guard_is_blind_to_case_but_not_to_style_or_user(db):
+    """`hk`/`700` 与 `HK`/`00700` 是同一只票：键归一之后才算重复。
+
+    换模板（`--style`）与换人是两条合法的另一条论：前者是「按另一套权重再看一次」，
+    后者本来就不共享这块地。
+    """
+    repo = ThesisRepo(db)
+    first = make(db, market="hk", code="700")
+    with pytest.raises(StorageError):
+        make(db, market="HK", code="00700")
+    assert make(db, style="trend").id != first.id
+    assert make(db, user_id=OTHER).id != first.id
+    assert len(repo.list(USER)) == 2
+
+
+def test_archiving_frees_the_key_for_a_new_thesis(db):
+    """了结过的不再是「活的」：同一只票可以再开一条，各带自己的时间线。"""
+    repo = ThesisRepo(db)
+    thesis = walk(
+        repo,
+        make(db),
+        PROPOSED,
+        OPENED,
+        TRACKING,
+        HIT_STOP,
+        ARCHIVED,
+        stop_price=27.0,
+        target_price=40.0,
+        reward_risk=2.5,
+    )
+    assert thesis.status == ARCHIVED
+    assert make(db).id != thesis.id
+    assert len(repo.list(USER)) == 2
+
+
+# --- 建仓那道闸的名单只有一份 -----------------------------------------------------------------
+
+
+def test_the_opened_gate_lists_what_is_missing_from_the_row(db):
+    """「齐不齐」这件事只有一个出处：仓库那道闸与服务那屏 `complete` 读同一份名单（D82）。
+
+    两处各写一遍时，改一栏（比如把赔率并进止损的检查）只会让退出码与建仓闸分叉——
+    屏幕上说「完整」而 `advance --to opened` 照样拒，是最难查的那种不一致。
+    """
+    thesis = make(db, stop_price=27.0, reward_risk=2.5)
+    assert missing_levels_for_opened(thesis) == ("target_price",)
+    assert missing_levels_for_opened(
+        make(db, code="000001", stop_price=27.0, target_price=40.0, reward_risk=2.5)
+    ) == ()
+

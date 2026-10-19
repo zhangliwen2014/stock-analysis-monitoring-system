@@ -85,7 +85,11 @@ def _show_parser(actions) -> None:
 def _advance_parser(actions) -> None:
     move = actions.add_parser(
         "advance",
-        help=f"沿那条链走一跳：{' → '.join(STATUS_NAMES)}",
+        help=(
+            "沿那条链走一跳（"
+            + "、".join(STATUS_NAMES)
+            + "）：能走到哪由仓库那张跳转表决定，不是按这个顺序一路往下"
+        ),
     )
     move.add_argument("thesis_id")
     move.add_argument("--user", required=True)
@@ -100,7 +104,7 @@ def _advance_parser(actions) -> None:
 
 
 def _revise_parser(actions) -> None:
-    fix = actions.add_parser("revise", help="改那几列价量（不改状态，因此不留事件）")
+    fix = actions.add_parser("revise", help="改那几列价位（不改状态，因此不留事件）")
     fix.add_argument("thesis_id")
     fix.add_argument("--user", required=True)
     fix.add_argument("--entry-low", help="买入区下限")
@@ -158,8 +162,8 @@ def run_add(container: Container, args: argparse.Namespace) -> int:
             roe_estimate=_ratio(args.roe_estimate),
             roe_basis=args.roe_basis,
         )
-    except ValidationError as exc:
-        return _refused(args, exc, 2)
+    except (ValidationError, StorageError) as exc:
+        return _refused(args, exc, _exit_for(exc))
     code = 0 if report.complete else 1
     nxt = container.theses.next_steps(report.thesis.status)
     if args.json:
@@ -171,8 +175,8 @@ def run_add(container: Container, args: argparse.Namespace) -> int:
 def run_list(container: Container, args: argparse.Namespace) -> int:
     try:
         rows = container.theses.list(args.user, status=args.status)
-    except ValidationError as exc:
-        return _refused(args, exc, 2)
+    except (ValidationError, StorageError) as exc:
+        return _refused(args, exc, _exit_for(exc))
     if args.json:
         _emit(
             {
@@ -209,7 +213,7 @@ def run_show(container: Container, args: argparse.Namespace) -> int:
             roe_basis=args.roe_basis,
         )
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, 2 if isinstance(exc, ValidationError) else 1)
+        return _refused(args, exc, _exit_for(exc))
     code = 0 if report.complete else 1
     nxt = container.theses.next_steps(report.thesis.status)
     if args.json:
@@ -224,7 +228,7 @@ def run_advance(container: Container, args: argparse.Namespace) -> int:
             args.user, args.thesis_id, args.to, note=args.note
         )
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, 2 if isinstance(exc, ValidationError) else 1)
+        return _refused(args, exc, _exit_for(exc))
     nxt = container.theses.next_steps(thesis.status)
     if args.json:
         _emit(
@@ -246,24 +250,22 @@ def run_advance(container: Container, args: argparse.Namespace) -> int:
 
 
 def run_revise(container: Container, args: argparse.Namespace) -> int:
-    levels = {
-        "entry_low": _money_arg("--entry-low", args.entry_low),
-        "entry_high": _money_arg("--entry-high", args.entry_high),
-        "stop_price": _money_arg("--stop", args.stop),
-        "target_price": _money_arg("--target", args.target),
-        "reward_risk": _money_arg("--odds", args.odds),
-    }
-    given = {key: value for key, value in levels.items() if value is not None}
-    if not given and not args.from_plan:
-        return _refused(
-            args,
-            ValidationError(
+    # 解析也在闸内（D57）：`--stop abc --json` 的报错得带着 JSON 出来，
+    # 冒到 `run()` 的兜底通道只剩一段 stderr 和一个错的退出码
+    try:
+        levels = {
+            "entry_low": _money_arg("--entry-low", args.entry_low),
+            "entry_high": _money_arg("--entry-high", args.entry_high),
+            "stop_price": _money_arg("--stop", args.stop),
+            "target_price": _money_arg("--target", args.target),
+            "reward_risk": _money_arg("--odds", args.odds),
+        }
+        given = {key: value for key, value in levels.items() if value is not None}
+        if not given and not args.from_plan:
+            raise ValidationError(
                 "没有要改的栏：给一两个价位（`--stop/--target/--odds/--entry-low/--entry-high`）"
                 "或说「按现在的库重算」（`--from-plan`）"
-            ),
-            2,
-        )
-    try:
+            )
         report = container.theses.revise(
             args.user,
             args.thesis_id,
@@ -274,7 +276,7 @@ def run_revise(container: Container, args: argparse.Namespace) -> int:
             **given,
         )
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, 2 if isinstance(exc, ValidationError) else 1)
+        return _refused(args, exc, _exit_for(exc))
     # 要求重算而一栏都没落下来 ⇒ 这次没算出任何可写的数（退出码 1），不是「改好了」
     code = 1 if not report.complete or (args.from_plan and not report.written) else 0
     nxt = container.theses.next_steps(report.thesis.status)
@@ -296,9 +298,9 @@ def _print_report(report: ThesisReport, code: int, *, next_steps: tuple[str, ...
         f"  立论 {_stamp(thesis.created_at)}  更新 {_stamp(thesis.updated_at)}"
         + (f"  归档 {_stamp(thesis.archived_at)}" if thesis.archived_at else "")
     )
-    if not any(row.stored[0] is not None for row in report.rows):
+    if not report.has_levels:
         print("  价位    空着（建仓那一步会被拒：止损/目标/赔率三列都得有数）")
-    print("  ── 对照：库里那次 vs 当前这次 ──")
+    print(f"  ── 对照：{report.stored_axis} vs 当前这次 ──")
     for row in report.rows:
         print(
             f"    {row.label:<{_LABEL_WIDTH}}  库里 {_range(*row.stored):<16}"
@@ -396,6 +398,9 @@ def _report_payload(report: ThesisReport, code: int, next_steps: tuple[str, ...]
         ],
         "placement": report.placement,
         "notes": list(report.notes),
+        # 库里那几列属于哪一次读数（0013）：`stored_on` 是这句话的机器可读形态。
+        # 一列价位都没落库时它是 null：说「没有测量日（手填）」是替一片空白编出处
+        "stored_on": report.stored_on if report.has_levels else None,
         "written": list(report.written),
         "next_steps": list(next_steps),
         "unavailable": report.unavailable,
@@ -447,10 +452,21 @@ def _thesis_payload(thesis) -> dict:
         "reward_risk": thesis.reward_risk,
         "win_rate": thesis.win_rate,
         "win_rate_samples": thesis.win_rate_samples,
+        # 那几列价位属于哪一天的读数；手填的数在这里是 null（0013）
+        "levels_on": str(thesis.levels_on) if thesis.levels_on else None,
         "created_at": thesis.created_at.isoformat() if thesis.created_at else None,
         "updated_at": thesis.updated_at.isoformat() if thesis.updated_at else None,
         "archived_at": thesis.archived_at.isoformat() if thesis.archived_at else None,
     }
+
+
+def _exit_for(exc: Exception) -> int:
+    """1 与 2 的分界只在这里写一遍（D77）：认得出的错在参数上就是 2，其余是业务拒绝。
+
+    脚本对两者的处置不同：2 是敲错了，重来多少次都一样；1 是这条记录还没到那一步，
+    补数据或走完上一步就能重跑。把这条线抄在五个 handler 里，总有一处会先失效。
+    """
+    return 2 if isinstance(exc, ValidationError) else 1
 
 
 def _refused(args: argparse.Namespace, exc: Exception, code: int) -> int:
@@ -499,9 +515,10 @@ def _stamp(value) -> str:
     `thesis_events.ts` 回来是会话本地时区（Asia/Shanghai）。两者是同一个瞬间，但按
     原样 `strftime` 会在同一屏上印出「立论 15:00 / 时间线 23:00」——看着像事件比记录晚
     八小时，而这一屏的用意正是回看「什么时候走了哪一步」。
+    到秒：两步落在同一分钟里时（脚本、M3 的触发器），分是分辨不出先后的。
     """
     if value is None:
         return "–"
     if value.tzinfo is not None:
         value = value.astimezone(UTC)
-    return f"{value:%Y-%m-%d %H:%M} UTC"
+    return f"{value:%Y-%m-%d %H:%M:%S} UTC"

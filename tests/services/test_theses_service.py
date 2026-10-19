@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 from support_valuation import CODE, make_container
 
@@ -107,13 +109,30 @@ def test_a_disabled_user_cannot_write_or_read(db, settings):
         container.theses.list(OTHER)
 
 
-def test_a_second_live_thesis_on_the_same_stock_is_refused_and_names_the_first(db, settings):
-    """同一个票同一套模板留两条活的，M3 的派生规则会翻倍，而回看时不知道哪条是当时的决定。"""
+def test_a_second_live_thesis_on_the_same_stock_is_a_one_not_a_two(db, settings):
+    """同一个票同一套模板留两条活的：命令没打错，是库里已经站着一条（退出码归 1，D81）。
+
+    断言的是接线：约束在仓库那层（`tests/storage` 守着），这一层要证明服务没有把它
+    包成「参数不对」——那种谎会让脚本以为换个写法就能过，于是原地重试。
+    """
     container = build(db, settings)
     first = container.theses.add(USER, "A", CODE).thesis
-    with pytest.raises(ValidationError, match=first.id):
+    with pytest.raises(StorageError, match=first.id):
         container.theses.add(USER, "A", CODE)
     assert len(container.theses.list(USER)) == 1
+
+
+def test_add_refuses_a_market_the_system_cannot_read(db, settings):
+    """`--market XX` 不该立出一条永远读不到行情的 thesis（F9 那一条）。
+
+    已知市场来自配置（`[markets.*]`）而不是某个硬编码名单：一个没配的市场在这里
+    等于「valuation.read 只能给 NotAdjustable」，那几条价位会永远空着，而屏幕上
+    说的是「这只票还没到买入区」。
+    """
+    container = build(db, settings)
+    with pytest.raises(ValidationError, match="未知市场"):
+        container.theses.add(USER, "XX", CODE)
+    assert container.theses.list(USER) == []
 
 
 def test_archiving_frees_the_slot(db, settings):
@@ -183,12 +202,54 @@ def test_a_level_the_current_plan_cannot_compute_does_not_erase_the_stored_one(d
 
 
 def test_the_report_says_which_measurement_each_number_is_from(db, settings):
-    """两栏的日期要印出来：把「今天算的」读成「当时定的」，回看时的结论就是反的。"""
+    """库里那几列要说自己**属于哪一天**，而不是「写库的那一秒」（D83）。
+
+    `created_at` 是今天写库的时刻；立论时传的 `--as-of` 才是那四个价位的读数日。
+    拿写入时刻当测量日，一屏会把「按 7 月 11 日的库定的计划」读成「今天重新量过，没变」。
+    """
+    container = build(db, settings)
+    thesis = container.theses.add(USER, "A", CODE, as_of=date(2024, 9, 30)).thesis
+    assert thesis.levels_on == date(2024, 9, 30)
+    report = container.theses.show(USER, thesis.id)
+    assert str(date(2024, 9, 30)) in report.stored_on
+    # `show` 没传 `--as-of` ⇒ 当前那次是今天：这时「两次测量」才成立，而话说的是那两个读数日
+    assert any("两次测量" in note for note in report.notes)
+    assert any(f"属于 {date(2024, 9, 30)}" in note for note in report.notes)
+
+
+def test_a_hand_set_level_has_no_measurement_day(db, settings):
+    """手填的数不带测量日：把它标成「今天算的」，等于给一个没有式子的数编一个出处（D83）。
+
+    `levels_on` 因此留 NULL，而 `show` 要说这一栏没有读数日、并因此**不**声称两栏可比。
+    """
     container = build(db, settings)
     thesis = container.theses.add(USER, "A", CODE).thesis
+    hand = container.theses.revise(USER, thesis.id, stop_price=12.34).thesis
+    assert hand.levels_on is None
+    report = container.theses.show(USER, hand.id)
+    assert "没有测量日" in report.stored_on
+    assert any("手填" in note for note in report.notes)
+
+
+def test_a_thesis_with_nothing_stored_says_so_instead_of_hand_filled(db, settings):
+    """一列价位都没落库时不能说「手填」：那是给用户安一个他没做过的动作。
+
+    `levels_on` 为空有两种截然不同的来路（D83）：人填了一个数（没有读数日），以及**根本
+    什么都没写过**（立论时估值给不出）。屏幕把后者读成前者，用户就以为自己填过止损价。
+    """
+    container = build(db, settings, with_bars=False)
+    thesis = container.theses.add(USER, "A", CODE).thesis
     report = container.theses.show(USER, thesis.id)
-    assert any("库里那次" in note for note in report.notes)
-    assert any(str(report.valuation.as_of) in note for note in report.notes)
+    assert report.stored_axis == "库里还没有价位"
+    assert "手填" not in report.stored_axis
+
+
+def test_the_add_screen_does_not_claim_two_measurements(db, settings):
+    """立论那一屏上两栏是同一次读数：说成「两次测量」是在替屏幕编一个对比（D83）。"""
+    container = build(db, settings)
+    report = container.theses.add(USER, "A", CODE)
+    assert not any("两次测量" in note for note in report.notes)
+    assert any("同一次测量" in note for note in report.notes)
 
 
 # --- 现价落在计划哪一段 ---------------------------------------------------------------------
@@ -203,13 +264,15 @@ def test_the_report_says_where_the_price_sits_against_the_plan(db, settings):
     assert "17" in report.placement
 
 
-def test_crossing_the_stored_stop_names_the_jump_that_matches(db, settings):
+def test_crossing_the_stored_stop_names_a_jump_the_state_machine_allows(db, settings):
+    """已经建仓的那条：破位时给出的 `--to hit_stop` 要当场敲得通（带着 id 与 `--user`）。"""
     container = build(db, settings)
     thesis = container.theses.add(USER, "A", CODE).thesis
-    container.theses.revise(USER, thesis.id, stop_price=99.0)
+    container.theses.advance(USER, thesis.id, PROPOSED)
+    container.theses.advance(USER, thesis.id, OPENED)
+    container.theses.revise(USER, thesis.id, stop_price=19.0, target_price=30.0)
     report = container.theses.show(USER, thesis.id)
     assert "止损" in report.placement
-    # 那句下一步要能当场敲出去：带着 id，也带着 `--user`（它是必填的）
     assert f"thesis advance {thesis.id} --user {USER}" in report.placement
     assert "--to hit_stop" in report.placement
 
@@ -217,10 +280,26 @@ def test_crossing_the_stored_stop_names_the_jump_that_matches(db, settings):
 def test_crossing_the_stored_target_names_hit_target(db, settings):
     container = build(db, settings)
     thesis = container.theses.add(USER, "A", CODE).thesis
-    container.theses.revise(USER, thesis.id, target_price=1.0)
+    container.theses.advance(USER, thesis.id, PROPOSED)
+    container.theses.advance(USER, thesis.id, OPENED)
+    container.theses.revise(USER, thesis.id, stop_price=10.0, target_price=15.0)
     report = container.theses.show(USER, thesis.id)
     assert "目标" in report.placement
     assert "hit_target" in report.placement
+
+
+def test_a_jump_the_state_machine_blocks_is_not_offered_as_a_command(db, settings):
+    """还没建仓的观点破位：不能印一条 `--to hit_stop`，因为它当场就会被仓库拒（F5）。
+
+    这一屏教的是「按那个词去敲」；一条敲不通的命令比没有命令更糟——用户会先怀疑数据。
+    """
+    container = build(db, settings)
+    thesis = container.theses.add(USER, "A", CODE).thesis
+    container.theses.revise(USER, thesis.id, stop_price=19.0, target_price=30.0)
+    report = container.theses.show(USER, thesis.id)
+    assert "--to hit_stop" not in report.placement
+    assert "走不了" in report.placement
+    assert PROPOSED in report.placement  # 要说得出现在这一步能往哪走
 
 
 def test_a_thesis_without_levels_says_so_instead_of_no_whereabouts(db, settings):
@@ -269,11 +348,14 @@ def test_next_steps_comes_from_the_same_table_the_repo_uses(db, settings):
 
 
 def test_opening_without_levels_names_a_command_that_exists(db, settings):
-    """拒绝的话里那条下一步命令要真能敲：指一个不存在的子命令等于没指。"""
+    """拒绝的话里那条下一步命令要真能敲：指一个不存在的子命令等于没指。
+
+    这也是一次「状态没到」而不是「参数打错」（D81）：补上价位就能重跑，所以它是 1 那一类。
+    """
     container = build(db, settings, with_bars=False)
     thesis = container.theses.add(USER, "A", CODE).thesis
     container.theses.advance(USER, thesis.id, PROPOSED)
-    with pytest.raises(ValidationError, match="sams thesis revise"):
+    with pytest.raises(StorageError, match="sams thesis revise"):
         container.theses.advance(USER, thesis.id, OPENED)
 
 

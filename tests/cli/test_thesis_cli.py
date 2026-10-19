@@ -99,14 +99,31 @@ def test_an_unknown_user_is_exit_two_in_json_too(db, settings, capsys):
 
 
 def test_add_refuses_a_second_live_thesis_on_the_same_stock(db, settings, capsys):
+    """第二次立论被拒是「库里已经站着一条」（1），不是「这条命令打错了」（2，D81）。
+
+    分错的代价是脚本原地重试：换个写法确实过不了，但把那条走完确实就够了。
+    """
     container = build(db, settings)
     first = add(container, capsys)
     code, data = payload(
         container, capsys, "add", "--user", USER, "--market", "A", "--code", CODE
     )
-    assert code == 2
+    assert code == 1
     assert data["status"] == "refused"
     assert first in data["reason"]
+
+
+def test_add_refuses_a_market_the_system_has_no_route_for(db, settings, capsys):
+    """`--market XX` 是打错（2），而且要在立论之前就拦：一条读不到行情的 thesis 只会长期空着。"""
+    container = build(db, settings)
+    code, data = payload(
+        container, capsys, "add", "--user", USER, "--market", "XX", "--code", CODE
+    )
+    assert code == 2 and data["exit"] == 2
+    assert "未知市场" in data["reason"]
+    assert "A" in data["reason"]  # 要说得出能用的是哪几个
+    _, body = out(container, capsys, "list", "--user", USER)
+    assert "没有" in body
 
 
 def test_add_on_a_stock_without_bars_still_records_the_view_but_exits_one(db, settings, capsys):
@@ -224,7 +241,7 @@ def test_list_rejects_an_unknown_status_before_reading(db, settings, capsys):
 # --- show ----------------------------------------------------------------------------------
 
 
-def test_show_prints_the_two_measurements_side_by_side(db, settings, capsys):
+def test_show_prints_the_stored_and_current_levels_side_by_side(db, settings, capsys):
     container = build(db, settings)
     thesis_id = add(container, capsys)
     code, body = out(container, capsys, "show", thesis_id, "--user", USER)
@@ -232,6 +249,46 @@ def test_show_prints_the_two_measurements_side_by_side(db, settings, capsys):
     assert "库里那次" in body and "当前这次" in body
     assert "现价" in body
     assert "时间线" in body
+
+
+def test_the_comparison_header_names_the_reading_day_of_the_stored_levels(db, settings, capsys):
+    """表头要说「库里那次」属于哪一天的读数（0013），不是它写进库的那一秒。
+
+    `created_at` 与测量日是两件事：立论时传了 `--as-of`，那四个价位就是那一天的；
+    表头只印今天，读的人会把「按 9 月 30 日定的计划」当成「今天量过、没变」。
+    """
+    container = build(db, settings)
+    thesis_id = add(container, capsys, "--as-of", str(BACK))
+    code, body = out(container, capsys, "show", thesis_id, "--user", USER)
+    assert code == 0  # 三列都在库里 ⇒ 结论完整；两栏不同日只是要说出来的那件事
+    assert f"库里那次（截至 {BACK}）" in body, body
+    code, data = payload(container, capsys, "show", thesis_id, "--user", USER)
+    assert data["thesis"]["levels_on"] == str(BACK)
+    assert data["stored_on"] == f"截至 {BACK}"
+
+
+def test_a_hand_set_level_shows_no_reading_day(db, settings, capsys):
+    """手填的数在表头留「没有测量日」：给它盖一个今天的日期，等于替它编出处。"""
+    container = build(db, settings)
+    thesis_id = add(container, capsys)
+    out(container, capsys, "revise", thesis_id, "--user", USER, "--stop", "12.34")
+    _, body = out(container, capsys, "show", thesis_id, "--user", USER)
+    assert "库里那次（没有测量日（手填））" in body, body
+
+
+def test_a_thesis_with_nothing_stored_has_no_comparison_axis(db, settings, capsys):
+    """一列都没落库时，表头不能说「库里那次（手填）」：那是给用户安一个他没做过的动作。
+
+    立论时数据缺位（没同步过日线）与「用户自己填了一个数」在库里长得一模一样
+    （`levels_on` 都是 NULL），区别只在价位那几列空不空。屏幕上混说这两件，
+    用户会以为止损价已经记过了。
+    """
+    container = build(db, settings, with_bars=False)
+    thesis_id = add(container, capsys, code=1)
+    _, body = out(container, capsys, "show", thesis_id, "--user", USER)
+    assert "对照：库里还没有价位 vs 当前这次" in body, body
+    _, data = payload(container, capsys, "show", thesis_id, "--user", USER)
+    assert data["stored_on"] is None
 
 
 def test_show_points_at_the_command_that_produces_the_full_trace(db, settings, capsys):
@@ -333,11 +390,12 @@ def test_an_unknown_status_is_a_two_not_a_one(db, settings, capsys):
 
 
 def test_opening_is_refused_until_the_levels_are_in(db, settings, capsys):
+    """价位没齐时建仓是 1（补上就能重跑），不是 2（打错了，D81）。"""
     container = build(db, settings, with_bars=False)
     thesis_id = add(container, capsys, code=1)
     out(container, capsys, "advance", thesis_id, "--user", USER, "--to", "proposed")
     code, body = out(container, capsys, "advance", thesis_id, "--user", USER, "--to", "opened")
-    assert code == 2
+    assert code == 1
     assert "sams thesis revise" in body
 
 
@@ -418,3 +476,59 @@ def test_revise_with_nothing_to_change_says_so(db, settings, capsys):
     code, body = out(container, capsys, "revise", thesis_id, "--user", USER)
     assert code == 2
     assert "--from-plan" in body
+
+
+@pytest.mark.parametrize("flag", ["--stop", "--target", "--odds", "--entry-low", "--entry-high"])
+def test_a_price_that_is_not_a_number_is_still_a_json_refusal(db, settings, capsys, flag):
+    """解析参数也在闸内（D57）：`--stop abc --json` 不能退成「一段 stderr 加一个空 stdout」。
+
+    这一族最容易漏，因为报错本身是对的（退出码 2、话说得清楚）——只是那句话走的是
+    `cli.run()` 的兜底通道：管道里读的人拿不到 JSON，而 2 也会变成兜底的 1。
+    """
+    container = build(db, settings)
+    thesis_id = add(container, capsys)
+    code, data = payload(container, capsys, "revise", thesis_id, "--user", USER, flag, "abc")
+    assert code == 2 and data["exit"] == 2
+    assert data["status"] == "refused"
+    assert flag in data["reason"]
+
+
+def test_a_bad_as_of_is_a_json_refusal_on_add_too(db, settings, capsys):
+    container = build(db, settings)
+    code, data = payload(
+        container,
+        capsys,
+        "add",
+        "--user",
+        USER,
+        "--market",
+        "A",
+        "--code",
+        CODE,
+        "--as-of",
+        "2024/07/11",
+    )
+    assert code == 2 and data["exit"] == 2
+    assert "YYYY-MM-DD" in data["reason"]
+
+
+def test_revise_refuses_a_stop_at_or_above_the_target(db, settings, capsys):
+    """反着填的一对不能落库并被这一屏背书（现价会同时「破止损」又「到目标」）。"""
+    container = build(db, settings)
+    thesis_id = add(container, capsys)
+    code, data = payload(
+        container,
+        capsys,
+        "revise",
+        thesis_id,
+        "--user",
+        USER,
+        "--stop",
+        "999",
+        "--target",
+        "1",
+    )
+    assert code == 2 and data["status"] == "refused"
+    assert "止损" in data["reason"]
+    _, after = out(container, capsys, "show", thesis_id, "--user", USER)
+    assert "999" not in after, "拒绝不能改掉库里那一个"

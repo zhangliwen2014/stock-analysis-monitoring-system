@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from math import isfinite
 
 from sams.core.codes import canonical_code, canonical_market
@@ -46,7 +46,7 @@ TRANSITIONS: dict[str, tuple[str, ...]] = {
 #: 建仓那一步要求齐备的三项：缺哪几个就点名哪几个（说「不能建仓」而不说缺什么是废提示）。
 OPENED_REQUIRED = (("stop_price", "止损"), ("target_price", "目标"), ("reward_risk", "赔率"))
 
-#: 可以改的价量列（`win_rate` 是 M5 回填的，这里只保证它落成小数口径）。
+#: 可以改的那几列价位（`win_rate` 与样本数是 M5 回填的，这里只保证它们落成小数口径）。
 LEVEL_COLUMNS = (
     "entry_low",
     "entry_high",
@@ -61,9 +61,18 @@ PRICES = ("entry_low", "entry_high", "stop_price", "target_price")
 
 _COLUMNS = (
     "id, user_id, market, code, style, status, entry_low, entry_high, stop_price, "
-    "target_price, reward_risk, win_rate, win_rate_samples, created_at, updated_at, "
+    "target_price, reward_risk, win_rate, win_rate_samples, levels_on, created_at, updated_at, "
     "archived_at"
 )
+
+
+def missing_levels_for_opened(row: Thesis) -> tuple[str, ...]:
+    """建仓那道闸还缺哪几列（列名，按 `OPENED_REQUIRED` 的顺序）。
+
+    名单只写一遍：仓库的 `advance` 用它决定能不能建仓，服务那屏的 `complete` 用它决定退出码。
+    两处各抄一份时，改一栏只会让「屏幕上说完整」与「`--to opened` 照样拒」分叉。
+    """
+    return tuple(column for column, _ in OPENED_REQUIRED if getattr(row, column) is None)
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,8 @@ class Thesis:
     reward_risk: float | None = None
     win_rate: float | None = None
     win_rate_samples: int | None = None
+    #: 库里那几列价位属于哪一天的读数（0013）；手填的数留 None
+    levels_on: date | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     archived_at: datetime | None = None
@@ -180,12 +191,41 @@ def _check_levels(values: dict) -> dict:
         raise ValidationError(
             f"买入区写反了：下限 {low} 高于上限 {high}（这一对在屏幕上是一个空区间）"
         )
+    stop, target = cleaned.get("stop_price"), cleaned.get("target_price")
+    if stop is not None and target is not None and stop >= target:
+        raise ValidationError(
+            f"止损 {stop} 不在目标 {target} 之下：这一对让赔率成为负数，"
+            "而现价会同时满足「已在止损之下」与「已到目标价」——"
+            "两条相反的了结路都被这屏背书（D81）"
+        )
     return cleaned
 
 
 class ThesisRepo:
     def __init__(self, db: Database) -> None:
         self.db = db
+
+    def _reject_unknown(self, levels: dict) -> None:
+        """写入口对列名一样严格（D81）：咽下一个 `stop_pirce`，屏幕上就像改好了而库里没有。"""
+        unknown = sorted(set(levels) - set(LEVEL_COLUMNS))
+        if unknown:
+            raise ValidationError(
+                f"thesis 没有这些列：{'、'.join(unknown)}；能改的是 {'、'.join(LEVEL_COLUMNS)}"
+            )
+
+    def _live_on_the_same_key(self, user_id: str, market: str, code: str, style: str) -> str | None:
+        """同一只票、同一套模板，同时只留一条没走完的（D81）。
+
+        这条约束在仓库而不在服务：写入口会有第二个、第三个（M3 的规则命中、周复检），
+        而一个绕得过的约束等于没有——开出的第二条让派生规则把同一个观点算两遍，
+        两条在屏幕上看起来都正常。
+        """
+        for existing in self.list(user_id):
+            if existing.status == ARCHIVED:
+                continue
+            if (existing.market, existing.code, existing.style) == (market, code, style):
+                return existing.id
+        return None
 
     def create(
         self,
@@ -198,6 +238,7 @@ class ThesisRepo:
         now: datetime,
         status: str = OBSERVING,
         note: str | None = None,
+        levels_on: date | None = None,
         **levels: float | int | None,
     ) -> Thesis:
         """开局只有 `observing` 与 `proposed` 两种：从链条中段开局等于跳过「观点怎么来的」。"""
@@ -211,8 +252,17 @@ class ThesisRepo:
             )
         if not style:
             raise ValidationError("style 不能为空：它决定这份结论是按哪套权重读出来的")
+        self._reject_unknown(levels)
         cleaned = _check_levels(levels)
         market_norm, code_norm = _norm(market, code)
+        clash = self._live_on_the_same_key(user_id, market_norm, code_norm, style)
+        if clash is not None:
+            raise StorageError(
+                f"{market_norm}/{code_norm} 已经有一条没走完的 thesis（{clash}，"
+                "同一套模板留两条活的，派生规则会把同一个观点算两遍，"
+                "回看时也分不清哪条才是当时的决定）。要重开请先走完那一条（`advance`），"
+                "或者换一套模板（style）"
+            )
         thesis = Thesis(
             id=new_id(),
             user_id=user_id,
@@ -220,6 +270,7 @@ class ThesisRepo:
             code=code_norm,
             style=style,
             status=name,
+            levels_on=levels_on,
             created_at=now,
             updated_at=now,
             **cleaned,
@@ -229,8 +280,8 @@ class ThesisRepo:
             INSERT INTO theses
                 (id, user_id, market, code, style, status, entry_low, entry_high,
                  stop_price, target_price, reward_risk, win_rate, win_rate_samples,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 levels_on, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 thesis.id,
@@ -246,6 +297,7 @@ class ThesisRepo:
                 thesis.reward_risk,
                 thesis.win_rate,
                 thesis.win_rate_samples,
+                levels_on,
                 now,
                 now,
             ],
@@ -315,24 +367,31 @@ class ThesisRepo:
         *,
         actor_id: str,
         now: datetime,
+        levels_on: date | None = None,
         **levels: float | int | None,
     ) -> Thesis:
-        """改价量而不改状态，因此**不写事件**：`thesis_events.to_status` 非空，
+        """改那几列价位而不改状态，因此**不写事件**：`thesis_events.to_status` 非空，
         一次没有状态变化的写入要么伪造一条跳转、要么什么都留不下——留不下是对的，
-        这条表要回答的是「我当时为什么买」，不是每个字段的修订史。"""
+        这条表要回答的是「我当时为什么买」，不是每个字段的修订史。
+
+        `levels_on` 由调用方说清「这次落的数属于哪一天的读数」（0013）：手填就传 None。
+        默认值不是今天是有意的——把写入日当测量日，一屏会把「今天填的数」说成
+        「今天重新量过一遍」。
+        """
         _require_user(actor_id, what="actor_id")
         current = self.require(user_id, thesis_id)
-        unknown = sorted(set(levels) - set(LEVEL_COLUMNS))
-        if unknown:
-            raise ValidationError(
-                f"thesis 没有这些列：{'、'.join(unknown)}；能改的是 {'、'.join(LEVEL_COLUMNS)}"
+        if current.status == ARCHIVED:
+            raise StorageError(
+                f"{thesis_id} 已经归档：`{ARCHIVED}` 是终点，改它不是在修订一条观点，"
+                "而是在重写历史（要修正就另开一条，两条各自带时间线）"
             )
+        self._reject_unknown(levels)
         merged = {**{c: getattr(current, c) for c in LEVEL_COLUMNS}, **levels}
         cleaned = _check_levels(merged)
         self.db.execute(
             "UPDATE theses SET entry_low = ?, entry_high = ?, stop_price = ?, "
             "target_price = ?, reward_risk = ?, win_rate = ?, win_rate_samples = ?, "
-            "updated_at = ? WHERE user_id = ? AND id = ?",
+            "levels_on = ?, updated_at = ? WHERE user_id = ? AND id = ?",
             [
                 cleaned["entry_low"],
                 cleaned["entry_high"],
@@ -341,6 +400,7 @@ class ThesisRepo:
                 cleaned["reward_risk"],
                 cleaned["win_rate"],
                 cleaned["win_rate_samples"],
+                levels_on,
                 now,
                 current.user_id,
                 current.id,
@@ -374,10 +434,13 @@ class ThesisRepo:
             raise StorageError(self._why_blocked(current, target, allowed))
         if target == OPENED:
             missing = [
-                label for column, label in OPENED_REQUIRED if getattr(current, column) is None
+                label
+                for column, label in OPENED_REQUIRED
+                if column in missing_levels_for_opened(current)
             ]
             if missing:
-                raise ValidationError(
+                # 状态前置条件不成立，不是参数打错（D81）：补上价位就能重来 ⇒ 退出码 1
+                raise StorageError(
                     f"建仓前要先给齐：{'、'.join(missing)}"
                     f"（{'、'.join(column for column, _ in OPENED_REQUIRED)} 三列现在是空的）。"
                     "落进来有两条路：`sams thesis revise <id> --stop .. --target .. --odds ..` "
@@ -463,6 +526,7 @@ def _to_theses(rows) -> list[Thesis]:
             reward_risk=r["reward_risk"],
             win_rate=r["win_rate"],
             win_rate_samples=r["win_rate_samples"],
+            levels_on=r["levels_on"],
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             archived_at=r["archived_at"],

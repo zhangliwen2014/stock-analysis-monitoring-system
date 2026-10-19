@@ -230,6 +230,8 @@ def build_container(
         ),
         analysis=analysis,
         valuation=valuation,
-        theses=ThesisService(theses_store, users, valuation, clock=clock),
+        # `settings` 是那个「已知市场」的出处：一个没配的市场立不出 thesis，
+        # 因为那条链上每一栏都读不到数（D84）
+        theses=ThesisService(theses_store, users, valuation, cfg, clock=clock),
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )
