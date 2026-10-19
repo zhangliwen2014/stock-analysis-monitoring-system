@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
+import polars as pl
 import pytest
 
+from sams.core.config import MarketCfg
 from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
 from sams.storage.repos.ledger import Account, SimAccountRepo, SimOrderRepo
+from sams.storage.repos.symbols import SymbolRepo
 
 USER = "u1"
 
@@ -147,6 +150,13 @@ def _fill(fills: SimOrderRepo, account_id: str, side: str, **over: object) -> ob
     return fills.record_fill(**fields)  # type: ignore[arg-type]
 
 
+def _order_rows(db: Database, account_id: str) -> int:
+    """直接数库里的订单行：拒绝路径要证明「什么都没写」，不能只数仓库方法的返回值。"""
+    return int(
+        db.scalar("SELECT count(*) FROM sim_orders WHERE account_id = ?", [account_id]) or 0
+    )
+
+
 def test_a_buy_writes_order_position_and_both_cash_rows(
     accounts: SimAccountRepo, fills: SimOrderRepo
 ) -> None:
@@ -275,3 +285,141 @@ def test_the_open_time_is_the_first_fill_not_the_last(
     _fill(fills, account_id, "buy", ts=first)
     _fill(fills, account_id, "buy", ts=first + timedelta(days=200))
     assert fills.position(account_id, "A", "601088").open_ts == first
+
+
+def _markets() -> dict[str, MarketCfg]:
+    return {
+        "A": MarketCfg(
+            market="A", tz="Asia/Shanghai", currency="CNY",
+            post_close_min=30, sources=("akshare",),
+        ),
+        "HK": MarketCfg(
+            market="HK", tz="Asia/Hong_Kong", currency="HKD",
+            post_close_min=30, sources=("akshare",),
+        ),
+        "US": MarketCfg(
+            market="US", tz="America/New_York", currency="USD",
+            post_close_min=30, sources=("yfinance",),
+        ),
+    }
+
+
+@pytest.fixture
+def gated(db: Database) -> SimOrderRepo:
+    return SimOrderRepo(db, markets=_markets(), symbols=SymbolRepo(db))
+
+
+def test_a_b_share_cannot_be_bought_with_the_market_currency(
+    accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    """200011 是深市 B 股，HKD 报价（`codes.py:52`）。按 CNY 记账会污染整条链。"""
+    account_id = accounts.open(USER, "G", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "HKD", 10_000.0, reason="初始", actor_id=USER)
+    with pytest.raises(ValidationError, match="HKD.*CNY|CNY.*HKD"):
+        gated.record_fill(
+            account_id=account_id, user_id=USER, market="A", code="200011",
+            side="buy", qty=100, price=3.0, currency="CNY", fee=0.0,
+        )
+
+
+def test_the_override_currency_is_accepted(
+    accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    account_id = accounts.open(USER, "G2", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "HKD", 10_000.0, reason="初始", actor_id=USER)
+    order = gated.record_fill(
+        account_id=account_id, user_id=USER, market="A", code="200011",
+        side="buy", qty=100, price=3.0, currency="HKD", fee=0.0,
+    )
+    assert order.currency == "HKD"
+
+
+def test_a_collected_symbol_currency_that_disagrees_is_refused(
+    db: Database, accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    """库里 `symbols.currency` 是采集时写下的事实；它和推定值不一致说明有一条链路错了。
+
+    这时候**两边都不能信**：记账选一个、展示按另一个，用户看到的是同一只票两个价格。
+    所以报错要说「请先 sync 或核对代码」，而不是替用户挑一个。
+    """
+    SymbolRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["601088"],
+                "name": ["中国神华"],
+                "currency": ["USD"],  # 故意写错
+                "listed_on": [date(2007, 10, 9)],
+            }
+        )
+    )
+    account_id = accounts.open(USER, "G3", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 10_000.0, reason="初始", actor_id=USER)
+    with pytest.raises(StorageError, match="601088"):
+        gated.record_fill(
+            account_id=account_id, user_id=USER, market="A", code="601088",
+            side="buy", qty=100, price=40.0, currency="CNY", fee=0.0,
+        )
+    assert _order_rows(db, account_id) == 0
+
+
+def test_a_symbol_row_that_agrees_is_not_a_problem(
+    db: Database, accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    SymbolRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["601088"],
+                "name": ["中国神华"],
+                "currency": ["CNY"],
+                "listed_on": [date(2007, 10, 9)],
+            }
+        )
+    )
+    account_id = accounts.open(USER, "G4", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 10_000.0, reason="初始", actor_id=USER)
+    assert gated.record_fill(
+        account_id=account_id, user_id=USER, market="A", code="601088",
+        side="buy", qty=100, price=40.0, currency="CNY", fee=0.0,
+    )
+
+
+def test_no_markets_configured_means_no_gate(
+    accounts: SimAccountRepo, fills: SimOrderRepo
+) -> None:
+    """闸门是加的，不是既有的：没传 cfg 的调用方（测试、早期脚本）行为不变。
+
+    这样「忘了传 markets」变成少一道保护而不是拒掉所有单——反过来写会让 T-4 的
+    测试全部报错，而报错原因和币种毫无关系。
+    """
+    account_id = _funded(accounts)
+    assert _fill(fills, account_id, "buy")
+
+
+def test_cross_currency_cash_is_refused_naming_both(
+    accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    """USD 定价的标的不能花 CNY 现金买（M3 不做自动换汇，§5.4 规则 4 把换汇留给流水）。"""
+    account_id = accounts.open(USER, "G5", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 10_000.0, reason="初始", actor_id=USER)
+    with pytest.raises(StorageError, match="USD.*CNY|CNY.*USD"):
+        gated.record_fill(
+            account_id=account_id, user_id=USER, market="US", code="AAPL",
+            side="buy", qty=1, price=200.0, currency="USD", fee=0.0,
+        )
+
+
+def test_the_cross_currency_refusal_writes_no_order(
+    db: Database, accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    """报错点名了两个币种还不够，那笔单本身不能留下痕迹。"""
+    account_id = accounts.open(USER, "G6", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 10_000.0, reason="初始", actor_id=USER)
+    with pytest.raises(StorageError):
+        gated.record_fill(
+            account_id=account_id, user_id=USER, market="US", code="AAPL",
+            side="buy", qty=1, price=200.0, currency="USD", fee=0.0,
+        )
+    assert _order_rows(db, account_id) == 0
+    assert accounts.cash_balances(account_id)["CNY"] == pytest.approx(10_000.0)

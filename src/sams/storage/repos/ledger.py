@@ -19,9 +19,11 @@ import polars as pl
 
 from sams.core import funds
 from sams.core.codes import canonical_code, canonical_market
+from sams.core.config import MarketCfg
 from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
 from sams.storage.ids import new_id
+from sams.storage.repos.symbols import SymbolRepo
 
 #: 认得的币种：三字母代码，不做模糊匹配。`RMB`/`rmb` 一律拒绝——
 #: 让它过的话，同一个口袋会在库里以两种写法各存一行，余额从此对不上。
@@ -274,10 +276,20 @@ def _row_to_position(row: dict) -> Position:
 class SimOrderRepo:
     """订单与持仓。`record_fill` 是唯一的成交入口。"""
 
-    def __init__(self, db: Database, accounts: SimAccountRepo | None = None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        accounts: SimAccountRepo | None = None,
+        *,
+        markets: dict[str, MarketCfg] | None = None,
+        symbols: SymbolRepo | None = None,
+    ) -> None:
         self.db = db
         #: 现金与流水归 SimAccountRepo 管；成交要顺手动它，所以持有同一个 db 上的一个实例
         self.accounts = accounts or SimAccountRepo(db)
+        #: 两个都不传就没有币种闸门（闸门是加的，不是既有的：见 test_no_markets_...）
+        self.markets = markets
+        self.symbols = symbols
 
     def record_fill(
         self,
@@ -306,6 +318,7 @@ class SimOrderRepo:
             raise ValidationError("手续费不能为负：负手续费等于把成本做低")
         market = canonical_market(market)
         code = canonical_code(market, code)
+        self._check_currency(market, code, currency)
         moment = _moment(ts)
         existing = self.position(account_id, market, code, strict=False)
         held = existing.qty if existing else 0.0
@@ -313,6 +326,14 @@ class SimOrderRepo:
             raise StorageError(f"超卖：{market} {code} 持有 {held:g}，本次要卖 {qty:g}")
         gross = qty * price
         cash_delta = -gross - fee if side == BUY else gross - fee
+        if side == BUY:
+            balances = self.accounts.cash_balances(account_id)
+            if currency not in balances:
+                raise StorageError(
+                    f"账户没有 {currency} 现金，买不了 {currency} 定价的 {market} {code}"
+                    f"（现有：{', '.join(sorted(balances)) or '空'}）。"
+                    f"M3 不自动换汇：先补一笔同币种现金并写明理由（§5.4 规则 4）"
+                )
         order_id = new_id()
         with self.db.transaction():
             # `fx_rate_applied` 留 NULL：那一列按 spec §5.2 只在「这笔伴随换汇」时才有值，
@@ -358,6 +379,32 @@ class SimOrderRepo:
         order = self.order(account_id, order_id)
         assert order is not None
         return order
+
+    def _check_currency(self, market: str, code: str, currency: str) -> None:
+        """币种三方对齐：配置推定值、库里采集值、这笔单要用的值。不一致就点名两个币种拒掉。
+
+        三条会分叉的路（D31 + §5.4 规则 1）：市场默认币种、`currency_override` 推定的
+        标的币种、采集时写进 `symbols.currency` 的那个。分叉时替用户挑一个，等于让记账
+        和展示各信一个，屏幕上同一只票两个价格，而没人知道哪一次是错的。
+        """
+        if self.markets is None:
+            return
+        expected = funds.quote_currency(market, code, self.markets)
+        if currency != expected:
+            raise ValidationError(
+                f"{market} {code} 的标的币种是 {expected}，这笔单记成了 {currency}。"
+                f"录入与存储永远用标的币种（§5.4）；要换币种请先动现金，别动这笔单"
+            )
+        if self.symbols is None:
+            return
+        row = self.symbols.get(market, code)
+        stored = None if row is None else row.get("currency")
+        if stored is not None and stored != expected:
+            raise StorageError(
+                f"{market} {code} 库里记的币种是 {stored}，与配置推定的 {expected} 不符。"
+                f"两边都不能信：请先同步这只票的标的信息，或核对代码是不是另一只票"
+                f"（B 股与港股人民币双柜台见 D31）"
+            )
 
     def order(self, account_id: str, order_id: str) -> Order | None:
         rows = self.db.query(
