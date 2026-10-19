@@ -49,6 +49,7 @@ def _basis_clause(basis: str) -> str:
 
     这一句只写在这里，不散进调用方：口径的日历日判据是 D62 的全部内容，
     改一次就要改所有读侧，而漏改一处的症状是「扫出的票数与算出 PR 的票数对不上」。
+    打印用的同一句判据是 `core.fundamentals.is_year_end()`（两处一起改）。
     """
     if basis not in ROE_BASIS:
         raise ValidationError(

@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict
-from datetime import date
 from math import isfinite
 
 from sams.bootstrap import Container
@@ -29,6 +28,7 @@ from sams.core.fundamentals import (
     ROE_BASIS,
     ROE_BASIS_ANNUAL,
     caliber_note,
+    is_year_end,
     roe_basis_note,
 )
 from sams.services.screen import PrHit
@@ -227,7 +227,7 @@ def _universe_line(scan) -> str:
 
 def _hit_line(hit: PrHit) -> str:
     period = (
-        f"{hit.period} {'年报' if _is_year_end(hit.period) else f'{hit.period.month} 月末期'}"
+        f"{hit.period} {'年报' if is_year_end(hit.period) else f'{hit.period.month} 月末期'}"
         if hit.period
         else "无期"
     )
@@ -235,10 +235,6 @@ def _hit_line(hit: PrHit) -> str:
         f"{hit.code}  PR {hit.value:.3f}  {hit.basis}  ROE {_ratio(hit.roe_used)}（{period}）"
         f"  PE(TTM) {_number(hit.pe_ttm)}  PB {_number(hit.pb)}  估值日 {hit.valuation_on}"
     )
-
-
-def _is_year_end(day: date | None) -> bool:
-    return day is not None and day.month == 12 and day.day == 31
 
 
 def _warnings(scan) -> list[str]:

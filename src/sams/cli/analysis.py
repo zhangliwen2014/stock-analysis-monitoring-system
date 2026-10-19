@@ -31,6 +31,7 @@ from sams.core.fundamentals import (
     ROE_BASIS_LATEST,
     STALE_VALUATION_DAYS,
     caliber_note,
+    is_year_end,
     roe_basis_note,
 )
 from sams.core.timeutil import gap_days
@@ -132,7 +133,7 @@ def _period_line(read) -> str:
             f"无 ← 库里没有 {read.market} {read.code} 在「{read.roe_basis}」口径下"
             "已披露的财务数据（先跑 `sams sync financials`）"
         )
-    kind = "年报" if _is_year_end(read.period) else f"{read.period.month} 月末期"
+    kind = "年报" if is_year_end(read.period) else f"{read.period.month} 月末期"
     head = (
         f"{read.period} {kind}（披露 {read.published_on}，源 {read.source}）"
         if read.published_on
@@ -142,10 +143,6 @@ def _period_line(read) -> str:
         f"{head}  ROE {_ratio(read.roe)}  营收 {_signed(read.revenue_yoy)}"
         f"  利润 {_signed(read.profit_yoy)}  股息率 {_ratio(read.dividend_yield)}"
     )
-
-
-def _is_year_end(day) -> bool:
-    return day is not None and day.month == 12 and day.day == 31
 
 
 def _valuation_line(read) -> str:

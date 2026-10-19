@@ -6,11 +6,13 @@ ROE/增速/股息率按百分数给（20.0 表示 20%），而市赚率写的算
 （D59）。按百分数存进去，PE=20、ROE=20% 会算出 PR=0.01，屏幕上它长得和「极度低估」
 一模一样——一条会把所有高 ROE 的票排进「PR ≤ 0.4」前列的选股规则就是这么来的。
 
-所以换算只发生在采集归一那一步（`from_percent`），库里只有小数口径这一种事实
-（D58），读取侧不再有任何一处 `÷ 100`。
+所以换算只发生在采集归一那一步（`datasource.fundamentals.normalize_rows()`，除数是下面的
+`PERCENT_DIVISOR`），库里只有小数口径这一种事实（D58），读取侧不再有任何一处 `÷ 100`。
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 #: 比率列：库里一律**小数**，0.20 = 20%，-0.05 = 下降 5%。源给百分数时在此 ÷100。
 RATIO_COLUMNS = ("roe", "revenue_yoy", "profit_yoy", "dividend_yield")
@@ -68,19 +70,13 @@ FLOW_COLUMNS = (
 TEXT_COLUMNS = ("market", "code", "source")
 
 #: 百分数 → 小数的除数。写成常量而不是在两侧各写一个 `100.0`：口径换算的**数值**也只有一个出处。
+#:
+#: 换算只有一处会发生：`datasource.fundamentals.normalize_rows()` 对着 `percent_columns`
+#: 做那一次 `÷ PERCENT_DIVISOR`（D58）。这里刻意**没有**标量版的 `from_percent()`：
+#: 它写出来时预想的消费者（yfinance 的 info 字典）最后压根没映射比率列——股息率那一列
+#: 单位未核实，进库即 null（`akshare_cn` 给的是百分数，走的就是上面那一次）。
+#: 留着它，「÷100 只有一处」这句话就要读的人自己去数有几个函数在除。
 PERCENT_DIVISOR = 100.0
-
-
-def from_percent(value: float | None) -> float | None:
-    """百分数 → 小数口径（D58）。None 原样交回，**不折成 0.0**。
-
-    「股息率 0」与「不知道股息率」在选股里后果不同：前者是一只好票真的不分红，
-    后者是源没给——把后者写成 0，「高股息」那条筛子就会把它静默排除掉。
-
-    逐帧换算走 `datasource.fundamentals`（那里除数用的就是上面这个常量），
-    这个标量版本留给源侧返回单个数字的场合（yfinance 的 info 字典）。
-    """
-    return None if value is None else value / PERCENT_DIVISOR
 
 
 #: 小数口径下**可信的最大绝对值**（含边界：达到它就不可信）。越过它最可能的解释不是
@@ -157,6 +153,17 @@ ROE_BASIS = (ROE_BASIS_ANNUAL, ROE_BASIS_LATEST)
 BASIS_PE = "pe"
 BASIS_PB_ESTIMATE = "pb_estimate"
 BASIS_REFUSED = "refused"
+
+
+def is_year_end(day: date | None) -> bool:
+    """这一报告期是不是「年报」那一期的**唯一拼写**（D62）。
+
+    打印「年报 / 3 月末期」的两个出口各自判一次时，判据就有两份：改一次只改到一处，
+    漏掉的那一处会继续把季报叫成年报，而 `--roe-basis annual` 那句话讲的正是这两个字。
+    入库侧的同一句判据写成 SQL（`storage/repos/financials.py` 的口径子句），
+    因为「哪一期参选」必须在库里判；两处改的时候一起改。
+    """
+    return day is not None and day.month == 12 and day.day == 31
 
 
 def roe_basis_note(basis: str) -> str:

@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-import pytest
+from datetime import date
 
 from sams.core.fundamentals import (
     FINANCIAL_COLUMNS,
@@ -17,7 +17,7 @@ from sams.core.fundamentals import (
     RATIO_COLUMNS,
     VALUATION_COLUMNS,
     caliber_note,
-    from_percent,
+    is_year_end,
 )
 
 
@@ -25,12 +25,17 @@ def columns_of(db, table: str) -> set[str]:
     return set(db.query(f"DESCRIBE {table}")["column_name"].to_list())
 
 
-def test_percent_becomes_a_fraction_and_stays_none_when_unknown():
-    """换算的全部含义：20.0 是 20%，而「没有」不是 0（D58）。"""
-    assert from_percent(20.0) == pytest.approx(0.20)
-    assert from_percent(-5.5) == pytest.approx(-0.055)
-    assert from_percent(0.0) == 0.0
-    assert from_percent(None) is None
+def test_a_period_is_the_annual_one_only_on_december_31():
+    """「12-31 那一报告期」这件事只有一个拼写（D62）。
+
+    两个命令行出口各自判一次时，改口径（比如哪天要开始认「12 月财务年度末」这种非自然
+    年末）只会改到一处，另一处继续把季报叫成年报——而 `--roe-basis annual` 那句话
+    正是打印出来的那两个字。
+    """
+    assert is_year_end(date(2023, 12, 31)) is True
+    assert is_year_end(date(2024, 3, 31)) is False
+    assert is_year_end(date(2024, 12, 30)) is False
+    assert is_year_end(None) is False, "没有报告期不是「年末」，而是「不知道」"
 
 
 def test_the_three_unit_families_do_not_overlap():
