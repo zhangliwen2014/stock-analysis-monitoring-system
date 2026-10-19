@@ -188,6 +188,25 @@ def test_the_first_lines_are_the_universe_then_the_hits(db, settings, capsys):
     assert codes_in(out, "命中") == ["600001", "600000"]
 
 
+def test_synced_codes_outside_the_master_are_not_counted_as_negative_range(db, settings, capsys):
+    """库里同步过基本面的票**比主档在市的还多**时，那句范围话不能说反。
+
+    `sync financials --code` 不要求主档有行，所以这状态是会发生的（退市票、或票池没同步）。
+    「范围外的 -1 只」不只是难看：负号在这里意味着「主档里还有 -1 只没覆盖」，而真相是
+    样本里有主档不认识的票——那句话把范围的反方向说成了同一个方向。
+    """
+    add_master(db, 1)  # 只有 600000 在市
+    add(db, "600000")
+    add(db, "600001")  # 有基本面与估值，主档里却没有
+    capsys.readouterr()
+    assert run(container_for(db, settings), scan([]).split()) == 0
+    out = capsys.readouterr().out
+    assert "-1 只" not in out, "负数的「范围外」是一句反话"
+    assert "范围外的 1 只" not in out, "主档里没有的那一只不是「范围外等着被同步」的票"
+    assert "主档里查不到" in out
+    assert "已同步基本面的 2 只" in out
+
+
 def test_an_empty_master_admits_it_does_not_know_the_denominator(db, settings, capsys):
     """主档为空时不给 0：0 只会被读成「这个市场没有票」，而真正的原因是没同步主档。"""
     add(db, "600000")

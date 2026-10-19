@@ -149,14 +149,19 @@ def _universe_line(scan) -> str:
         # 票数未知时不给 0：「主档 0 只」会被读成「这个市场没有票」，真正的原因是没有票池同步命令
         return f"{head}；这个市场主档里一行都没有，总票数未知（本系统没有全市场票池的同步入口）"
     gap = scan.market_size - scan.universe_size
-    return (
-        f"{head}；主档 {scan.market_size} 只在市"
-        + (
+    if gap > 0:
+        return (
+            f"{head}；主档 {scan.market_size} 只在市"
             f"——范围外的 {gap} 只先跑 `sams sync financials --market {scan.market} --code <代码>`"
-            if gap
-            else "——本次已覆盖主档里的全部"
         )
-    )
+    if gap < 0:
+        # 基本面可以按代码直采，不要求主档有行：退市票、或票池没同步都会落到这里。
+        # 说成「范围外的 -N 只」是句反话——主档里没那几只票，不是「主档还等着被覆盖」
+        return (
+            f"{head}；主档只有 {scan.market_size} 只在市"
+            f"——其中 {-gap} 只在主档里查不到在市记录（退市或票池未同步），PR 照算"
+        )
+    return f"{head}；主档 {scan.market_size} 只在市——本次已覆盖主档里的全部"
 
 
 def _hit_line(hit: PrHit) -> str:
