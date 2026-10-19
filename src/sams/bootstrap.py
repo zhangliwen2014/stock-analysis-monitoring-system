@@ -206,7 +206,7 @@ def build_container(
     sim_orders = SimOrderRepo(database, sim_accounts, markets=cfg.markets, symbols=symbols)
     ledger = LedgerService(sim_accounts, sim_orders, theses_store, cfg)
     fx_store = FxRepo(database)
-    portfolio = PortfolioService(sim_accounts, sim_orders, bars, fx_store)
+    portfolio = PortfolioService(sim_accounts, sim_orders, bars, fx_store, clock=clock)
 
     return Container(
         settings=cfg,

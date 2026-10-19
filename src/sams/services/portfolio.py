@@ -14,10 +14,16 @@ from dataclasses import dataclass, replace
 from datetime import date
 
 from sams.core import funds
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import ValidationError
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.fx import FxRepo
-from sams.storage.repos.ledger import Position, SimAccountRepo, SimOrderRepo
+from sams.storage.repos.ledger import (
+    Account,
+    Position,
+    SimAccountRepo,
+    SimOrderRepo,
+)
 
 
 @dataclass(frozen=True)
@@ -71,6 +77,32 @@ class PositionRow:
         return False if self.pnl is None else self.pnl.rate_stale
 
 
+@dataclass(frozen=True)
+class AccountSummary:
+    """一个账户的汇总：本币小计分开、逐笔换算、换汇单列（§5.4 规则 2/3）。"""
+
+    account_id: str
+    name: str
+    report_currency: str
+    #: 各币种的现金余额，原样给出（本币数额，不做换算）
+    cash_by_currency: dict[str, float]
+    #: 各币种持仓的市值，取各行情日的收盘价；没有行情的那一行不进这里
+    position_value_by_currency: dict[str, float]
+    #: 报告币种里的总市值（现金 + 持仓）。换不出的那一笔不在里面，在 `notes` 里
+    total_report: float
+    price_pnl_report: float
+    fx_pnl: float
+    realized_report: float
+    #: 换算锚在哪一天：持仓里最新的行情日，没有持仓才用钟（见 `_as_of`）
+    as_of: date
+    notes: tuple[str, ...]
+    duplicate_holdings: tuple[str, ...]
+
+    @property
+    def total_pnl_report(self) -> float:
+        return self.price_pnl_report + self.fx_pnl
+
+
 class PortfolioService:
     def __init__(
         self,
@@ -78,11 +110,14 @@ class PortfolioService:
         orders: SimOrderRepo,
         bars: BarRepo,
         fx: FxRepo,
+        *,
+        clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self.accounts = accounts
         self.orders = orders
         self.bars = bars
         self.fx = fx
+        self.clock = clock
 
     def positions(self, user_id: str, account_id: str) -> list[PositionRow]:
         """当前持仓逐行给出（已清仓的不出现）；报告币种取的是**账户**那一列。
@@ -90,15 +125,19 @@ class PortfolioService:
         读也带 user_id：与 `repos/theses.py` 同形，不提供「查全量再由调用方过滤」的接口
         ——后者把隔离交给每一个调用方，总有一个忘记。
         """
-        account = self.accounts.get(user_id, account_id)
-        if account is None:
-            raise ValidationError(f"账户 {account_id} 不存在或不属于用户 {user_id}")
+        account = self._account(user_id, account_id)
         rows: list[PositionRow] = []
         for pos in self.orders.positions(account_id):
             if pos.qty <= 0:
                 continue
             rows.append(self._one(account_id, pos, account.report_currency))
         return rows
+
+    def _account(self, user_id: str, account_id: str) -> Account:
+        account = self.accounts.get(user_id, account_id)
+        if account is None:
+            raise ValidationError(f"账户 {account_id} 不存在或不属于用户 {user_id}")
+        return account
 
     def _one(self, account_id: str, pos: Position, report: str) -> PositionRow:
         base = PositionRow(
@@ -193,3 +232,115 @@ class PortfolioService:
                 return None
             entries.append((order.qty, order.fx_rate_ref, False))
         return funds.weighted_rate(entries)
+
+    def summary(self, user_id: str, account_id: str) -> AccountSummary:
+        """账户汇总：先按币种给出本币小计，再逐笔换算（§5.4 规则 2/3）。
+
+        把所有币种的数额直接相加报成一个数，是比「算错」更隐蔽的错：它看着完全正常。
+        所以换不出的那一笔不进合计，但一定在 `notes` 里点名。
+        """
+        account = self._account(user_id, account_id)
+        rows = self.positions(user_id, account_id)
+        as_of = self._as_of(rows)
+        notes: list[str] = []
+        value_by_ccy: dict[str, float] = {}
+        price_report = 0.0
+        fx_total = 0.0
+        positions_report = 0.0
+        for row in rows:
+            # 本币小计是「有几股、什么价」的事实，与能不能换算成报告币种无关
+            if row.last_price is not None:
+                value_by_ccy[row.currency] = (
+                    value_by_ccy.get(row.currency, 0.0) + row.qty * row.last_price
+                )
+            if row.pnl is None:
+                if row.unavailable_note is not None:
+                    notes.append(row.unavailable_note)
+                continue
+            price_report += row.pnl.price_pnl * (row.pnl.rate_base or 1.0)
+            fx_total += row.pnl.fx_pnl
+            positions_report += row.pnl.market_report
+        cash = self.accounts.cash_balances(account_id)
+        cash_report = 0.0
+        for ccy, amount in sorted(cash.items()):
+            if amount == 0:
+                continue
+            cash_report += self._convert(
+                account, ccy, amount, as_of, notes, f"现金 {amount:.2f} {ccy}"
+            )
+        return AccountSummary(
+            account_id=account_id,
+            name=account.name,
+            report_currency=account.report_currency,
+            cash_by_currency=cash,
+            position_value_by_currency=value_by_ccy,
+            total_report=positions_report + cash_report,
+            price_pnl_report=price_report,
+            fx_pnl=fx_total,
+            realized_report=self._realized(account, as_of, notes),
+            as_of=as_of,
+            notes=tuple(notes),
+            duplicate_holdings=self.duplicate_holdings(user_id, account_id),
+        )
+
+    def _as_of(self, rows: list[PositionRow]) -> date:
+        """换算锚在哪一天：持仓行情日里最新的那个，没有持仓才问钟。
+
+        持仓的换算根本不用它（各自锚在自己的行情日），用它的只有现金与已实现盈亏——
+        那些没有「行情日」可言。这里读钟是为了不写 `date.today()`：重放要能钉住时间。
+        """
+        days = [row.last_price_date for row in rows if row.last_price_date is not None]
+        return max(days) if days else self.clock.today()
+
+    def _convert(
+        self, account: Account, ccy: str, amount: float, as_of: date, notes: list[str], label: str
+    ) -> float:
+        """一笔本币数额换成报告币种；换不出就点名并贡献 0，不猜一个汇率。"""
+        if ccy == account.report_currency:
+            return amount
+        found = self.fx.latest(as_of, ccy, account.report_currency)
+        if found is None:
+            notes.append(
+                f"{label} 换不出 {account.report_currency}"
+                f"（{as_of} 或之前没有可用的 {ccy}→{account.report_currency} 汇率），未计入合计"
+            )
+            return 0.0
+        return amount * found.rate
+
+    def _realized(self, account: Account, as_of: date, notes: list[str]) -> float:
+        """已实现盈亏按币种汇总再换算：它算的是历史（`sim_orders` 重放），与当前持仓无关，
+        所以已清仓的那几只也要算进来。"""
+        by_ccy: dict[str, float] = {}
+        for pos in self.orders.positions(account.id):
+            amount = self.orders.realized_pnl(account.id, pos.market, pos.code)
+            if amount == 0.0:
+                continue
+            by_ccy[pos.currency] = by_ccy.get(pos.currency, 0.0) + amount
+        out = 0.0
+        for ccy, amount in sorted(by_ccy.items()):
+            out += self._convert(
+                account, ccy, amount, as_of, notes, f"已实现 {amount:.2f} {ccy}"
+            )
+        return out
+
+    def duplicate_holdings(self, user_id: str, account_id: str) -> tuple[str, ...]:
+        """本账户里那些「在别的账户也有一份」的标的。
+
+        库里不冲突（`sim_positions` 主键带 account_id），但读的人会以为一只票坏了：
+        两个账户各有一笔 601088，两个成本，屏幕上同一只票两个价。
+        """
+        holders: dict[tuple[str, str], set[str]] = {}
+        for account in self.accounts.list_for(user_id):
+            for pos in self.orders.positions(account.id):
+                if pos.qty > 0:
+                    holders.setdefault((pos.market, pos.code), set()).add(account.name)
+        mine = {
+            (pos.market, pos.code)
+            for pos in self.orders.positions(account_id)
+            if pos.qty > 0
+        }
+        return tuple(
+            f"{market} {code} 同时在 {'、'.join(sorted(names))} 里持有"
+            for (market, code), names in sorted(holders.items())
+            if len(names) > 1 and (market, code) in mine
+        )
