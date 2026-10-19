@@ -358,18 +358,40 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 - **先给 U20 那条序列出口定形**：`sams analysis series` 与指标共用同一条取数路径，列名与窗口语义
   在这一步定下来，不要各自发明。
 
-- [ ] `indicators.py` 全部为纯函数（输入已复权序列，输出带新列的帧），入口拒绝未复权序列
-- [ ] 黄金样例：MA/MACD/RSI/ATR 与手算/已知值逐位对齐；KDJ/DMI/CCI/WR 至少一条与公开样例对齐
-- [ ] `resample.py`：周/月 K 由日线现算（周五收市口径、非交易日跳过），不入库
-- [ ] **反未来函数专项**（spec §13）：篡改 T+1 及之后数据，T 日每个指标逐位不变；盘中未完成 K 线参与计算时结果带 `intraday=true` 标记
-- [ ] 三道闸 + 提交
+- [x] `indicators.py` 全部为纯函数（输入已复权序列，输出带新列的帧），入口拒绝未复权序列
+- [x] 黄金样例：MA/MACD/RSI/ATR 与手算/已知值逐位对齐；KDJ/DMI/CCI/WR 至少一条与公开样例对齐
+- [x] `resample.py`：周/月 K 由日线现算（周五收市口径、非交易日跳过），不入库
+- [x] **反未来函数专项**（spec §13）：篡改 T+1 及之后数据，T 日每个指标逐位不变（`test_tampering_with_the_future_leaves_the_present_untouched` / `test_computing_up_to_t_and_computing_the_whole_thing_agree_at_t` 按指标参数化）。**`intraday=true` 那半句没做，也不该在 B 块做**：它标的是「盘中未定型的日线参与合成」，而本系统还没有盘中快照采集器（`quotes_snapshot` 有表无写入方，U7），那一半属于 D 块的 `valuation_snapshots`
+- [x] 三道闸 + 提交
 
-### C 块：基本面与资金流接入
+**B 块已完成**（2026-10-19 收口，提交 `6dd97a3` 与三道闸修复 `e0a0d08`）：`sams analysis series
+--period {day,week,month} --indicators …` 与指标共用 `adjusted_series()` 那一条取数路径，U20 闭合。
 
-- [ ] `financials`/`funding_flow` 仓库（幂等 upsert、`report_date` 口径、缺失字段存 null 不填 0）
-- [ ] 采集器：A 股 akshare/东财、港美股 yfinance。**PE-PB 历史分位的分子必须是「发布日 ≤ T」的口径**（否则未来函数）
-- [ ] `sams health` 的 `[数据]` 段加基本面覆盖一行
-- [ ] 三道闸 + 提交
+### C 块：基本面与资金流接入 ✅（2026-10-19，新增 D58–D65，闭合 U18）
+
+按 `~/.qoder/plans/tranquil-pebble-shrew.md` 的 T-0…T-12 执行，任务与提交一一对应：
+
+- [x] **T-0** 降级链与能力声明收敛成一份：`datasource/capabilities.py` 的 `CAPABILITIES` 是唯一词表，`registry._walk()` 是唯一的「按路由顺序、跳过缺能力的源、限速、归类失败/空答复」循环，`fetch_daily`/`fetch_actions` 各自那套**空答复语义**一字不动地改为调用它（提交 `d0e530c`）。上面那条「M2-C 开工前」的旧债就此勾掉。
+- [x] **T-1** 迁移 0012：`financials.published_date`、`valuation_daily`、`funding_flow`、`symbols.listed_on`（`8196330`；**没有改任何已应用的迁移**，0004 的校验和闸会当场拒绝）
+- [x] **T-2** `core/fundamentals.py`：比率/倍数/金额三份列名单、`from_percent`、`RATIO_BOUNDS`、`caliber_note()`、`roe_basis_note()`（D58/D60，`cc73733`）
+- [x] **T-3** `storage/repos/financials.py`（`FinancialRepo`/`ValuationRepo`/`FundingFlowRepo`）与 `scan_results.py`：幂等 upsert、PIT 读（`published_date <= as_of`，为 NULL 的行排除并计数成 `dropped_unpublished`）、缺字段存 null 不填 0，而 `financials` 收到 `pe_ttm`/`pb` 抛 `StorageError`（D60/D61，`df0032b`）
+- [x] **T-4** `datasource/fundamentals.py`：`FinancialAdapter`/`ValuationAdapter`/`FundingFlowAdapter` 三个协议 + `normalize_rows()`——`÷100` 从此只在这一个函数里发生（D58，`5234d53`）
+- [x] **T-5** 适配器：akshare A 股三链接通（按报告期财务指标 / 按交易日估值 / 资金流）、yfinance 港美股**当日**估值快照与无披露日的期间财务表（`672ea79`）
+- [x] **T-6** `services/fundamentals.py`：`FundamentalSyncService`（三条链各走一次降级）与 `FundamentalService.read`（两个粒度在这里合成 PR，算不出的原因分三条诊）（`a647f84`）
+- [x] **T-7** `analysis/fundamentals.py::pr()`：两条分支、四种拒绝、`basis` 随数出门、算不出不给 0（D59，`1d0d991`）
+- [x] **T-8** `sams analysis fundamentals`——用户要的「查询时增加一个参数 PR」（`ad957f8`）
+- [x] **T-9** `sams screen pr --pr-max 0.4`——用户要的「按市赚率选股」：第一行是真实边界、命中/落选/排除三堆（D64，`7e94f07`；`d7a7e1a` 补上「样本比主档多」那个方向，此前打印「范围外的 -1 只」）
+- [x] **T-9.5**（中途的用户决策）「可以设置，默认用年报？」⇒ **D62**：`--roe-basis annual|latest`，默认年报，且那句话由 `core.roe_basis_note()` 生成、与两个口径各自的实测数一起进文档（`99c6059`）
+- [x] **T-10** `sams health` 按市场报**只数**不报行数，并说出资金流与 `screen pr` 的能力缺口（D65，`ec45602`）；U18 闭合：上市日期由 `sync financials` 填进主档那一格、读用例自动取它并把**来源**随数打印，三处都取不到仍按 D56 拒绝（D63，`4843911`）
+- [x] **T-11** 文档：新建 `specs/2026-10-18-market-profit-ratio-design.md`（用户点名要的那份，`1f09f66`）、本 spec 补 D58–D65 + §8.3 的 PR 那一行 + U 表（U18/U20 闭合、新增 U24/U25）、本计划 B/C 块按实际执行改写
+- [ ] **T-12** 三道闸（测试 / 架构 / 交易员）——下一轮，一轮不跳
+
+**计划里定过而有意不做的四件事**（不是漏掉；每一件的理由都要能当场验）：
+
+- `--watchlist` / `--keep-empty`（原 T-9 列过）：自选股是**用户域**的票池，而这条命令的第一句诚实话是「输入是同步过基本面的票」（D64）。先加 `--watchlist`，读的人会以为「我的自选都扫过了」，而库里多数自选票根本没有财务行——那正是这条命令最要出声的一种沉默。`--codes` 已经能表达同一件事且不带那种误读；真要做，得连「自选里有几只压根没同步过」一起说清（M3 排程化时一并定）。
+- `--stale-after-days` 只做成了 `ScreenService.pr_max` 的参数（默认 7 天），没做成命令行开关：屏幕第一行已经把「旧过 7 天的票进排除」说出口，而改这个数的需求还没出现（YAGNI）。
+- 原 T-5 的「迁移 0013 给 `data_sources` 补这三个方法的能力位」：**没有 0013**。能力位由 `capabilities.provided_by(适配器类)` 在注册时从「方法是否存在」推导，库里再存一份就是第二份声明——那正是 T-0 收敛掉的东西（D65）。漂移的方向恰好是「看起来有这个能力，调用了才知道没有」。
+- 原 T-9 写「空 universe 时退出码 0」，实现是 **1**：「扫了而篮子空」是 0 并打印「空篮子不等于市场不便宜」，「压根没有输入」是 1 并给采集命令。把两者都记成 0，脚本就无法区分「今天不便宜」与「今天没查」——这是 D43 那条「0 行 ≠ 成功」在选股出口的另一半。
 
 ### D 块：估值合成（§8.3）
 
@@ -391,12 +413,13 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 
 ## 验收清单（spec §14 M2）
 
-1. `sams sync actions --market A --code 601088` 后，跨 2024-07-08 的区间收益与交易所公布值一致；未采集该股时同样调用被拒绝并说明原因。
+1. ✅（M2-A）`sams sync actions --market A --code 601088` 后，跨 2024-07-08 的区间收益与交易所公布值一致；未采集该股时同样调用被拒绝并说明原因。
 2. `sams sync --market A --code 600519` 后 `sams thesis show` 输出估值报告：fair/entry/stop/target/reward_risk + 分项打分，每项带 evidence。
-3. 篡改任意一只票 T+1 之后的日线，T 日全部指标与估值输出逐位不变。
-4. 周线指标由日线现算，库里没有 `bars_weekly` 之类的新表。
+3. ✅指标那一半（M2-B）：篡改 T+1 之后的日线，T 日全部指标逐位不变（两条参数化用例）。**估值输出那一半在 D 块**——现在还没有估值合成可篡改。
+4. ✅（M2-B）周线指标由日线现算，库里没有 `bars_weekly` 之类的新表。
 5. 非法状态跳转（未建仓直接归档）在仓库层被拒；每次合法跳转都有 `thesis_events`。
 6. `uv run pytest -q` 全绿；`uv run ruff check .` 干净；分层守卫不因新层放宽。
+7. ✅（M2-C，用户要的第三条与第四条）`PR = PE ÷ ROE ÷ 100`（PE 不为正时 `PB ÷ ROE ÷ ROE ÷ 100`）在 `sams analysis fundamentals` 里有出口，`sams screen pr --pr-max 0.4` 出一篮子并按 PR 升序；单位自检（`PE=20 / ROE=0.20 ⇒ 1.00`）与「把 `--as-of` 挪到披露日之前，那一期的 ROE 与由它算出的 PR 一起消失」都有用例钉住。
 
 ## 三道闸的执行形态（每块都走一遍）
 
