@@ -77,7 +77,8 @@ PB 却已经把复苏折进去一部分）、困境反转股（账面在亏，�
 ## 3. 单位口径：这一节是整个功能里最容易静默错两位的地方
 
 **库里只有一种比率口径：小数。** `roe = 0.20` 就是 20%，`-0.05` 就是下降 5%。
-百分数 → 小数的换算只发生在采集归一那一步（`datasource/fundamentals.py` 的 `from_percent`），
+百分数 → 小数的换算只发生在采集归一那一步（`datasource/fundamentals.py` 的 `normalize_rows()`，
+对着 `percent_columns` 除一次 `core.fundamentals.PERCENT_DIVISOR`），
 读取侧没有任何一处 `÷ 100`（D58）。
 
 为什么单独钉这一条：akshare 的 `ROEJQ`、增速、股息率都按百分数给（`20.0` 表示 20%），

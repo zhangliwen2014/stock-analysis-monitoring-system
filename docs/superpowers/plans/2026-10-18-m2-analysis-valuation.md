@@ -373,7 +373,7 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 
 - [x] **T-0** 降级链与能力声明收敛成一份：`datasource/capabilities.py` 的 `CAPABILITIES` 是唯一词表，`registry._walk()` 是唯一的「按路由顺序、跳过缺能力的源、限速、归类失败/空答复」循环，`fetch_daily`/`fetch_actions` 各自那套**空答复语义**一字不动地改为调用它（提交 `d0e530c`）。上面那条「M2-C 开工前」的旧债就此勾掉。
 - [x] **T-1** 迁移 0012：`financials.published_date`、`valuation_daily`、`funding_flow`、`symbols.listed_on`（`8196330`；**没有改任何已应用的迁移**，0004 的校验和闸会当场拒绝）
-- [x] **T-2** `core/fundamentals.py`：比率/倍数/金额三份列名单、`from_percent`、`RATIO_BOUNDS`、`caliber_note()`、`roe_basis_note()`（D58/D60，`cc73733`）
+- [x] **T-2** `core/fundamentals.py`：比率/倍数/金额三份列名单、`from_percent`（**后来删掉了**，见闸次 7）、`RATIO_BOUNDS`、`caliber_note()`、`roe_basis_note()`（D58/D60，`cc73733`）
 - [x] **T-3** `storage/repos/financials.py`（`FinancialRepo`/`ValuationRepo`/`FundingFlowRepo`）与 `scan_results.py`：幂等 upsert、PIT 读（`published_date <= as_of`，为 NULL 的行排除并计数成 `dropped_unpublished`）、缺字段存 null 不填 0，而 `financials` 收到 `pe_ttm`/`pb` 抛 `StorageError`（D60/D61，`df0032b`）
 - [x] **T-4** `datasource/fundamentals.py`：`FinancialAdapter`/`ValuationAdapter`/`FundingFlowAdapter` 三个协议 + `normalize_rows()`——`÷100` 从此只在这一个函数里发生（D58，`5234d53`）
 - [x] **T-5** 适配器：akshare A 股三链接通（按报告期财务指标 / 按交易日估值 / 资金流）、yfinance 港美股**当日**估值快照与无披露日的期间财务表（`672ea79`）
@@ -384,12 +384,29 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 - [x] **T-9.5**（中途的用户决策）「可以设置，默认用年报？」⇒ **D62**：`--roe-basis annual|latest`，默认年报，且那句话由 `core.roe_basis_note()` 生成、与两个口径各自的实测数一起进文档（`99c6059`）
 - [x] **T-10** `sams health` 按市场报**只数**不报行数，并说出资金流与 `screen pr` 的能力缺口（D65，`ec45602`）；U18 闭合：上市日期由 `sync financials` 填进主档那一格、读用例自动取它并把**来源**随数打印，三处都取不到仍按 D56 拒绝（D63，`4843911`）
 - [x] **T-11** 文档：新建 `specs/2026-10-18-market-profit-ratio-design.md`（用户点名要的那份，`1f09f66`）、本 spec 补 D58–D65 + §8.3 的 PR 那一行 + U 表（U18/U20 闭合、新增 U24/U25）、本计划 B/C 块按实际执行改写
-- [ ] **T-12** 三道闸（测试 / 架构 / 交易员）——下一轮，一轮不跳
+- [x] **T-12** 三道闸（测试 / 架构 / 交易员）——**七轮 + 真实网络那一组，一轮没跳**（`995b6af` / `50fa780` / `3f07faf` / `14843f4` / `b8a7566` + 文档这一轮）。每轮修的都是同一类东西：一个「看起来完全正常的错数」或一句「屏幕上像实话而机器读者拿不到」的话
+  - 闸次 1（口径闸）：`RATIO_BOUNDS` 那道小数死区改成**含边界**、单个谓词 `out_of_caliber`，`pr()` 自己挡非有限值，`--help` 崩溃修掉 ⇒ **D66**
+  - 闸次 2（universe）：把「同步过而从未披露」的票算进输入面，`--codes` 里库中没有财务行的代码进第四堆 `unmatched`，对账等式 `hits + priced_out + excluded == universe` 才成立（D64）
+  - 闸次 3（开关名实相符）：`--include-pb-branch` 真按名字生效，跨支不可比在屏幕上出声而不是排进同一个顺序里
+  - 闸次 4（陈旧出声）：`analysis fundamentals` 打印 PE 那天离 `as_of` 几天并把「旧过 7 天」进 `--json` 的 `warnings` ⇒ **D67**（那个 7 从此两个出口读同一个 `STALE_VALUATION_DAYS`）
+  - 闸次 5（存档身份）：`scan_results` 的规则身份**不含 `codes`**，所以 `--codes` 子集扫描**根本不写存档**且当场说出来；`--as-of` 落在今天之后按未来函数拒绝；`--pr-max` 要有限且不在比较精度下 round 成 0 ⇒ **D68**
+  - 闸次 6（D60 双向）：`_prepare` 对三张表都拒未登记的列（原来是 `select()` 静默丢一列，「写成功而读回来没有」比一次 `StorageError` 贵），`valuation_daily` 反向拒比率列（否则市赚率会拿今天的 ROE 去配任何一天的 PE）
+  - 闸次 7（文档与死代码诚实，写债时当场验出来的两条）：`core.from_percent()` **删掉**——模块文档与 PR 设计稿都把它说成「÷100 的那一处」，而生产里没有任何调用点（换算实际发生在 `normalize_rows()` 对着 `percent_columns` 的那一次；yfinance 那侧最终压根没映射比率列，`percent_columns=()`）。它自己那条单测的行为早就在 `tests/datasource/test_fundamentals_adapters.py::test_zero_stays_zero_while_unknown_stays_unknown` 里按真站点断言过，所以删函数不丢覆盖。另一条：**「这一期是不是年报」那句谓词原来抄了三遍**（`storage/repos/financials.py:58` 的 SQL、`cli/screen.py:_is_year_end`、`cli/analysis.py:_is_year_end`，后两份逐字相同），收成 `core.fundamentals.is_year_end()` 一处 + SQL 那一处的 docstring 点名它，并补一条先红的用例钉住 `None` 不是「年末」而是「不知道」
+  - 真实网络那一组：修掉两条**自己写坏**的 live 用例（`corp_actions` 给全史而用例按 `[0]` 取窗口内那期；sina 那条按 `today~today` 请求，于是盘前/周末/假期必红），A 股资金流端点连续两轮通过后去掉 xfail（U25 收窄），Yahoo 429 那条改成只在 `RateLimited` 时 skip ⇒ 离线 **1522 passed / 13 deselected**，live **12 passed / 1 skipped**，ruff 干净
+
+**T-12 之后剩下的债（P2，都还没咬人，但每一条都得在这里写下来才不算被抹掉）**：
+
+- **退出码↔`--json` 的 `exit` 是九处手写映射**（D57 要求两者同值），散在 `cli/analysis.py` 七处与 `cli/screen.py` 两处。现在靠用例守着，没有机器闸：新增一个出口时忘记写 `exit`，`$?` 与 payload 就会各说一套。该收成一个「出口对象自带 exit，payload 从它生成」的形状（M3 之前）。
+- **三份单位名单没有生产调用方，而真正的 ÷100 名单在采集侧另写了一份**：`RATIO_COLUMNS`/`MULTIPLE_COLUMNS`/`MONEY_COLUMNS` 只被 `tests/core/test_fundamentals_caliber.py` 的「三族不重叠 + 每列都有归属」那两条读；生产里那一次换算用的是 `akshare_cn.FINANCIAL_PERCENT = ("roe", "revenue_yoy", "profit_yoy")`——它是 `RATIO_COLUMNS` 去掉 `dividend_yield` 的手写子集，差那一列的理由写在模块文档里（东财那一列已经给的是别的形态），但**没有任何一条用例检查这个子集关系**。给 `RATIO_COLUMNS` 加一列而忘了 `FINANCIAL_PERCENT`，症状是新那一列静默不 ÷100。`ValuationRepo.covered_codes()`（`within_days` 那个参数）同样只有 `tests/storage/test_financials_repo.py` 调，采集端还没用它做「已覆盖就不重采」——名单先于消费者存在是对的，`covered_codes` 不是：到 M3 排程化仍没人调就该删。
+- **`_walk()` 的四种结局由三个调用方各自分类**（`fetch_daily` / `fetch_actions` / `_frame()`，`registry.py:327`、`:373`、`:470`）。这是 T-0 **有意**留下的：链不许替取数种类决定「0 行算不算成功」（`_walk` 的 docstring 写了理由），第五种数据进来时要在**调用方**加语义而不是在链里加 `if`。代价是同一份 `skipped/failed/no_answer` 判断抄了三遍，加第四种取数就是第四遍——真要收敛，收敛点是「分类器 + 各自的后处理」，不是把判定塞回链里。
+- **顶层 `sams --help` 里 `sync` 那一行只点名了 `daily`/`actions`**：`sams sync --help` 五条都列（`{daily,actions,financials,valuation,flow}`），所以这不是命令缺失，是**顶层帮助落后于子命令**。为什么算债：D64/D67 的下一步提示（`先跑 sams sync valuation`、`先跑 sams sync financials`）是用户从帮助里抄的，而帮助那一行读起来像「采集只有两件事」。修法要么把那句改成不逐个点名，要么补全五条——顺手可修，不该由一条 PR 顺带做。
+- **主档那一格上市日不记来源**：`SymbolRepo.fill_listed_on` 只在 `listed_on IS NULL` 时写，`services/fundamentals._fill_listed_on` 把「这次是哪个源给的」只写进**当次日志**（`logger.info`）。库里 `symbols` 没有 `listed_on_source` 这一列，所以两只票由不同源填入时事后看不出区别，而 D37 的豁免窗口跟着这个日子走。这是**有意**的（覆盖会带来更大的错：换一家源就换一天），但读的人该知道库里答不了这个问题——真要补，补的是那一列而不是那个覆盖。
+- **`services/health.py` 用三段裸 SQL 重算聚合**（`_COVERAGE_QUERIES`，`services/health.py:111-139`）。它同时 import `Database`、`storage.migrate.pending` 与别的仓库（`services → storage` 这一条边分层闸是放行的，所以这不是过闸漏洞），但「只数」这条口径因此在仓库之外又写了一遍：`flow_latest` 那种「交易日 vs 日历日」的差别将来一改就容易只改一处。收进仓库层是 M3 的事（`sams health` 的出口形状那时也要跟着通知层定）。
 
 **计划里定过而有意不做的四件事**（不是漏掉；每一件的理由都要能当场验）：
 
 - `--watchlist` / `--keep-empty`（原 T-9 列过）：自选股是**用户域**的票池，而这条命令的第一句诚实话是「输入是同步过基本面的票」（D64）。先加 `--watchlist`，读的人会以为「我的自选都扫过了」，而库里多数自选票根本没有财务行——那正是这条命令最要出声的一种沉默。`--codes` 已经能表达同一件事且不带那种误读；真要做，得连「自选里有几只压根没同步过」一起说清（M3 排程化时一并定）。
-- `--stale-after-days` 只做成了 `ScreenService.pr_max` 的参数（默认 7 天），没做成命令行开关：屏幕第一行已经把「旧过 7 天的票进排除」说出口，而改这个数的需求还没出现（YAGNI）。
+- `--stale-after-days` 只做成了 `ScreenService.pr_max` 的参数（默认取 `core.STALE_VALUATION_DAYS = 7`），没做成命令行开关：屏幕第一行已经把「旧过 7 天的票进排除」说出口，而改这个数的需求还没出现（YAGNI）。闸次 4 之后这个 7 是**两个出口共用的一份**（D67）：读 PE 的那条命令与按 PE 选股的那条各写一个字面量时，同一个 PE 会在一处叫「旧过」、在另一处叫「新鲜」，而屏幕上两句都像实话。
 - 原 T-5 的「迁移 0013 给 `data_sources` 补这三个方法的能力位」：**没有 0013**。能力位由 `capabilities.provided_by(适配器类)` 在注册时从「方法是否存在」推导，库里再存一份就是第二份声明——那正是 T-0 收敛掉的东西（D65）。漂移的方向恰好是「看起来有这个能力，调用了才知道没有」。
 - 原 T-9 写「空 universe 时退出码 0」，实现是 **1**：「扫了而篮子空」是 0 并打印「空篮子不等于市场不便宜」，「压根没有输入」是 1 并给采集命令。把两者都记成 0，脚本就无法区分「今天不便宜」与「今天没查」——这是 D43 那条「0 行 ≠ 成功」在选股出口的另一半。
 
