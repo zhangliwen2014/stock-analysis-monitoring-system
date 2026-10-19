@@ -61,7 +61,7 @@ src/sams/storage/repos/corp_actions_coverage.py             覆盖区间仓库
 src/sams/storage/repos/financials.py                        financials 仓库
 src/sams/storage/repos/funding_flow.py                      funding_flow 仓库
 src/sams/storage/repos/theses.py                            theses + thesis_events 仓库（用户隔离）
-src/sams/storage/repos/valuation_snapshots.py               快照仓库
+src/sams/storage/repos/valuation_snapshots.py               快照仓库（**没建**：D 块不落快照，D76；表在 0001 里已有，写入方是 M3）
 src/sams/cli/analysis.py                                    `sams analysis return`（守卫唯一的人类出口，D44）
 src/sams/cli/thesis.py                                      `sams thesis add/list/show/advance/close`
 tests/…                                                     镜像上述每个文件
@@ -361,7 +361,7 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 - [x] `indicators.py` 全部为纯函数（输入已复权序列，输出带新列的帧），入口拒绝未复权序列
 - [x] 黄金样例：MA/MACD/RSI/ATR 与手算/已知值逐位对齐；KDJ/DMI/CCI/WR 至少一条与公开样例对齐
 - [x] `resample.py`：周/月 K 由日线现算（周五收市口径、非交易日跳过），不入库
-- [x] **反未来函数专项**（spec §13）：篡改 T+1 及之后数据，T 日每个指标逐位不变（`test_tampering_with_the_future_leaves_the_present_untouched` / `test_computing_up_to_t_and_computing_the_whole_thing_agree_at_t` 按指标参数化）。**`intraday=true` 那半句没做，也不该在 B 块做**：它标的是「盘中未定型的日线参与合成」，而本系统还没有盘中快照采集器（`quotes_snapshot` 有表无写入方，U7），那一半属于 D 块的 `valuation_snapshots`
+- [x] **反未来函数专项**（spec §13）：篡改 T+1 及之后数据，T 日每个指标逐位不变（`test_tampering_with_the_future_leaves_the_present_untouched` / `test_computing_up_to_t_and_computing_the_whole_thing_agree_at_t` 按指标参数化）。**`intraday=true` 那半句没做，也不该在 B 块做**：它标的是「盘中未定型的日线参与合成」，而本系统还没有盘中快照采集器（`quotes_snapshot` 有表无写入方，U7），那一半**不在 D 块做**：D 块定过读数侧不落快照（D76），`intraday` 跟着 M3 的盘中采集与 `quotes_snapshot` 的写入方一起落
 - [x] 三道闸 + 提交
 
 **B 块已完成**（2026-10-19 收口，提交 `6dd97a3` 与三道闸修复 `e0a0d08`）：`sams analysis series
@@ -410,13 +410,26 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 - 原 T-5 的「迁移 0013 给 `data_sources` 补这三个方法的能力位」：**没有 0013**。能力位由 `capabilities.provided_by(适配器类)` 在注册时从「方法是否存在」推导，库里再存一份就是第二份声明——那正是 T-0 收敛掉的东西（D65）。漂移的方向恰好是「看起来有这个能力，调用了才知道没有」。
 - 原 T-9 写「空 universe 时退出码 0」，实现是 **1**：「扫了而篮子空」是 0 并打印「空篮子不等于市场不便宜」，「压根没有输入」是 1 并给采集命令。把两者都记成 0，脚本就无法区分「今天不便宜」与「今天没查」——这是 D43 那条「0 行 ≠ 成功」在选股出口的另一半。
 
-### D 块：估值合成（§8.3）
+### D 块：估值合成（§8.3）✅（2026-10-19，新增 D69–D76）
 
-- [ ] `styles.py`：内置 `value`/`trend` 两套权重，参数从配置读、可复制
-- [ ] `scoring.py`：技术面（均线位置/周线趋势/布林位置/量能）+ 基本面（分位/ROE/增速）+ 资金面（主力净流入/北向），**每项带 `evidence` 指明来源字段与计算窗口**
-- [ ] `compose.py`：fair_low/high、entry、stop（固定/pct/ATR2/周MA20 四种）、target、reward_risk；`win_rate` 留空并显示「未回测」；`win_rate_samples < 30` 不得参与排序
-- [ ] 快照落库含 `intraday` 标记；黄金样例：一条手算赔率对齐 + 每个分数都能追溯到 evidence
-- [ ] 三道闸 + 提交
+范围在这里收过一次刀：只做**读数侧**（分析层 + 一个命令行出口），合成结果不落库、不接告警（D76）——落库会把一个随输入补齐而变的数变成历史事实，而 M3 的触发器要的是「规则在某时刻命中」并自带存档身份（D68）。
+
+- [x] **T-13** `analysis/valuation/percentile.py`：PR / PE / PB 三条 PIT 历史分位（`b9ee822`）。`MIN_SAMPLES = 250`（样本不足时当场拒，不报一个「0 分位」）、窗口 `DEFAULT_WINDOW_YEARS = 5`、并列计入分子、**截至日自己不投票**（`samples = 天数 - 1`）。PR 那条逐日挑分母那一期用的是与 `analysis fundamentals` 完全同一个谓词（`published_date ≤ 那一天`，`NULL` 不采信且单独计数）⇒ **D69**
+- [x] **T-14** `styles.py`：内置 `value` / `trend` 两套权重与参数词表（`e8c871a`）。权重和必须为 1、`min_covered_weight` 不得 > 1、参数从配置读且 `with_overrides` 可复制；`trend` 压根不问布林位置那一格（那正是 D72 要防的「同一个 %B 两套解释」）
+- [x] **T-15** `scoring.py` 十二个分项 + `compose.py` 五个价位（`2bbd2dc` / `3a644d2`）。每个分数带 `evidence`（来源字段 + 计算窗口）；缺输入 ⇒ 逐项拒绝、**不补一个中性的 50**、`score = Σ(分×权重) ÷ 覆盖权重`、覆盖不到地板就整分不出（**D70**）；入场那道分位闸门与权重表解耦（**D71**）；布林只读回调、突破归 M3（**D72**）；周MA20/ATR/前高按「现价 ÷ 当日后复权收盘」折回现价口径（**D73**）；资金流窗口 `FLOW_WINDOW_DAYS = 5`、「这几天没行」与「这列不存在」分两句、「过去 N 日」说真查过的根数（**D74**）。`win_rate` 留空并明说「未回测」，`win_rate_samples < 30` 不许参与排序（M5 回填）
+- [x] **T-16** `services/valuation.py` 那一个读取用例 + `sams analysis valuation`（`e0a2974` / `bcef2f5`）：四路输入（过闸日线、日线现算的周线、按日估值、按报告期财务、资金流）在这里决定取哪几个数；CLI 把合成分拆成一张逐项表打印，缺的那几行是 `–` 而不是 0，`--json` 每个出口都带 `exit`（D57）。容器里 `ValuationService` 接在 `FundamentalService` / `AnalysisService` **之上**，不是并列的第三路取数
+- [x] **T-17** 三道闸：
+  - **测试闸**：把 §14 第 3 条欠的「估值那一半」补上——`test_a_read_at_t_does_not_look_at_anything_after_t` 把 T 之后改写成另一段行情（PE 掉到 1、价格继续上坡、一期**尚未披露**的年报、一笔资金流），T 日那份读数（现价、PR 与它那一期的分母、三条分位的样本数/窗口/当前值、合成分与 12 行证据、五个价位、三个技术项、`flow_days`、`notes`）**逐位不变**；同一段数在 `as_of` 挪过去之后第一次被读到，所以那条不是空跑。黄金用例 `test_trade_plan_hand_computed_value_chain`（T-15 就写）把整条数链拿计算器对上
+  - **交易员闸**：真跑 `sams analysis valuation --market A --code 601088 --as-of 2024-07-11` 那张屏。两条改的都是屏幕而不是算式：合成分那行实测 1500 字、把整张缺项表复读一遍 ⇒ 只报「有没有分、几分、几成权重、缺几项」，全文留 `--json`（**D75**，`34fa9fd`）；`volume_follow` 的证据里 `-0.0007192519779428697` 要读的人先数零才知道是跌 0.07% ⇒ 改成 `-.2%` 与带千分位的量
+  - **架构闸**：`tests/test_layering.py` 仍绿，`cli` 只 import `core` + `services`，所以样式名经 `services/valuation.STYLE_NAMES` 再出口；样本数据抽进 `tests/support_valuation.py` 一份，命令行侧与读数侧对着**同一批数**点头（分叉的两份样本各自验各自的数）
+  - 离线 **1657 passed / 13 deselected**，`uv run ruff check src tests` 干净
+
+**D 块定过而有意不做的三件事**：
+
+- **快照落库 / `intraday` 标记**（D76，仍属 U7）：写入方是 M3 的盘中采集，那里还要带「这次是盘中还是收盘后」。
+- **告警接线**（§11）：合成分不是一个可告警的事件——它每天随输入补齐而变，而告警要的是一句能被复述的「规则在某时刻命中」。
+- **`boll_position` 读突破**（D72）：那是跨日事件，需要读数侧存前一日状态；读数用例保持无状态，事件归 §10.3 的规则模板。
+
 
 ### E 块：thesis 生命周期 + `sams thesis show`（§9.1，M2 验收项）
 
@@ -432,7 +445,7 @@ D37 跳变证据在 HK/US 只覆盖一半跳变，而双源到位前加这道闸
 
 1. ✅（M2-A）`sams sync actions --market A --code 601088` 后，跨 2024-07-08 的区间收益与交易所公布值一致；未采集该股时同样调用被拒绝并说明原因。
 2. `sams sync --market A --code 600519` 后 `sams thesis show` 输出估值报告：fair/entry/stop/target/reward_risk + 分项打分，每项带 evidence。
-3. ✅指标那一半（M2-B）：篡改 T+1 之后的日线，T 日全部指标逐位不变（两条参数化用例）。**估值输出那一半在 D 块**——现在还没有估值合成可篡改。
+3. ✅指标那一半（M2-B）+ ✅估值那一半（M2-D T-17）：篡改 T+1 之后的日线，T 日全部指标逐位不变（两条参数化用例）；把 T 之后改写成另一段行情（PE 掉到 1、价格上坡、一期尚未披露的年报、一笔资金流），T 日那份估值读数逐位不变（`test_a_read_at_t_does_not_look_at_anything_after_t`），且同一段数在 `as_of` 挪过去之后第一次被读到。
 4. ✅（M2-B）周线指标由日线现算，库里没有 `bars_weekly` 之类的新表。
 5. 非法状态跳转（未建仓直接归档）在仓库层被拒；每次合法跳转都有 `thesis_events`。
 6. `uv run pytest -q` 全绿；`uv run ruff check .` 干净；分层守卫不因新层放宽。
