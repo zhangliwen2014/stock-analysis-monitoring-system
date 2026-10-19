@@ -23,7 +23,7 @@ from datetime import date
 import polars as pl
 import pytest
 
-from sams.core.errors import EmptyResponse, FieldDrift, RateLimited
+from sams.core.errors import EmptyResponse, FieldDrift, RateLimited, TransientError
 from sams.core.fundamentals import FINANCIAL_COLUMNS
 from sams.datasource.akshare_cn import (
     AkshareAdapter,
@@ -362,9 +362,16 @@ def test_live_flow_gives_main_net_in_and_leaves_north_bound_unknown():
 
     留在这里的那三句断言是这份契约的全部形状知识：`main_net_in` 有数、`north_net` 全 NULL
     （这个端点不给北向，缺字段存 null 而不是 0，D58），而 U25 剩下的缺口是 HK/US 没有源。
+
+    端点把连接掐掉（`RemoteDisconnected` → `TransientError`，2026-10-19 复现两次）时跳过而不是
+    让它红：红说的是「契约破了」，而这里说的是「这台机器此刻被拒」，那条分类由上面的桩测守着。
+    留一条每次都复现的红，教出来的是「红色的 live 不用看」。
     """
     real = AkshareAdapter()
-    out = real.funding_flow("A", "601088", date(2026, 9, 1), date(2026, 10, 17))
+    try:
+        out = real.funding_flow("A", "601088", date(2026, 9, 1), date(2026, 10, 17))
+    except TransientError as exc:
+        pytest.skip(f"资金流端点此刻拒绝本机：{exc}（契约未被证伪，也未被验到）")
     assert out.height > 0
     assert len(out["main_net_in"].drop_nulls()) > 0
     assert out["north_net"].to_list() == [None] * out.height
