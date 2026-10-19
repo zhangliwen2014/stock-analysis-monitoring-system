@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
@@ -35,6 +35,7 @@ from support_valuation import (
     PR_NOW,
     PRICE,
     TODAY,
+    bars,
     dividend,
     financial_rows,
     flow_rows,
@@ -364,3 +365,133 @@ def test_the_style_travels_with_the_read(db):
     read = build(db).read("A", CODE, style="trend")
     assert read.style is TREND
     assert "模板 trend" in read.composite.evidence
+
+
+# --- 未来函数专项（spec §14 M2 第 3 条的估值那一半）---------------------------------------
+
+
+def _snapshot(read) -> tuple:
+    """一次读数里**所有会被人读到的数**，收成一份能逐位比较的元组。
+
+    证据句也一起比：那些句子里印着窗口、样本数与输入值，未来一旦漏进来，
+    就算分数没动，那句话也会先说漏嘴。
+    """
+    fun = read.fundamental
+    plan = read.plan
+    return (
+        (read.price, str(read.price_on), read.price_age_days),
+        (
+            fun.pr.value,
+            str(fun.period),
+            fun.roe,
+            fun.market_cap,
+            fun.dropped_unpublished,
+            fun.pr.basis,
+        ),
+        read.weekly_ma20,
+        read.atr,
+        read.recent_high,
+        str(read.open_weekly_period),
+        tuple(str(d) for d in read.flow_days),
+        read.notes,
+        [
+            (
+                row.metric,
+                row.value,
+                row.samples,
+                str(row.window_from),
+                str(row.window_to),
+                row.current,
+                row.unpublished_periods,
+                row.ok,
+                row.reason,
+            )
+            for row in read.percentiles
+        ],
+        (
+            read.composite.score,
+            read.composite.covered_weight,
+            list(read.composite.missing),
+            read.composite.reason,
+            [(row.key, row.value, row.evidence, row.reason) for row in read.composite.items],
+        ),
+        (
+            plan.style,
+            plan.price,
+            [(row.key, row.low, row.high, row.evidence, row.reason) for row in
+             (plan.fair, plan.entry, plan.stop, plan.target)],
+            (plan.odds.value, plan.odds.evidence, plan.odds.reason),
+            plan.notes,
+        ),
+    )
+
+
+def _future(db, *, days: int = 30) -> None:
+    """把 T 之后写成另一段行情：价格继续上坡、PE 掉到 1、再补一期**尚未披露**的年报和资金流。
+
+    每一路都挑成「一旦漏进读数就会把分数、区间或闸门那句话改掉」的样子，
+    不然这条用例只是在比一堆本来就动不了的数。
+    """
+    after = [TODAY + timedelta(days=i) for i in range(1, days + 1)]
+    #: 逐日 1.7% 的上坡：涨跌幅闸门（D39）不看这段，跳变会先在那一步被拒，
+    #: 而这条用例要验的是「往后看没看」，不是「裸价能不能过闸」。
+    BarRepo(db).upsert(bars(after, [17.2 + 0.3 * i for i in range(len(after))]))
+    ValuationRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * len(after),
+                "code": [CODE] * len(after),
+                "date": after,
+                "pe_ttm": [1.0] * len(after),
+                "pb": [0.05] * len(after),
+                "dividend_yield": [None] * len(after),
+                "market_cap": [1.0e11] * len(after),
+                "source": ["akshare"] * len(after),
+            }
+        )
+    )
+    FinancialRepo(db).upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "A",
+                    "code": CODE,
+                    "report_date": date(2024, 12, 31),
+                    "published_date": TODAY + timedelta(days=20),
+                    "roe": 0.60,
+                    "revenue_yoy": 0.90,
+                    "profit_yoy": 0.90,
+                    "dividend_yield": 0.10,
+                    "market_cap": 1.0e11,
+                    "source": "akshare",
+                }
+            ]
+        )
+    )
+    FundingFlowRepo(db).upsert(flow_rows(after, net=5.0e9, north=4.0e9))
+    #: 那条拒绝本身是对的（D36：铺到 11-25 就得有 11-25 的覆盖确认），这里补上它，
+    #: 好让下面那条用例问的是「新数能不能被读到」，而不是停在覆盖确认上。
+    CorpActionsCoverageRepo(db).record(
+        "A", CODE, covered_from=DAYS[0], covered_to=after[-1], full_history=True, src="akshare"
+    )
+
+
+def test_a_read_at_t_does_not_look_at_anything_after_t(db):
+    """截至 T 的整份读数，在 T 之后被改写成另一段行情时逐位不变（D9、D61、D69）。
+
+    这条是 §14 M2 第 3 条欠的估值那一半：指标侧的同类用例在 M2-B，而合成分多四路输入
+    ——逐日估值、按报告期的财务、周线现算、资金流窗口——每一路都得单独证明它没往后看。
+    """
+    service = build(db)
+    before = _snapshot(service.read("A", CODE, as_of=TODAY))
+    _future(db)
+    assert _snapshot(service.read("A", CODE, as_of=TODAY)) == before
+
+
+def test_the_same_read_at_t_after_the_future_arrives_is_still_what_t_said(db):
+    """把截至日挪到未来那段之后，那些新数才**第一次**被读到：上面那条不是「读不到新数据」。"""
+    service = build(db)
+    _future(db)
+    late = service.read("A", CODE, as_of=TODAY + timedelta(days=30))
+    assert late.price > PRICE, "T 之后的那段行情要真的能被读到，否则上一条是空跑"
+    assert str(late.fundamental.period) == "2024-12-31", "那期年报在它自己的披露日之后才该被采信"
