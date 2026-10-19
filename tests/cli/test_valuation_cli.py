@@ -112,6 +112,32 @@ def test_a_refused_item_shows_a_dash_not_zero(db, settings, capsys):
         assert "–" in line, f"{key} 那行没把「没有数」打成 –"
 
 
+def test_the_composite_line_does_not_read_out_every_missing_item(db, settings, capsys):
+    """缺项的原因在它自己那一行已经说完了；合成分那行再整段抄一遍，屏幕上就只剩原因、
+    看不见分数（真跑一遍那一行 1500 字）。`--json` 里仍带完整 evidence：那是给机器读的，
+    不占人的行数。"""
+    container = make_container(db, settings)
+    _, body = out(container, capsys)
+    assert body.count("sams sync flow") == 2, "那句下一步命令应当在两行分项里各出现一次"
+    line = next(row for row in body.splitlines() if "合成分" in row)
+    assert len(line) < 160, f"合成分那一行 {len(line)} 字，把整张缺项表抄了一遍"
+    assert "缺 2 项" in line, "少了那行要指到哪几项没数"
+    _, data = payload(container, capsys)
+    assert "缺项：" in data["composite"]["evidence"], "屏上省的那段必须在 JSON 里原样还在"
+
+
+def test_a_composite_below_the_floor_refuses_the_score_but_keeps_the_rows(db, settings, capsys):
+    """覆盖不到地板时不给合成分（也不补一个中性分），但有数的那几项仍旧逐行印出来；
+    那一行说的是「哪些权重的数没到」，不是「这只票 0 分」。"""
+    container = make_container(db, settings, with_fundamentals=False)
+    code, body = out(container, capsys)
+    assert code == 1
+    line = next(row for row in body.splitlines() if "合成分" in row)
+    assert "–" in line and "不合成" in line
+    assert len(line) < 160, f"拒分那行把缺项逐条抄了一遍：{len(line)} 字"
+    assert "ma_position" in body, "有数的分项不能跟着一起消失"
+
+
 def test_the_percentile_lines_carry_their_own_sample_count(db, settings, capsys):
     """分位那句要带着样本数与窗口：一个没有天数的百分位说不出它凭什么。"""
     container = make_container(db, settings)

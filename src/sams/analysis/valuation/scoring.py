@@ -237,11 +237,11 @@ def volume_follow(
     price_change: float | None, volume: float | None, volume_ma: float | None
 ) -> Item:
     """量能配合：涨跌方向 × 放量/缩量 的四格表（`VOLUME_QUADRANTS`）。"""
-    shown = f"当日涨跌={price_change} 成交量={volume} 均量={volume_ma}"
     if price_change is None or volume is None or volume_ma is None or volume_ma <= 0:
         return _refused(
             "volume_follow", "来源：当日复权涨跌幅与成交量/均量（5 日）", "缺涨跌、量或均量"
         )
+    shown = f"当日涨跌={price_change:.2%} 成交量={volume:,.0f} 均量={volume_ma:,.0f}"
     direction = "up" if price_change > 0 else "down" if price_change < 0 else "flat"
     if direction == "flat":
         score = 50.0

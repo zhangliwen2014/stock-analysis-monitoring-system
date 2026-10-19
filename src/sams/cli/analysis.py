@@ -832,15 +832,24 @@ def _percentile_line(row) -> str:
 
 
 def _composite_line(read) -> str:
+    """那一行只报「有没有分、几分、这几分吃了几成权重」，不复述缺项。
+
+    逐条原因在下面那张分项表里一行一条；合成分那行把它们整段抄一遍，屏幕上就只剩原因、
+    看不见分数了（实测 1500 字）。全文仍在 `--json` 的 `composite.evidence` 里。
+    """
     comp = read.composite
     asked = len(read.style.asked())
     got = sum(1 for item in comp.items if item.ok)
+    floor = float(read.style.param("min_covered_weight"))
+    head = (
+        f"{comp.score:.1f}" if comp.ok else "–"
+    ) + f"（{asked} 项里 {got} 项有数，覆盖权重 {comp.covered_weight:.0%}，地板 {floor:.0%}）"
+    missing = "" if not comp.missing else f"缺 {len(comp.missing)} 项，原因在对应那一行"
     if not comp.ok:
-        return f"–（{asked} 项里 {got} 项有数，覆盖权重 {comp.covered_weight:.2f}）← {comp.reason}"
-    return (
-        f"{comp.score:.1f}（{asked} 项里 {got} 项有数，覆盖权重 {comp.covered_weight:.2f}）"
-        f" ← {comp.evidence}"
-    )
+        before, sep, _ = comp.reason.partition("不合成：")
+        reason = before + "不合成" if sep else comp.reason
+        return f"{head} ← {reason}；{missing}" if missing else f"{head} ← {reason}"
+    return f"{head} ← {missing}" if missing else f"{head} ← 每一项都有数"
 
 
 def _item_lines(read) -> list[str]:

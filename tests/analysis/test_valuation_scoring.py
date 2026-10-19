@@ -146,6 +146,15 @@ def test_volume_follow_is_a_four_quadrant_table():
     assert volume_follow(0.0, 2000.0, 1000.0).value == pytest.approx(50.0), "平盘没有方向可判"
 
 
+def test_volume_follow_evidence_prints_numbers_a_person_can_read():
+    """evidence 是给人核对的那一行：把 `-0.0007192519779428697` 原样印出来，读的人得先数零
+    才知道那是「跌 0.07%」——一行证据不该是一道换算题。"""
+    item = volume_follow(-0.0007192519779428697, 34006900.0, 31765860.0)
+    assert "-0.07%" in item.evidence
+    assert "34,006,900" in item.evidence and "31,765,860" in item.evidence
+    assert "34006900.0" not in item.evidence
+
+
 def test_pr_score_anchors_carry_the_users_own_threshold():
     """`PR ≤ 0.4` 是需求原文里唯一的数，它在打分表上必须能对上一个具体的分数。"""
     assert pr_score(0.4).value == pytest.approx(90.0)
