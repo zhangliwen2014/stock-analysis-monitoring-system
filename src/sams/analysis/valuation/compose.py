@@ -437,8 +437,13 @@ def trade_plan(
     atr: float | None = None,
     recent_high: float | None = None,
     fixed_stop: float | None = None,
+    lookback_days: int | None = None,
 ) -> Plan:
-    """把一只票的读数换成一条结论；参数一律从模板取，不在这里再写一遍字面量。"""
+    """把一只票的读数换成一条结论；参数一律从模板取，不在这里再写一遍字面量。
+
+    `lookback_days` 只改「前高」那一行的**措辞**：模板里的 `target_lookback_days` 是想要的
+    根数，调用方手里可能只有更少（新上市的票、或库里没铺够）。不传就按模板说。
+    """
     if pr_percentile is not None and pr_percentile.metric != "pr":
         raise ValidationError(
             f"入场闸门问的是 PR 的历史分位，收到 metric={pr_percentile.metric!r} 的分位："
@@ -473,7 +478,9 @@ def trade_plan(
         price=price,
         fair_high=fair.high,
         recent_high=recent_high,
-        lookback_days=style.param("target_lookback_days"),
+        lookback_days=(
+            style.param("target_lookback_days") if lookback_days is None else lookback_days
+        ),
     )
     odds = reward_risk(price=price, stop=stop.low, target=target.low)
     notes: tuple[str, ...] = ()

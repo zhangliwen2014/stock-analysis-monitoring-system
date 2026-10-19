@@ -293,3 +293,15 @@ def test_items_cover_the_whole_vocabulary():
     assert produced == set(ITEM_KEYS)
     assert isinstance(producers["pr"], Item)
     assert Composite is not None and Item is not None
+
+
+def test_a_flow_refusal_can_carry_the_callers_sentence():
+    """「这一段库里没有行」与「有行而这一列全空」的下一步命令不同，那句话由调用方带。
+
+    写死一句「该源不给」会让人去换源，而真正该跑的是 `sams sync flow`。
+    """
+    mine = main_inflow_score(None, 1e11)
+    assert "该源不给" in mine.reason, "不给 reason 时落回那句默认话"
+    got = main_inflow_score(None, 1e11, reason="库里这段没有资金流行：先 `sams sync flow`")
+    assert "sams sync flow" in got.reason and "该源不给" not in got.reason
+    assert not north_score(None, 1e11, reason="没有行").ok

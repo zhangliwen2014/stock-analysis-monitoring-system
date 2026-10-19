@@ -348,10 +348,22 @@ def growth_score(revenue_yoy: float | None, profit_yoy: float | None) -> Item:
     )
 
 
-def _flow_score(key: str, net: float | None, market_cap: float | None, column: str) -> Item:
+def _flow_score(
+    key: str, net: float | None, market_cap: float | None, column: str, reason: str = ""
+) -> Item:
     source = f"来源：funding_flow.{column} 区间合计 ÷ valuation_daily.market_cap"
     if net is None:
-        return _refused(key, source, f"{column} 这一列没有数（该源不给，见 U25）")
+        # 「这一段没有行」与「有行而这一列全空」是两句不同的话，下一步命令也不同：
+        # 前者去 `sams sync flow`，后者是那个源压根不给这一列（U25）。调用方知道是哪种，
+        # 所以这个 `reason` 由它带进来，不给时落到下面那句
+        return _item(
+            key,
+            None,
+            source,
+            reason
+            or f"{column} 这一列没有数（该源不给，见 U25）："
+            "这一项没有数据，不给分也不补一个「中性」的 50",
+        )
     if market_cap is None or market_cap <= 0:
         return _item(
             key,
@@ -369,15 +381,15 @@ def _flow_score(key: str, net: float | None, market_cap: float | None, column: s
     )
 
 
-def main_inflow_score(net_in: float | None, market_cap: float | None) -> Item:
+def main_inflow_score(net_in: float | None, market_cap: float | None, *, reason: str = "") -> Item:
     """主力净流入方向与规模：`main_net_in` 区间合计按当期市值归一。"""
-    return _flow_score("main_inflow", net_in, market_cap, "main_net_in")
+    return _flow_score("main_inflow", net_in, market_cap, "main_net_in", reason)
 
 
-def north_score(north_net: float | None, market_cap: float | None) -> Item:
+def north_score(north_net: float | None, market_cap: float | None, *, reason: str = "") -> Item:
     """北向增减持。现在这一列在库外没有源给得出（U25），所以这里大概率是 None —— 而
     一句「该源没有北向」比补一个 50 分诚实。"""
-    return _flow_score("north_bound", north_net, market_cap, "north_net")
+    return _flow_score("north_bound", north_net, market_cap, "north_net", reason)
 
 
 def composite(

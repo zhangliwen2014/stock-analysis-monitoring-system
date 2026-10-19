@@ -440,3 +440,32 @@ def test_plan_evidence_reads_as_one_traceable_page():
     for part in (plan.fair, plan.entry, plan.stop, plan.target):
         assert part.evidence in blob
     assert plan.odds.evidence in blob
+
+
+def test_trade_plan_labels_the_lookback_the_caller_actually_used():
+    """库里只有 120 根日线时，目标那行不能说「过去 250 日高点」。
+
+    模板里那个数是**想要**的窗口；服务层带回来的是**用到**的根数，标签得跟着它换，
+    否则屏幕上那句「前高」引用的是一个根本没查过的区间——而它与现价一样是减数。
+    """
+    narrow = trade_plan(
+        style=VALUE,
+        price=30.0,
+        pr=0.4,
+        basis=BASIS_PE,
+        pr_percentile=pctl(10.0),
+        recent_high=36.0,
+        lookback_days=120,
+    )
+    assert "过去 120 日高点" in narrow.target.evidence
+    wide = trade_plan(
+        style=VALUE,
+        price=30.0,
+        pr=0.4,
+        basis=BASIS_PE,
+        pr_percentile=pctl(10.0),
+        recent_high=36.0,
+    )
+    assert f"过去 {VALUE.param('target_lookback_days'):g} 日高点" in wide.target.evidence, (
+        "不传就按模板那个数说，别在调用方留一个必须记得传的暗参数"
+    )

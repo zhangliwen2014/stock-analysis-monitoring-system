@@ -277,6 +277,23 @@ class FinancialRepo:
             sql.append(f"LIMIT {int(limit)}")
         return self.db.query(" ".join(sql), params)
 
+    def periods(self, market: str, code: str) -> pl.DataFrame:
+        """这只票在库里的**每一**期，含披露日为 NULL 的那些，报告期升序。
+
+        唯一问得出「历史分位那段曲线每天能采信哪一期」的入口：`load_as_of` 与 `history`
+        都把 NULL 披露日滤掉了，而分位要**逐日**做 PIT（每一天的截至日不一样），
+        并且还要把那些没披露日的期**数出来**（D61）。在仓库侧先滤掉，分析层就会把
+        「我们不知道它何时公开」读成「库里没有那一期」，`unpublished_periods` 恒为 0。
+
+        这里不设 `as_of`：那条曲线的一天一天各自带闸门，在本方法上加一个总上界会把
+        窗口尾部的那些天一起削掉，而分位问的正是尾部。
+        """
+        return self.db.query(
+            "SELECT report_date, published_date, roe FROM financials"
+            " WHERE market = ? AND code = ? ORDER BY report_date",
+            [canonical_market(market), canonical_code(market, code)],
+        )
+
     def synced_codes(self, market: str) -> list[str]:
         """库里**有财务行**的全部代码，不看披露日、不看口径、不看截至日。
 

@@ -343,3 +343,29 @@ def test_load_as_of_needs_an_as_of_date(fin):
 def test_a_missing_required_column_is_refused_not_null_filled(fin):
     with pytest.raises(StorageError, match="必需列"):
         fin.upsert(pl.DataFrame([{"market": "A", "code": "601088"}]))
+
+
+def test_periods_keeps_the_undated_rows_that_history_filters_out(fin):
+    """分位曲线要逐日做 PIT，所以它得**自己**筛披露日，而不是在仓库侧就被筛掉（D61）。
+
+    `history` 少一行是少一行，`periods` 少那一行会让 `unpublished_periods` 恒为 0：
+    屏幕上那句「另有 N 期因为没有发布日而全程未被采信」就变成一句没有出处的话。
+    """
+    fin.upsert(
+        pl.DataFrame(
+            [
+                row(report_date=Q4, published_date=PUBLISHED_Q4),
+                row(report_date=Q1, published_date=None),
+            ]
+        )
+    )
+    got = fin.periods("A", "601088").to_dicts()
+    assert [r["report_date"] for r in got] == [Q4, Q1], "分位按报告期递推，升序才是那条曲线"
+    assert [r["published_date"] for r in got] == [PUBLISHED_Q4, None]
+    assert fin.history("A", "601088").height == 1, "同一只票，另一条问法只认已披露的那一期"
+
+
+def test_periods_keys_like_every_other_read(fin):
+    """`hk`/`700` 进来要按 D50 的形态落键，否则这一问在港美股上永远是空表。"""
+    fin.upsert(pl.DataFrame([row(market="HK", code="00700", report_date=Q4)]))
+    assert fin.periods("hk", "700").height == 1
