@@ -24,6 +24,7 @@ from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
 from sams.services.health import HealthService
+from sams.services.ledger import LedgerService
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
@@ -37,6 +38,7 @@ from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
@@ -99,6 +101,8 @@ class Container:
     valuation: ValuationService
     #: 观点的生命周期：它吃上面那个仓库与那份估值读数（spec §9.1）
     theses: ThesisService
+    #: 账本的写用例：一次成交跨订单/持仓/现金/流水四张表，入口只有这一个（§5.4）
+    ledger: LedgerService
     health: HealthService
     source_admin: SourceAdminService
 
@@ -192,6 +196,9 @@ def build_container(
     valuation = ValuationService(
         fundamentals, analysis, financials_store, valuation_store, flow_store, clock=clock
     )
+    sim_accounts = SimAccountRepo(database)
+    sim_orders = SimOrderRepo(database, sim_accounts, markets=cfg.markets, symbols=symbols)
+    ledger = LedgerService(sim_accounts, sim_orders, theses_store, cfg)
 
     return Container(
         settings=cfg,
@@ -233,5 +240,6 @@ def build_container(
         # `settings` 是那个「已知市场」的出处：一个没配的市场立不出 thesis，
         # 因为那条链上每一栏都读不到数（D84）
         theses=ThesisService(theses_store, users, valuation, cfg, clock=clock),
+        ledger=ledger,
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )
