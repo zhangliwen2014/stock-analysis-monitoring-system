@@ -25,6 +25,7 @@ from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
 from sams.services.health import HealthService
 from sams.services.ledger import LedgerService
+from sams.services.portfolio import PortfolioService
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
@@ -38,6 +39,7 @@ from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
@@ -83,6 +85,8 @@ class Container:
     flow_store: FundingFlowRepo
     scan_store: ScanResultRepo
     watchlists: WatchlistRepo
+    #: 汇率仓库：`fx` 这个名字留给服务（M3-A 的 `sams sync fx`），带 `_store` 是为了不误用
+    fx_store: FxRepo
     #: thesis 的仓库带 `_store`：`container.theses` 是那个读取用例（写入口只有一个）
     theses_store: ThesisRepo
     calendar_store: CalendarRepo
@@ -103,6 +107,8 @@ class Container:
     theses: ThesisService
     #: 账本的写用例：一次成交跨订单/持仓/现金/流水四张表，入口只有这一个（§5.4）
     ledger: LedgerService
+    #: 持仓与汇总的读用例：它只读账本，不改账本
+    portfolio: PortfolioService
     health: HealthService
     source_admin: SourceAdminService
 
@@ -199,6 +205,8 @@ def build_container(
     sim_accounts = SimAccountRepo(database)
     sim_orders = SimOrderRepo(database, sim_accounts, markets=cfg.markets, symbols=symbols)
     ledger = LedgerService(sim_accounts, sim_orders, theses_store, cfg)
+    fx_store = FxRepo(database)
+    portfolio = PortfolioService(sim_accounts, sim_orders, bars, fx_store)
 
     return Container(
         settings=cfg,
@@ -217,6 +225,7 @@ def build_container(
         scan_store=scan_store,
         theses_store=theses_store,
         watchlists=WatchlistRepo(database),
+        fx_store=fx_store,
         calendar_store=calendar_store,
         source_health=source_health,
         data_sources=data_sources,
@@ -241,5 +250,6 @@ def build_container(
         # 因为那条链上每一栏都读不到数（D84）
         theses=ThesisService(theses_store, users, valuation, cfg, clock=clock),
         ledger=ledger,
+        portfolio=portfolio,
         health=HealthService(database, registry, calendar_store, cfg, clock=clock),
     )
