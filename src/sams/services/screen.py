@@ -18,7 +18,7 @@ from datetime import date, timedelta
 
 import polars as pl
 
-from sams.analysis.fundamentals import BASIS_PB_ESTIMATE, pr
+from sams.analysis.fundamentals import BASIS_PB_ESTIMATE, BASIS_PE, pr
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.fundamentals import ROE_BASIS, ROE_BASIS_ANNUAL, ROE_BASIS_LATEST
@@ -30,9 +30,13 @@ from sams.storage.repos.symbols import SymbolRepo
 #: 两处各写一份的代价是「排除 3 只：原因 A」与「排除 3 只：原因 A（另一种写法）」并存
 NO_ANNUAL_ROE = "只披露到季报/半年报，没有已披露的年报可用（要用它：`--roe-basis latest`）"
 PB_BRANCH_EXCLUDED = (
-    "PE 不为正，那一支的 PR 里嵌了预估 ROE：只与**同一个预估**下的数可比，"
-    "默认不与其他票同列排序（要用它：`--include-estimated`）"
+    "PE 不为正，走的是现值 PB 那一支（`PB ÷ ROE ÷ ROE ÷ 100`，ROE 用已披露那期）："
+    "两条公式算出的 PR 不可放在同一篮子里排序，默认不与其他票同列"
+    "（要用它：`--include-pb-branch`）"
 )
+
+#: 两条公式算出的 PR 不可同列排序，所以先按支分组、支内再按值升序
+_BASIS_ORDER = {BASIS_PE: 0, BASIS_PB_ESTIMATE: 1}
 
 
 def no_usable_period(market: str, code: str, state: dict, until: date) -> str:
@@ -66,7 +70,11 @@ def no_valuation(market: str, code: str) -> str:
 
 @dataclass(frozen=True)
 class PrHit:
-    """一只通过门槛的票。口径与两个日期跟着每一行走（D59、D60、D62）。"""
+    """一只通过门槛的票。口径与两个日期跟着每一行走（D59、D60、D62）。
+
+    `estimated` 说的是「分母是不是手填的预估」，不是「走的是 PB 那一支」：`screen pr`
+    不传预估 ROE，所以那一支下它恒为 False，用的仍是已披露那期的 ROE。
+    """
 
     code: str
     #: 与门槛比较的是 `round(value, 6)`：门槛写在命令行上，就要能被正好敲中
@@ -109,6 +117,8 @@ class PrScan:
     #: 它们不属于三堆里的任何一堆：universe 是「库里有行的票」，硬塞进 excluded 会让
     #: 「hits + priced_out + excluded == universe」这条对账等式不成立
     unmatched: list[str] = field(default_factory=list)
+    #: 进了篮子的 PB 那一支有几只（D59：它与非它混排不可比，屏幕上必须出声）
+    pb_branch_count: int = 0
     #: 算得出 PR、只是高于门槛的票数。落选与排除是两件事：前者是「不便宜」，后者是「不知道」
     priced_out: int = 0
     dropped_unpublished: int = 0
@@ -142,7 +152,7 @@ class ScreenService:
         as_of: date | None = None,
         codes: list[str] | None = None,
         roe_basis: str = ROE_BASIS_ANNUAL,
-        include_estimated: bool = False,
+        include_pb_branch: bool = False,
         stale_after_days: int = 7,
         record: bool = True,
     ) -> PrScan:
@@ -166,7 +176,7 @@ class ScreenService:
             present = set(synced)
             universe = [c for c in synced if c in keep]
             unmatched = sorted(keep - present)
-        strategy_id = _strategy_id(threshold, roe_basis, include_estimated)
+        strategy_id = _strategy_id(threshold, roe_basis, include_pb_branch)
         market_size = self.symbols.list_market(market).height or None
         common = {
             "market": market,
@@ -204,7 +214,7 @@ class ScreenService:
                 threshold=threshold,
                 until=until,
                 stale_after_days=stale_after_days,
-                include_estimated=include_estimated,
+                include_pb_branch=include_pb_branch,
             )
             if outcome is PRICED_OUT:
                 priced_out += 1
@@ -212,7 +222,9 @@ class ScreenService:
                 excluded.append(outcome)
             else:
                 hits.append(outcome)
-        hits.sort(key=lambda h: (round(h.value, 6), h.code))
+        # 先按支分组（PE 那一支在前）、支内按值升序：两条公式算出的 0.06 与 0.3
+        # 不是同一个量的大小，混排会让「最便宜的在第一位」这句话只对组内成立
+        hits.sort(key=lambda h: (_BASIS_ORDER[h.basis], round(h.value, 6), h.code))
         excluded.sort(key=lambda e: e.code)
         if record:
             self.scans.record(
@@ -225,6 +237,7 @@ class ScreenService:
         return PrScan(
             hits=hits,
             excluded=excluded,
+            pb_branch_count=sum(1 for hit in hits if hit.basis == BASIS_PB_ESTIMATE),
             priced_out=priced_out,
             dropped_unpublished=dropped,
             **common,
@@ -250,7 +263,7 @@ def _one(
     threshold: float,
     until: date,
     stale_after_days: int,
-    include_estimated: bool,
+    include_pb_branch: bool,
 ) -> PrHit | PrExclusion | object:
     if reported is None:
         # 两种「这一口径下没有可用的期」，下一步不同：有更新的期 ≠ 一期都没披露（D61）
@@ -266,11 +279,13 @@ def _one(
             f"最近的按日估值停在 {valued['date']}，比截至日 {until} 旧过 {stale_after_days} 天："
             "那只票可能停牌，而拿旧 PE 算出的 PR 不属于今天这一篮子",
         )
+    # 这里不传 `--roe-estimate`：选股要的是「这只票自己的已披露 ROE 配现值 PB」，
+    # 拿一个手填的数排进一篮子，那个篮子量的就是我的猜测而不是它的便宜
     ratio = pr(pe_ttm=valued["pe_ttm"], pb=valued["pb"], roe=reported["roe"])
     if not ratio.ok:
         # D59：拒绝不是 0，也不是一条通用文案——原因由算式那一层给，这里只搬运
         return PrExclusion(code, ratio.reason)
-    if ratio.basis == BASIS_PB_ESTIMATE and not include_estimated:
+    if ratio.basis == BASIS_PB_ESTIMATE and not include_pb_branch:
         return PrExclusion(code, PB_BRANCH_EXCLUDED)
     if round(ratio.value, 6) > round(threshold, 6):
         return PRICED_OUT
@@ -287,15 +302,15 @@ def _one(
     )
 
 
-def _strategy_id(threshold: float, roe_basis: str, include_estimated: bool) -> str:
-    """规则的身份：门槛、分母口径、以及有没有把预估那一支混进来。
+def _strategy_id(threshold: float, roe_basis: str, include_pb_branch: bool) -> str:
+    """规则的身份：门槛、分母口径、以及有没有把 PB 那一支混进来。
 
     三者任一不同，产出的就是不同的一篮子；共用一个 id 会让后一次覆盖前一次，
     而「今天扫出什么」变成「今天最后一次扫出什么」。
     """
     bits = [f"pr<={threshold:g}", roe_basis]
-    if include_estimated:
-        bits.append("with-estimate")
+    if include_pb_branch:
+        bits.append("pb-branch")
     return "|".join(bits)
 
 

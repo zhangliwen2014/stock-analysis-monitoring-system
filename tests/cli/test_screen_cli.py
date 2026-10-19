@@ -253,19 +253,25 @@ def test_a_negative_pe_stock_is_excluded_by_default_and_named(db, settings, caps
     out = capsys.readouterr().out
     assert codes_in(out, "命中") == ["600000"]
     assert codes_in(out, "排除") == ["600001"]
-    assert "预估" in " ".join(block(out, "排除"))
+    excluded = " ".join(block(out, "排除"))
+    assert "--include-pb-branch" in excluded, "下一步命令要当场能敲"
+    assert "预估" not in excluded, (
+        f"`screen pr` 不传预估 ROE，那句排除不能说它嵌了一个预估：{excluded}"
+    )
 
 
-def test_include_estimated_puts_the_pb_branch_back_with_its_basis_labelled(db, settings, capsys):
+def test_include_pb_branch_puts_the_pb_branch_back_with_its_basis_labelled(db, settings, capsys):
     add(db, "600000")
     add(db, "600001", pe=-8.0, pb=1.0)  # PB 支：1 / 0.5 / 0.5 / 100 = 0.04
     capsys.readouterr()
-    run(container_for(db, settings), scan(["--include-estimated"]).split())
+    run(container_for(db, settings), scan(["--include-pb-branch"]).split())
     out = capsys.readouterr().out
-    assert codes_in(out, "命中") == ["600001", "600000"]
+    # 两支不可比 ⇒ 分组列出，PE 那一支在前；不是一条全局升序（D59）
+    assert codes_in(out, "命中") == ["600000", "600001"]
     assert any("pb_estimate" in row for row in block(out, "命中")[1:]), (
-        "混进同一张表时，那一行必须自己声明它是预估那一支"
+        "混进同一张表时，那一行必须自己声明它走的是 PB 那一支"
     )
+    assert "不可比" in out, "屏幕上要有一句「这两段的数不可比」"
 
 
 def test_the_staleness_of_a_valuation_row_is_printed_with_its_date(db, settings, capsys):

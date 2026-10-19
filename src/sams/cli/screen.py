@@ -53,9 +53,12 @@ def add_to(subparsers) -> None:
         ),
     )
     pr.add_argument(
-        "--include-estimated",
+        "--include-pb-branch",
         action="store_true",
-        help="把 PE 不为正那一支（嵌了预估 ROE）也放进同一张表排序",
+        help=(
+            "把 PE 不为正那一支（现值 PB 配已披露 ROE）也排进来；"
+            "它与 PE 那一支不可比，故分两组、组内升序"
+        ),
     )
     pr.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
     pr.set_defaults(handler=run_pr)
@@ -70,7 +73,7 @@ def run_pr(container: Container, args: argparse.Namespace) -> int:
             as_of=iso_date(args.as_of) if args.as_of else None,
             codes=_codes(args.codes),
             roe_basis=args.roe_basis,
-            include_estimated=args.include_estimated,
+            include_pb_branch=args.include_pb_branch,
         )
     except ValidationError as exc:
         # D57：`--json` 下参数错也是 JSON——让它冒到顶层，管道里的下游只会拿到空 stdin
@@ -115,7 +118,7 @@ def _print(scan, code: int) -> int:
     if code == 1:
         print(_empty_line(scan))
         return code
-    print(f"命中 {len(scan.hits)} 只（按 PR 升序）：")
+    print(f"命中 {len(scan.hits)} 只（{_order_note(scan)}）：")
     for hit in scan.hits:
         print(f"  {_hit_line(hit)}")
     _print_unmatched(scan)
@@ -138,6 +141,13 @@ def _print(scan, code: int) -> int:
 def _g(value: float) -> str:
     """门槛按命令行上敲的样子打印：`0.4` 不打印成 `0.400000`。"""
     return f"{value:g}"
+
+
+def _order_note(scan) -> str:
+    """「按 PR 升序」这句话只对一组成立。混进第二支时得说清是分了两组（D59）。"""
+    if not scan.pb_branch_count:
+        return "按 PR 升序"
+    return f"分两组、组内按 PR 升序（PB 那一支 {scan.pb_branch_count} 只，排在后面）"
 
 
 def _empty_line(scan) -> str:
@@ -205,12 +215,20 @@ def _is_year_end(day: date | None) -> bool:
 
 
 def _warnings(scan) -> list[str]:
-    if not scan.dropped_unpublished:
-        return []
-    return [
-        f"另有 {scan.dropped_unpublished} 行没有披露日、未被采信（D61）："
-        "这不等于那几期不存在，也不等于它们已经公开"
-    ]
+    """屏幕上那些 ⚠ 就是机器读者该读到的同一批话（D57）：`--json` 里叫 `warnings`。"""
+    lines = []
+    if scan.pb_branch_count:
+        lines.append(
+            f"命中里有 {scan.pb_branch_count} 只走的是 PB 那一支（PE 不为正）："
+            "两条公式算出的 PR 不是同一个量，**不可比**——所以表按支分组、组内升序，"
+            "别把它的 0.06 读成比 PE 那一支的 0.30 更便宜"
+        )
+    if scan.dropped_unpublished:
+        lines.append(
+            f"另有 {scan.dropped_unpublished} 行没有披露日、未被采信（D61）："
+            "这不等于那几期不存在，也不等于它们已经公开"
+        )
+    return lines
 
 
 def _number(value) -> str:
@@ -237,6 +255,8 @@ def _payload(scan, code: int) -> dict:
         "hits": [_hit_json(hit) for hit in scan.hits],
         "excluded": [asdict(e) for e in scan.excluded],
         "priced_out": scan.priced_out,
+        "pb_branch_count": scan.pb_branch_count,
+        "warnings": _warnings(scan),
         "dropped_unpublished": scan.dropped_unpublished,
         "stale_within_days": scan.stale_within_days,
         "caliber": caliber_note(),

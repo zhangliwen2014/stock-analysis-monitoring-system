@@ -133,11 +133,19 @@ def test_a_negative_pe_is_excluded_by_default_and_named(db):
     scan = screen(db).pr_max("A", 0.4)
     assert [r.code for r in scan.hits] == ["600001"]
     assert [e.code for e in scan.excluded] == ["600000"]
-    assert "预估" in scan.excluded[0].reason
+    reason = scan.excluded[0].reason
+    assert "不可放在同一篮子" in reason and "--include-pb-branch" in reason
+    assert "预估" not in reason, (
+        f"`pr_max` 从不传预估 ROE，那句排除不能说它嵌了一个预估：{reason}"
+    )
 
-    included = screen(db).pr_max("A", 0.4, include_estimated=True)
-    assert [r.code for r in included.hits] == ["600000", "600001"]
-    assert included.hits[0].basis == BASIS_PB_ESTIMATE
+    included = screen(db).pr_max("A", 0.4, include_pb_branch=True)
+    assert [r.code for r in included.hits] == ["600001", "600000"], (
+        "两支不可比 ⇒ 先按支分组、组内升序，不是一条全局升序"
+    )
+    assert included.hits[0].basis == BASIS_PE
+    assert included.hits[1].basis == BASIS_PB_ESTIMATE
+    assert included.pb_branch_count == 1
 
 
 def test_a_code_with_no_daily_valuation_is_not_silently_dropped(db):
