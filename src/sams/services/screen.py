@@ -21,7 +21,9 @@ import polars as pl
 from sams.analysis.fundamentals import BASIS_PB_ESTIMATE, BASIS_PE, pr
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
+from sams.core.errors import ValidationError
 from sams.core.fundamentals import (
+    PR_SCALE_DECIMALS,
     ROE_BASIS,
     ROE_BASIS_ANNUAL,
     ROE_BASIS_LATEST,
@@ -82,7 +84,7 @@ class PrHit:
     """
 
     code: str
-    #: 与门槛比较的是 `round(value, 6)`：门槛写在命令行上，就要能被正好敲中
+    #: 与门槛比较的是 `round(value, PR_SCALE_DECIMALS)`：门槛写在命令行上，就要能被正好敲中
     value: float
     basis: str
     roe_used: float | None
@@ -124,6 +126,9 @@ class PrScan:
     unmatched: list[str] = field(default_factory=list)
     #: 进了篮子的 PB 那一支有几只（D59：它与非它混排不可比，屏幕上必须出声）
     pb_branch_count: int = 0
+    #: 这次是否进了 `scan_results` 那一行。`--codes` 子集扫描**不存档**（D57）：
+    #: 存档的主键是规则身份，而试跑不是「今天这一篮子」——覆盖了反而没人知道
+    archived: bool = False
     #: 算得出 PR、只是高于门槛的票数。落选与排除是两件事：前者是「不便宜」，后者是「不知道」
     priced_out: int = 0
     dropped_unpublished: int = 0
@@ -170,6 +175,13 @@ class ScreenService:
             raise ValueError(f"ROE 口径只认 {' 或 '.join(ROE_BASIS)}，收到 {roe_basis!r}")
         market = canonical_market(market)
         until = as_of if as_of is not None else self.clock.today()
+        if until > self.clock.today():
+            # 「截至那天已披露」这道闸门在未来那天上是永真的：库里每一期都过了它的
+            # 公开日。那不是一个更宽的窗口，是一次未来函数（D9）
+            raise ValidationError(
+                f"截至日 {until} 在今天（{self.clock.today()}）之后："
+                "PIT 闸门在那天形同不设，那是一次未来函数，算出的 PR 今天无法核实"
+            )
         # universe = 库里同步过基本面的全部代码，不带披露日、不带口径（D64 + D66）：
         # 一只披露日全为 NULL 的票按「有已披露一期」划会静默从范围那句话里消失，
         # 而它需要的恰好是「我们不知道它何时公开」这句点名，不是「这只票没同步」
@@ -182,6 +194,10 @@ class ScreenService:
             universe = [c for c in synced if c in keep]
             unmatched = sorted(keep - present)
         strategy_id = _strategy_id(threshold, roe_basis, include_pb_branch)
+        # 存档的主键是 (日期, 市场, 规则身份)，而规则身份里刻意不含 codes：
+        # 把 codes 编进去会让「今天这一篮子」变成 N 行试跑，通知层从此不知道读哪一行。
+        # 所以子集扫描根本不写存档——覆盖全量那一条比不写严重得多（D57）
+        archived = record and codes is None
         market_size = self.symbols.list_market(market).height or None
         common = {
             "market": market,
@@ -193,6 +209,7 @@ class ScreenService:
             "market_size": market_size,
             "unmatched": unmatched,
             "stale_within_days": stale_after_days,
+            "archived": archived,
         }
         if not universe:
             return PrScan(hits=[], excluded=[], **common)
@@ -229,9 +246,9 @@ class ScreenService:
                 hits.append(outcome)
         # 先按支分组（PE 那一支在前）、支内按值升序：两条公式算出的 0.06 与 0.3
         # 不是同一个量的大小，混排会让「最便宜的在第一位」这句话只对组内成立
-        hits.sort(key=lambda h: (_BASIS_ORDER[h.basis], round(h.value, 6), h.code))
+        hits.sort(key=lambda h: (_BASIS_ORDER[h.basis], round(h.value, PR_SCALE_DECIMALS), h.code))
         excluded.sort(key=lambda e: e.code)
-        if record:
+        if archived:
             self.scans.record(
                 on=until,
                 market=market,
@@ -292,7 +309,7 @@ def _one(
         return PrExclusion(code, ratio.reason)
     if ratio.basis == BASIS_PB_ESTIMATE and not include_pb_branch:
         return PrExclusion(code, PB_BRANCH_EXCLUDED)
-    if round(ratio.value, 6) > round(threshold, 6):
+    if round(ratio.value, PR_SCALE_DECIMALS) > round(threshold, PR_SCALE_DECIMALS):
         return PRICED_OUT
     return PrHit(
         code=code,

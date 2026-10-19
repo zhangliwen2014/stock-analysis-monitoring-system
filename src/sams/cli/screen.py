@@ -19,11 +19,18 @@ import argparse
 import json
 from dataclasses import asdict
 from datetime import date
+from math import isfinite
 
 from sams.bootstrap import Container
 from sams.cli.common import group, iso_date
 from sams.core.errors import ValidationError
-from sams.core.fundamentals import ROE_BASIS, ROE_BASIS_ANNUAL, caliber_note, roe_basis_note
+from sams.core.fundamentals import (
+    PR_SCALE_DECIMALS,
+    ROE_BASIS,
+    ROE_BASIS_ANNUAL,
+    caliber_note,
+    roe_basis_note,
+)
 from sams.services.screen import PrHit
 
 PR_USAGE = "例如 0.4（PR 是小数口径的比值，不是百分数：`PR ≤ 0.4` 写 0.4）"
@@ -94,8 +101,19 @@ def _threshold(value: str) -> float:
         number = float(value)
     except ValueError:
         raise ValidationError(f"--pr-max {value!r} 不是一个数：{PR_USAGE}") from None
+    # nan 与 inf 都能被 `float()` 接住，而 `nan <= 0` 是 False：它会一路走进 payload，
+    # 那里 `"threshold": NaN` 已经不是合法 JSON（Python 的 json 模块能写、别人读不了）
+    if not isfinite(number):
+        raise ValidationError(f"--pr-max {value!r} 要的是一个有限的数：{PR_USAGE}")
     if number <= 0:
         raise ValidationError(f"--pr-max {value} 要的是一个正数：{PR_USAGE}")
+    if round(number, PR_SCALE_DECIMALS) == 0:
+        # 比较是在这个精度上做的，round 成 0 的门槛就是「只收免费的票」——
+        # 而 0 在 PR 的刻度上意思是免费，是这条公式最贵的一个误读（§7）
+        raise ValidationError(
+            f"--pr-max {value} 在比较精度（{PR_SCALE_DECIMALS} 位小数）下就是 0："
+            f"门槛要写成能落进这个精度的数，{PR_USAGE}"
+        )
     return number
 
 
@@ -177,6 +195,15 @@ def _print_unmatched(scan) -> None:
         print(f"  {code}  先跑 `sams sync financials --market {scan.market} --code {code}`")
 
 
+def _archive_note(scan) -> str:
+    """子集扫描不写存档，而屏幕上原来连「没写」这一句都没有（D57）。"""
+    return (
+        "这次是 --codes 子集扫描，**不存档**："
+        "`scan_results` 那一行的身份是规则本身，试跑不是「今天这一篮子」——"
+        "写了会覆盖当天全量那一条，而不写什么都没说"
+    )
+
+
 def _universe_line(scan) -> str:
     head = f"已同步基本面的 {scan.universe_size} 只"
     if scan.market_size is None:
@@ -217,6 +244,8 @@ def _is_year_end(day: date | None) -> bool:
 def _warnings(scan) -> list[str]:
     """屏幕上那些 ⚠ 就是机器读者该读到的同一批话（D57）：`--json` 里叫 `warnings`。"""
     lines = []
+    if not scan.archived and scan.universe_size:
+        lines.append(_archive_note(scan))
     if scan.pb_branch_count:
         lines.append(
             f"命中里有 {scan.pb_branch_count} 只走的是 PB 那一支（PE 不为正）："
@@ -249,6 +278,7 @@ def _payload(scan, code: int) -> dict:
         "threshold": scan.threshold,
         "roe_basis": scan.roe_basis,
         "strategy_id": scan.strategy_id,
+        "archived": scan.archived,
         "universe_size": scan.universe_size,
         "market_size": scan.market_size,
         "unmatched": list(scan.unmatched),
