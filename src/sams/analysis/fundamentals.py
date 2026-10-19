@@ -14,9 +14,15 @@ PE 不为正时（亏损、困境反转、周期股在周期底部）市盈率�
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
-from sams.core.fundamentals import BASIS_PB_ESTIMATE, BASIS_PE, BASIS_REFUSED
+from sams.core.fundamentals import (
+    BASIS_PB_ESTIMATE,
+    BASIS_PE,
+    BASIS_REFUSED,
+    out_of_caliber,
+)
 
 __all__ = ["BASIS_PB_ESTIMATE", "BASIS_PE", "BASIS_REFUSED", "MarketProfitRatio", "pr"]
 
@@ -56,6 +62,39 @@ def _refused(reason: str) -> MarketProfitRatio:
     return MarketProfitRatio(None, BASIS_REFUSED, reason=reason)
 
 
+def _percent(value: float) -> str:
+    """按小数口径把这个数读成百分数（D66 那句「它只能这么读」的证据）。"""
+    return f"{value * 100:.4g}%"
+
+
+def _computed(
+    value: float, *, formula: str, used: float, basis: str, estimated: bool
+) -> MarketProfitRatio:
+    """算式给的数必须还是一个数（D57、D66）。
+
+    分母小到 `PB ÷ ROE ÷ ROE` 溢出时，`inf` 在屏幕上写作 `PR = inf`、在 `--json` 里写作
+    `Infinity`——后者按 RFC 8259 不是合法 JSON，`jq` 与 `JSON.parse` 当场拒收，而进程
+    退出码是 0。一个溢出的比值也不是「极度便宜」：它是算式没了意义，所以按拒绝出门。
+    """
+    if not math.isfinite(value):
+        return _refused(
+            f"{formula} 在 ROE={used:g} 上溢出成 {value}：分母太小，这个数不再是比值，"
+            "也不是「免费」——换一个说得清的分母（`--roe-estimate 0.15` 这种小数）"
+        )
+    return MarketProfitRatio(value, basis, roe_used=used, estimated=estimated)
+
+
+def _implausible_denominator(used: float, *, whence: str) -> MarketProfitRatio:
+    """分母落进口径死区（D66）：宁可不出数，也不给一个短两个数量级的「便宜」。"""
+    return _refused(
+        f"{whence}的 ROE={used:g} 在小数口径里只能读成 {_percent(used)}，达到可信上界"
+        "（|ROE| ≥ 1 即不可信）："
+        f"这更像是「{used * 100:g}%」忘了 ÷100，而拿它当分母会把 PR 算小两个数量级，"
+        "方向永远是「极度便宜」。两种解释不可区分时选不出数"
+        "——请先核对这只票的财务指标（`sams sync financials`）"
+    )
+
+
 def pr(
     *,
     pe_ttm: float | None = None,
@@ -70,7 +109,15 @@ def pr(
                 f"PE(TTM)={pe_ttm:g} 可用，但 ROE {'缺失' if roe is None else f'为 {roe:g}'}："
                 "分母没有，PR 无从谈起——先补这只票的财务指标（`sams sync financials`）"
             )
-        return MarketProfitRatio(pe_ttm / roe / 100.0, BASIS_PE, roe_used=roe)
+        if out_of_caliber("roe", roe):
+            return _implausible_denominator(roe, whence="已披露那期")
+        return _computed(
+            pe_ttm / roe / 100.0,
+            formula="PE ÷ ROE ÷ 100",
+            used=roe,
+            basis=BASIS_PE,
+            estimated=False,
+        )
 
     # 到这儿是 PE 为负、为零，或源压根没给。三种情形的下一步不一样，所以说清是哪一种
     missing = "PE(TTM) 缺失（源没给这一列）" if pe_ttm is None else f"PE(TTM)={pe_ttm:g} 不为正"
@@ -88,10 +135,14 @@ def pr(
             f"{missing}，PB={pb:g}，{named}：这一支算的是「扭亏后能赚多少」，"
             "缺一个为正的 ROE 就没有 PR 可给（传 `--roe-estimate 0.15` 这种小数）"
         )
-    return MarketProfitRatio(
+    if out_of_caliber("roe", used):
+        return _implausible_denominator(
+            used, whence="预估" if roe_estimate is not None else "最近一期已披露"
+        )
+    return _computed(
         pb / used / used / 100.0,
-        BASIS_PB_ESTIMATE,
-        roe_used=used,
-        # 只有真给了预估值才算「预估」：回落到已披露 ROE 时，那个数是有出处的
+        formula="PB ÷ ROE ÷ ROE ÷ 100",
+        used=used,
+        basis=BASIS_PB_ESTIMATE,
         estimated=roe_estimate is not None,
     )

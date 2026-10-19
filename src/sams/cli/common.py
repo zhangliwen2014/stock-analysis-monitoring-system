@@ -10,7 +10,7 @@ from argparse import _SubParsersAction
 from datetime import date
 
 from sams.core.errors import ValidationError
-from sams.core.fundamentals import RATIO_BOUNDS
+from sams.core.fundamentals import RATIO_BOUNDS, out_of_caliber
 
 
 def group(subparsers: _SubParsersAction, name: str, help_text: str) -> _SubParsersAction:
@@ -44,22 +44,22 @@ def iso_date(value: str) -> date:
 
 
 def ratio_arg(name: str, value: str) -> float:
-    """比率参数按**小数口径**解析（D58）：`--roe-estimate 15` 拒收。
+    """比率参数按**小数口径**解析（D58 + D66）：`--roe-estimate 15` 与 `--roe-estimate 5` 都拒收。
 
     这不是洁癖。PR 的 PB 那一支把 ROE 乘两遍（`PB ÷ ROE ÷ ROE ÷ 100`），
     把 15% 写成 15 会让那个数小两百倍——屏幕上它长得像「极度便宜」，而这是
-    一条会把票排进 `PR ≤ 0.4` 前列的选股规则。仓库层对库里的数有同一道闸
-    （`core.fundamentals.RATIO_BOUNDS`），命令行是这条口径的另一个入口，
-    不能只挡一边。上限直接取那一处，不在这里再造一个数。
+    一条会把票排进 `PR ≤ 0.4` 前列的选股规则。仓库层对库里的数有同一道闸，
+    命令行是这条口径的另一个入口，不能只挡一边：判据取 core 那一个 `out_of_caliber`，
+    所以「库里存不下 1.0 以上的 ROE」与「命令行收不下 1.0 以上的预估」不会是两句话。
     """
     try:
         number = float(value)
     except ValueError:
         raise ValidationError(f"{name} 要的是一个数，收到 {value!r}") from None
     ceiling = RATIO_BOUNDS["roe"]
-    if not 0.0 < number <= ceiling:
+    if number <= 0 or out_of_caliber("roe", number):
         raise ValidationError(
-            f"{name}={value} 不像一个小数口径的比率：要 0 < x ≤ {ceiling:g}"
-            "（15% 写 0.15，不是 15）"
+            f"{name}={value} 不像一个小数口径的比率：要 0 < x < {ceiling:g}"
+            "（15% 写 0.15，不是 15；而 1 以上在这里只能读成 100% 开外，同样不收）"
         )
     return number

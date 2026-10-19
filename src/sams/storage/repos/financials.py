@@ -36,6 +36,7 @@ from sams.core.fundamentals import (
     ROE_BASIS_ANNUAL,
     TEXT_COLUMNS,
     VALUATION_COLUMNS,
+    out_of_caliber,
 )
 from sams.storage.db import Database
 from sams.storage.repos._keys import normalize_keys
@@ -102,23 +103,29 @@ def _prepare(
         pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c)
         for c in numeric
     )
-    # 小数口径越界（多半是百分数没换算，D58）：置空那一列，留 warn 给人看
-    for column, bound in RATIO_BOUNDS.items():
+    # 小数口径越界（多半是百分数没换算，D58 + D66）：置空那一列，留 warn 给人看。
+    # 判据逐行走 core 那一个 `out_of_caliber`，不在这里重写 `>=`：仓库拦下而命令行放过的
+    # 数，最后会以「同一个数在两侧口径不同」的形状出现在 PR 里
+    for column in RATIO_BOUNDS:
         if column not in out.columns:
             continue
-        suspect = out.filter(pl.col(column).abs() > bound).height
+        flagged = [out_of_caliber(column, value) for value in out[column].to_list()]
+        suspect = sum(flagged)
         if suspect:
             logger.warning(
-                "%s 有 %d 行的 %s 越出小数口径的可能范围（>|%g|，疑似百分数未 ÷100）已置空",
+                "%s 有 %d 行的 %s 越出小数口径的可信范围（|x| >= %g，疑似百分数未 ÷100）已置空",
                 table,
                 suspect,
                 column,
-                bound,
+                RATIO_BOUNDS[column],
             )
-            out = out.with_columns(
-                pl.when(pl.col(column).abs() > bound).then(None).otherwise(pl.col(column)).alias(
-                    column
+            mark = f"__{column}_out_of_caliber"
+            out = (
+                out.with_columns(pl.Series(mark, flagged, dtype=pl.Boolean))
+                .with_columns(
+                    pl.when(pl.col(mark)).then(None).otherwise(pl.col(column)).alias(column)
                 )
+                .drop(mark)
             )
     return out.unique(subset=list(key), keep="last").sort(list(key))
 

@@ -1137,3 +1137,25 @@ def test_analysis_series_reports_an_unmarked_jump_on_this_path(container, capsys
         code="601999", extra=["--indicators", "ma"])) == 1
     out = capsys.readouterr().out
     assert "裸价变动" in out and "-30.0%" in out
+
+
+def test_every_subcommand_help_page_formats():
+    """argparse 把 help 文本里的 `%` 当格式化符号：`（15% 写 0.15）` 让 `--help` 当场抛 ValueError。
+
+    `--help` 是唯一一条「参数还没传就崩」的路——它不碰库、不碰网络，所以用户连
+    「这个命令要什么参数」都问不出来。逐页 format 一次比记住「百分号要写两个」可靠。
+    """
+    visited: list[str] = []
+
+    def walk(current, path):
+        visited.append(" ".join(path))
+        current.format_help()
+        for action in current._actions:
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict):
+                for name, sub in choices.items():
+                    if hasattr(sub, "format_help"):
+                        walk(sub, (*path, name))
+
+    walk(cli.build_parser(), ("sams",))
+    assert {"sams screen pr", "sams analysis fundamentals"} <= set(visited), visited

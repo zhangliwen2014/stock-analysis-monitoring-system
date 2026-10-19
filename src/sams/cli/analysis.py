@@ -78,7 +78,7 @@ def add_fundamentals(subparsers) -> None:
     )
     fun.add_argument(
         "--roe-estimate",
-        help="预估 ROE，小数口径（15% 写 0.15）：PE 不为正时那一支要用它",
+        help="预估 ROE，小数口径（15%% 要写 0.15）：PE 不为正时那一支要用它",
     )
     fun.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
     fun.set_defaults(handler=run_fundamentals)
