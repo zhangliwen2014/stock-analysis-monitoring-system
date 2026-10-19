@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 
 import polars as pl
@@ -33,6 +33,29 @@ PB_BRANCH_EXCLUDED = (
     "PE 不为正，那一支的 PR 里嵌了预估 ROE：只与**同一个预估**下的数可比，"
     "默认不与其他票同列排序（要用它：`--include-estimated`）"
 )
+
+
+def no_usable_period(market: str, code: str, state: dict, until: date) -> str:
+    """「库里同步过这只票，但截至这天没有一期可用」——按库的性状说清下一步。
+
+    「同步了却一期都用不上」有两种缺法，前者的下一步是重采、后者是换截至日（D61 + D64）；
+    与 `NO_ANNUAL_ROE` 的分工是：那条说「有已披露的期，只是不是年报」。
+    """
+    gaps = []
+    if state["unpublished"]:
+        gaps.append(f"{state['unpublished']} 期的披露日是空的（D61：不知何时公开即不采信）")
+    next_day = state["next_published"]
+    if next_day is not None:
+        gaps.append(f"最早的一期 {next_day} 才公开，那天之前它在 PIT 上不存在")
+    step = (
+        f"要按公开那天算：`--as-of {next_day}`"
+        if next_day is not None
+        else f"先重跑 `sams sync financials --market {market} --code {code}`"
+    )
+    return (
+        f"截至 {until} 没有已披露的一期可用"
+        f"（库里那 {state['periods']} 期：{'；'.join(gaps)}）——{step}"
+    )
 
 
 #: 「下一步命令」必须当场能跑：`sams sync valuation` 缺 --market/--code 会直接报错，
@@ -82,6 +105,10 @@ class PrScan:
     market_size: int | None
     hits: list[PrHit]
     excluded: list[PrExclusion]
+    #: `--codes` 里点了名、但库里 `financials` 一行都没有的代码（D64）。
+    #: 它们不属于三堆里的任何一堆：universe 是「库里有行的票」，硬塞进 excluded 会让
+    #: 「hits + priced_out + excluded == universe」这条对账等式不成立
+    unmatched: list[str] = field(default_factory=list)
     #: 算得出 PR、只是高于门槛的票数。落选与排除是两件事：前者是「不便宜」，后者是「不知道」
     priced_out: int = 0
     dropped_unpublished: int = 0
@@ -121,19 +148,24 @@ class ScreenService:
     ) -> PrScan:
         """`PR ≤ threshold` 的一篮子，按 PR 升序；算不出 PR 的票逐个点名。
 
-        批量入口各一次查询（`covered_codes` / `load_as_of` / `latest`），不在循环里
-        逐只问库：一次扫描问 5000 次是慢，问 3 次是可用。
+        批量入口各一次查询（`synced_codes` / `load_as_of` / `latest` / `publication_state`），
+        不在循环里逐只问库：一次扫描问 5000 次是慢，问 4 次是可用。
         """
         if roe_basis not in ROE_BASIS:
             raise ValueError(f"ROE 口径只认 {' 或 '.join(ROE_BASIS)}，收到 {roe_basis!r}")
         market = canonical_market(market)
         until = as_of if as_of is not None else self.clock.today()
-        # universe 按「有没有已披露的一期」划，不带上口径：一只只有季报的票确实在库里，
-        # 年报口径下算不出 PR 是**要被点名的排除**，不是「这只票不在样本里」
-        universe = self.financials.covered_codes(market, as_of=until, basis=ROE_BASIS_LATEST)
+        # universe = 库里同步过基本面的全部代码，不带披露日、不带口径（D64 + D66）：
+        # 一只披露日全为 NULL 的票按「有已披露一期」划会静默从范围那句话里消失，
+        # 而它需要的恰好是「我们不知道它何时公开」这句点名，不是「这只票没同步」
+        synced = self.financials.synced_codes(market)
+        universe = synced
+        unmatched: list[str] = []
         if codes is not None:
             keep = {canonical_code(market, c) for c in codes}
-            universe = [c for c in universe if c in keep]
+            present = set(synced)
+            universe = [c for c in synced if c in keep]
+            unmatched = sorted(keep - present)
         strategy_id = _strategy_id(threshold, roe_basis, include_estimated)
         market_size = self.symbols.list_market(market).height or None
         common = {
@@ -144,6 +176,7 @@ class ScreenService:
             "strategy_id": strategy_id,
             "universe_size": len(universe),
             "market_size": market_size,
+            "unmatched": unmatched,
             "stale_within_days": stale_after_days,
         }
         if not universe:
@@ -153,6 +186,9 @@ class ScreenService:
         newest = self._newest_periods(market, universe, until, roe_basis)
         valued = self.valuation.latest(market, universe, until)
         by_report, by_newest, by_value = _index(reported), _index(newest), _index(valued)
+        # 只在「没有可用期」时才用到的那一句：为什么没有。一次 group-by 问全 universe，
+        # 不在循环里逐只问库（下面那只票的排除原因要说出具体的日期）
+        by_state = _index(self.financials.publication_state(market, universe, until))
 
         hits: list[PrHit] = []
         excluded: list[PrExclusion] = []
@@ -164,6 +200,7 @@ class ScreenService:
                 by_report.get(code),
                 by_newest.get(code),
                 by_value.get(code),
+                by_state[code],
                 threshold=threshold,
                 until=until,
                 stale_after_days=stale_after_days,
@@ -208,6 +245,7 @@ def _one(
     reported: dict | None,
     newest: dict | None,
     valued: dict | None,
+    state: dict,
     *,
     threshold: float,
     until: date,
@@ -215,7 +253,10 @@ def _one(
     include_estimated: bool,
 ) -> PrHit | PrExclusion | object:
     if reported is None:
-        period = "" if newest is None else f"{newest['report_date']} 不是年报："
+        # 两种「这一口径下没有可用的期」，下一步不同：有更新的期 ≠ 一期都没披露（D61）
+        if newest is None:
+            return PrExclusion(code, no_usable_period(market, code, state, until))
+        period = f"{newest['report_date']} 不是年报："
         return PrExclusion(code, f"{period}{NO_ANNUAL_ROE}")
     if valued is None:
         return PrExclusion(code, no_valuation(market, code))

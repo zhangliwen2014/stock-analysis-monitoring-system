@@ -47,8 +47,8 @@ logger = logging.getLogger("sams.storage.fundamentals")
 def _basis_clause(basis: str) -> str:
     """ROE 口径 → SQL 谓词（D62）。认报告期的日历日，不认名字或字段。
 
-    拼在这里而不是散在两条 SQL 里：`load_as_of` 与 `covered_codes` 必须说同一个口径，
-    两边各写一份时漏改一边，选股的 universe 与真正算出 PR 的票数就对不上。
+    这一句只写在这里，不散进调用方：口径的日历日判据是 D62 的全部内容，
+    改一次就要改所有读侧，而漏改一处的症状是「扫出的票数与算出 PR 的票数对不上」。
     """
     if basis not in ROE_BASIS:
         raise ValidationError(
@@ -267,21 +267,58 @@ class FinancialRepo:
             sql.append(f"LIMIT {int(limit)}")
         return self.db.query(" ".join(sql), params)
 
-    def covered_codes(
-        self, market: str, *, as_of: date, basis: str = ROE_BASIS_ANNUAL
-    ) -> list[str]:
-        """该口径下「至少有一期已披露财务数据」的代码：按 PR 选股的 universe 的一半。
+    def synced_codes(self, market: str) -> list[str]:
+        """库里**有财务行**的全部代码，不看披露日、不看口径、不看截至日。
 
-        universe 必须与 `load_as_of` 同一个 `basis`，否则选股会说「扫了 137 只」而其中
-        一部分在读取时根本没有可用的期——那只票既不在结果里、也不在「排除」里，静默消失。
+        选股的 universe 用它而不是「某口径下有已披露一期」（D64 + D66）：一只披露日全为
+        NULL 的票确实在库里，按「有已披露一期」划样本会让它从「已同步基本面的 N 只」那句
+        话里静默消失——而它正是「我们没数据」被读成「压根没同步」的那一只。它必须进
+        universe，然后作为排除被点名。
         """
         rows = self.db.query(
-            f"SELECT DISTINCT code FROM financials"
-            f" WHERE market = ? AND published_date IS NOT NULL AND published_date <= ?"
-            f" {_basis_clause(basis)} ORDER BY code",
-            [canonical_market(market), as_of],
+            "SELECT DISTINCT code FROM financials WHERE market = ? ORDER BY code",
+            [canonical_market(market)],
         )
         return list(rows["code"].to_list())
+
+    def publication_state(self, market: str, codes: list[str], as_of: date) -> pl.DataFrame:
+        """每只票的「为什么这一期用不上」：有几期、其中几期没披露日、最早的一期哪天公开。
+
+        这一问是**库的性状**，不是口径的性状：`load_as_of` 只回答「有什么可用」，而一句
+        「没有可用期」要区分三件不同的事，各自的下一步命令不同（D61 + D64）：
+
+        * 有 `unpublished` 期 → 「我们不知道它何时公开」，下一步是重采；
+        * 有 `next_published` 晚于 `as_of` → 「那天之前它还不存在」，下一步是换截至日；
+        * 两样都没有 → 可用期落在口径之外（季报/半年报），那句由调用方按口径说。
+
+        `as_of` 不给就拒（M2-A 那条同名的红线）：那个 `min` 没有闸门时答的是「任何时候都行」。
+        """
+        if as_of is None:
+            raise ValidationError("publication_state 必须给截至日：那个 min 不设闸门就没有意义")
+        market = canonical_market(market)
+        if not codes:
+            return pl.DataFrame(
+                schema={
+                    "code": pl.Utf8,
+                    "periods": pl.Int64,
+                    "unpublished": pl.Int64,
+                    "next_published": pl.Date,
+                }
+            )
+        wanted = [canonical_code(market, c) for c in codes]
+        return self.db.query(
+            """
+            SELECT code,
+                   count(*) AS periods,
+                   count(*) FILTER (WHERE published_date IS NULL) AS unpublished,
+                   min(published_date) FILTER (WHERE published_date > ?) AS next_published
+            FROM financials
+            WHERE market = ? AND code = ANY(?)
+            GROUP BY code
+            ORDER BY code
+            """,
+            [as_of, market, wanted],
+        )
 
     def count(self, market: str | None = None) -> int:
         sql = "SELECT count(*) FROM financials"

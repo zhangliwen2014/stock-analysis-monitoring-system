@@ -113,15 +113,12 @@ def _print(scan, code: int) -> int:
     print(f"扫描范围 {_universe_line(scan)}")
     print(roe_basis_note(scan.roe_basis))
     if code == 1:
-        print(
-            f"⇒ 一只都没扫成：{scan.market} 在库里没有已披露的基本面数据。"
-            "先跑 `sams sync financials --market "
-            f"{scan.market} --code <代码>`，这条命令的输入是**同步过的票**，不是全市场"
-        )
+        print(_empty_line(scan))
         return code
     print(f"命中 {len(scan.hits)} 只（按 PR 升序）：")
     for hit in scan.hits:
         print(f"  {_hit_line(hit)}")
+    _print_unmatched(scan)
     if scan.excluded:
         print(f"排除 {len(scan.excluded)} 只（算不出 PR，或按默认口径不与其他票同列）：")
         for exclusion in scan.excluded:
@@ -141,6 +138,33 @@ def _print(scan, code: int) -> int:
 def _g(value: float) -> str:
     """门槛按命令行上敲的样子打印：`0.4` 不打印成 `0.400000`。"""
     return f"{value:g}"
+
+
+def _empty_line(scan) -> str:
+    """「一只都没扫成」有两种，各自的下一步不同：整个市场没同步，还是 `--codes` 没命中。"""
+    command = f"`sams sync financials --market {scan.market} --code <代码>`"
+    if scan.unmatched:
+        return (
+            f"⇒ 一只都没扫成：--codes 里那 {len(scan.unmatched)} 个代码"
+            f"（{'、'.join(scan.unmatched)}）在 {scan.market} 的 financials 里一行都没有"
+            f"——先跑 {command}，或去掉 --codes 扫库里已有的全部"
+        )
+    return (
+        f"⇒ 一只都没扫成：{scan.market} 在库里没有任何已同步的基本面行。先跑 {command}，"
+        "这条命令的输入是**同步过的票**，不是全市场"
+    )
+
+
+def _print_unmatched(scan) -> None:
+    """`--codes` 里没命中的代码必须点名（D64）：静默少吃一只，与「这只票不便宜」是两件事。"""
+    if not scan.unmatched:
+        return
+    print(
+        f"未同步 {len(scan.unmatched)} 只（--codes 点了名、库里的 financials 一行都没有，"
+        "所以压根没进范围——不算排除）："
+    )
+    for code in scan.unmatched:
+        print(f"  {code}  先跑 `sams sync financials --market {scan.market} --code {code}`")
 
 
 def _universe_line(scan) -> str:
@@ -209,6 +233,7 @@ def _payload(scan, code: int) -> dict:
         "strategy_id": scan.strategy_id,
         "universe_size": scan.universe_size,
         "market_size": scan.market_size,
+        "unmatched": list(scan.unmatched),
         "hits": [_hit_json(hit) for hit in scan.hits],
         "excluded": [asdict(e) for e in scan.excluded],
         "priced_out": scan.priced_out,

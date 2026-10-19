@@ -88,11 +88,18 @@ def test_a_period_without_a_publication_date_is_not_trusted_and_is_counted(fin):
     assert dropped == 1
 
 
-def test_covered_codes_only_counts_periods_we_know_the_publication_of(fin):
-    fin.upsert(pl.DataFrame([row(), row(report_date=Q4, published_date=None)]))
-    assert fin.covered_codes("A", as_of=date(2024, 4, 30), basis="latest") == ["601088"]
-    # 截至日在披露日之前就是没有
-    assert fin.covered_codes("A", as_of=date(2024, 4, 25), basis="latest") == []
+def test_synced_codes_names_every_code_with_a_row_even_with_no_publication(fin):
+    """选股的 universe 问的是「库里同步过谁」，不是「谁已披露」——两者差的那些票
+    必须在屏幕上被点名（D64 + D66），而不是从「已同步基本面的 N 只」那句话里静默消失。
+    """
+    fin.upsert(
+        pl.DataFrame([row(code="600001", published_date=None), row(code="600002")])
+    )
+    assert fin.synced_codes("A") == ["600001", "600002"]
+    adopted, _ = fin.load_as_of("A", ["600001", "600002"], date(2024, 4, 30), basis="latest")
+    assert adopted["code"].to_list() == ["600002"], (
+        "同两行数据，两个问法给两个数：差的那一只是「同步了但我们不知道它何时公开」"
+    )
 
 
 # ---------- 年报口径（D62）：PR 的分母要与 PE(TTM) 同为一年 ----------
@@ -139,11 +146,33 @@ def test_annual_means_the_report_date_is_a_year_end(fin):
     assert adopted["report_date"].to_list() == [date(2024, 12, 31)]
 
 
+def test_publication_state_distinguishes_no_date_from_a_later_date(fin):
+    """「没有可用期」有两种，下一步命令不同：一句排除要说得出是哪种（D61 + D64）。"""
+    fin.upsert(
+        pl.DataFrame(
+            [
+                row(code="600001", published_date=None),
+                row(code="600002", report_date=Q4, published_date=date(2024, 3, 20)),
+            ]
+        )
+    )
+    state = fin.publication_state("A", ["600001", "600002"], date(2024, 3, 19)).to_dicts()
+    assert [r["code"] for r in state] == ["600001", "600002"]
+    by_code = {r["code"]: r for r in state}
+    assert by_code["600001"]["unpublished"] == 1
+    assert by_code["600001"]["next_published"] is None
+    assert by_code["600002"]["unpublished"] == 0
+    assert by_code["600002"]["next_published"] == date(2024, 3, 20), "那天之前它还不存在"
+    # 已披露的那期不再报「等待公开」
+    later = fin.publication_state("A", ["600002"], date(2024, 4, 1)).to_dicts()
+    assert later[0]["next_published"] is None
+
+
 def test_a_code_with_only_interim_periods_is_not_covered_on_the_annual_basis(fin):
-    """universe 也按口径走：只有季报的票在年报口径下不该被当成「有基本面」。"""
+    """只有季报的票在年报口径下没有可用的一期：它进不了结果，但必须被点名（D64）。"""
     fin.upsert(pl.DataFrame([row()]))
-    assert fin.covered_codes("A", as_of=date(2024, 4, 30)) == []
-    assert fin.covered_codes("A", as_of=date(2024, 4, 30), basis="latest") == ["601088"]
+    assert fin.load_as_of("A", ["601088"], date(2024, 4, 30))[0].height == 0
+    assert fin.synced_codes("A") == ["601088"], "「没可用期」不等于「没同步」"
 
 
 def test_an_unknown_basis_is_refused_with_the_two_names(fin):
