@@ -29,6 +29,7 @@ from sams.core.fundamentals import (
     ROE_BASIS,
     ROE_BASIS_ANNUAL,
     ROE_BASIS_LATEST,
+    STALE_VALUATION_DAYS,
     caliber_note,
     roe_basis_note,
 )
@@ -151,13 +152,31 @@ def _valuation_line(read) -> str:
     if read.valuation_on is None:
         return "无 ← 库里没有这只票的按日估值（先跑 `sams sync valuation`）"
     return (
-        f"{read.valuation_on}（源 {read.valuation_source}）  PE(TTM) {_number(read.pe_ttm)}"
+        f"{read.valuation_on}（{_age(read)}，源 {read.valuation_source}）"
+        f"  PE(TTM) {_number(read.pe_ttm)}"
         f"  PB {_number(read.pb)}  市值 {_money(read.market_cap)}"
     )
 
 
+def _age(read) -> str:
+    """「那一天」与「离今天多远」是两句话：只印日期时读者要自己心算，而不印日期他根本不算。"""
+    return f"{read.valuation_age_days} 天"
+
+
+def _stale(read) -> bool:
+    """旧过阈值（D64）。没有那一行时不是「0 天前」，也就谈不上旧不过。"""
+    return read.valuation_age_days is not None and read.valuation_age_days > STALE_VALUATION_DAYS
+
+
 def _fundamentals_warnings(read) -> list[str]:
     out = []
+    if _stale(read):
+        out.append(
+            f"⚠ PE/PB 是 {read.valuation_age_days} 天前（{read.valuation_on}）的数，"
+            f"旧过 {STALE_VALUATION_DAYS} 天：这几天里那只票可能停牌，而停牌期间的 PE 不是"
+            f"市场现在的出价——先 `sams sync valuation --market {read.market} "
+            f"--code {read.code}`"
+        )
     if read.interim_period is not None:
         out.append(
             f"⚠ 库里另有更新的一期 {read.interim_period}（ROE {_ratio(read.interim_roe)}，"
@@ -220,6 +239,9 @@ def _fundamentals_payload(read, code: int) -> dict:
         "pb": read.pb,
         "market_cap": read.market_cap,
         "valuation_on": str(read.valuation_on) if read.valuation_on else None,
+        "valuation_age_days": read.valuation_age_days,
+        "valuation_stale": _stale(read),
+        "stale_within_days": STALE_VALUATION_DAYS,
         "source": read.source,
         "valuation_source": read.valuation_source,
         "dropped_unpublished": read.dropped_unpublished,
@@ -239,6 +261,9 @@ def _fundamentals_payload(read, code: int) -> dict:
         },
         "caliber": caliber_note(),
         "basis_note": roe_basis_note(read.roe_basis),
+        # 屏幕上那些 ⚠ 就是机器读者该读到的同一批话（D57）：不给这一项，
+        # 脚本只能在中文文案里正则找「旧过」
+        "warnings": _fundamentals_warnings(read),
     }
 
 

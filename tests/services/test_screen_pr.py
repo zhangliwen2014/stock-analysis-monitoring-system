@@ -11,13 +11,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
 from support import FrozenClock
 
-from sams.core.fundamentals import BASIS_PB_ESTIMATE, BASIS_PE
+from sams.core.fundamentals import BASIS_PB_ESTIMATE, BASIS_PE, STALE_VALUATION_DAYS
 from sams.services.screen import ScreenService
 from sams.storage.repos.financials import FinancialRepo, ValuationRepo
 from sams.storage.repos.scan_results import ScanResultRepo
@@ -165,6 +165,19 @@ def test_a_stale_valuation_row_is_named_with_its_date(db):
     scan = screen(db).pr_max("A", 0.4)
     assert scan.hits == []
     assert str(STALE) in scan.excluded[0].reason
+
+
+def test_the_staleness_threshold_is_one_number_for_both_exits(db):
+    """选股与 `analysis fundamentals` 在问同一个问题，就该拿同一个答案。
+
+    11 天正是会被两处「各自定义」的数：字面量各写一份时，同一个 PE 在一个命令里
+    叫「旧过」、在另一个里叫「新鲜」，而屏幕上两句都像实话（D64）。
+    """
+    add_financial(db, "600000", roe=0.5)
+    add_valuation(db, "600000", pe=15.0, on=TODAY - timedelta(days=11))
+    scan = screen(db).pr_max("A", 0.4)
+    assert scan.hits == [], "旧过阈值的票不能算落选，也不能算命中"
+    assert scan.stale_within_days == STALE_VALUATION_DAYS
 
 
 def test_a_code_with_only_interim_financials_names_the_basis_flag(db):

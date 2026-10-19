@@ -132,10 +132,23 @@ $ sams analysis fundamentals --market A --code 000802 --roe-estimate 15
 
 ```
   采信期  2023-12-31 年报（披露 2024-03-23，源 akshare）  ROE 14.52%  营收 -0.42%  利润 -14.29%  股息率 5.01%
-  估值日  2024-07-11（源 akshare）  PE(TTM) 14.54  PB 2.09  市值 8,281.20亿
+  估值日  2024-07-11（0 天，源 akshare）  PE(TTM) 14.54  PB 2.09  市值 8,281.20亿
 ```
 
 `--as-of` 同时是这两侧的上界：它问的是「在那一天，站在那一天能看到的报表上，这只票的 PR 是多少」。
+
+那一行的**天数**按 `as_of` 算，不按真实今天：把截至日挪回 2024 年时，PE 的陈旧程度也要跟着
+回到那时候。旧过 `STALE_VALUATION_DAYS`（7 个日历日，`core/fundamentals.py` 唯一出处）时屏幕上
+多一句 ⚠，因为停在几天前最常见的解释是那只票这几天停牌，而停牌期间的 PE 不是市场现在的出价（实测）：
+
+```
+  估值日  2024-07-11（52 天，源 akshare）  PE(TTM) -12.50  PB 2.89  市值 35.22亿
+  ⚠ PE/PB 是 52 天前（2024-07-11）的数，旧过 7 天：这几天里那只票可能停牌，而停牌期间的 PE
+    不是市场现在的出价——先 `sams sync valuation --market A --code 000802`
+```
+
+同一个 7 也是 `screen pr` 把陈旧估值放进「排除」时用的那个数：两处各写一个字面量时，同一个 PE
+会在一个命令里叫「旧过」、在另一个里叫「新鲜」，而屏幕上两句都像实话（D64）。
 
 各市场能拿到什么（实测，`datasource/capabilities.py` 是唯一出处）：**只有 A 股能算 PR**。
 A 股三条链都有源（ROE 与披露日来自东财 F10 系列，`published_date` 只有它给）。
@@ -252,7 +265,7 @@ sams analysis fundamentals --market A --code 601088
 ```
 A/601088  截至 2024-07-11
   采信期  2023-12-31 年报（披露 2024-03-23，源 akshare）  ROE 14.52%  营收 -0.42%  利润 -14.29%  股息率 5.01%
-  估值日  2024-07-11（源 akshare）  PE(TTM) 14.54  PB 2.09  市值 8,281.20亿
+  估值日  2024-07-11（0 天，源 akshare）  PE(TTM) 14.54  PB 2.09  市值 8,281.20亿
   市赚率  PR = 1.001   ← PE ÷ ROE ÷ 100，ROE=0.1452（已披露，小数口径）
   分母口径：ROE 取最新已披露年报（12-31 那一报告期）的加权值——十二个月，与 PE(TTM) 同周期；…
   口径：比率列一律小数（0.20 = 20%），PE/PB 是倍数，金额是本币原值；ROE 按报告期、PE/PB 按交易日，两个粒度各取各的截至日
@@ -268,12 +281,18 @@ A/601088  截至 2024-07-11
 {"status": "ok", "exit": 0, "market": "A", "code": "601088", "as_of": "2024-07-11",
  "period": "2023-12-31", "published_on": "2024-03-23", "roe": 0.1452,
  "pe_ttm": 14.53709075, "pb": 2.08533504, "valuation_on": "2024-07-11",
+ "valuation_age_days": 0, "valuation_stale": false, "stale_within_days": 7,
  "source": "akshare", "valuation_source": "akshare", "dropped_unpublished": 0,
  "roe_basis": "annual", "interim_period": "2024-03-31", "interim_roe": 0.0354,
  "pr": {"value": 1.0011770488980718, "basis": "pe", "roe_used": 0.1452,
         "estimated": false, "reason": "PE ÷ ROE ÷ 100，ROE=0.1452（已披露，小数口径）"},
- "caliber": "口径：…", "basis_note": "分母口径：…"}
+ "caliber": "口径：…", "basis_note": "分母口径：…",
+ "warnings": ["⚠ 库里另有更新的一期 2024-03-31（ROE 3.54%，…）未用于 PR：…"]}
 ```
+
+`warnings` 就是屏幕上那几行 ⚠ 的原文（D57）：不给这一项，脚本只能在中文文案里正则找「旧过」。
+`valuation_age_days` 在**没有**按日估值那一行时是 `null` 而不是 `0`——「不知道几天」与
+「就是今天」在选股里后果不同。
 
 算不出 PR 时 `status` 是 `refused`、`exit` 是 1，两只票之间没有第三种「ok 但值为 null」（实测 000802）：
 
@@ -281,6 +300,7 @@ A/601088  截至 2024-07-11
 {"status": "refused", "exit": 1, "market": "A", "code": "000802", "as_of": "2024-07-11",
  "period": null, "roe": null,
  "pe_ttm": -12.49637285, "pb": 2.89030713, "valuation_on": "2024-07-11",
+ "valuation_age_days": 0, "valuation_stale": false, "stale_within_days": 7,
  "valuation_source": "akshare", "roe_basis": "annual",
  "interim_period": "2024-03-31", "interim_roe": -0.011, "interim_published_on": "2024-04-18",
  "pr": {"value": null, "basis": "refused", "roe_used": null, "estimated": false,
@@ -289,8 +309,10 @@ A/601088  截至 2024-07-11
 ```
 
 `pr.value` 为 null 时 `pr.reason` 一定非空，而拒绝的那只票**仍然带着 PE/PB 与那期季度数出门**——
-读的人要能看出「是哪一个数不为正挡住了这一支」，而不是一句「算不出」。参数错才是 `status: "error"`
-（退出码 2）。每个出口都带与进程退出码同值的 `exit`（D57）——管道里 `$?` 会被下游命令覆盖。
+读的人要能看出「是哪一个数不为正挡住了这一支」，而不是一句「算不出」。参数错也是
+`status: "refused"`，只是 `exit` 是 2（实测 `--roe-estimate 15`）——这个命令没有
+`status: "error"` 那个出口，`--json` 下每个出口都必须是可解析 JSON。
+每个出口都带与进程退出码同值的 `exit`（D57）——管道里 `$?` 会被下游命令覆盖。
 
 ### 8.2 按 PR 选股
 

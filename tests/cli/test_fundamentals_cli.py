@@ -423,3 +423,68 @@ def test_the_default_refusal_still_names_the_basis_when_nothing_is_annual(wired,
     capsys.readouterr()
     assert run(wired, argv("--as-of", "2024-03-19")) == 1
     assert "annual" in capsys.readouterr().out
+
+
+# ---------- 按日估值的新旧（D60 + D64）----------
+
+
+def test_a_stale_valuation_day_is_counted_in_days_and_named_on_screen(wired, capsys):
+    """只印日期时，「2024-06-28」离今天多远要读者自己心算；不印日期他更当作今天的 PE。
+
+    这只票的 PE 停在 11 天前（阈值 7 天）——期间它可能停牌，而停牌期间的 PE 不是
+    市场现在的出价。那句话必须跟着数出门，并给出跑得通的下一步。
+    """
+    capsys.readouterr()
+    assert run(wired, argv()) == 0
+    out = capsys.readouterr().out
+    assert "11 天" in out, out
+    assert "sams sync valuation --market A --code 601088" in out, "下一步要能当场敲"
+
+
+def test_a_fresh_valuation_day_does_not_complain_about_being_old(db, settings, capsys):
+    """没旧过阈值就不该出声：常喊狼来的警告会被读的人整条跳过。"""
+    capsys.readouterr()
+    container = seeded(
+        db, settings, financials=financials_rows(), valuation=valuation_rows(date=date(2024, 7, 8))
+    )
+    sync(container, "financials")
+    sync(container, "valuation")
+    capsys.readouterr()
+    assert run(container, argv()) == 0
+    out = capsys.readouterr().out
+    assert "旧过" not in out and "sams sync valuation" not in out
+    assert "1 天" in out, "天数照印，只是不构成警告"
+
+
+def test_json_carries_the_age_of_the_valuation_row(wired, capsys):
+    """屏幕上那些 ⚠ 就是脚本该读到的同一批话（D57）：阈值与天数都进 payload。"""
+    capsys.readouterr()
+    assert run(wired, argv("--json")) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valuation_age_days"] == 11
+    assert payload["valuation_stale"] is True
+    assert payload["stale_within_days"] == 7
+    assert any("11 天" in line for line in payload["warnings"])
+
+
+def test_a_fresh_valuation_row_is_not_marked_stale_in_json(db, settings, capsys):
+    capsys.readouterr()
+    container = seeded(
+        db, settings, financials=financials_rows(), valuation=valuation_rows(date=date(2024, 7, 8))
+    )
+    sync(container, "financials")
+    sync(container, "valuation")
+    capsys.readouterr()
+    assert run(container, argv("--json")) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valuation_age_days"] == 1 and payload["valuation_stale"] is False
+    assert payload["warnings"] == []
+
+
+def test_no_valuation_row_has_no_age_rather_than_zero_days(wired, capsys):
+    """库里没有那一行时说「0 天前」是把「不知道」报成了「最新」。"""
+    capsys.readouterr()
+    assert run(wired, argv("--json", code="600000")) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valuation_on"] is None and payload["valuation_age_days"] is None
+    assert payload["valuation_stale"] is False

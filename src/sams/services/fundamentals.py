@@ -196,6 +196,8 @@ class FundamentalRead:
     market_cap: float | None = None
     #: PE/PB 是**哪一天**的数（D60：与报告期不是一个粒度，不能混为一谈）
     valuation_on: date | None = None
+    #: 那一行离 `as_of` 几天；`valuation_on` 为空时这里也是空（「不知道」不是「0 天前」）
+    valuation_age_days: int | None = None
     #: 这个数来自哪一家（D54：数的出处要跟着数一起出门）
     source: str = ""
     valuation_source: str = ""
@@ -245,6 +247,7 @@ class FundamentalService:
         frame, dropped = self.financials.load_as_of(market, [code], until, basis=roe_basis)
         reported = _first(frame)
         valued = _first(self.valuation.latest(market, [code], until))
+        valuation_on = _get(valued, "date")
         # 年报口径下顺手问一次「最新一期是哪天」：那只票可能刚报了半年数。不说这句，
         # 读的人会以为我们不知道有更新的一期——而我们知道，只是那个数的周期不同
         newest = (
@@ -284,7 +287,10 @@ class FundamentalService:
             pb=_get(valued, "pb"),
             # 市值是某一天的数：优先按日那一行，只有它没有时才回落到报告期那一列
             market_cap=_pick(_get(valued, "market_cap"), _get(reported, "market_cap")),
-            valuation_on=_get(valued, "date"),
+            valuation_on=valuation_on,
+            # 天数按 as_of 算，不按真实今天：把截至日挪回 2024 年时，PE 的陈旧程度
+            # 也要跟着回到那时候，否则回看的每一行都被夸大成「旧过一年」
+            valuation_age_days=None if valuation_on is None else (until - valuation_on).days,
             source=_get(reported, "source") or "",
             valuation_source=_get(valued, "source") or "",
             dropped_unpublished=dropped,

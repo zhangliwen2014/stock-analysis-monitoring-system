@@ -21,7 +21,12 @@ import polars as pl
 from sams.analysis.fundamentals import BASIS_PB_ESTIMATE, BASIS_PE, pr
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
-from sams.core.fundamentals import ROE_BASIS, ROE_BASIS_ANNUAL, ROE_BASIS_LATEST
+from sams.core.fundamentals import (
+    ROE_BASIS,
+    ROE_BASIS_ANNUAL,
+    ROE_BASIS_LATEST,
+    STALE_VALUATION_DAYS,
+)
 from sams.storage.repos.financials import FinancialRepo, ValuationRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -122,7 +127,7 @@ class PrScan:
     #: 算得出 PR、只是高于门槛的票数。落选与排除是两件事：前者是「不便宜」，后者是「不知道」
     priced_out: int = 0
     dropped_unpublished: int = 0
-    stale_within_days: int = 7
+    stale_within_days: int = STALE_VALUATION_DAYS
 
 
 #: 「算得出但高于门槛」这个事实不需要带数据出门，一个单例就够
@@ -153,7 +158,7 @@ class ScreenService:
         codes: list[str] | None = None,
         roe_basis: str = ROE_BASIS_ANNUAL,
         include_pb_branch: bool = False,
-        stale_after_days: int = 7,
+        stale_after_days: int = STALE_VALUATION_DAYS,
         record: bool = True,
     ) -> PrScan:
         """`PR ≤ threshold` 的一篮子，按 PR 升序；算不出 PR 的票逐个点名。

@@ -117,6 +117,26 @@ def test_the_unit_self_check_pe_20_with_roe_20_percent_is_one(db):
     assert read.pr.roe_used == pytest.approx(0.2)
 
 
+def test_the_valuation_row_carries_how_old_it_is(db):
+    """「PE 是哪一天的」与「那天下来的 PR 离今天多远」是两句话（D60）。
+
+    只印日期，读的人得自己心算；不印日期，他会把 11 天前的 PE 当成今天的数——那只票
+    可能刚好这些天停牌，而停牌期间的 PE 不是市场现在的出价。
+    """
+    seed_financials(db, {})
+    seed_valuation(db, {})
+    read = service(db).read("A", "601088", as_of=TODAY)
+    assert (read.valuation_on, read.valuation_age_days) == (VALUATION_DAY, 11)
+
+    fresh = service(db).read("A", "601088", as_of=VALUATION_DAY)
+    assert fresh.valuation_age_days == 0, "截至日就是那一天时，这个数不属于昨天"
+
+    alone = service(db).read("A", "999999", as_of=TODAY)
+    assert alone.valuation_on is None and alone.valuation_age_days is None, (
+        "没有那一行时不能报「0 天前」"
+    )
+
+
 def test_the_two_grains_are_reported_separately(db):
     seed_financials(db, {})
     seed_valuation(db, {})
