@@ -74,6 +74,15 @@ def _prepare(
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise StorageError(f"{table} 缺少必需列: {missing}")
+    # 未登记的列过去由 `select(list(columns))` 静默丢掉：加一条采集时写库不报错、
+    # 读回来没有，而「静默少一列」比一次 StorageError 贵得多
+    unknown = [c for c in df.columns if c not in columns]
+    if unknown:
+        raise StorageError(
+            f"{table} 的列名单里没有 {unknown}：这一列会被丢掉而你以为写成功了。"
+            "要么把它加进 `core.fundamentals` 的名单（连同 DDL 与类型），"
+            "要么在采集归一那一步就把它去掉"
+        )
     out = df
     for column in columns:
         if column not in out.columns:
@@ -361,6 +370,15 @@ class ValuationRepo:
     def upsert(self, df: pl.DataFrame) -> int:
         if df.is_empty():
             return 0
+        # 反向的粒度守卫（D60）：`financials` 拒 pe_ttm/pb，这一侧拒比率。
+        # `dividend_yield` 不在名单里——按日那个是源当日给的「股息率(TTM)」，粒度对得上
+        borrowed = [c for c in ("roe", "revenue_yoy", "profit_yoy") if c in df.columns]
+        if borrowed:
+            raise StorageError(
+                f"valuation_daily 不收 {borrowed}：这一行的粒度是交易日，"
+                "而比率是某一期的数（D60）。按报告期的比率写 `financials`——"
+                "把它们塞进按日那一行，市赚率会拿今天的 ROE 去配任何一天的 PE"
+            )
         prepared = _prepare(
             df,
             columns=VALUATION_COLUMNS,
