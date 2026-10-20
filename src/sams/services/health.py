@@ -186,8 +186,8 @@ class HealthService:
         *,
         year_horizon: int = 3,
         clock: Clock = SYSTEM_CLOCK,
-        accounts: SimAccountRepo | None = None,
-        orders: SimOrderRepo | None = None,
+        sim_accounts: SimAccountRepo | None = None,
+        sim_ledger: SimOrderRepo | None = None,
         fx: FxRepo | None = None,
     ) -> None:
         self.db = db
@@ -196,9 +196,10 @@ class HealthService:
         self.settings = settings
         self.year_horizon = year_horizon
         self.clock = clock
-        #: 账本那一节的三个读数（仓库不传就是全 0，见 `LedgerData`）
-        self.accounts = accounts
-        self.orders = orders
+        #: 账本那一节的三个读数（仓库不传就是全 0，见 `LedgerData`）。
+        #: 带 `sim_` 前缀是因为 `accounts` 在别的类里指用户账号服务，两个都对上名字必被误用
+        self.sim_accounts = sim_accounts
+        self.sim_ledger = sim_ledger
         self.fx = fx
 
     def report(self) -> HealthReport:
@@ -228,15 +229,15 @@ class HealthService:
         """
         tables = set(self.db.table_names())
         ledger_ready = (
-            self.accounts is not None
-            and self.orders is not None
+            self.sim_accounts is not None
+            and self.sim_ledger is not None
             and {"sim_accounts", "sim_orders", "sim_positions"} <= tables
         )
         fx_ready = self.fx is not None and "fx_rates" in tables
         return LedgerData(
-            accounts=self.accounts.count() if ledger_ready else 0,
-            orders=self.orders.count_orders() if ledger_ready else 0,
-            positions=self.orders.count_holdings() if ledger_ready else 0,
+            accounts=self.sim_accounts.count() if ledger_ready else 0,
+            orders=self.sim_ledger.count_orders() if ledger_ready else 0,
+            positions=self.sim_ledger.count_holdings() if ledger_ready else 0,
             fx=self.fx.freshness(self.clock.today()) if fx_ready else (),
         )
 

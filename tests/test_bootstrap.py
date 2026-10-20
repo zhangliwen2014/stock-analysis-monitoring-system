@@ -8,8 +8,13 @@ from support import FrozenClock, StubAdapter, sample_bars
 
 from sams.bootstrap import attach_log_sink, build_container
 from sams.core.events import EventBus, SystemAlarm
+from sams.monitor.router import NotifyService
+from sams.services.accounts import AccountService
 from sams.storage.db import Database
 from sams.storage.migrate import apply_migrations
+from sams.storage.repos.alerts import AlertRepo
+from sams.storage.repos.channels import ChannelRepo
+from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 
 
 def stub_adapters() -> dict:
@@ -170,3 +175,87 @@ def test_a_market_left_without_sources_warns_instead_of_crashing(migrated, caplo
         assert "HK" not in second.registry.market_sources
     finally:
         second.close()
+
+
+def test_the_container_carries_the_notify_parts(container):
+    built, _ = container
+    assert isinstance(built.channels_store, ChannelRepo)
+    assert isinstance(built.alerts_store, AlertRepo)
+    assert isinstance(built.notify, NotifyService)
+    assert built.cipher is not None
+    # 加解密住在仓库那一层，路由只拿密文/掩码视图：这一句钉住「router 不接 cipher」
+    assert not hasattr(built.notify, "cipher")
+    # 同一个仓库对象，不是各造一份：两份 `ChannelRepo` 意味着两套对同一条通道的认知
+    assert built.notify.channels is built.channels_store
+    assert built.notify.alerts is built.alerts_store
+    assert built.notify.users is built.users
+
+
+def test_the_sim_repos_are_named_for_what_they_are(container):
+    """`accounts` 这个名字属于用户账号服务（`AccountService`），SIM 的两个仓库带 `sim_` 前缀：
+    留着裸名，下一个人加字段时会照着 `accounts` 的形状加，于是又造出一个歧义。"""
+    built, _ = container
+    assert isinstance(built.accounts, AccountService)
+    assert isinstance(built.sim_accounts, SimAccountRepo)
+    assert isinstance(built.sim_ledger, SimOrderRepo)
+    assert not hasattr(built, "orders")
+
+
+def test_a_real_dispatch_runs_through_the_container(db, settings):
+    """容器级的最小一枚：换掉工厂，从 `notify.add` 到 `notify.dispatch` 走一遍。
+
+    路由的分支在 `tests/monitor/test_router.py` 里逐条钉过，这里只验组装根把
+    「同一个仓库、同一个总线、被注入的那个工厂」接在了一起——接线错成两个容器时，
+    单元用例全绿而屏幕上什么都收不到。
+    """
+    from sams.core.notify import AlertMessage, NotifyResult
+
+    made: list[str] = []
+
+    def factory(kind, config):
+        made.append(kind)
+
+        class Node:
+            name = kind
+
+            def available(self):
+                return True
+
+            def unavailable_reason(self):
+                return ""
+
+            def send(self, message):
+                return NotifyResult(ok=True)
+
+        return Node()
+
+    built = build_container(
+        settings, db=db, adapters=stub_adapters(), clock=FrozenClock(
+            datetime(2026, 3, 9, 4, 0, tzinfo=UTC)
+        ), notifier_factory=factory
+    )
+    try:
+        built.users.create("trader", "correct-horse-battery")
+        user = built.users.get_by_username("trader")
+        node = built.notify.add(user.id, "wecom", "主群", {"url": "https://x/key=k"})
+        result = built.notify.dispatch(
+            AlertMessage(
+                market="A",
+                code="601088",
+                severity="mid",
+                triggered_at=datetime(2026, 3, 9, 3, 0, tzinfo=UTC),
+                name="中国神华",
+                rule_name="PR 低",
+                value_text="PR=0.31",
+                threshold_text="PR≤0.4",
+            ),
+            user_id=user.id,
+            channel_ids=[node.id],
+        )
+        assert result.any_sent
+        assert made == ["wecom", "wecom"]  # add 先过一遍工厂，dispatch 再一次
+        row = built.alerts_store.get(result.alert_id)
+        assert row.severity == "mid"
+        assert built.alerts_store.deliveries(result.alert_id)[0].outcome == "sent"
+    finally:
+        built.close()

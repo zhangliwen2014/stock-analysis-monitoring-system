@@ -326,7 +326,7 @@ def test_an_unknown_publication_date_does_not_become_the_latest_one(db, settings
 
 
 def ledger_service(
-    db, settings, *, accounts=None, orders=None, fx=None, today=D
+    db, settings, *, sim_accounts=None, sim_ledger=None, fx=None, today=D
 ) -> HealthService:
     """把三个仓库接上，时钟冻在 `today`：`age_days` 不冻住就没法断言。"""
     registry = AdapterRegistry(
@@ -340,8 +340,8 @@ def ledger_service(
         CalendarRepo(db),
         settings,
         clock=FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC)),
-        accounts=accounts,
-        orders=orders,
+        sim_accounts=sim_accounts,
+        sim_ledger=sim_ledger,
         fx=fx,
     )
 
@@ -367,7 +367,7 @@ def test_the_ledger_section_counts_accounts_orders_and_open_positions(db, settin
         currency="CNY",
     )
     report = ledger_service(
-        db, settings, accounts=accounts, orders=ledger, fx=FxRepo(db)
+        db, settings, sim_accounts=accounts, sim_ledger=ledger, fx=FxRepo(db)
     ).report()
     assert (report.ledger.accounts, report.ledger.orders, report.ledger.positions) == (1, 1, 1)
 
@@ -390,7 +390,7 @@ def test_a_closed_position_is_not_counted_as_a_holding(db, settings) -> None:
             currency="CNY",
         )
     report = ledger_service(
-        db, settings, accounts=accounts, orders=ledger, fx=FxRepo(db)
+        db, settings, sim_accounts=accounts, sim_ledger=ledger, fx=FxRepo(db)
     ).report()
     assert (report.ledger.orders, report.ledger.positions) == (2, 0)
 
@@ -430,8 +430,8 @@ def test_the_ledger_section_survives_a_database_without_migration_0014(tmp_path,
         report = ledger_service(
             fresh,
             settings,
-            accounts=accounts,
-            orders=SimOrderRepo(fresh, accounts),
+            sim_accounts=accounts,
+            sim_ledger=SimOrderRepo(fresh, accounts),
             fx=FxRepo(fresh),
         ).report()
         assert (report.ledger.accounts, report.ledger.orders) == (0, 0)

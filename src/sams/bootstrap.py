@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from sams.core.calendar import CalendarProvider
@@ -18,6 +19,8 @@ from sams.datasource.base import BarAdapter
 from sams.datasource.calendar_providers import default_providers
 from sams.datasource.registry import AdapterRegistry
 from sams.datasource.sources import build as build_source
+from sams.monitor.notifiers import Notifier, build_notifier_factory
+from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
 from sams.services.analysis import AnalysisService
 from sams.services.calendar import CalendarService
@@ -32,10 +35,13 @@ from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
 from sams.services.theses import ThesisService
 from sams.services.valuation import ValuationService
+from sams.storage.crypto import Cipher, cipher_for
 from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
+from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
+from sams.storage.repos.channels import ChannelRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
@@ -112,6 +118,17 @@ class Container:
     ledger: LedgerService
     #: 持仓与汇总的读用例：它只读账本，不改账本
     portfolio: PortfolioService
+    #: SIM 的账户仓库：`accounts` 这个名字属于用户账号服务（`AccountService`），
+    #: 两个都对得上名字的东西放在一起一定会被误用，所以这里带 `sim_` 前缀
+    sim_accounts: SimAccountRepo
+    #: 成交/持仓/现金的那个仓库（订单历史 + 状态）
+    sim_ledger: SimOrderRepo
+    channels_store: ChannelRepo
+    alerts_store: AlertRepo
+    #: 通道凭据的加密器：CLI 要能在不碰 `storage.services.*` 的情况下掩码
+    cipher: Cipher
+    #: 发送路由（spec §11）
+    notify: NotifyService
     health: HealthService
     source_admin: SourceAdminService
 
@@ -176,6 +193,7 @@ def build_container(
     clock: Clock | None = None,
     adapters: dict[str, BarAdapter] | None = None,
     providers: dict[str, CalendarProvider] | None = None,
+    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
 ) -> Container:
     cfg = settings or Settings.load()
     database = db or Database.open(cfg.db_path)
@@ -210,6 +228,16 @@ def build_container(
     ledger = LedgerService(sim_accounts, sim_orders, theses_store, users, cfg)
     fx_store = FxRepo(database)
     portfolio = PortfolioService(sim_accounts, sim_orders, bars, fx_store, users, clock=clock)
+    cipher = cipher_for(cfg)
+    channels_store = ChannelRepo(database, cipher=cipher, clock=clock)
+    alerts_store = AlertRepo(database, clock=clock)
+    notify = NotifyService(
+        channels_store,
+        alerts_store,
+        users,
+        bus=event_bus,
+        factory=notifier_factory if notifier_factory is not None else build_notifier_factory(),
+    )
 
     return Container(
         settings=cfg,
@@ -255,14 +283,20 @@ def build_container(
         theses=ThesisService(theses_store, users, valuation, cfg, clock=clock, orders=sim_orders),
         ledger=ledger,
         portfolio=portfolio,
+        sim_accounts=sim_accounts,
+        sim_ledger=sim_orders,
+        channels_store=channels_store,
+        alerts_store=alerts_store,
+        cipher=cipher,
+        notify=notify,
         health=HealthService(
             database,
             registry,
             calendar_store,
             cfg,
             clock=clock,
-            accounts=sim_accounts,
-            orders=sim_orders,
+            sim_accounts=sim_accounts,
+            sim_ledger=sim_orders,
             fx=fx_store,
         ),
     )

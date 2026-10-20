@@ -151,11 +151,14 @@ def flow_rows(
     )
 
 
-def make_container(db, settings, *, today: date = TODAY, **seeded):
+def make_container(db, settings, *, today: date = TODAY, notifier_factory=None, **seeded):
     """一个铺好样本库、时钟冻在 `today` 的容器：命令行与服务用例都对着同一个世界跑。
 
     放这里而不是各测试文件里抄一份，是因为两边要验的是同一条链的两端（服务给的数 /
     屏幕上那句怎么说）；两份装配一旦分叉，一边改的数就再也对不上另一边说的话。
+
+    `notifier_factory` 是给通知那一路的后门：真通道会打网络，而这条链上每一个用例
+    要断言的都是「路由把这条告警交给了哪个 kind」。
     """
     adapter = StubFundamentalsAdapter(["A"])
     container = build_container(
@@ -169,6 +172,7 @@ def make_container(db, settings, *, today: date = TODAY, **seeded):
             ),
         },
         clock=support.FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC)),
+        notifier_factory=notifier_factory,
     )
     container.registry.sleep = lambda _seconds: None
     seed(db, **seeded)
