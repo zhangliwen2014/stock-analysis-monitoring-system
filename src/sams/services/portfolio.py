@@ -33,6 +33,9 @@ class PositionRow:
     market: str
     code: str
     currency: str
+    #: 报告币种：`fx_pnl` 那一段的单位。它之前只在 `AccountSummary` 里有，所以屏幕上
+    #: 那段数一直没人认领——标错了也没人看得出
+    report_currency: str
     qty: float
     avg_cost: float
     last_price: float | None
@@ -155,6 +158,7 @@ class PortfolioService:
             market=pos.market,
             code=pos.code,
             currency=pos.currency,
+            report_currency=report,
             qty=pos.qty,
             avg_cost=pos.avg_cost,
             last_price=None,

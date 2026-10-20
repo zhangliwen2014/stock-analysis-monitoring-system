@@ -11,7 +11,7 @@ import json
 from datetime import date
 
 import pytest
-from support_valuation import make_container
+from support_valuation import DAYS, bars, make_container
 
 import sams.cli as cli
 
@@ -281,3 +281,45 @@ def test_the_same_currency_pair_is_refused_as_a_typo(container) -> None:
         )
         == 2
     )
+
+
+def test_positions_labels_the_two_pnl_halves_with_their_own_currency(
+    container, capsys
+) -> None:
+    """`price_pnl` 用标的币种、`fx_pnl` 用报告币种（§5.4 规则 3）。
+
+    共用一个后缀会在屏幕上造出一个不存在的数：1000.00 是美元、400.00 是人民币，
+    打成 `1000.00400.00 CNY` 读起来像一笔 1400 的亏损，而那是两个币种的两个量。
+    """
+    account_id = _funded(container, capsys)
+    assert (
+        invoke(
+            container, "cash", "--user", USER, "--account", account_id,
+            "--currency", "USD", "--amount", "10000", "--reason", "美元口袋",
+        )
+        == 0
+    )
+    # 美股行情：库里的 K 线只有 A/601088，所以现场铺一条恒定 20 美元的 AAPL
+    container.bars.upsert(bars(DAYS, [20.0] * len(DAYS), market="US", code="AAPL"))
+    # 买入基准 7.0、行情日 7.2 ⇒ 换汇段 = 100 股 × 现价 20 × (7.2-7.0) = 400
+    assert (
+        invoke(
+            container, "buy", "--user", USER, "--account", account_id,
+            "--market", "US", "--code", "AAPL", "--qty", "100", "--price", "10",
+            "--on", "2024-10-25", "--fx-rate", "7.0",
+        )
+        == 0
+    )
+    assert invoke(
+        container, "fx", "set", "--day", "2024-10-26", "--base", "USD",
+        "--quote", "CNY", "--rate", "7.2",
+    ) == 0
+    capsys.readouterr()
+
+    code, body = payload(container, capsys, "positions", "--user", USER, "--account", account_id)
+    assert code == 0
+    row = body["positions"][0]
+    assert row["report_currency"] == "CNY"  # 机器侧也要能问出这一段是什么币种
+    _, text = out(container, capsys, "positions", "--user", USER, "--account", account_id)
+    assert "1000.00 USD" in text and "400.00 CNY" in text
+    assert "1000.00400.00" not in text  # 两半之间必须有东西隔着，不能靠列宽挤出来

@@ -360,6 +360,7 @@ def _position_payload(row: PositionRow) -> dict:
         "market": row.market,
         "code": row.code,
         "currency": row.currency,
+        "report_currency": row.report_currency,
         "qty": row.qty,
         "avg_cost": row.avg_cost,
         "last_price": row.last_price,
@@ -448,18 +449,21 @@ def _print_positions(rows: list[PositionRow]) -> None:
     if not rows:
         print("空仓：一笔成交都还没有（`sams ledger buy --help` 看怎么记）")
         return
-    print(f"{'市场/代码':<14}{'数量':>9}{'成本':>10}{'现价':>10}{'盈亏':>11}{'换汇':>9}")
+    print(f"{'市场/代码':<14}{'数量':>9}{'成本':>10}{'现价':>10}{'价格盈亏':>17}{'换汇盈亏':>17}")
     for row in rows:
         label = f"{row.market}/{row.code}"
         if row.price_pnl is None:
-            print(f"{label:<14}{row.qty:>9g}{'—':>10}{'—':>10}{'—':>11}{'—':>9}")
+            print(f"{label:<14}{row.qty:>9g}{'—':>10}{'—':>10}{'—':>17}{'—':>17}")
             # 那一行为什么没有数，与它是 0，是两句不同的话
             print(f"    {row.unavailable_note}")
             continue
         day = f"（{row.last_price_date} 收盘）" if row.last_price_date else ""
+        # 两段各带自己的币种：`price_pnl` 在标的币种里、`fx_pnl` 在报告币种里，
+        # 共用一个后缀就是在屏幕上把两个量加成一个（§5.4 规则 3）
         print(
             f"{label:<14}{row.qty:>9g}{row.avg_cost:>10.4g}{row.last_price:>10.4g}"
-            f"{row.price_pnl:>11.2f}{row.fx_pnl:>9.2f}  {row.currency}{day}"
+            f"{row.price_pnl:>13.2f} {row.currency:<4}{row.fx_pnl:>13.2f} "
+            f"{row.report_currency}{day}"
         )
 
 
