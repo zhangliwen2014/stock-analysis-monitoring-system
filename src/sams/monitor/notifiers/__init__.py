@@ -34,20 +34,16 @@ __all__ = [
 #: 只有这两个 kind 读 `deps.env`；其余通道发不发的出去与本机有没有桌面无关
 LOCAL_KINDS = (DESKTOP, VOICE)
 
-#: kind → 模块名。延迟 import（不是在文件顶部 import 六个模块）有两个理由：
+#: kind → (模块, 类名)。延迟 import（不是在文件顶部 import 六个模块）有两个理由：
 #: 拼错 kind 时不该已经把六个通道全加载一遍，而 desktop 不可用时那一条实现根本不该被读进来。
-_MODULES = {
-    "wecom": "sams.monitor.notifiers.wecom",
-    "dingtalk": "sams.monitor.notifiers.dingtalk",
-    "pushplus": "sams.monitor.notifiers.pushplus",
-    "email": "sams.monitor.notifiers.email",
-    DESKTOP: "sams.monitor.notifiers.desktop",
-    VOICE: "sams.monitor.notifiers.voice",
+_CHANNELS = {
+    "wecom": ("sams.monitor.notifiers.wecom", "WecomNotifier"),
+    "dingtalk": ("sams.monitor.notifiers.dingtalk", "DingTalkNotifier"),
+    "pushplus": ("sams.monitor.notifiers.pushplus", "PushPlusNotifier"),
+    "email": ("sams.monitor.notifiers.email", "EmailNotifier"),
+    DESKTOP: ("sams.monitor.notifiers.desktop", "DesktopNotifier"),
+    VOICE: ("sams.monitor.notifiers.voice", "VoiceNotifier"),
 }
-
-#: 每个模块里那个通道的类都叫 `Notifier`：`wecom.Notifier` 读起来已经说清了是什么，
-#: 而六个各起一个名字（WecomNotifier / DingTalkNotifier…）会让这张表多一列映射
-_CLASS = "Notifier"
 
 
 class Post(Protocol):
@@ -175,8 +171,8 @@ def build_notifier_factory(
             # 让它们占一份 `subprocess` 依赖没有意义
             if not env.available(name):
                 return UnavailableNotifier(name, env.reason(name))
-        module = import_module(_MODULES[name])
-        return getattr(module, _CLASS)(config, deps=active)
+        module_path, class_name = _CHANNELS[name]
+        return getattr(import_module(module_path), class_name)(config, deps=active)
 
     return build
 
