@@ -11,13 +11,25 @@ import time
 from collections.abc import Callable
 
 from sams.core.errors import RateLimited
+from sams.core.retry import Sleeper, backoff_delays, call_with_backoff
 
 logger = logging.getLogger("sams.datasource.ratelimit")
 
+#: 单调秒表：只给 TokenBucket 记账用，与 `core.clock.Clock`（now_utc）不是一回事。
 Clock = Callable[[], float]
-Sleeper = Callable[[float], None]
 
 RETRYABLE = (RateLimited, OSError, TimeoutError)
+
+#: `backoff_delays`/`call_with_backoff` 的定义已上提 `core.retry`；这里重新导出是为了
+#: 让「按源退避」和「按源限速」仍然从一个模块拿——消费者不该知道内部搬过家。
+__all__ = [
+    "Clock",
+    "RETRYABLE",
+    "Sleeper",
+    "TokenBucket",
+    "backoff_delays",
+    "call_with_backoff",
+]
 
 
 class TokenBucket:
@@ -56,41 +68,3 @@ class TokenBucket:
         if wait > 0:
             self.sleep(wait)
         return wait
-
-
-def backoff_delays(attempts: int, *, base: float = 1.0, factor: float = 4.0) -> list[float]:
-    """重试之间的等待序列：3 次尝试 → [1, 4]（第 3 次失败后不再等）。"""
-    if attempts < 1:
-        raise ValueError("attempts 至少为 1")
-    return [base * factor**i for i in range(attempts - 1)]
-
-
-def call_with_backoff(
-    func: Callable[[], object],
-    *,
-    attempts: int = 3,
-    base: float = 1.0,
-    factor: float = 4.0,
-    sleep: Sleeper = time.sleep,
-    retryable: tuple[type[BaseException], ...] = RETRYABLE,
-    label: str = "",
-) -> object:
-    """退避重试；最后一次仍失败则原样抛出，由调用方（路由器）决定降级还是上抛。"""
-    delays = backoff_delays(attempts, base=base, factor=factor)
-    last: BaseException | None = None
-    for index in range(attempts):
-        try:
-            return func()
-        except retryable as exc:
-            last = exc
-            if index < len(delays):
-                logger.warning(
-                    "%s 第 %d 次失败（%s），%.1fs 后重试",
-                    label or "调用",
-                    index + 1,
-                    type(exc).__name__,
-                    delays[index],
-                )
-                sleep(delays[index])
-    assert last is not None  # 循环必然至少失败一次才会走到这里
-    raise last
