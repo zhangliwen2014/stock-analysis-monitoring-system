@@ -101,6 +101,19 @@ class Database:
         )
         return sorted(rows["table_name"].to_list()) if not rows.is_empty() else []
 
+    def columns(self, table: str) -> set[str]:
+        """一张表的列名集合。
+
+        健康报告用它做护栏：`0015` 之前建的库没有 `outcome` 那一列，按列名的 SQL 会当场
+        报错，而「通知好不好用」这个问题不该让整份健康报告跑不起来。
+        """
+        rows = self.query(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND table_name = ?",
+            [table],
+        )
+        return set(rows["column_name"].to_list()) if not rows.is_empty() else set()
+
     def row_count(self, table: str) -> int:
         if table not in self.table_names():
             raise StorageError(f"表不存在: {table}")
