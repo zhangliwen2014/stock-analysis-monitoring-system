@@ -30,7 +30,9 @@ ALLOWED: dict[str, set[str]] = {
     "datasource": {"core"},
     "services": {"core", "storage", "datasource", "analysis"},
     "analysis": {"core"},
-    "monitor": {"core", "storage", "datasource", "services", "analysis"},
+    # monitor 只许认识 core 与 storage：路由住在这里（`monitor/router.py`），而 services
+    # 不许 import monitor——放宽这三项等于把 monitor 与 services 长成一块
+    "monitor": {"core", "storage"},
     "trading": {"core", "storage", "services", "analysis"},
     "cli": {"core", "services"},
 }
@@ -82,15 +84,20 @@ def _imports(path: Path) -> list[tuple[str, ...]]:
 GATED: dict[str, tuple[str, ...]] = {
     "duckdb": ("storage/db.py",),
     "bcrypt": ("storage/repos/users.py",),
-    "requests": ("datasource",),
+    # 通道实现也要发 HTTP：但只许在通道文件里，router/CLI 碰不到 requests
+    "requests": ("datasource", "monitor/notifiers"),
     "akshare": ("datasource",),
     "yfinance": ("datasource",),
     "exchange_calendars": ("datasource",),
     # M1 没有任何模块需要 pandas：跨层传 DataFrame 一律 Polars（D13），
     # 边界处转 pandas 是 M5 与 backtrader 对接时才开的小口
     "pandas": (),
-    # Fernet 属 M2 的通道加密，落点届时加进 storage
-    "cryptography": (),
+    # Fernet 只许住在 storage/crypto.py：通道凭据的加解密是存储层的细节，
+    # 谁都能 import cryptography 就等于谁都能自己决定怎么存别人的密钥
+    "cryptography": ("storage/crypto.py",),
+    # 桌面与语音通道只能起本机进程；`env` 探测件不许起进程（它只读环境变量）
+    "subprocess": ("monitor/notifiers",),
+    "smtplib": ("monitor/notifiers/email.py",),
 }
 
 
@@ -231,3 +238,25 @@ def test_imports_point_downward(path: Path):
             f"{path.relative_to(SRC)}：{own} 层不得 import {target} 层，"
             f"允许的是 {sorted(ALLOWED[own])}"
         )
+
+
+def test_monitor_may_only_reach_core_and_storage():
+    """`monitor` 的许可是 `{core, storage}`，不是声明里那个更宽的集合。
+
+    收紧的理由只有一条：路由（`monitor/router.py`）住在 monitor，而 `services` 不许
+    import `monitor`。如果 monitor 又能 import services，两边就会长成一个大模块——
+    「谁认识谁」这件事不再有一个可检查的答案。
+    """
+    assert ALLOWED["monitor"] == {"core", "storage"}
+
+
+def test_notify_transports_have_a_home_and_nowhere_else():
+    assert _allowed_here("monitor/notifiers/wecom.py", GATED["requests"][1]), (
+        "通道实现要能落在 monitor/notifiers，但不能顺手扩到整个 monitor 层：发送侧的"
+        "HTTP 只许出现在通道文件里，router 与 CLI 碰不到 requests"
+    )
+    assert not _allowed_here("monitor/router.py", GATED["requests"][1])
+    assert _allowed_here("monitor/notifiers/email.py", GATED["smtplib"][0])
+    assert _allowed_here("monitor/notifiers/desktop.py", GATED["subprocess"][0])
+    assert not _allowed_here("monitor/env.py", GATED["subprocess"][0])
+    assert GATED["cryptography"] == ("storage/crypto.py",)
