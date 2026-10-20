@@ -260,3 +260,21 @@ def test_notify_transports_have_a_home_and_nowhere_else():
     assert _allowed_here("monitor/notifiers/desktop.py", GATED["subprocess"][0])
     assert not _allowed_here("monitor/env.py", GATED["subprocess"][0])
     assert GATED["cryptography"] == ("storage/crypto.py",)
+
+
+def test_cli_never_reaches_for_plaintext_credentials():
+    """§4.2「屏幕上永远不许出现明文凭据」由机器看着，而不是靠某个模块的自觉。
+
+    导入守卫挡不住这件事：`cli` 拿得到整个 Container，`container.channels_store` 就在手边，
+    一次 `credentials(...)` 就能把别人的 webhook key 打进终端。所以这条按**属性名**拦——
+    那个取明文的入口在仓库层只有一个，认识名字就认识不了绕过。
+    """
+    offenders: list[str] = []
+    for path in sorted((SRC / "cli").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(
+            isinstance(node, ast.Attribute) and node.attr == "credentials"
+            for node in ast.walk(tree)
+        ):
+            offenders.append(str(path.relative_to(SRC)))
+    assert offenders == [], f"CLI 里出现了取明文凭据的调用：{offenders}"
