@@ -5,12 +5,52 @@
 
 from __future__ import annotations
 
+import argparse
 import getpass
+import json
 from argparse import _SubParsersAction
-from datetime import date
+from datetime import UTC, date
 
 from sams.core.errors import ValidationError
 from sams.core.fundamentals import RATIO_BOUNDS, out_of_caliber
+
+
+def exit_for(exc: Exception) -> int:
+    """1 与 2 的分界只在这里写一遍（D77）：认得出的错在参数上就是 2，其余是业务拒绝。
+
+    脚本对两者的处置不同：2 是敲错了，重来多少次都一样；1 是这条记录还没到那一步，
+    补数据或走完上一步就能重跑。把这条线抄在两个命令模块里，总有一处会先失效。
+    """
+    return 2 if isinstance(exc, ValidationError) else 1
+
+
+def emit(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def refused(args: argparse.Namespace, exc: Exception, code: int) -> int:
+    """拒绝也要有 JSON（D57）：管道里读的人拿到的是一句原因加一个码，不是一个空 stdin。"""
+    if getattr(args, "json", False):
+        emit({"status": "refused", "reason": str(exc), "exit": code})
+    else:
+        print(f"{exc}")
+    return code
+
+
+def stamp(value) -> str:
+    """时间戳统一到 UTC 再落屏，并把时区说出来。
+
+    DuckDB 对 `TIMESTAMPTZ` 的回读不稳定：`theses.created_at` 回来是 UTC，
+    `thesis_events.ts` 与 `sim_orders.ts` 回来是会话本地时区（Asia/Shanghai）。两者是同一个
+    瞬间，但按原样 `strftime` 会在同一屏上印出「立论 15:00 / 时间线 23:00」——看着像事件比
+    记录晚八小时，而这一屏的用意正是回看「什么时候走了哪一步」（D80）。
+    到秒：两步落在同一分钟里时（脚本、M3 的触发器），分是分辨不出先后的。
+    """
+    if value is None:
+        return "–"
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC)
+    return f"{value:%Y-%m-%d %H:%M:%S} UTC"
 
 
 def group(subparsers: _SubParsersAction, name: str, help_text: str) -> _SubParsersAction:

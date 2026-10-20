@@ -25,6 +25,7 @@ from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
+from sams.services.actors import resolve_actor
 from sams.services.valuation import STYLE_NAMES, ValuationRead, ValuationService
 from sams.storage.repos.theses import (
     HIT_STOP,
@@ -37,7 +38,7 @@ from sams.storage.repos.theses import (
     ThesisRepo,
     missing_levels_for_opened,
 )
-from sams.storage.repos.users import ACTIVE, User, UserRepo
+from sams.storage.repos.users import User, UserRepo
 
 #: 命令行要念的状态词表与 `--style` 的候选名，都是下层那张表的转述（抄第二份就会分叉）
 STATUS_NAMES = STATUSES
@@ -317,18 +318,7 @@ class ThesisService:
     # --- 内部 ------------------------------------------------------------------------------
 
     def _actor(self, username: str) -> User:
-        user = self.users.get_by_username((username or "").strip())
-        if user is None:
-            raise ValidationError(
-                f"没有用户 {username!r}：先 `sams user add {username}`"
-                "（归属只认用户名，屏幕上的 `--user` 也是它）"
-            )
-        if user.status != ACTIVE:
-            raise ValidationError(
-                f"用户 {username} 已被禁用：启用之后才能读写 thesis，"
-                "否则「禁用即停止一切动作」这条就不成立"
-            )
-        return user
+        return resolve_actor(self.users, username)
 
     def _known_market(self, market: str) -> None:
         """市场要在配置里，否则这条 thesis 永远读不到行情（D84）。

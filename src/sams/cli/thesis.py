@@ -12,11 +12,9 @@
 from __future__ import annotations
 
 import argparse
-import json
-from datetime import UTC
 
 from sams.bootstrap import Container
-from sams.cli.common import group, iso_date, ratio_arg
+from sams.cli.common import emit, exit_for, group, iso_date, ratio_arg, refused, stamp
 from sams.core.errors import StorageError, ValidationError
 from sams.core.fundamentals import ROE_BASIS, ROE_BASIS_ANNUAL
 from sams.services.theses import STATUS_NAMES, ThesisReport
@@ -163,11 +161,11 @@ def run_add(container: Container, args: argparse.Namespace) -> int:
             roe_basis=args.roe_basis,
         )
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, _exit_for(exc))
+        return refused(args, exc, exit_for(exc))
     code = 0 if report.complete else 1
     nxt = container.theses.next_steps(report.thesis.status)
     if args.json:
-        _emit(_report_payload(report, code, nxt))
+        emit(_report_payload(report, code, nxt))
         return code
     return _print_report(report, code, next_steps=nxt)
 
@@ -176,9 +174,9 @@ def run_list(container: Container, args: argparse.Namespace) -> int:
     try:
         rows = container.theses.list(args.user, status=args.status)
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, _exit_for(exc))
+        return refused(args, exc, exit_for(exc))
     if args.json:
-        _emit(
+        emit(
             {
                 "status": "ok",
                 "exit": 0,
@@ -213,11 +211,11 @@ def run_show(container: Container, args: argparse.Namespace) -> int:
             roe_basis=args.roe_basis,
         )
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, _exit_for(exc))
+        return refused(args, exc, exit_for(exc))
     code = 0 if report.complete else 1
     nxt = container.theses.next_steps(report.thesis.status)
     if args.json:
-        _emit(_report_payload(report, code, nxt))
+        emit(_report_payload(report, code, nxt))
         return code
     return _print_report(report, code, next_steps=nxt)
 
@@ -228,10 +226,10 @@ def run_advance(container: Container, args: argparse.Namespace) -> int:
             args.user, args.thesis_id, args.to, note=args.note
         )
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, _exit_for(exc))
+        return refused(args, exc, exit_for(exc))
     nxt = container.theses.next_steps(thesis.status)
     if args.json:
-        _emit(
+        emit(
             {
                 "status": "ok",
                 "exit": 0,
@@ -276,12 +274,12 @@ def run_revise(container: Container, args: argparse.Namespace) -> int:
             **given,
         )
     except (ValidationError, StorageError) as exc:
-        return _refused(args, exc, _exit_for(exc))
+        return refused(args, exc, exit_for(exc))
     # 要求重算而一栏都没落下来 ⇒ 这次没算出任何可写的数（退出码 1），不是「改好了」
     code = 1 if not report.complete or (args.from_plan and not report.written) else 0
     nxt = container.theses.next_steps(report.thesis.status)
     if args.json:
-        _emit(_report_payload(report, code, nxt))
+        emit(_report_payload(report, code, nxt))
         return code
     return _print_report(report, code, next_steps=nxt)
 
@@ -295,8 +293,8 @@ def _print_report(report: ThesisReport, code: int, *, next_steps: tuple[str, ...
     print(f"  id    {thesis.id}")
     print(
         f"  归属  {report.username}"
-        f"  立论 {_stamp(thesis.created_at)}  更新 {_stamp(thesis.updated_at)}"
-        + (f"  归档 {_stamp(thesis.archived_at)}" if thesis.archived_at else "")
+        f"  立论 {stamp(thesis.created_at)}  更新 {stamp(thesis.updated_at)}"
+        + (f"  归档 {stamp(thesis.archived_at)}" if thesis.archived_at else "")
     )
     if not report.has_levels:
         print("  价位    空着（建仓那一步会被拒：止损/目标/赔率三列都得有数）")
@@ -313,7 +311,7 @@ def _print_report(report: ThesisReport, code: int, *, next_steps: tuple[str, ...
     print("  ── 时间线 ──")
     for event in report.events:
         print(
-            f"    {_stamp(event.ts)}  {_jump(event.from_status, event.to_status)}"
+            f"    {stamp(event.ts)}  {_jump(event.from_status, event.to_status)}"
             f"  {_who(event, thesis, report.username)}"
             + (f"  {event.note}" if event.note else "")
         )
@@ -460,28 +458,6 @@ def _thesis_payload(thesis) -> dict:
     }
 
 
-def _exit_for(exc: Exception) -> int:
-    """1 与 2 的分界只在这里写一遍（D77）：认得出的错在参数上就是 2，其余是业务拒绝。
-
-    脚本对两者的处置不同：2 是敲错了，重来多少次都一样；1 是这条记录还没到那一步，
-    补数据或走完上一步就能重跑。把这条线抄在五个 handler 里，总有一处会先失效。
-    """
-    return 2 if isinstance(exc, ValidationError) else 1
-
-
-def _refused(args: argparse.Namespace, exc: Exception, code: int) -> int:
-    """拒绝也要有 JSON（D57）：管道里读的人拿到的是一句原因加一个码，不是一个空 stdin。"""
-    if args.json:
-        _emit({"status": "refused", "reason": str(exc), "exit": code})
-    else:
-        print(f"{exc}")
-    return code
-
-
-def _emit(payload: dict) -> None:
-    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-
-
 def _ratio(value: str | None) -> float | None:
     return None if value is None else ratio_arg("--roe-estimate", value)
 
@@ -506,19 +482,3 @@ def _range(low: float | None, high: float | None) -> str:
     if low == high:
         return _money(low)
     return f"{_money(low)}~{_money(high)}"
-
-
-def _stamp(value) -> str:
-    """时间戳统一到 UTC 再落屏，并把时区说出来。
-
-    DuckDB 对 `TIMESTAMPTZ` 的回读不稳定：`theses.created_at` 回来是 UTC，
-    `thesis_events.ts` 回来是会话本地时区（Asia/Shanghai）。两者是同一个瞬间，但按
-    原样 `strftime` 会在同一屏上印出「立论 15:00 / 时间线 23:00」——看着像事件比记录晚
-    八小时，而这一屏的用意正是回看「什么时候走了哪一步」。
-    到秒：两步落在同一分钟里时（脚本、M3 的触发器），分是分辨不出先后的。
-    """
-    if value is None:
-        return "–"
-    if value.tzinfo is not None:
-        value = value.astimezone(UTC)
-    return f"{value:%Y-%m-%d %H:%M:%S} UTC"

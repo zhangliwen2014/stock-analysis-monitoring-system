@@ -15,7 +15,8 @@ from datetime import date
 
 from sams.core import funds
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError
+from sams.services.actors import resolve_actor
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import (
@@ -24,6 +25,7 @@ from sams.storage.repos.ledger import (
     SimAccountRepo,
     SimOrderRepo,
 )
+from sams.storage.repos.users import User, UserRepo
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,7 @@ class PortfolioService:
         orders: SimOrderRepo,
         bars: BarRepo,
         fx: FxRepo,
+        users: UserRepo,
         *,
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
@@ -117,15 +120,19 @@ class PortfolioService:
         self.orders = orders
         self.bars = bars
         self.fx = fx
+        self.users = users
         self.clock = clock
 
-    def positions(self, user_id: str, account_id: str) -> list[PositionRow]:
+    def positions(self, username: str, account_id: str) -> list[PositionRow]:
+        return self._positions(resolve_actor(self.users, username), account_id)
+
+    def _positions(self, user: User, account_id: str) -> list[PositionRow]:
         """当前持仓逐行给出（已清仓的不出现）；报告币种取的是**账户**那一列。
 
-        读也带 user_id：与 `repos/theses.py` 同形，不提供「查全量再由调用方过滤」的接口
+        读也带归属：与 `repos/theses.py` 同形，不提供「查全量再由调用方过滤」的接口
         ——后者把隔离交给每一个调用方，总有一个忘记。
         """
-        account = self._account(user_id, account_id)
+        account = self._account(user, account_id)
         rows: list[PositionRow] = []
         for pos in self.orders.positions(account_id):
             if pos.qty <= 0:
@@ -133,10 +140,14 @@ class PortfolioService:
             rows.append(self._one(account_id, pos, account.report_currency))
         return rows
 
-    def _account(self, user_id: str, account_id: str) -> Account:
-        account = self.accounts.get(user_id, account_id)
+    def _account(self, user: User, account_id: str) -> Account:
+        """1 不是 2（D77）：`--account` 这个参数没写错，错的是库里没有（或不是你的）这笔账。
+
+        写用例那边给的也是 1：同一个条件给两个退出码，脚本按哪个分支都是赌。
+        """
+        account = self.accounts.get(user.id, account_id)
         if account is None:
-            raise ValidationError(f"账户 {account_id} 不存在或不属于用户 {user_id}")
+            raise StorageError(f"账户 {account_id} 不存在或不属于用户 {user.username}")
         return account
 
     def _one(self, account_id: str, pos: Position, report: str) -> PositionRow:
@@ -233,14 +244,15 @@ class PortfolioService:
             entries.append((order.qty, order.fx_rate_ref, False))
         return funds.weighted_rate(entries)
 
-    def summary(self, user_id: str, account_id: str) -> AccountSummary:
+    def summary(self, username: str, account_id: str) -> AccountSummary:
         """账户汇总：先按币种给出本币小计，再逐笔换算（§5.4 规则 2/3）。
 
         把所有币种的数额直接相加报成一个数，是比「算错」更隐蔽的错：它看着完全正常。
         所以换不出的那一笔不进合计，但一定在 `notes` 里点名。
         """
-        account = self._account(user_id, account_id)
-        rows = self.positions(user_id, account_id)
+        user = resolve_actor(self.users, username)
+        account = self._account(user, account_id)
+        rows = self._positions(user, account_id)
         as_of = self._as_of(rows)
         notes: list[str] = []
         value_by_ccy: dict[str, float] = {}
@@ -280,7 +292,7 @@ class PortfolioService:
             realized_report=self._realized(account, as_of, notes),
             as_of=as_of,
             notes=tuple(notes),
-            duplicate_holdings=self.duplicate_holdings(user_id, account_id),
+            duplicate_holdings=self._duplicate_holdings(user.id, account_id),
         )
 
     def _as_of(self, rows: list[PositionRow]) -> date:
@@ -323,7 +335,10 @@ class PortfolioService:
             )
         return out
 
-    def duplicate_holdings(self, user_id: str, account_id: str) -> tuple[str, ...]:
+    def duplicate_holdings(self, username: str, account_id: str) -> tuple[str, ...]:
+        return self._duplicate_holdings(resolve_actor(self.users, username).id, account_id)
+
+    def _duplicate_holdings(self, user_id: str, account_id: str) -> tuple[str, ...]:
         """本账户里那些「在别的账户也有一份」的标的。
 
         库里不冲突（`sim_positions` 主键带 account_id），但读的人会以为一只票坏了：

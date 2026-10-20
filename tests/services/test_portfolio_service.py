@@ -8,15 +8,16 @@ import polars as pl
 import pytest
 from support import FrozenClock
 
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError, ValidationError
 from sams.services.portfolio import PortfolioService
 from sams.storage.db import Database
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.symbols import SymbolRepo
+from sams.storage.repos.users import UserRepo
 
-USER = "u1"
+USER = "trader"
 DAY = date(2024, 10, 25)
 #: 冻住的「今天」：只有现金没有持仓时，换算锚在这一天（TODAY − DAY = 1，在陈旧窗口内）
 TODAY = date(2024, 10, 26)
@@ -43,13 +44,23 @@ def _bars(market: str, code: str, closes: list[tuple[date, float]]) -> pl.DataFr
 def portfolio(db: Database, settings) -> PortfolioService:
     accounts = SimAccountRepo(db)
     orders = SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db))
+    users = UserRepo(db)
+    users.create(USER, "correct-horse-battery")
     return PortfolioService(
         accounts,
         orders,
         BarRepo(db),
         FxRepo(db),
+        users,
         clock=FrozenClock(datetime(2024, 10, 26, 2, 0, tzinfo=UTC)),
     )
+
+
+def _uid(portfolio: PortfolioService) -> str:
+    """库里认的是 `users.id`，屏幕上打的是用户名：这一步解析由服务自己做（下面的仓库
+    直写用例要自己取那个 id，好让「用 `USER` 读」这条路测到的是解析，不是巧合）。
+    """
+    return portfolio.users.get_by_username(USER).id
 
 
 def _funded_position(
@@ -62,13 +73,13 @@ def _funded_position(
     fx_rate_ref: float | None = None,
 ) -> str:
     currency = {"A": "CNY", "HK": "HKD", "US": "USD"}[market]
-    account = portfolio.accounts.open(USER, f"账户 {market}", report_currency="CNY")
+    account = portfolio.accounts.open(_uid(portfolio), f"账户 {market}", report_currency="CNY")
     portfolio.accounts.adjust_cash(
         account.id, currency, 1_000_000.0, reason="初始", actor_id=USER
     )
     portfolio.orders.record_fill(
         account_id=account.id,
-        user_id=USER,
+        user_id=_uid(portfolio),
         market=market,
         code=code,
         side="buy",
@@ -164,17 +175,26 @@ def test_a_position_missing_its_base_rate_is_not_split(db, portfolio) -> None:
 
 
 def test_an_unknown_account_is_refused(db, portfolio) -> None:
-    """读也带 user_id：不提供「查全量再由调用方过滤」的接口，隔离不该指望每个调用方都记得。"""
-    with pytest.raises(ValidationError, match="不存在"):
+    """读也带 user_id：不提供「查全量再由调用方过滤」的接口，隔离不该指望每个调用方都记得。
+
+    是 StorageError 不是 ValidationError（1 不是 2）：`--account` 这个参数没写错，
+    错的是库里没有这笔账——同一个条件在写用例那边给的也是 1。
+    """
+    with pytest.raises(StorageError, match="不存在"):
         portfolio.positions(USER, "no-such-account")
-    with pytest.raises(ValidationError, match="不存在"):
+    with pytest.raises(StorageError, match="不存在"):
         portfolio.summary(USER, "no-such-account")
+
+
+def test_an_unknown_username_is_refused_before_the_library_is_queried(portfolio) -> None:
+    with pytest.raises(ValidationError, match="sams user add"):
+        portfolio.positions("trder", "any-account")
 
 
 def _buy(portfolio: PortfolioService, account_id: str, **over) -> None:
     args = {
         "account_id": account_id,
-        "user_id": USER,
+        "user_id": _uid(portfolio),
         "market": "A",
         "code": "601088",
         "side": "buy",
@@ -189,7 +209,7 @@ def _buy(portfolio: PortfolioService, account_id: str, **over) -> None:
 def _sell(portfolio: PortfolioService, account_id: str, **over) -> None:
     args = {
         "account_id": account_id,
-        "user_id": USER,
+        "user_id": _uid(portfolio),
         "market": "A",
         "code": "601088",
         "side": "sell",
@@ -267,7 +287,7 @@ def test_realized_pnl_is_its_own_line_and_not_part_of_the_position_change(db, po
 
 def test_a_cash_only_account_anchors_the_conversion_to_the_clock(db, portfolio) -> None:
     """没有持仓就没有「行情日」，这时才问钟：锚的是注入的那一天，不是墙钟。"""
-    account = portfolio.accounts.open(USER, "只有现金", report_currency="CNY")
+    account = portfolio.accounts.open(_uid(portfolio), "只有现金", report_currency="CNY")
     portfolio.accounts.adjust_cash(account.id, "USD", 1_000.0, reason="初始", actor_id=USER)
     FxRepo(db).put(TODAY, "USD", "CNY", 7.0, source="manual")
     summary = portfolio.summary(USER, account.id)
@@ -277,7 +297,7 @@ def test_a_cash_only_account_anchors_the_conversion_to_the_clock(db, portfolio) 
 def test_a_position_held_in_two_accounts_is_called_out(db, portfolio) -> None:
     """库里不冲突（主键带 account_id），但读的人会以为是数据坏了。"""
     first = _funded_position(portfolio)
-    second = portfolio.accounts.open(USER, "副账户", report_currency="CNY").id
+    second = portfolio.accounts.open(_uid(portfolio), "副账户", report_currency="CNY").id
     portfolio.accounts.adjust_cash(second, "CNY", 100_000.0, reason="初始", actor_id=USER)
     _buy(portfolio, second, qty=100, price=40.0)
     summary = portfolio.summary(USER, first)
