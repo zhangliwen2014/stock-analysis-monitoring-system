@@ -17,6 +17,7 @@ from sams.core.errors import DatasourceError
 from sams.datasource.actions import has_actions
 from sams.datasource.base import has_bars
 from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
+from sams.datasource.fx import has_fx
 from sams.datasource.listed_date import has_listed_date
 
 
@@ -40,6 +41,10 @@ CAPABILITIES: dict[str, Capability] = {
     # 主档的一格，不是一类数据：它不走 `_walk`（没有窗口，也不记源健康），
     # 但「哪个源能给」仍然只在这里答一次，好让 `chain_for` 与目录用同一份判据
     "listed_date": Capability(label="上市日期", lacking="不提供上市日期", probe=has_listed_date),
+    # 汇率也没有「市场」这个维度（USD→CNY 与哪个市场无关），所以它不走 `chain_for`
+    # 与 `_walk`，由 `registry.fetch_fx` 自己按注册顺序走一遍。登记在这张表里是为了让
+    # 「谁能给汇率」与其余五种共用同一份判据：健康页、目录、降级链三处不会各说一套
+    "fx_rate": Capability(label="汇率", lacking="不提供汇率", probe=has_fx),
 }
 
 

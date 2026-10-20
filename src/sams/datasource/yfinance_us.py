@@ -7,6 +7,10 @@
 估值（`valuation`）在这里只是**当日一行**的快照，理由与它不给 `financials` 是同一个，
 两条都写在 `datasource/test_yfinance_valuation.py` 的模块文档里：Yahoo 给不出
 「这一期是什么时候公开的」，而 D61 的 PIT 闸门只认披露日。
+
+汇率（`fx_rate`）也挂在这个类上，是同一条理由：它与日线是同一个源的第四种能力（D38），
+拆成第五个 kind 会让「Yahoo 挂了」变成两条互不相干的告警。它没有市场维度，所以不走
+`chain_for` 那条按 `(market, code)` 路由的链，由 `registry.fetch_fx` 自己按注册顺序问一遍。
 """
 
 from __future__ import annotations
@@ -26,8 +30,10 @@ from sams.datasource.base import (
     code_in_market,
     normalize_bars,
     parses_as_date,
+    to_date_expr,
 )
 from sams.datasource.fundamentals import normalize_valuation
+from sams.datasource.fx import normalize_fx
 from sams.datasource.sources import source
 
 logger = logging.getLogger("sams.datasource")
@@ -333,5 +339,54 @@ class YfinanceAdapter:
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
 
+    def fx_rate(self, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
+        """1 单位 base = ? 单位 quote：`{base}{quote}=X` 是 Yahoo 的外汇代码。
 
-source("yfinance", note="yfinance 港美股日线 + 公司行为 + 当日估值快照（Yahoo）")(YfinanceAdapter)
+        只按请求的方向拼代码，绝不反过来请求再取倒数：方向写反的症状是「大约对」，
+        而持仓那一屏的换汇影响会带着这个错一直算下去（§5.4 规则 2）。
+        周末与假日没有报价是这条序列的正常形状，这里既不补值也不报错。
+        """
+        symbol = f"{base}{quote}=X"
+        try:
+            frame = self._fetch(symbol, start, end)
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+        if frame is None or frame.empty:
+            raise EmptyResponse("yfinance", f"{symbol} 在 {start}~{end} 没有数据")
+        flatten_columns(frame)
+        prepared = frame.reset_index()
+        prepared.columns = [str(column) for column in prepared.columns]
+        pl_frame = pl.from_pandas(prepared)
+        date_column = next(
+            (
+                column
+                for column in pl_frame.columns
+                if column.lower() in DATE_INDEX_NAMES and parses_as_date(pl_frame, column)
+            ),
+            None,
+        )
+        if date_column is None or "Close" not in pl_frame.columns:
+            raise FieldDrift(
+                "yfinance",
+                f"{symbol} 的响应里读不出日期列或收盘价，实际列 {pl_frame.columns}",
+            )
+        return normalize_fx(
+            pl.DataFrame(
+                {
+                    "date": pl_frame.select(to_date_expr(pl.col(date_column))).to_series(),
+                    "base": [base] * pl_frame.height,
+                    "quote": [quote] * pl_frame.height,
+                    "rate": pl_frame["Close"],
+                }
+            ),
+            base=base,
+            quote=quote,
+            source=self.name,
+        )
+
+
+source("yfinance", note="yfinance 港美股日线 + 公司行为 + 当日估值快照 + 汇率（Yahoo）")(
+    YfinanceAdapter
+)

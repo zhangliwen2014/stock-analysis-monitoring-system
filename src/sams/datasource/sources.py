@@ -37,6 +37,7 @@ _NOT_ADAPTERS = frozenset(
         "capabilities",
         "fundamentals",
         "listed_date",
+        "fx",
         "akshare_actions",
     }
 )

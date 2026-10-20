@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 import pytest
 from support_valuation import make_container
@@ -239,3 +240,44 @@ def test_an_unconvertable_cash_is_named_in_the_text_summary(container, capsys) -
     code, body = out(container, capsys, "summary", "--user", USER, "--account", account_id)
     assert code == 0
     assert "USD" in body and "未计入" in body
+
+
+# ---------- 手工汇率：`sams ledger fx set`（采集链失败时的出口） ----------
+
+
+def _fx_set(*extra: str) -> tuple[str, ...]:
+    return ("fx", "set", "--day", "2024-10-25", "--base", "USD", "--quote", "CNY", *extra)
+
+
+def test_a_manual_fx_rate_is_written_and_names_its_source(container, capsys) -> None:
+    """手工填的那一行必须在库里**看得出是手工的**：否则下次同步覆盖它时，
+    没人知道自己丢掉的是 Yahoo 的数还是自己手敲的数。"""
+    code, body = payload(container, capsys, *_fx_set("--rate", "7.1"))
+    assert code == 0
+    assert body["rate"]["source"] == "manual"
+    stored = container.fx_store.get(date(2024, 10, 25), "USD", "CNY")
+    assert stored.rate == pytest.approx(7.1)
+    assert stored.source == "manual"
+
+
+def test_the_manual_rate_screen_says_which_direction_was_written(container, capsys) -> None:
+    """屏幕上要说清「1 USD = 7.1 CNY」：只印一个 7.1，下一行就被读成倒数。"""
+    code, body = out(container, capsys, *_fx_set("--rate", "7.1"))
+    assert code == 0
+    assert "USD→CNY" in body
+
+
+def test_a_zero_rate_is_a_parameter_error(container) -> None:
+    """0 不是「没有汇率」而是一个会毁掉换算的数：仓库层当场拒收，这里给出 2。"""
+    assert invoke(container, *_fx_set("--rate", "0")) == 2
+
+
+def test_the_same_currency_pair_is_refused_as_a_typo(container) -> None:
+    """CNY→CNY 恒为 1，写进库会让下一次读它的人以为那天真的换过汇。"""
+    assert (
+        invoke(
+            container, "fx", "set", "--day", "2024-10-25", "--base", "CNY",
+            "--quote", "CNY", "--rate", "1",
+        )
+        == 2
+    )

@@ -28,6 +28,7 @@ from sams.datasource.fundamentals import (
     empty_flow,
     empty_valuation,
 )
+from sams.datasource.fx import empty_fx, has_fx
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
 from sams.datasource.sources import known
@@ -75,13 +76,18 @@ class Attempt:
 
 
 class _SourceFailed(Exception):
-    """内部信号：把「这个源这次实际被调了几次」带出 `_call`。"""
+    """内部信号：把「这个源这次实际被调了几次」带出 `_call`。
 
-    def __init__(self, source: str, tries: int, error: str) -> None:
+    `cause` 是原始异常而不只是它的文字：汇率那条链要按「全链是不是都只抖了一下」决定
+    这次算 `TransientError` 还是算一句永久的失败，而类型在字符串里活不下来。
+    """
+
+    def __init__(self, source: str, tries: int, error: str, cause: Exception | None = None) -> None:
         super().__init__(error)
         self.source = source
         self.tries = tries
         self.error = error
+        self.cause = cause
 
 
 @dataclass(frozen=True)
@@ -168,6 +174,34 @@ class FrameResult:
     @property
     def degraded(self) -> bool:
         return len(self.attempts) > 1
+
+
+@dataclass(frozen=True)
+class FxResult:
+    """汇率链的返回，与 `FrameResult` 同一侧：0 行要说清是「源答了没有」还是「源没答」。
+
+    不复用 `FrameResult`：它的必填字段是 `market`/`code`，而外汇没有市场维度——
+    把 `market=""` 塞进去，每一句拒绝文案与每一行日志都会多出两个读不通的空格。
+    """
+
+    base: str
+    quote: str
+    frame: pl.DataFrame
+    source: str
+    attempts: tuple[Attempt, ...] = ()
+    #: 链上没有 `fx_rate` 的源（D38）：「谁能给汇率」与健康页共用一份判据
+    skipped: tuple[tuple[str, str], ...] = ()
+    #: 每个有能力的源都独立答了「这段没有报价」时才非空（D36）
+    confirmed_empty_by: tuple[str, ...] = ()
+
+    @property
+    def degraded(self) -> bool:
+        return len(self.attempts) > 1
+
+    @property
+    def empty_everywhere(self) -> bool:
+        """全链都答了「没有」，且一个都没答上——这才是可以落库的「确实没有」。"""
+        return bool(self.confirmed_empty_by) and self.frame.is_empty()
 
 
 @dataclass
@@ -525,6 +559,124 @@ class AdapterRegistry:
                 else ""
             ),
         )
+
+    def fetch_fx(self, base: str, quote: str, start: date, end: date) -> FxResult:
+        """汇率链：注册表里所有「提供汇率」的源，按注册顺序试，与 `market_sources` 无关。
+
+        不走 `chain_for` / `_walk` 是因为外汇没有市场维度，那两个是按 `(market, code)`
+        路由的；仍然记源健康、仍然在连续失败时发 SystemAlarm——「汇率取不到」的后果
+        （跨币种持仓的换汇影响拆不出）与「日线取不到」同量级，不能只让服务层的 notes
+        单独承担。
+
+        一次问整段区间（问 `start` 那天，收下源给的全部行）而不是按日循环：按日循环会把
+        一次限流风险变成三十次，而汇价是连续序列，逐日问的答复不会比一次问的多。
+
+        **「源答了这段没有」是一句答复，「源挂了」不是**（D36/D43，与日线同侧）：
+        只有每个有能力的源都说了没有，才攒成一次可落库的确认 `confirmed_empty_by`。
+        """
+        cap = capability("fx_rate")
+        attempts: list[Attempt] = []
+        skipped: list[tuple[str, str]] = []
+        empties: list[str] = []
+        failed: list[tuple[str, Exception]] = []
+        for name in self.adapters:
+            adapter = self.adapter(name)
+            if not has_fx(adapter):
+                logger.info("汇率 跳过 %s（链上没有这个能力）", name)
+                skipped.append((name, cap.lacking))
+                continue
+            try:
+                frame = self._call_fx(name, base, quote, start, end)
+            except _SourceFailed as exc:
+                attempts.append(Attempt(name, False, exc.tries, exc.error))
+                failed.append((name, exc.cause))
+                continue
+            except EmptyResponse as exc:
+                attempts.append(Attempt(name, True, 1, f"无数据: {exc}"))
+                empties.append(name)
+                logger.info("汇率 %s 说 %s→%s 这段没有数据，换源", name, base, quote)
+                continue
+            self._mark_ok(name)
+            attempts.append(Attempt(name, True))
+            return FxResult(
+                base, quote, frame, name, tuple(attempts), tuple(skipped)
+            )
+
+        if empties and not failed:
+            return FxResult(
+                base,
+                quote,
+                empty_fx(),
+                empties[0],
+                tuple(attempts),
+                tuple(skipped),
+                confirmed_empty_by=tuple(empties),
+            )
+
+        detail = "；".join(f"{name}: {cause}" for name, cause in failed) or "（无）"
+        said_no = "、".join(empties)
+        reason = (
+            f"取不到 {base}→{quote} 的汇率。链 {list(self.adapters)} 里"
+            f"被跳过的源 {skipped or []}；真调用过又失败的 {detail}"
+            + (
+                f"；说这段没有数据的 {said_no}（因为 {'、'.join(n for n, _ in failed)} "
+                f"没答上来，这些「没有」还不能写成确认）"
+                if empties and failed
+                else ""
+            )
+        )
+        # 「待会儿重跑就好」还是「链真的坏了」，看的是失败本身值不值得再试一次：
+        # 全链都是限流或抖动就抛 `TransientError`，掺进一个改版（`FieldDrift`）就抛
+        # `DatasourceError`——调度器据这个分界决定是下轮再试还是出声告警。
+        if failed and all(isinstance(cause, RETRYABLE) for _, cause in failed):
+            raise TransientError("registry", reason)
+        raise DatasourceError("registry", reason)
+
+    def _call_fx(self, name: str, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
+        """对单个源的一次汇率取数：限速、退避、归类，与 `_call` 同一套预算。
+
+        不复用 `_call` 是因为它按 `(market, code)` 组织调用；这里刻意把失败归类、
+        源健康标记与「0 行继续问」那套语义原样抄一遍形状，让两条链对同一个源的
+        判定不会分叉。
+        """
+        adapter = self.adapter(name)
+        if self.bucket is not None:
+            self.bucket.acquire()
+        calls = 0
+
+        def invoke() -> pl.DataFrame:
+            nonlocal calls
+            calls += 1
+            return adapter.fx_rate(base, quote, start, end)
+
+        try:
+            frame = call_with_backoff(
+                invoke,
+                attempts=self.attempts_per_source,
+                retryable=RETRYABLE,
+                sleep=self.sleep,
+                label=f"{name}:fx {base}→{quote}",
+            )
+        except EmptyResponse:
+            raise
+        except DatasourceError as exc:
+            self._mark_failure(name, exc)
+            raise _SourceFailed(name, calls, str(exc), exc) from exc
+        except Exception as exc:  # noqa: BLE001 — 适配器漏归类时兜底，路由不能被打断
+            wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
+            self._mark_failure(name, wrapped)
+            raise _SourceFailed(name, calls, str(wrapped), wrapped) from exc
+        out = frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
+        if out.is_empty():
+            # 一个 0 行的帧与一次 `EmptyResponse` 是同一句话：这段没有。
+            # 让它走进「拿到了数据」那条分支，降级链就会替一句该继续问的空答复背书
+            raise EmptyResponse(name, f"{base}→{quote} 在 {start}~{end} 返回 0 行")
+        # 源的窗口比我们问的宽（Yahoo 给 `start` 前后几天）：请求说到的区间就是承诺，
+        # 多出来的日子落进库会让人以为 `--end` 那天之前真的都同步过
+        trimmed = out.filter(pl.col("date").is_between(start, end))
+        if trimmed.is_empty():
+            raise EmptyResponse(name, f"{base}→{quote} 给的行都在 {start}~{end} 之外")
+        return trimmed
 
     def _call(
         self,

@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 
-from sams.cli.common import emit, exit_for, group, iso_date, refused, stamp
+from sams.cli.common import currency_arg, emit, exit_for, group, iso_date, refused, stamp
 from sams.core.codes import canonical_market
 from sams.core.errors import SamsError, ValidationError
 from sams.services.portfolio import AccountSummary, PositionRow
@@ -23,7 +23,7 @@ _LABEL = 12
 
 
 def add_to(subparsers) -> None:
-    """`sams ledger <action>`：account / cash / buy / sell / positions / summary。"""
+    """`sams ledger <action>`：account / cash / buy / sell / positions / summary / fx。"""
     actions = group(subparsers, "ledger", "模拟盘：开户、记成交、看持仓与汇总")
     _account_parser(actions)
     _cash_parser(actions)
@@ -31,6 +31,7 @@ def add_to(subparsers) -> None:
     _trade_parser(actions, "sell")
     _positions_parser(actions)
     _summary_parser(actions)
+    _fx_parser(actions)
 
 
 def _account_parser(actions) -> None:
@@ -107,6 +108,25 @@ def _summary_parser(actions) -> None:
 def _account_args(add) -> None:
     add.add_argument("--user", required=True, help="归属的用户名（不是 id）")
     add.add_argument("--account", required=True, help="`account add` 屏幕上那个 id")
+
+
+def _fx_parser(actions) -> None:
+    """汇率的手工出口，唯一一条不吃 `--user` 的 `ledger` 子命令。
+
+    它写的不是某个人的账，是一条全局事实：`fx_rates` 那一行没有归属，硬加 `--user`
+    会读成「这行汇率只对该用户生效」，而换算时谁都不会被问到是谁。
+    """
+    add = actions.add_parser(
+        "fx",
+        help="set 手工填一行汇率（`sams sync fx` 那条链取不到时的出口）",
+    )
+    add.add_argument("action", choices=("set",))
+    add.add_argument("--day", required=True, help="哪一天：YYYY-MM-DD")
+    add.add_argument("--base", required=True, help="1 单位哪种币种：USD / HKD …")
+    add.add_argument("--quote", required=True, help="换成哪种币种：CNY …")
+    add.add_argument("--rate", required=True, type=float, help="那一天的汇率（正数）")
+    add.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    add.set_defaults(handler=run_fx)
 
 
 # --- 成交时刻 -------------------------------------------------------------------------------
@@ -256,7 +276,44 @@ def run_summary(container, args) -> int:
     return 0
 
 
+def run_fx(container, args) -> int:
+    """手工填一行汇率：正数、有限、同币种那三道闸门都由 `FxRepo.put` 说，不在这里重问。
+
+    打印的是**落库之后读回来的那一行**（含 `source`）：把手工填进去的字符原样回显，
+    等于替库背书说「这一行在这儿」。
+    """
+    try:
+        day = iso_date(args.day)
+        base = currency_arg(args.base)
+        quote = currency_arg(args.quote)
+        rate = container.fx_sync.set_manual(base, quote, day, args.rate)
+        payload = {"status": "ok", "rate": _fx_payload(rate)}
+    except SamsError as exc:
+        return refused(args, exc, exit_for(exc))
+    if args.json:
+        emit(payload)
+        return 0
+    print(
+        f"手工汇率 {rate.base}→{rate.quote}  1 {rate.base} = {rate.rate:g} {rate.quote}"
+        f"  （{rate.day}，库里 source={rate.source}）"
+    )
+    # 换算按行情日取「当天或之前最近的一行」（D73）：填错一天不会报错，只会静默用不上
+    print("  生效条件：这一天要在 `positions` 那一行的行情日当天或之前")
+    return 0
+
+
 # --- 输出 ----------------------------------------------------------------------------------
+
+
+def _fx_payload(rate) -> dict:
+    return {
+        "day": str(rate.day),
+        "base": rate.base,
+        "quote": rate.quote,
+        "rate": rate.rate,
+        #: 「manual」这一列是这条命令存在的理由：下次 `sams sync fx` 覆盖时要知道覆盖掉的是什么
+        "source": rate.source,
+    }
 
 
 def _account_payload(account) -> dict:

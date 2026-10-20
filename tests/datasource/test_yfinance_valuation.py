@@ -157,8 +157,14 @@ def test_an_unsupported_market_is_refused_before_the_network():
 def test_yfinance_now_offers_valuation_and_still_no_financials():
     """能力由方法是否存在推出来（D38）。这里没有 `financials` 是**有意的**：
     Yahoo 的免费接口给不出「这一期是什么时候公开的」，而 D61 的 PIT 闸门只认披露日——
-    接进来只会写出一库永远读不到的行。"""
-    assert known()["yfinance"].capabilities == ("daily_bars", "corp_actions", "valuation")
+    接进来只会写出一库永远读不到的行。`fx_rate` 是第四种能力，挂在同一个类上：
+    它与日线是同一个源的两种能力，拆成两个 kind 会让「Yahoo 挂了」变成两条告警。"""
+    assert known()["yfinance"].capabilities == (
+        "daily_bars",
+        "corp_actions",
+        "valuation",
+        "fx_rate",
+    )
 
 
 def test_a_payload_that_is_not_a_mapping_is_field_drift():

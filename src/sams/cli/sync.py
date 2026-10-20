@@ -16,7 +16,8 @@ import argparse
 from datetime import date
 
 from sams.bootstrap import Container
-from sams.cli.common import group, iso_date
+from sams.cli.common import currency_arg, emit, exit_for, group, iso_date, refused
+from sams.core.errors import SamsError, ValidationError
 
 #: 除权记录的默认起点：沪深交易所 1990/1991 年才成立，再早不存在可查的 A 股除权日
 DEFAULT_ACTIONS_START = date(1990, 1, 1)
@@ -60,6 +61,17 @@ def add_to(subparsers) -> None:
         parser.add_argument("--start", help=f"YYYY-MM-DD，默认 {DEFAULT_FUNDAMENTALS_START}")
         parser.add_argument("--end", help="YYYY-MM-DD，默认今天")
         parser.set_defaults(handler=run_fundamental)
+
+    fx = actions.add_parser(
+        "fx",
+        help="汇率（跨币种持仓的换汇影响全靠这张表；它没有市场维度，所以不吃 --market）",
+    )
+    fx.add_argument("--base", required=True, help="1 单位哪种币种：USD / HKD …")
+    fx.add_argument("--quote", required=True, help="换成哪种币种：CNY …")
+    fx.add_argument("--start", required=True, help="YYYY-MM-DD")
+    fx.add_argument("--end", help="YYYY-MM-DD，默认今天")
+    fx.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    fx.set_defaults(handler=run_fx)
 
 
 def run_fundamental(container: Container, args: argparse.Namespace) -> int:
@@ -141,6 +153,58 @@ def run_actions(container: Container, args: argparse.Namespace) -> int:
         # 跳过的是「这个源不给除权记录」，不是「这个源没数据」：两者在报告上必须分开
         for name, reason in summary.skipped:
             print(f"           跳过 {name}：{reason}")
+    return 0
+
+
+def run_fx(container: Container, args: argparse.Namespace) -> int:
+    """汇率一条命令：区间一次问，答上了才一行行落库。
+
+    取不到要**退出 1**，而不是打一行「0 条」：持仓那一屏对「换不出」的处置是说清哪一笔
+    没进去，采集这层要是替它把「没数」报成一次成功的同步，下一层就没人再提了。
+    「每个有能力的源都说这段没有」才是 0 与一句确认（D36），那条走 0。
+    """
+    try:
+        base = currency_arg(args.base)
+        quote = currency_arg(args.quote)
+        start = iso_date(args.start)
+        end = iso_date(args.end) if args.end else container.clock.today()
+        if start > end:
+            # 区间反了是手滑：链会照问不误然后回一句「这段没有」，把参数错报成数据缺
+            raise ValidationError(f"--start {start} 在 --end {end} 之后：区间反了")
+        summary = container.fx_sync.sync(base, quote, start, end)
+    except SamsError as exc:
+        return refused(args, exc, exit_for(exc))
+    if args.json:
+        emit(
+            {
+                "status": "ok",
+                "base": summary.base,
+                "quote": summary.quote,
+                "source": summary.source,
+                "fetched": summary.fetched,
+                "written": summary.written,
+                "degraded": summary.degraded,
+                "empty": summary.empty,
+                "latest_date": str(summary.latest_date) if summary.latest_date else None,
+                "confirmed_empty_by": list(summary.confirmed_empty_by),
+                "skipped": [[name, reason] for name, reason in summary.skipped],
+            }
+        )
+        return 0
+    line = f"{summary.base}→{summary.quote}  源={summary.source or '—'}"
+    if summary.empty:
+        said = "+".join(summary.confirmed_empty_by)
+        line += f" 入库=0  链上每个有能力的源都说这段没有报价（{said}）"
+    else:
+        line += (
+            f" 取回={summary.fetched} 入库={summary.written} 最新={summary.latest_date}"
+        )
+    if summary.degraded:
+        line += f" [降级: {_trail(summary.attempts)}]"
+    print(line)
+    # 跳过的是「这个源不给汇率」，不是「这个源没数据」：两者在报告上必须分开
+    for name, reason in summary.skipped:
+        print(f"           跳过 {name}：{reason}")
     return 0
 
 

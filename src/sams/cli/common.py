@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import re
 from argparse import _SubParsersAction
 from datetime import UTC, date
 
@@ -81,6 +82,20 @@ def iso_date(value: str) -> date:
         raise ValidationError(
             f"日期 {value!r} 看不懂：要的是 YYYY-MM-DD，例如 2024-07-01"
         ) from None
+
+
+def currency_arg(value: str) -> str:
+    """币种码归一成 ISO 4217 的大写，形状不对就当场拒收。
+
+    小写不会让任何一层报错，只会让那一行**永远查不到**：持仓换算拿配置里的
+    `USD`/`CNY` 去问 `fx_rates`，库里躺着的是 `usd`，症状是「换汇影响永远是 0」。
+    这与仓库层「`RMB`/`rmb` 一律拒绝、不做模糊匹配」那条不是同一件事：这里不改字母，
+    只是把大小写收到唯一的那种写法上（同 `canonical_code` 收键形态的道理，D50）。
+    """
+    code = value.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        raise ValidationError(f"币种 {value!r} 看不懂：要三字母代码，例如 USD / CNY")
+    return code
 
 
 def ratio_arg(name: str, value: str) -> float:

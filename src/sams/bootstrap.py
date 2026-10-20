@@ -23,6 +23,7 @@ from sams.services.analysis import AnalysisService
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
+from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
 from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
@@ -98,6 +99,8 @@ class Container:
     sync: SyncService
     corp_action_sync: CorpActionSyncService
     fundamental_sync: FundamentalSyncService
+    #: 汇率那条链：没有市场维度，所以它不跟着 `sync`/`fundamental_sync` 走市场路由
+    fx_sync: FxSyncService
     fundamentals: FundamentalService
     screen: ScreenService
     analysis: AnalysisService
@@ -240,6 +243,7 @@ def build_container(
         fundamental_sync=FundamentalSyncService(
             registry, financials_store, valuation_store, flow_store, symbols
         ),
+        fx_sync=FxSyncService(registry, fx_store),
         fundamentals=fundamentals,
         screen=ScreenService(
             financials_store, valuation_store, symbols, scan_store, clock=clock

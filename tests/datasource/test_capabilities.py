@@ -18,8 +18,8 @@ from sams.datasource.sources import build, catalog, known
 def test_the_kind_name_is_the_adapter_method_name():
     """种类名 = 方法名 = `fetch_<方法名>`：没有第二套词，也就没有「两处叫法漂移」这件事。
 
-    `listed_date` 是唯一一个不走降级链的种类（它问的是主档的一格，不是一类数据），
-    但它同样登记在这张表里：谁能填上市日期，判据仍然只有这一份。
+    `listed_date` 与 `fx_rate` 是两个不走 `_walk` 的种类（一个问主档的一格，一个没有市场
+    维度），但它们同样登记在这张表里：谁能填上市日期、谁能给汇率，判据仍然只有这一份。
     """
     assert set(CAPABILITIES) == {
         "daily_bars",
@@ -28,6 +28,7 @@ def test_the_kind_name_is_the_adapter_method_name():
         "valuation",
         "funding_flow",
         "listed_date",
+        "fx_rate",
     }
 
 
