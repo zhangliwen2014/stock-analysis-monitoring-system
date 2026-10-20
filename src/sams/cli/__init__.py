@@ -45,7 +45,11 @@ COMMAND_MODULES = (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sams", description="SAMS 运维入口")
     parser.add_argument(
+        # dest 特意不叫 `config`：子命令有权用自己的 `--config`（`channel add --config k=v`
+        # 就是），而两个名字撞在同一个 Namespace 上时，子解析器的默认值会把这里那个路径抹掉——
+        # 症状不是报错，是 `sams --config X channel add …` 悄悄读了另一个配置文件
         "--config",
+        dest="config_path",
         help="配置文件路径，默认取 SAMS_CONFIG 或 config/settings.toml",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -57,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        container = build_container(Settings.load(args.config))
+        container = build_container(Settings.load(args.config_path))
     except SamsError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 1

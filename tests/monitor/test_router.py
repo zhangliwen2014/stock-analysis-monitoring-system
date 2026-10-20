@@ -397,6 +397,27 @@ def test_add_refuses_a_kind_the_factory_does_not_know(world):
     assert world.channels.list_for(user.id) == []
 
 
+def test_add_refuses_a_remote_channel_missing_its_webhook(world):
+    """kind 需要哪些字段是**工厂**的知识：仓库层允许空配置（`desktop` 没得配），
+    所以「wecom 少了 url」这一句必须从工厂这里出来，而且必须在落库之前。
+    """
+    from sams.monitor.notifiers import build_notifier_factory
+
+    user = world.user()
+    service = world.service(build_notifier_factory())
+    with pytest.raises(ValidationError, match="url"):
+        service.add(user.id, "wecom", "空群", {})
+    assert world.channels.list_for(user.id) == []
+
+
+def test_add_accepts_a_local_channel_with_no_config(world):
+    from sams.monitor.notifiers import build_notifier_factory
+
+    user = world.user()
+    service = world.service(build_notifier_factory())
+    assert service.add(user.id, "desktop", "本机弹窗", {}).config == {}
+
+
 def test_maintenance_entries_scope_by_user_when_given(world):
     mine = world.user("trader")
     theirs = world.user("other")

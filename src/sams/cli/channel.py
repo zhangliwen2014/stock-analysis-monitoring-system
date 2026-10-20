@@ -183,6 +183,9 @@ def show_channel(container: Container, args) -> int:
     print(f"  上次成功：{stamp(node.last_ok_at) if node.last_ok_at else '–'}")
     print(f"  上次失败：{node.last_error or '–'}")
     print("  配置（值已掩码）：")
+    if not node.config:
+        # 空一节会被读成「渲染坏了」：本机通道确实没有要配的东西，那就说出来
+        print("    （这一条不需要配置：本机通道没有凭据）")
     for key in sorted(node.config):
         print(f"    {key:<12} {node.config[key]}")
     return 0

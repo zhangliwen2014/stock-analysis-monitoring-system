@@ -1,7 +1,7 @@
 # 股票分析监控系统 · 设计文档
 
 日期：2026-10-17
-状态：M1 已实现并自测通过（477 用例离线绿 + CLI 冒烟），本文档已同步 M1 落地的口径决定；M2–M3 待实施计划
+状态：**M1 + M2（A–E）+ M3-A 账本 + M3-B 通知层已实现并离线自测通过**（2195 用例绿 + 真实屏），本文档已同步这些里程碑落地的口径决定（D1–D93，§14 按里程碑分段记录）；**M3-C 规则引擎、M3-D 调度器**待实施计划，M4–M5 只有范围
 实施范围：**M1–M3 详细设计；M4–M5 仅定义范围与关键决策**
 
 ---
@@ -123,6 +123,11 @@
 | D86 | **持仓的基准汇率 = 各笔买入的 `fx_rate_ref` 按股数加权**（`funds.weighted_rate`）；少一笔已知基准，整段 `fx_pnl` 就不拆（返回 `None`，进 `notes` 点名），不拿一个猜出来的汇率补齐 | 「成本汇率」不是下单那天的汇率的算术平均：300 股 @7.1 配 100 股 @7.3，均价按笔数是 7.2，按股数是 7.15，差异直接进盈亏。更危险的是半拆：一笔买入没记基准汇率（换汇走的是 M5 才有的 `fx_trades`），拿今天汇率补上，那一行的 `price_pnl + fx_pnl` 照样等于总值——恒等式仍然成立，而汇率影响被挪到了价格影响里，屏幕上那条「涨 3.1%」是假的。整段不拆会被读成「这一行我不知道」，正是这句话该被读成的样子（§5.4 规则 2 的「两个键同时出现」在跨币种那一侧的含义） |
 | D87 | **换算与现价锚在行情日，不锚在墙钟**：每笔持仓按自己的 `last_price_date` 取现价与汇率，`summary.as_of` 取持仓里最新的行情日，没有持仓才问钟 | `core/clock.py` 开头那条警告的应用现场：UTC 的今天与 A 股的今天差半天到一天，拿墙钟当截至日会把「还没收盘的那天」读成已有数据。周末与长假也不该让数字变旧——`FxRepo.latest(day, …)` 在 `day` 那天没有汇率时回退到之前最近的一条，标的不涨也不跌，那是合法读数不是过期数据；真正假的是第五天还在用周五那个数（`FX_STALE_DAYS = 4`），所以超过它就拒给并带 `age_days` 露头（`sams health` 的 `[账本]` 一节按币种对各报最后一天：全库一个 `max(date)` 会让三周没动的 HKD→CNY 被昨天同步过的 USD→CNY 背书）。重放同理：锚在钟上，同一个库回放两次会得到两个数 |
 | D88 | **降级链耗尽时按「失败值不值得再试一次」分类，不按异常的名字分类**：全链的失败都落在 `RETRYABLE`（`RateLimited`/`TransientError`/`OSError`/`TimeoutError`）里才抛 `TransientError`，掺进任何一个不属于这一族的（`FieldDrift`、契约破）就抛 `DatasourceError` | 这两句话在 M3-D 的调度器里是两个动作：`TransientError` 是「下轮悄悄再试」，`DatasourceError` 是「出声告警」。判据写成 `isinstance(cause, TransientError)` 时，一条全是 429 的链会被报成「链坏了」——限流是此刻被拒，不是契约破，于是调度器该沉默的时候响，而真改版的时候反而跟着那批沉默的重试一起被吞掉。这一条是冒烟跑出来的：`sams sync fx` 拿 Yahoo 429 手工跑一次，屏幕上那句「链断了」当场就是错的 |
+| D89 | **免打扰窗口只挡 `mid`/`weak`，`strong` 不受挡；窗口里的时刻折到用户自己的时区**（`users.dnd_tz`），跨午夜（23:00→07:00）是合法形状而不是错误 | 「止损/停牌/赔率崩塌」恰恰落在盘后与隔夜，也就是美国人睡前的美股时段与北京的后半夜——一个人设置免打扰是为了睡觉不被扫描类消息吵，不是为了把止损闸掉。反过来，拿市场的时区去判「这个人在睡觉吗」，一个住上海、看着美股的账户会在北京 08:00 被挡掉他本来醒着的那一条，而在 22:00 放行他正在睡的那一条：这条链上唯一说得出「谁在睡觉」的字段是 `dnd_tz`，它在 0015 里就是为此存在的。要求 `start < end` 会直接拒掉这个功能最主要的那个窗口，所以跨午夜的判据写在读取侧（`router._in_dnd`）而不是写入侧 |
+| D90 | **路由三级：规则指定的渠道 → 该级别的默认渠道类型 ∩ 已启用 → 用户的默认渠道**；三级都落空写一条 `no_channel` 而不是丢弃；**规则点名的那些渠道若全部不可用，不向下降级** | 不降级这一条是反直觉的，但它守的是「发错地方比没发更糟」：用户在规则上勾了「止损发进 A 群」，A 群被停用那一刻，把这条止损抄送进他另一个群，屏幕上留下的是「发了，且发到了他明确没选的地方」。而 `no_channel` 必须落库而不是静默：§11 的原话是「不静默丢弃」，一条被丢掉的告警在库里没有痕迹，运维下一次问的是「为什么我没收到」，这个问题只有库里那一行能回答。级别默认用**类型**而不是具体渠道（`DEFAULT_ROUTE`），因为「mid 走企微」是策略，「走哪一个群」是那个人的配置——把两者混在一处，改一个群就会改掉整个系统的策略。名下第一条通道自动成为默认、默认通道不能停用（要先 `sams channel default` 移走），为的是「没有任何兜底」这一状态不能是用户随手造出来的 |
+| D91 | **本机通道（`desktop`/`voice`）探测不到落点时是 `suppressed`，不重试、不写 `last_error`**；`NotifyResult.unavailable` 这个旗就是为这一处存在的；`sams channel probe` 的退出码恒 0，即使那条没送出去 | 远程终端（SSH/tmux）上没有桌面是**这台机器的永久事实**，不是一次失败：按失败处理的话，每一次 weak 级告警都要退避 3 次（1s+4s）再记一条「上次失败：没有 DISPLAY」，而那条通道在屏幕上从此永远带着红字——真正的故障会被这句噪音盖住。`unavailable` 让 router 分得开「发不出去」与「没地方发」：前者要重试，后者要立刻停。探针恒 0 与 `sams source probe` 同约定：探针是在问一个问题，把它做成非零退出，「配完通道顺手试一次」那条脚本会在探针正常回答「本机发不了」时整条中断，而那一句本来就是要显示的答复 |
+| D92 | **明文凭据永不出屏**：`Channel.config` 是掩码视图（短值全掩、长值最多露 4 个字符），CLI/健康页只读它；这条由 `tests/test_layering.py` 里按**属性名**拦的静态守卫钉住（`cli/**/*.py` 里不许出现 `credentials` 这个属性访问），不由一条 grep 钉住 | CLI 拿得到整个 Container，`container.channels_store` 就在手边，一次 `credentials(...)` 就能把别人的 webhook key 打进终端——导入守卫对此完全无感（那个名字本来就在许可的层里）。原计划用「`grep -rn "credentials(" src/sams/cli` 为空」来保证，实现当场就红了：那条 grep 串写在它要保护的模块的注释里，任何解释这条规则的注释都会让它变红，而把它改写成别的写法只是把守卫挪到一个更脆的位置。按属性名在 AST 上拦，注释和文档字符串自动豁免，取明文的那**一个**入口（`ChannelRepo.credentials`）也只有一个。露 4 个字符而不是全掩：两家的 webhook 地址常常只差末尾几位，一个都不露就认不出「这是哪个群」 |
+| D93 | **健康页 `[通知]` 的 `None` 与 `0` 是两句话，而本机可用性是三态**（`None` 未接入探测、`""` 发得出去、其余是原因）；「这一节能不能出数」的护栏问的是**列**（`notify_log.outcome`）不是表 | `channels`/`alerts`/`notify_log` 三张表在 `0001` 就有，`outcome` 才是 0015 加的——只查表在不在，未迁移的库会交出六个 0，而那一句在屏幕上读起来像「这套系统配了通道但一次都没发出去」，真实原因是「该跑迁移」。`0` 与 `None` 的分工与 `[账本]` 一节同源（M3-A）：0 是「问得出答案」，None 是「这一层还没被接上」。desktop/voice 走**注入的 `Callable`**（`build_container` 传 `local_status=notify.local_status`）而不是 `HealthService` 自己 import `monitor`：`ALLOWED["services"]` 里没有 monitor，而把那个函数当参数收下来，这一层就只需要转述一个别人算出来的结论。三态里最贵的是中间那一格——把「没接入」显示成「可用」，等于健康页替一条从没试过的通道打包票 |
 
 ---
 
@@ -340,17 +345,32 @@ rules(id, user_id, account_id, name, enabled, target_type, target_ref,
 rule_revisions(id, rule_id, changed_by, before_json, after_json, changed_at)
   防止"跌破后偷偷下移止损线"可追溯
 
-channels(id, user_id, kind, config_encrypted, enabled, last_ok_at)
-  kind: wecom|dingtalk|email|desktop|voice|pushplus|serverchan
-  Fernet 加密，密钥来自环境变量，禁止入库明文
+channels(id, user_id, kind, name, config_encrypted, enabled, is_default,
+         last_ok_at, last_error, last_error_at, created_at)
+  kind: wecom|dingtalk|email|desktop|voice|pushplus（名单的唯一出处是 `core/notify.KINDS`）
+  name（0015）不是装饰：一个用户接了两个企微群时，`sams channel list` 里两行 `wecom`
+  是不可区分的，而规则上的 channel_ids 存的正是 id——选错一个就把告警发进了另一个群
+  last_error + last_error_at 是「健康页说它不健康」的唯一依据：只有 last_ok_at 的话，
+  「从没发过」与「每次都失败」在屏幕上长得一样
+  Fernet 加密，密钥材料来自 secret_key，禁止入库明文；出屏只有掩码视图（D92）
 
-alerts(id, user_id, rule_id, code, market, triggered_at, stage,
-       payload_json, status, handled_at, handle_note)
+alerts(id, user_id, rule_id, account_id, market, code, severity, stage,
+       triggered_at, payload_json, status, handled_at, handle_note, dismiss_reason)
+  severity: strong|mid|weak —— 属于**那一条告警**，不属于规则：规则今天把 mid 改成 strong，
+  历史里那条仍然是当时的 mid，否则「上次为什么没打电话」这个问题没有答案（0015）
+  rule_id/account_id 可空：手工投递与 M3-D 的系统告警不由规则产生
+  名称类字段（rule_name/symbol_name/account_name）在 payload_json 里，不另开列：
+  它们是那条告警当时的说法，规则改名不该改写历史
   stage: pre|hit|urgent
   status: new|acknowledged|acted|dismissed
   dismissed 必须带 reason（喂给忽略率统计）
 
-notify_log(id, alert_id, channel_id, ts, success, error, attempt)
+notify_log(id, alert_id, channel_id, ts, outcome, error, attempt)
+  outcome: sent|failed|suppressed|no_channel —— 0015 用它换掉原来的 `success BOOLEAN`：
+  四态里后两种既不是成功也不是失败，混在一个 false 里健康页就只能说「N 次没成」而说不出
+  「其中 M 次是你自己让开的」。列可空（DuckDB 不许 ADD COLUMN NOT NULL），读侧一律
+  coalesce(outcome,'failed')——手工插进去的行算失败，不冒充成功
+  channel_id 为空只允许配 suppressed/no_channel：压制的意思是「还没选到通道就停了」
 
 sim_accounts(id, user_id, name, broker, market_scope, fee_model,
              margin_enabled, report_currency)
@@ -847,20 +867,21 @@ M3 走**模板表单**：选模板 → 填参数（标的、阈值、过滤、�
 ## 11. 通知层
 
 ```python
-class Notifier(Protocol):
-    kind: str
-    def send(self, msg: AlertMessage) -> NotifyResult: ...
-    def probe(self) -> bool: ...   # admin 后台"测试发送"
+class Notifier(Protocol):   # monitor/notifiers/__init__.py：M3-B 落地的形状
+    name: str
+    def available(self) -> bool: ...        # 现在能不能发
+    def unavailable_reason(self) -> str: ...  # 不能发时的那一句人话
+    def send(self, message: AlertMessage) -> NotifyResult: ...
 ```
 
-实现：`wecom`/`dingtalk`（群机器人 webhook）、`email`（SMTP）、`desktop`（macOS `terminal-notifier`）、`voice`（macOS `say`，仅用于 `强` 级告警，与桌面通知并发）、`pushplus`/`serverchan`（个人微信，扫码关注，无官方 API 的第三方通道）。`desktop` 与 `voice` 依赖本机桌面环境，部署到服务器后自动禁用（由 `core` 按运行环境注册，不算失败）。
+实现六个 kind，名单的唯一出处是 `core/notify.py` 的 `KINDS`：`wecom`/`dingtalk`（群机器人 webhook，钉钉带 HMAC-SHA256 签名）、`pushplus`（个人微信）、`email`（SMTP，465 隐式 TLS / 587 STARTTLS，用授权码）、`desktop`（macOS `osascript` 的 `display notification`、Linux `notify-send`）、`voice`（macOS `say`，仅 `strong` 级与桌面并发）。**没有** `terminal-notifier`（要多装一个 Homebrew 包，而系统自带的 `osascript` 够用）与 `serverchan`（与 pushplus 同属「无官方 API 的个人微信通道」，本期只留一个）。`probe` **不在通道上**而是 `NotifyService.probe(channel_id)`：探针要走的是与告警完全相同的那条代码（同一条凭据解码、同一个裁剪、同一次退避），挂在通道上就等于允许有人绕过路由发一条。
 
-- **路由**：规则绑定渠道列表；未指定时降级到用户默认渠道；默认渠道也没有则写 `notify_log` 失败记录，不静默丢弃。
-- **严重级别 → 渠道默认映射**（可覆盖）：`强`(止损/赔率崩塌/停牌/解禁) → 语音+企微+桌面；`中` → 企微；`弱`(盘后总结/扫描) → 邮件或仅 Web 查看。
-- **重试**：失败退避重试 3 次；最终失败不影响规则引擎继续运行；`NotifyFailed` 事件让 admin 后台可见。
-- **消息格式**：`[市场][账户名] 名称 代码 | 规则描述 | 当前值/阈值 | 时间 | 阶段`，账户名为空则省略该段——多账户下不带账户名的止损告警无法行动。附操作提示（如"该账户为 T+1，今日买入无法当日卖出"）；各渠道按长度限制裁剪。
-- **静默**：非交易时段/节假日由调度层控制，不写进规则本身；用户级免打扰时段独立配置。
-- 凭据 Fernet 加密，日志与 admin 界面一律脱敏。
+- **路由**（`monitor/router.py`，三级，D90）：规则绑定的渠道 → 该严重级别的默认渠道**类型** ∩ 已启用 → 用户的默认渠道；三级都落空写一条 `no_channel` 记录，不静默丢弃。规则点名的渠道全部不可用时**不向下降级**。
+- **严重级别 → 渠道默认映射**（`core/notify.DEFAULT_ROUTE`，可被规则上的渠道列表覆盖）：`strong`(止损/赔率崩塌/停牌/解禁) → voice+wecom+dingtalk；`mid` → wecom+dingtalk；`weak`(盘后总结/扫描) → email。
+- **重试**：3 次，退避 1s→4s（`core/retry.call_with_backoff`，采集侧与通知侧共用同一件）；最终失败发 `NotifyFailed` 上总线供 admin 可见，且不影响调用方继续跑（§12）。本机通道探测不到落点时既不是失败也不重试（D91）。
+- **消息格式**：`format_headline` = `[市场][账户名] 名称 代码 | 规则描述 | 当前值/阈值 | 时间 | 阶段`，账户名为空则省略该段；附操作提示（`action_note`）。各渠道按 `core/notify.LIMITS` 裁剪，裁剪按 **UTF-8 字节**——企微那个 4000 是字节数，中文字符按 3 个算。
+- **静默**：非交易时段/节假日由调度层控制（M3-D），不写进规则本身；用户级免打扰窗口是 `users.dnd_start/dnd_end/dnd_tz`（0015），跨午夜合法，`strong` 不受挡（D89）。
+- 凭据整份 Fernet 加密进 `channels.config_encrypted`（`storage/crypto.py`，密钥材料来自 `secret_key`，换它等于读不回旧通道），日志、CLI 与健康页一律只读 `Channel.config` 那个掩码视图（D92）。四态投递结果落 `notify_log.outcome`（`sent`/`failed`/`suppressed`/`no_channel`，可空列 + 读侧 `coalesce(...,'failed')`，宁缺勿滥的方向是不冒充成功）。
 
 ---
 
@@ -904,10 +925,11 @@ class Notifier(Protocol):
 | 仓库层 | 内存 DuckDB 单测 | 幂等 upsert 重跑无重复行；**用户隔离**（查 A 拿不到 B）；非法状态跳转被拒 |
 | 指标/估值 | 黄金样例对比 | MA/MACD/RSI 与已知值一致；赔率公式与手算一致；分项 evidence 可追溯 |
 | 观点生命周期 | 状态机测试 | 合法/非法跳转；派生规则随参数变更同步；派生规则不可删 |
-| 通知器 | mock 发送 | 重试 3 次、渠道降级、脱敏、失败不影响引擎 |
+| 通知器 | 注入 `post`/`mail`/`run` 三个传输件（`NotifierDeps`），不打网络 | 三家「成功长什么样」（企微/钉钉 `errcode=0`、PushPlus `code=200`）、缺必填凭据是 `ValidationError` 而不是发送失败、签名 URL 可复算、按字节裁剪、异常折成人话且不回显凭据；`desktop`/`voice` 用假 `which` 与假 `CompletedProcess` 验 argv 与「退出码非 0 ≠ 本机没地方发」 |
+| 路由 | 直接装配的 `World`（三个仓库 + 假工厂）+ 一枚容器级用例 | 三级顺序与每一级兜底、规则点名的渠道全不可用时**不降级**、DND 挡 mid/weak 而不挡 strong、跨午夜窗口、按用户时区而非市场时区、四态各自落库且 `channel_id` 形状正确、退避次数与秒数（`sleep` 注入）、探针不写 `notify_log` 但改 `last_ok_at` |
 | Web/admin | 冒烟 | 登录、越权访问被拒、admin 只读页可访问 |
 | 回测(M5) | 小样本手算对齐 | 胜率/盈亏比统计一致 |
-| **分层与系统边界** | AST 扫 import（`tests/test_layering.py`） | 依赖方向与 §3.1 表一致；`core` 不 import 上层；凑齐三层的那一个模块只能是 `bootstrap.py`；第三方库落点受管——`duckdb` 只在 `storage/db.py`、`requests`/`akshare`/`yfinance`/`exchange_calendars` 只在 `datasource/`、`bcrypt` 只在 `storage/repos/users.py`、`pandas` 全库禁止 |
+| **分层与系统边界** | AST 扫 import（`tests/test_layering.py`） | 依赖方向与 §3.1 表一致；`core` 不 import 上层；凑齐三层的那一个模块只能是 `bootstrap.py`；第三方库落点受管——`duckdb` 只在 `storage/db.py`、`requests` 只在 `datasource/` 与 `monitor/notifiers/`、`akshare`/`yfinance`/`exchange_calendars` 只在 `datasource/`、`bcrypt` 只在 `storage/repos/users.py`、`cryptography` 只在 `storage/crypto.py`、`subprocess` 只在 `monitor/notifiers/`（`monitor/env.py` 只探测不起进程）、`smtplib` 只在 `monitor/notifiers/email.py`、`pandas` 全库禁止。**另有一条非 import 的守卫**：`cli/**/*.py` 里不许出现 `credentials` 这个属性访问——CLI 拿得到整个 Container，取明文凭据那条路不在依赖方向上（D92） |
 | **时间相关不变式** | 冻结时钟（`core/clock.py` 端口） | 会话在跨日/跨月边界不过期、`revoked_at` 取注入时刻、告警 `ts` 跟随 clock、限速等的正好是配置间隔。**禁止用 `datetime.now()` 直读**——否则这类用例会在真实日历上随机失败 |
 | **对抗契约** | 四份 `tests/test_adversarial_*.py`（storage / datasource / services / caliber） | 每轮评审与测试后把「这里有坑」改写成「这里必须是这个行为」；断言只描述已成立的契约，不留 red-xfail 的漏洞存档 |
 
@@ -993,11 +1015,13 @@ D46 把归一放在服务边界，等于把主键形态交给「调用方走没�
 
 ### M3 监控告警（详设 §10 §11 §12）
 
-规则模板引擎与止损止盈九种（模板集合按 M0 裁剪结果实现，§10.3 的 40 个为能力目录而非承诺数量）、过滤条件组合、三级触发、事件总线、**五个通知渠道**（企微钉钉/邮件/桌面/语音/PushPlus）、按市场调度器、stale 处理、崩溃恢复、admin 系统健康页、**多账户多币种账本**（一个用户多账户、账户内多币种现金池、订单与持仓手动/CSV 录入、汇率日采集与折算、盈亏拆 price_pnl/fx_pnl，供持仓类与止损止盈规则使用；不含回测与 fx_trades）。
+规则模板引擎与止损止盈九种（模板集合按 M0 裁剪结果实现，§10.3 的 40 个为能力目录而非承诺数量）、过滤条件组合、三级触发、事件总线、**六个通知通道**（`KINDS`：企微、钉钉、PushPlus、邮件、桌面、语音；§11 说明为什么不是「五类」以及被裁掉的是 `terminal-notifier` 与 `serverchan`）、按市场调度器、stale 处理、崩溃恢复、admin 系统健康页、**多账户多币种账本**（一个用户多账户、账户内多币种现金池、订单与持仓手动/CSV 录入、汇率日采集与折算、盈亏拆 price_pnl/fx_pnl，供持仓类与止损止盈规则使用；不含回测与 fx_trades）。
 
 **M3-A 模拟账本已完成（2026-10-20，新增 D85–D88，闭合 U26）**：§9.2 的账本部分与 §5.4 的四条硬规则落成 T-1…T-12——迁移 0014 加 `sim_accounts`/`sim_cash_balances`/`sim_cash_moves`/`sim_orders`/`sim_positions` 与 `Database.transaction()`（唯一的回滚原语）、`core/funds.py`（币种推定 + `weighted_rate` + 两段拆分，这一层没有 IO）、三个仓库（`SimAccountRepo`/`SimOrderRepo`/`FxRepo`）、两个服务（`LedgerService` 写用例、`PortfolioService` 读用例）、`sams ledger {account,cash,buy,sell,positions,summary,fx}` 七个子命令、`sams sync fx` 那条按币种对（无市场维度）走到的采集链与 `sams ledger fx set` 的手工出口。这一节防的还是同一类「屏幕上看着对」：**同币种时 `fx_pnl` 必须是那个 0，不是缺那个键**（两个键恒在，机器读者不该靠「有没有这个键」判断，§5.4 规则 2）；现价取不到就是 `None` 并用成本价做本币小计、那一行不计入盈亏（把它当 0 会把「不知道」说成「没涨没跌」）；清仓后留下的 0 股行是历史不是持仓，健康页按 `qty <> 0` 数（按行数会把「全都卖了」读成「还持有 N 只」）；跨账户重复持仓单独点名（那是两个账户各自的事实，不是数据坏了）；无杠杆账户不透支，现金不足当场拒并说出余额、这次要动的数与结果；拿 CNY 现金的账户买 USD 定价的美股当场被拒，那句点名两个币种并说「M3 不自动换汇，先补一笔同币种现金」（§5.4 规则 1/4——换汇是显式流水，不是一步四舍五入）。交易员闸在临时库里手工核到分：100 股 @40 配 5 元手续费 → 均价 40.05、现金 95995.00，再叠 200 股 @38 配 6 元 → 300 股均价 38.7033、现金 88389.00，`--json` 与文本给同一组数。冒烟跑还揪出一个分类缺陷：一条全是 429 的链被报成「链断了」，改成按 `RETRYABLE` 族分类（D88）——这一句 M3-D 的调度器要拿去做「沉默重试 vs 出声告警」的分界。`sams health` 多一节 `[账本]`：三个数 + 每个币种对各自的新鲜度与 `age_days`，账本动过而 `fx_rates` 一行没有时明说「跨币种持仓的换汇影响拆不出」并给出两条出口。U26 的闭合形态是「并排说，不硬拦」：`sams thesis show` 在对照表与时间线之间多一节成交，一笔都没挂时那句「状态是推出来的，不是核对过的」必须被说出来（没有 `fills` 表——`sim_orders.thesis_id` 就是那张表）。三道闸：离线 **1953 passed / 14 deselected**；真实网络 **12 passed / 2 skipped**（两条 skip 都是 Yahoo 此刻 429，说的是这台机器被拒而不是契约破了）；分层守卫与 `ruff check` 全绿。
 
-**M3 还剩**：通知层（M3-B，§11：`alerts`/`notify_log`/`channels` 三张表已在库里，没有写入方）、规则引擎（M3-C，§9.2/§9.3/§10：持仓类规则读 `PortfolioService.positions`，到价了结写 `SimOrderRepo.record_fill`，别在服务层外开第二个事务边界）、调度器与崩溃恢复与 admin 健康页（M3-D，§12：`task_runs` 已在库里，`sync_fx` 与 `weekly recheck` 应是注册进任务表的条目而不是各自起循环）。§14 那条「挂机运行一个真实 A 股交易日」的 M3 总验收要等这三份都落地。
+**M3-B 通知层已完成（2026-10-20，新增 D89–D93）**：§11 那一张空表落成有写入方的一层——迁移 0015 给 `channels` 补 `name`/`last_error`/`last_error_at`/`created_at`、给 `users` 补免打扰三列、把 `notify_log.success BOOLEAN` 换成 `outcome VARCHAR`（四态，可空列 + 读侧 `coalesce(...,'failed')`），并按 0003 的重建形状去掉 `alerts.rule_id`/`severity` 的 NOT NULL（级别属于那一条告警，不属于规则；`ALTER` 那条路 DuckDB 当场拒绝，因为索引挂在表上）；`storage/crypto.py` 的 Fernet（`key_from_secret` = sha256 → urlsafe-base64，所以「换 `secret_key` ⇒ 旧通道读不回来」是直接的因果，`config/settings.example.toml` 头部那句话就是为此写的）；`ChannelRepo`（掩码视图恒为 `Channel.config`、名下第一条自动默认、默认通道不能停用、`credentials()` 是取明文的**唯一**入口）与 `AlertRepo`（告警落库 + 每条投递的 `Delivery`）；`core/retry.py` 把采集侧的退避上提成 `call_with_backoff`，通知侧共用同一件（3 次、1s→4s）；`core/notify.py` 是名单与格式的唯一出处（`KINDS` 六个、`SEVERITIES` 三级、`OUTCOMES` 四态、`DEFAULT_ROUTE` 按**类型**而非具体渠道、`LIMITS` 裁剪按 UTF-8 字节——企微那个 4000 是字节，中文按 3 个算）；`monitor/env.py` + `monitor/notifiers/` 六件（三家走注入的 `post`、邮件走注入的 `mail`、本机两件走注入的 `run`，`smtplib`/`subprocess` 的落点由分层守卫看着）；`monitor/router.py` 的 `NotifyService` 十一个入口（`dispatch`、`probe`、`local_status`，加上通道的 `add`/`list`/`show`/`set_enabled`/`set_default`/`remove` 与免打扰的 `set_dnd`/`clear_dnd`）；`sams channel {add,list,show,enable,disable,default,remove,probe,dnd set|show|clear}`，每条都带 `--user` 与 `--json`（D57 的「拒绝也给 JSON」在这一层继续成立）；`sams health` 多一节 `[通知]`。这一层要防的仍然是同一类「屏幕上看着正常」：**被压制**和**发失败**是两个数（混成一个 `false`，健康页就只能说「N 次没成」而说不出其中 M 次是用户自己让开的，D90/D93）；三级都落空必须写一条 `no_channel` 而不是丢弃（丢掉的告警在库里没有痕迹，而「为什么我没收到」只有库里那一行能回答）；规则点名的渠道全不可用时**不向下降级**（发错地方比没发更糟）；本机探测不到落点是 `suppressed`、不重试、不写 `last_error`（远程终端上没有桌面是这台机器的永久事实，按失败处理会让那条通道永远挂红字，真故障就被这句噪音盖住，D91）；免打扰只挡 `mid`/`weak` 且时刻折到**用户自己的**时区（`strong` 不受挡——止损恰好落在盘后与隔夜，D89）；`[通知]` 的 `None` 与 `0` 是两句话，而「这一节能不能出数」问的是 `notify_log.outcome` 这一**列**而不是三张表都在不在（`0001` 就有那三张表，未迁移的库交出六个 0，读起来像「配了通道但一次没发出去」，真相是「该跑迁移」，D93）。真实屏揪出两处，都不是设计错而是**边界放错了层**：`ChannelRepo` 对空配置一律拒，于是唯一一条不需要凭据的通道（`desktop`）在屏幕上建不起来，用户被逼着编一个假 `--config`——「这个 kind 缺 url 就发不出去」是 kind 的知识，住在工厂里，仓库层自己判就得认识六个 kind，于是把那道闸移到 `NotifyService.add` 落库之前问工厂；`sams --config X channel add … --config url=…` 直接一段栈，因为子命令那个同名 `--config`（`append`）在共用的 Namespace 上把全局的配置文件路径抹成了一个 list，`Settings.load` 收到 `list` 才炸——全局那一个的 `dest` 从此改名 `config_path`，症状是「悄悄读了另一个配置文件」而不是报错的那种撞名最贵。另一处是**计划的前提被实测推翻**：§1 第 12 条写「本会话在远程终端，`desktop` 探针应回 `suppressed`」，而这台机器上 `osascript` 退出 0、探针回的是「已送达」（`LocalEnv` 认的是 `SSH_TTY`/`DISPLAY`，这个会话两个都不成立），所以 `suppressed` 那一支只能由注入假环境的用例钉住，「网络那头认不认」留在验收清单里人工确认一次。掩码这一条另有一处收口：计划原本要用「`grep -rn "credentials(" src/sams/cli` 为空」保证明文凭据不出屏，实现当场就红了——那条 grep 写在它要保护的模块的注释里，任何解释这条规则的注释都会让它变红（D92）；换成 `tests/test_layering.py` 里按属性名在 AST 上拦的守卫，注释与文档字符串自动豁免。三道闸：`ruff check` 全绿、分层 **336 passed**、离线 **2195 passed / 14 deselected**（M3-A 收尾时 1953，本层新增 242 枚）；真实网络那一组**没有新增用例**，原因写在计划 §1 第 13 条：六个通道全要外部凭据，本机与 CI 都没有，而一次真实成功发送会打到用户手机上——那不是你想要的东西。
+
+**M3 还剩**：规则引擎（M3-C，§9.2/§9.3/§10：命中后调 `NotifyService.dispatch`，那条路已经通了；持仓类规则读 `PortfolioService.positions`，到价了结写 `SimOrderRepo.record_fill`，别在服务层外开第二个事务边界）、调度器与崩溃恢复与 admin 健康页（M3-D，§12：`task_runs` 已在库里，`sync_fx` 与 `weekly recheck` 应是注册进任务表的条目而不是各自起循环；「非交易时段静默」这一条在 M3-B 是**故意没做**的——它属于调度层，不写进规则本身，见 §11 的「静默」）。§14 那条「挂机运行一个真实 A 股交易日」的 M3 总验收要等这两份都落地。
 
 **验收**：**挂机运行一个真实 A 股交易日**——自选股无漏报、无同规则 30 分钟内刷屏、非交易时段全静默、除权股无误报、重启后不重复推送；建两个账户（一个持 A 股 CNY、一个同时持港股 HKD 与美股 USD），同一标的两账户设不同成本 → 各自止损按自己成本正确触发、两条告警不互相吞、汇总页本币与报告币种两套数字一致且汇兑贡献单列。
 

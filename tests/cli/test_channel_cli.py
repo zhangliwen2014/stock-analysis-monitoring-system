@@ -197,6 +197,68 @@ def test_unknown_kind_names_the_six(container, capsys):
     assert "wecom" in text
 
 
+def test_the_global_config_path_is_not_hijacked_by_the_channels_one() -> None:
+    """`--config` 在这个 CLI 里有两个意思：全局那个是**配置文件路径**，`channel add` 那个是
+    一条 k=v。它们共用一个 Namespace，所以全局那一个的 dest 必须改名——否则
+    `sams --config X channel add …` 读到的是 `["url=…"]`，而 `Settings.load` 收到 list
+    当场一段栈（这一枚是真实屏跑出来的）。
+    """
+    args = cli.build_parser().parse_args(
+        [
+            "--config",
+            "/tmp/elsewhere.toml",
+            "channel",
+            "add",
+            "--user",
+            USER,
+            "--kind",
+            "wecom",
+            "--name",
+            "n",
+            "--config",
+            "url=https://x",
+        ]
+    )
+    assert args.config_path == "/tmp/elsewhere.toml"
+    assert args.config == ["url=https://x"]
+
+
+def test_a_local_channel_needs_no_config(container, capsys) -> None:
+    """`desktop` 没有要配的字段：屏幕上不该逼用户编一个假 `--config` 才建得起来。
+
+    这一枚是真实屏跑出来的：原来 `ChannelRepo` 对空配置一律拒，于是
+    `sams channel add --kind desktop --name 本机弹窗` 在唯一一条不需要凭据的通道上失败。
+    """
+    code, row = payload(
+        container,
+        capsys,
+        "add",
+        "--user",
+        USER,
+        "--kind",
+        "desktop",
+        "--name",
+        "本机弹窗",
+    )
+    assert code == 0
+    assert row["channel"]["config"] == {}
+
+
+def test_a_remote_channel_without_url_is_refused_by_name(container, capsys) -> None:
+    code, text = out(
+        container,
+        capsys,
+        "add",
+        "--user",
+        USER,
+        "--kind",
+        "wecom",
+        "--name",
+        "主群",
+    )
+    assert code == 2 and "url" in text
+
+
 def test_first_channel_cannot_decline_to_be_the_default(container, capsys):
     code, text = out(
         container,

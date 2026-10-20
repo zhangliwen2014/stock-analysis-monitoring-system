@@ -92,10 +92,12 @@ class ChannelRepo:
             raise ValidationError("通道必须属于一个用户：跨用户共用凭据没有审计口径")
         channel_kind = _require_kind(kind)
         label = _require_name(name)
-        if not isinstance(config, Mapping) or not dict(config):
+        # 空配置在这里是合法的：`desktop`/`voice` 这两条本机通道**没有**要配的字段。
+        # 「这条通道缺了 url 就发不出去」是 kind 的知识，它住在 monitor/notifiers，
+        # 由 `NotifyService.add` 在落库之前问一次工厂——仓库层若自己判，就得认识名单
+        if not isinstance(config, Mapping):
             raise ValidationError(
-                f"通道 {label} 没有配置：至少要有它需要的字段"
-                "（`--config url=https://…`，一个 k=v 一个参数）"
+                f"通道 {label} 的配置要是一份 k=v（可空）：收到 {type(config).__name__}"
             )
         channel_id = new_id()
         self.db.execute(

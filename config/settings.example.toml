@@ -1,5 +1,11 @@
 # SAMS 配置模板：复制为 config/settings.toml 后修改。
 # 秘密（secret_key）不要写在这里，用环境变量 SAMS_SECRET_KEY 提供。
+#
+# ⚠ 这一个 key 是**通知通道凭据的 Fernet 密钥材料**（spec §4.2、`storage/crypto.py`），
+# 不只是「登录用的一句话」。换掉它，库里已有的每一行 `channels.config_encrypted` 都解不开，
+# 而那条通道在屏幕上照样显示为「启用」——症状是「配过却从来没收过告警」，
+# 报错只在你真去发一条时才出现（`Cipher.decrypt` 那句「换过 secret_key 就要重新 add」）。
+# 真要换：先 `sams channel list --user …` 记下每一条，逐条重新 `add`，别指望旧密文读得回来。
 
 [storage]
 db_path = "data/sams.duckdb"

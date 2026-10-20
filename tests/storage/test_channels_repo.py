@@ -182,9 +182,21 @@ def test_by_kind_only_returns_enabled_channels(repo, seeded_user):
     assert [row.name for row in repo.by_kind(seeded_user, "wecom")] == ["主群"]
 
 
-def test_a_channel_without_config_is_refused(repo, seeded_user):
-    with pytest.raises(ValidationError, match="没有配置"):
-        repo.create(seeded_user, "wecom", "主群", {})
+def test_an_empty_config_is_a_channel_with_nothing_to_configure(repo, seeded_user):
+    """`desktop`/`voice` 没有要配的字段：仓库层若把「空配置」当错误，本机通道就建不出来。
+
+    「wecom 缺 url 就发不出去」是 kind 的知识，住在 `monitor/notifiers`，由
+    `NotifyService.add` 在落库之前问工厂（`tests/monitor/test_router.py` 那枚用例守着）；
+    仓库层自己判就得认识六个 kind，而它连名单都不该知道。
+    """
+    local = repo.create(seeded_user, "desktop", "本机弹窗", {})
+    assert local.config == {}
+    assert repo.show(local.id).config == {}
+
+
+def test_a_non_mapping_config_is_refused(repo, seeded_user):
+    with pytest.raises(ValidationError, match="要是一份 k=v"):
+        repo.create(seeded_user, "wecom", "主群", None)
 
 
 def test_created_at_is_recorded(repo, seeded_user):
