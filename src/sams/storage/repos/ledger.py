@@ -130,6 +130,13 @@ class SimAccountRepo:
         )
         return [_row_to_account(r) for r in rows.to_dicts()]
 
+    def count(self) -> int:
+        """全库账户数（跨用户）：健康页要的是「这套系统有没有人在记账」，不是某人名下几个。
+
+        归属在这里没有意义——按用户数就得先有一个用户参数，而健康检查恰好不知道是谁。
+        """
+        return int(self.db.scalar("SELECT count(*) FROM sim_accounts") or 0)
+
     def cash_balances(self, account_id: str) -> dict[str, float]:
         rows = self.db.query(
             "SELECT currency, amount FROM sim_cash_balances WHERE account_id = ? "
@@ -442,6 +449,20 @@ class SimOrderRepo:
             [account_id],
         )
         return [_row_to_position(r) for r in rows.to_dicts()]
+
+    def count_orders(self) -> int:
+        """全库成交笔数（跨账户、跨用户）：健康页问的是「这套账本动过没有」。"""
+        return int(self.db.scalar("SELECT count(*) FROM sim_orders") or 0)
+
+    def count_holdings(self) -> int:
+        """还持有的只数，**不含清仓后留下的 0 股行**。
+
+        `record_fill` 把那一行留在库里当历史（均价归 0），按行数算会把「全都卖了」
+        读成「还持有 N 只」——那是这一屏上最容易看错的一格。
+        """
+        return int(
+            self.db.scalar("SELECT count(*) FROM sim_positions WHERE qty <> 0") or 0
+        )
 
     def position(
         self, account_id: str, market: str, code: str, *, strict: bool = True

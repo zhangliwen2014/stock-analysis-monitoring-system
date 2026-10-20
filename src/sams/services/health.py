@@ -12,10 +12,13 @@ from datetime import date, datetime
 from sams.core.calendar import CalendarStore
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
+from sams.core.funds import FX_STALE_DAYS
 from sams.core.sources import SourceHealthView, SourceRecord
 from sams.storage.db import Database
 from sams.storage.migrate import pending
 from sams.storage.repos.bars import ADJUST
+from sams.storage.repos.fx import FxPair, FxRepo
+from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 
 
 def _as_date(value) -> date | None:
@@ -88,6 +91,26 @@ class FundamentalsCoverage:
 
 
 @dataclass(frozen=True)
+class LedgerData:
+    """账本那一节：这套系统有没有人在记账，以及换汇影响拆不拆得出来。
+
+    三个数分开报。「只有订单没有持仓」（全卖了）与「一笔都没记」是两件事，合成一个
+    「账本行数」就分不出来了。`fx` 按币种对列而不给一个全库最新日：见 `FxRepo.freshness`。
+    """
+
+    accounts: int = 0
+    orders: int = 0
+    #: 还持有的只数（不含清仓后留下的 0 股行）
+    positions: int = 0
+    fx: tuple[FxPair, ...] = ()
+
+    @property
+    def stale_pairs(self) -> tuple[FxPair, ...]:
+        """超过 `FX_STALE_DAYS` 的那几个对：长假第五天还在用周五那个数就是假数（D87）。"""
+        return tuple(p for p in self.fx if p.age_days > FX_STALE_DAYS)
+
+
+@dataclass(frozen=True)
 class HealthReport:
     db_path: str
     tables: dict[str, int] = field(default_factory=dict)
@@ -96,6 +119,8 @@ class HealthReport:
     pending_migrations: list[str] = field(default_factory=list)
     market_data: dict[str, MarketData] = field(default_factory=dict)
     fundamentals: dict[str, FundamentalsCoverage] = field(default_factory=dict)
+    #: 没接线时也给一节全 0，而不是让这一节从屏幕上消失：缺席会被读成「账本没在用」
+    ledger: LedgerData = field(default_factory=LedgerData)
 
     @property
     def degraded_sources(self) -> list[SourceRecord]:
@@ -161,6 +186,9 @@ class HealthService:
         *,
         year_horizon: int = 3,
         clock: Clock = SYSTEM_CLOCK,
+        accounts: SimAccountRepo | None = None,
+        orders: SimOrderRepo | None = None,
+        fx: FxRepo | None = None,
     ) -> None:
         self.db = db
         self.registry = registry
@@ -168,6 +196,10 @@ class HealthService:
         self.settings = settings
         self.year_horizon = year_horizon
         self.clock = clock
+        #: 账本那一节的三个读数（仓库不传就是全 0，见 `LedgerData`）
+        self.accounts = accounts
+        self.orders = orders
+        self.fx = fx
 
     def report(self) -> HealthReport:
         tables = {
@@ -181,6 +213,31 @@ class HealthService:
             pending_migrations=pending(self.db),
             market_data=self._market_data(),
             fundamentals=self._fundamentals_coverage(),
+            ledger=self._ledger_data(),
+        )
+
+    def _ledger_data(self) -> LedgerData:
+        """账户/成交/持仓三个数 + 每个币种对的新鲜度。
+
+        这里不写 SQL：三个数各自的口径（持仓不含 0 股行、汇率按对各取最后一天）都在仓库里，
+        在健康页重抄一遍的话，先失效的是这一屏——它会报一个账本查询报不出来的数。
+
+        表在不在要先问：0014 之前的老库照样要出这一节，那三个数就是 0，而不是当场炸——
+        `sams health` 是「先看看这个库怎么了」的入口，它不能是第一个倒下的
+        （`_fundamentals_coverage` 同此）。
+        """
+        tables = set(self.db.table_names())
+        ledger_ready = (
+            self.accounts is not None
+            and self.orders is not None
+            and {"sim_accounts", "sim_orders", "sim_positions"} <= tables
+        )
+        fx_ready = self.fx is not None and "fx_rates" in tables
+        return LedgerData(
+            accounts=self.accounts.count() if ledger_ready else 0,
+            orders=self.orders.count_orders() if ledger_ready else 0,
+            positions=self.orders.count_holdings() if ledger_ready else 0,
+            fx=self.fx.freshness(self.clock.today()) if fx_ready else (),
         )
 
     def _fundamentals_coverage(self) -> dict[str, FundamentalsCoverage]:

@@ -1159,3 +1159,64 @@ def test_every_subcommand_help_page_formats():
 
     walk(cli.build_parser(), ("sams",))
     assert {"sams screen pr", "sams analysis fundamentals"} <= set(visited), visited
+
+
+# ---------- `sams health` 的账本那一节 ----------
+
+
+def _ledger_rows(container, *, fx=None) -> None:
+    """铺一条真成交：账户 1、成交 1、持仓 1。"""
+    container.users.create("trader", "correct-horse-battery-long")
+    account = container.ledger.open_account("trader", "主账户")
+    container.ledger.deposit(
+        account.id, "CNY", 100_000.0, username="trader", reason="初始", actor_id="trader"
+    )
+    container.ledger.buy(
+        account.id, "trader", "A", "600000", qty=100, price=40.0, ts=container.clock.now_utc()
+    )
+    if fx is not None:
+        for day, (base, quote, rate) in fx.items():
+            container.fx_store.put(day, base, quote, rate, source="manual")
+
+
+def test_health_prints_the_ledger_counts(container, capsys) -> None:
+    _ledger_rows(container)
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "[账本]" in out
+    assert "账户 1" in out and "成交 1 笔" in out and "持有 1 只" in out
+
+
+def test_health_says_the_conversion_cannot_be_split_when_fx_is_empty(container, capsys) -> None:
+    """账本动过而 `fx_rates` 一行没有：这一屏要说「跨币种持仓的换汇影响拆不出」并给出出口。
+
+    只报一个 0 行不够——读的人不知道那是「还没同步」还是「这个库不需要汇率」。
+    """
+    _ledger_rows(container)
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "换汇影响拆不出" in out
+    assert "sams sync fx" in out
+
+
+def test_health_names_the_stale_currency_pair(container, capsys) -> None:
+    """按对点名，不给一个全库最新日：USD 新、HKD 旧时，被背书的正是旧的那一笔。"""
+    from datetime import date as _date
+
+    _ledger_rows(
+        container,
+        fx={
+            container.clock.today(): ("USD", "CNY", 7.1),
+            _date(2020, 1, 1): ("HKD", "CNY", 0.85),
+        },
+    )
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    # 逐行判：`HKD→CNY` 在「最新 …」那行本来就出现，只断言串里有两个词，
+    # 会被「⚠ 挂在 USD 那行上」这种反了的输出蒙过去
+    assert any("⚠ HKD→CNY" in line and "天没更新" in line for line in lines)
+    assert not any("⚠ USD→CNY" in line for line in lines)

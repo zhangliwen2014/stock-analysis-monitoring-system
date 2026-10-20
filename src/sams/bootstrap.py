@@ -252,8 +252,17 @@ def build_container(
         valuation=valuation,
         # `settings` 是那个「已知市场」的出处：一个没配的市场立不出 thesis，
         # 因为那条链上每一栏都读不到数（D84）
-        theses=ThesisService(theses_store, users, valuation, cfg, clock=clock),
+        theses=ThesisService(theses_store, users, valuation, cfg, clock=clock, orders=sim_orders),
         ledger=ledger,
         portfolio=portfolio,
-        health=HealthService(database, registry, calendar_store, cfg, clock=clock),
+        health=HealthService(
+            database,
+            registry,
+            calendar_store,
+            cfg,
+            clock=clock,
+            accounts=sim_accounts,
+            orders=sim_orders,
+            fx=fx_store,
+        ),
     )

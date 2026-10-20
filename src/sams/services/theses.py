@@ -12,12 +12,16 @@
 * **谁在读写这一条**。用户名解析成 `user_id` 才交给仓库；不存在与已禁用是两种拒绝（后者
   若放行，「禁用即停止一切动作」就成了纸面规则）。别人的 thesis 连时间线都读不到，那条
   不变式在仓库层，这里只验接线没漏。
+
+U26 补上第四件：**这条论到底买过没有**。状态走到 `opened` 只说明「库里那几列齐了、
+这一跳被允许」，它不是「按那个价成交过」的凭证。报告把挂在 `thesis_id` 上的真成交一起带出去，
+没有成交时明说「状态是推出来的，不是核对过的」——不写这句，时间线会被读成一句没发生过的动作。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from sams.analysis.valuation.compose import Plan
 from sams.core.clock import SYSTEM_CLOCK, Clock
@@ -27,6 +31,7 @@ from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
 from sams.services.actors import resolve_actor
 from sams.services.valuation import STYLE_NAMES, ValuationRead, ValuationService
+from sams.storage.repos.ledger import SimOrderRepo
 from sams.storage.repos.theses import (
     HIT_STOP,
     HIT_TARGET,
@@ -89,6 +94,20 @@ class LevelRow:
 
 
 @dataclass(frozen=True)
+class Fill:
+    """挂在一条论上的一笔真成交（U26 的视图）。
+
+    只给屏幕要用的四列：仓库那个 `Order` 带着 account_id 与 fee_currency，把它们透出去
+    等于让命令层以为自己是服务层，下一句「顺手」就会去改账本。
+    """
+
+    side: str
+    qty: float
+    price: float
+    ts: datetime | None
+
+
+@dataclass(frozen=True)
 class ThesisReport:
     """一屏 thesis：记录本身、那条时间线、当前那份估值，以及它们怎么对上。"""
 
@@ -101,6 +120,9 @@ class ThesisReport:
     written: tuple[str, ...] = ()
     valuation: ValuationRead | None = None
     unavailable: str | None = None
+    #: 挂在这个立论上的真成交（U26）。空元组 = 一笔都没有。
+    fills: tuple[Fill, ...] = ()
+    fills_note: str = ""
 
     @property
     def price(self) -> float | None:
@@ -155,6 +177,7 @@ class ThesisService:
         valuation: ValuationService,
         settings: Settings,
         clock: Clock = SYSTEM_CLOCK,
+        orders: SimOrderRepo | None = None,
     ) -> None:
         self.theses = theses
         self.users = users
@@ -162,6 +185,10 @@ class ThesisService:
         #: 已知市场只有配置里那几个：`market_cfg` 是「系统能不能在这个市场读到数」的出处
         self.settings = settings
         self.clock = clock
+        #: U26 的那只读接口。默认 `None` 只为兼容既有构造点，装配根一定传（见
+        #: `test_the_container_always_wires_the_orders_repo`）：漏传不会报错，只会让
+        #: 每一屏都说「没有成交」——那是把接线断了报成一条业务结论
+        self.orders = orders
 
     # --- 写 --------------------------------------------------------------------------------
 
@@ -373,6 +400,7 @@ class ThesisService:
             _row(thesis, plan, key=key, label=label, columns=columns, unavailable=unavailable)
             for key, label, columns in _ROWS
         )
+        fills = _fills(self.orders, thesis.id)
         return ThesisReport(
             username=username,
             thesis=thesis,
@@ -383,7 +411,26 @@ class ThesisService:
             written=written,
             valuation=read,
             unavailable=unavailable,
+            fills=fills,
+            fills_note=_fills_note(fills),
         )
+
+
+def _fills(orders: SimOrderRepo | None, thesis_id: str) -> tuple[Fill, ...]:
+    if orders is None:
+        return ()
+    return tuple(
+        Fill(side=order.side, qty=order.qty, price=order.price, ts=order.ts)
+        for order in orders.orders_for_thesis(thesis_id)
+    )
+
+
+#: 「状态是推出来的」这句话要说足：`hit_target` 只说明屏幕上那一眼过了价，不说明按那个价买过
+_UNVERIFIED = "没有任何成交挂在这个立论上（状态是推出来的，不是核对过的）"
+
+
+def _fills_note(fills: tuple[Fill, ...]) -> str:
+    return _UNVERIFIED if not fills else f"{len(fills)} 笔成交挂在这个立论上"
 
 
 # --- 对照与位置 ----------------------------------------------------------------------------

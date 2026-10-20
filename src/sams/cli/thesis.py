@@ -308,6 +308,13 @@ def _print_report(report: ThesisReport, code: int, *, next_steps: tuple[str, ...
     print(f"  {report.placement}")
     for note in report.notes:
         print(f"    · {note}")
+    # 成交排在时间线之前：这一节是「那条链说的话有没有钱真的动过」的凭据，放在后面就成附注了
+    print("  ── 成交（状态到了 ≠ 按那个价买过）──")
+    print(f"    {report.fills_note}")
+    for fill in report.fills:
+        # `buy`/`sell` 用账本那一屏的原词：同一笔成交在两处显示成两种说法，
+        # 读的人要先猜它们是不是同一件事
+        print(f"      {stamp(fill.ts)}  {fill.side} {fill.qty:g} 股 @ {fill.price:g}")
     print("  ── 时间线 ──")
     for event in report.events:
         print(
@@ -400,6 +407,18 @@ def _report_payload(report: ThesisReport, code: int, next_steps: tuple[str, ...]
         # 一列价位都没落库时它是 null：说「没有测量日（手填）」是替一片空白编出处
         "stored_on": report.stored_on if report.has_levels else None,
         "written": list(report.written),
+        # 两个键在有无成交时都出现（同 §5.4 规则 2）：靠「有没有这个键」判断买没买是错的，
+        # 空列表与缺键在 JSON 里都读得通，而管道要的是一句「几笔成交」或那句「没有」
+        "fills": [
+            {
+                "side": fill.side,
+                "qty": fill.qty,
+                "price": fill.price,
+                "ts": fill.ts.isoformat() if fill.ts else None,
+            }
+            for fill in report.fills
+        ],
+        "fills_note": report.fills_note,
         "next_steps": list(next_steps),
         "unavailable": report.unavailable,
         "valuation": None if report.valuation is None else _valuation_payload(report),

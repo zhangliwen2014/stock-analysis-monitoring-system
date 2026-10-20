@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from support_valuation import CODE, make_container
@@ -532,3 +532,72 @@ def test_revise_refuses_a_stop_at_or_above_the_target(db, settings, capsys):
     assert "止损" in data["reason"]
     _, after = out(container, capsys, "show", thesis_id, "--user", USER)
     assert "999" not in after, "拒绝不能改掉库里那一个"
+
+
+# --- U26：这一条论到底买过没有 ---------------------------------------------------------------
+
+
+def _opened(container, capsys) -> str:
+    """立论 → `proposed` → `opened`，把 id 交出来。
+
+    走 CLI 而不是服务层：这一屏要说的是「用户敲出来的那几步之后，库里现在是什么状态」，
+    中间那步用服务层铺就等于把要验的接线绕过去。
+    """
+    thesis_id = add(container, capsys)
+    assert invoke(container, "advance", thesis_id, "--user", USER, "--to", "proposed") == 0
+    assert invoke(container, "advance", thesis_id, "--user", USER, "--to", "opened") == 0
+    return thesis_id
+
+
+def _buy(container, thesis_id: str) -> None:
+    account = container.ledger.open_account(USER, "T")
+    container.ledger.deposit(
+        account.id, "CNY", 100_000.0, username=USER, reason="初始", actor_id=USER
+    )
+    container.ledger.buy(
+        account.id,
+        USER,
+        "A",
+        CODE,
+        qty=100,
+        price=40.0,
+        thesis_id=thesis_id,
+        ts=datetime(2024, 10, 25, 15, tzinfo=UTC),
+    )
+
+
+def test_show_says_so_when_nothing_was_actually_bought(db, settings, capsys):
+    """`opened` 却没有成交：屏幕要说「这是推出来的，不是核对过的」。
+
+    不说这句，时间线那一屏会被读成「我按那个价买进了」，而库里一分钱都没动。
+    """
+    container = build(db, settings)
+    thesis_id = _opened(container, capsys)
+    code, body = out(container, capsys, "show", thesis_id, "--user", USER)
+    assert code == 0
+    assert "没有任何成交" in body
+
+
+def test_show_lists_the_fill_under_the_thesis(db, settings, capsys):
+    container = build(db, settings)
+    thesis_id = _opened(container, capsys)
+    _buy(container, thesis_id)
+    code, body = out(container, capsys, "show", thesis_id, "--user", USER)
+    assert code == 0
+    assert "成交" in body and "100" in body and "40" in body
+
+
+def test_both_fill_keys_are_present_whether_or_not_there_is_a_fill(db, settings, capsys):
+    """两个键同时出现（§5.4 规则 2 的那条红线搬到 fills 上）。
+
+    靠「有没有这个键」判断买没买是错的：空列表与「这一项不存在」在 JSON 里都读得通，
+    而管道那边要的是一句「1 笔成交挂在这个立论上」或那句「没有」。
+    """
+    container = build(db, settings)
+    thesis_id = _opened(container, capsys)
+    _, empty = payload(container, capsys, "show", thesis_id, "--user", USER)
+    assert empty["fills"] == [] and "没有任何成交" in empty["fills_note"]
+    _buy(container, thesis_id)
+    _, filled = payload(container, capsys, "show", thesis_id, "--user", USER)
+    assert [f["side"] for f in filled["fills"]] == ["buy"]
+    assert "1 笔成交" in filled["fills_note"]

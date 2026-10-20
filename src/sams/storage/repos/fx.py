@@ -27,9 +27,45 @@ class FxRate:
     age_days: int = 0
 
 
+@dataclass(frozen=True)
+class FxPair:
+    """一个币种对的最后一天：健康页按对报，不按全库 `max(date)` 报（见 `freshness`）。"""
+
+    base: str
+    quote: str
+    latest: date
+    age_days: int
+    source: str | None
+
+
 class FxRepo:
     def __init__(self, db: Database) -> None:
         self.db = db
+
+    def freshness(self, today: date) -> tuple[FxPair, ...]:
+        """每个存在过的币种对各报自己的最后一天与距今几天。
+
+        全库一个 `max(date)` 会说「汇率很新」：USD→CNY 昨天同步过、HKD→CNY 三周没动时，
+        港币那笔持仓的换汇影响照样是假数，而那一屏看不出被谁背了书。
+        「距今几天」按 `today` 算而不是存下来：陈旧是读出来的，写下的那天它不陈旧。
+        """
+        rows = self.db.query(
+            "SELECT base_ccy, quote_ccy, date, source FROM ("
+            "  SELECT base_ccy, quote_ccy, date, source,"
+            "         rank() OVER (PARTITION BY base_ccy, quote_ccy ORDER BY date DESC) AS newest"
+            "  FROM fx_rates) WHERE newest = 1 ORDER BY base_ccy, quote_ccy",
+            [],
+        )
+        return tuple(
+            FxPair(
+                base=row["base_ccy"],
+                quote=row["quote_ccy"],
+                latest=row["date"],
+                age_days=(today - row["date"]).days,
+                source=row["source"],
+            )
+            for row in rows.to_dicts()
+        )
 
     def put(
         self,
@@ -66,7 +102,7 @@ class FxRepo:
         """`day` 或之前最近的一条；超过 `max_age_days` 就不给（宁可没有，不要过期）。
 
         默认 `FX_STALE_DAYS`：周末用周五的汇率是合法的（标的不涨也不跌），
-        长假第七天还在用同一个数是假数。放宽要由调用方明说，不由这里默认放行。
+        长假第五天还在用周五那个数是假数。放宽要由调用方明说，不由这里默认放行。
         """
         if base == quote:
             return FxRate(day, base, quote, 1.0, "same", False, 0)

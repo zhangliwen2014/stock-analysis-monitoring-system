@@ -14,11 +14,12 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from support_valuation import CODE, make_container
 
+from sams.bootstrap import build_container
 from sams.core.errors import StorageError, ValidationError
 from sams.storage.repos.theses import (
     ARCHIVED,
@@ -32,6 +33,8 @@ from sams.storage.repos.theses import (
 USER = "trader"
 OTHER = "watcher"
 PWD = "correct-horse-battery"
+#: 与 `support_valuation` 那个冻结时钟同一时刻：成交落在「今天」，屏幕上的日期才对得上
+TRADE_MOMENT = datetime(2024, 10, 25, 15, tzinfo=UTC)
 
 
 def build(db, settings, **seeded):
@@ -375,3 +378,78 @@ def test_list_passes_the_status_filter_through(db, settings):
     container.theses.advance(USER, thesis.id, TRACKING)
     assert [item.status for item in container.theses.list(USER, status=TRACKING)] == [TRACKING]
     assert container.theses.list(USER, status=PROPOSED) == []
+
+
+# --- U26：状态与真成交对账 -------------------------------------------------------------------
+
+
+def _opened_thesis(container):
+    """走到 `opened`：那是一笔真成交唯一允许挂靠的状态（D85）。"""
+    thesis = container.theses.add(USER, "A", CODE, status=PROPOSED).thesis
+    container.theses.advance(USER, thesis.id, OPENED)
+    return thesis
+
+
+def test_a_thesis_with_no_fills_says_the_status_is_unverified(db, settings):
+    """U26：hit_target 只说明「屏幕上到价了」，有没有按那个价买是另一件事。
+
+    不写这句，时间线会读成「我按 50 元止盈了」，而库里一分钱都没动过。
+    """
+    container = build(db, settings)
+    thesis = _opened_thesis(container)
+    report = container.theses.show(USER, thesis.id)
+    assert report.fills == ()
+    assert "没有任何成交" in report.fills_note
+    assert "不是核对过的" in report.fills_note
+
+
+def test_fills_under_a_thesis_are_listed_with_side_qty_and_price(db, settings):
+    container = build(db, settings)
+    thesis = _opened_thesis(container)
+    account = container.ledger.open_account(USER, "T")
+    container.ledger.deposit(
+        account.id, "CNY", 100_000.0, username=USER, reason="初始", actor_id=USER
+    )
+    container.ledger.buy(
+        account.id,
+        USER,
+        "A",
+        CODE,
+        qty=100,
+        price=40.0,
+        thesis_id=thesis.id,
+        ts=TRADE_MOMENT,
+    )
+    report = container.theses.show(USER, thesis.id)
+    assert [(f.side, f.qty, f.price) for f in report.fills] == [("buy", 100.0, 40.0)]
+    assert report.fills[0].ts == TRADE_MOMENT
+    assert "1 笔成交" in report.fills_note
+
+
+def test_a_fill_on_another_thesis_is_not_counted_here(db, settings):
+    """两条论的成交不能互相冒充：按 thesis_id 筛，而不是按「同一只票」筛。
+
+    两条论要落在**同一只票、同一套模板**上才验得到这一点——换成两只票，按代码筛也能通过。
+    先把第一条作废，才绕得开 D81 那道「同一套模板只留一条活的」闸（作废不删记录，
+    它还在，正是要区分的那两条之一）。
+    """
+    container = build(db, settings)
+    first = _opened_thesis(container)
+    container.theses.advance(USER, first.id, INVALIDATED)
+    container.theses.advance(USER, first.id, ARCHIVED)
+    second = _opened_thesis(container)
+    account = container.ledger.open_account(USER, "T")
+    container.ledger.deposit(
+        account.id, "CNY", 100_000.0, username=USER, reason="初始", actor_id=USER
+    )
+    container.ledger.buy(
+        account.id, USER, "A", CODE, qty=100, price=40.0, thesis_id=second.id, ts=TRADE_MOMENT
+    )
+    assert container.theses.show(USER, first.id).fills == ()
+    assert len(container.theses.show(USER, second.id).fills) == 1
+
+
+def test_the_container_always_wires_the_orders_repo(db, settings):
+    """`orders=None` 只为既有测试的构造点存在；装配根漏传，U26 就永远不会闭合。"""
+    container = build_container(settings, db=db)
+    assert container.theses.orders is not None

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import polars as pl
 import pytest
-from support import StubAdapter, sample_bars
+from support import FrozenClock, StubAdapter, sample_bars
 
 from sams.core.errors import DatasourceError, RateLimited
 from sams.core.timeutil import CalendarDay, SessionWindow
@@ -15,6 +15,8 @@ from sams.storage.migrate import discover
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.fx import FxRepo
+from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
 
@@ -318,3 +320,123 @@ def test_an_unknown_publication_date_does_not_become_the_latest_one(db, settings
     cov = coverage(db, settings, "A")
     assert cov.financials_latest_period == date(2024, 6, 30), "库里最新报告期照实说"
     assert cov.financials_latest_published == date(2024, 3, 20)
+
+
+# ---------- 账本那一节：能不能记账、能不能拆换汇（M3-A 的 U26 之后） ----------
+
+
+def ledger_service(
+    db, settings, *, accounts=None, orders=None, fx=None, today=D
+) -> HealthService:
+    """把三个仓库接上，时钟冻在 `today`：`age_days` 不冻住就没法断言。"""
+    registry = AdapterRegistry(
+        adapters={"akshare": StubAdapter("akshare", ["A"], sample_bars())},
+        market_sources={"A": ("akshare",)},
+        sleep=lambda seconds: None,
+    )
+    return HealthService(
+        db,
+        registry,
+        CalendarRepo(db),
+        settings,
+        clock=FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC)),
+        accounts=accounts,
+        orders=orders,
+        fx=fx,
+    )
+
+
+def test_the_ledger_section_counts_accounts_orders_and_open_positions(db, settings) -> None:
+    """三个数分开报：只有订单没有持仓（全卖了）与一笔都没记，是两件不同的事。
+
+    持仓只数**不含清仓后留下的 0 股行**——那一行是历史，不是「还持有」。
+    """
+    accounts = SimAccountRepo(db)
+    ledger = SimOrderRepo(db, accounts)
+    user_id = UserRepo(db).create("trader", PASSWORD).id
+    account = accounts.open(user_id, "主账户")
+    accounts.adjust_cash(account.id, "CNY", 100_000.0, reason="初始", actor_id=user_id)
+    ledger.record_fill(
+        account_id=account.id,
+        user_id=user_id,
+        market="A",
+        code="600000",
+        side="buy",
+        qty=100,
+        price=40.0,
+        currency="CNY",
+    )
+    report = ledger_service(
+        db, settings, accounts=accounts, orders=ledger, fx=FxRepo(db)
+    ).report()
+    assert (report.ledger.accounts, report.ledger.orders, report.ledger.positions) == (1, 1, 1)
+
+
+def test_a_closed_position_is_not_counted_as_a_holding(db, settings) -> None:
+    accounts = SimAccountRepo(db)
+    ledger = SimOrderRepo(db, accounts)
+    user_id = UserRepo(db).create("trader", PASSWORD).id
+    account = accounts.open(user_id, "主账户")
+    accounts.adjust_cash(account.id, "CNY", 100_000.0, reason="初始", actor_id=user_id)
+    for side, qty in (("buy", 100.0), ("sell", 100.0)):
+        ledger.record_fill(
+            account_id=account.id,
+            user_id=user_id,
+            market="A",
+            code="600000",
+            side=side,
+            qty=qty,
+            price=40.0,
+            currency="CNY",
+        )
+    report = ledger_service(
+        db, settings, accounts=accounts, orders=ledger, fx=FxRepo(db)
+    ).report()
+    assert (report.ledger.orders, report.ledger.positions) == (2, 0)
+
+
+def test_fx_freshness_is_reported_per_pair_not_as_one_global_max(db, settings) -> None:
+    """两个币种对各报自己的最后一天：全局 `max(date)` 会说「汇率很新」。
+
+    而 USD→CNY 昨天刚同步、HKD→CNY 三周没动时，港币那笔持仓的换汇影响照样是假数——
+    一个数替两个对背书，屏幕上看不出的那一半正是错的那一半。
+    """
+    fx = FxRepo(db)
+    fx.put(date(2024, 1, 2), "USD", "CNY", 7.1, source="yfinance")
+    fx.put(date(2023, 12, 1), "HKD", "CNY", 0.91, source="manual")
+    pairs = ledger_service(db, settings, fx=fx, today=D).report().ledger.fx
+    by_pair = {(p.base, p.quote): p for p in pairs}
+    assert by_pair[("USD", "CNY")].age_days == 0
+    assert by_pair[("USD", "CNY")].source == "yfinance"
+    assert by_pair[("HKD", "CNY")].age_days == 32
+    assert by_pair[("HKD", "CNY")].latest == date(2023, 12, 1)
+
+
+def test_an_empty_fx_table_is_an_empty_list_not_a_missing_section(db, settings) -> None:
+    """没同步过要报「一个币种对都没有」，不是这一节不出现：缺席会被读成「账本没在用」。"""
+    report = ledger_service(db, settings, fx=FxRepo(db)).report()
+    assert report.ledger.fx == ()
+
+
+def test_the_ledger_section_survives_a_database_without_migration_0014(tmp_path, settings) -> None:
+    """0014 之前的老库：那三个数是 0，而不是当场 `Catalog Error`。
+
+    崩在这里的症状比缺数据严重：`sams health` 正是「先看看这个库怎么了」的入口，
+    而待迁移的库恰好是它最该开口说话的那一刻——它自己不能是第一个倒下的。
+    """
+    fresh = Database.open(tmp_path / "pre-0014.duckdb")
+    try:
+        accounts = SimAccountRepo(fresh)
+        report = ledger_service(
+            fresh,
+            settings,
+            accounts=accounts,
+            orders=SimOrderRepo(fresh, accounts),
+            fx=FxRepo(fresh),
+        ).report()
+        assert (report.ledger.accounts, report.ledger.orders) == (0, 0)
+        assert report.ledger.positions == 0 and report.ledger.fx == ()
+        # 前置条件也说一句：这里数不到东西是因为迁移还没跑，不是因为账本真的空
+        assert any(name.startswith("0014") for name in report.pending_migrations)
+    finally:
+        fresh.close()

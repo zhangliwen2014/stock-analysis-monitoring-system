@@ -78,6 +78,38 @@ def _print_fundamentals(container: Container, report) -> None:
         print(line + "".join(f"  ⚠ {m}" for m in marks))
 
 
+def _print_ledger(report) -> None:
+    """账本那一节：三个数 + 每个币种对各自的新鲜度。
+
+    「账本动过而 `fx_rates` 一行没有」必须单独说一句：那一屏上的 0 会被读成「这个库不需要
+    汇率」，而它的实际后果是跨币种持仓的换汇影响从此拆不出（`positions` 那一行会变成
+    「换不出」）。陈旧也按**对**点名，不给一个全库最新日——USD 新、HKD 旧时，被那个数
+    背书的恰好是错的那一笔。
+    """
+    ledger = report.ledger
+    print("[账本]")
+    print(f"  账户 {ledger.accounts} · 成交 {ledger.orders} 笔 · 持有 {ledger.positions} 只")
+    if not ledger.fx:
+        if ledger.accounts:
+            print(
+                "  ⚠ fx_rates 0 行而账本已经动过：跨币种持仓的换汇影响拆不出"
+                "（`sams sync fx --base USD --quote CNY …`，取不到时 `sams ledger fx set`）"
+            )
+        return
+    for pair in ledger.fx:
+        line = (
+            f"  汇率 {pair.base}→{pair.quote}  最新 {pair.latest}"
+            f"（距今 {pair.age_days} 天，source={pair.source or '—'}）"
+        )
+        print(line)
+    for pair in ledger.stale_pairs:
+        print(
+            f"  ⚠ {pair.base}→{pair.quote} 已经 {pair.age_days} 天没更新："
+            f"谁把 {pair.base} 换成 {pair.quote} 都还在用这一天（`sams sync fx --base {pair.base}"
+            f" --quote {pair.quote} --start {pair.latest} …`）"
+        )
+
+
 def show(container: Container, args: argparse.Namespace) -> int:
     report = container.health.report()
     print(f"库: {report.db_path}")
@@ -88,6 +120,7 @@ def show(container: Container, args: argparse.Namespace) -> int:
         print(f"  {name:<18} {rows:>8} 行")
     _print_data(report)
     _print_fundamentals(container, report)
+    _print_ledger(report)
     print("[日历覆盖]")
     for market, years in report.calendar_years.items():
         shown = ", ".join(str(y) for y in years) or "（无）"
