@@ -1220,3 +1220,100 @@ def test_health_names_the_stale_currency_pair(container, capsys) -> None:
     # 会被「⚠ 挂在 USD 那行上」这种反了的输出蒙过去
     assert any("⚠ HKD→CNY" in line and "天没更新" in line for line in lines)
     assert not any("⚠ USD→CNY" in line for line in lines)
+
+
+# ---------- `sams health` 的通知那一节 ----------
+
+
+def _one_channel_with_deliveries(container, *outcomes) -> None:
+    """一条通道 + 挂在它名下的若干次投递：健康页那一节数的就是这些。"""
+    from datetime import UTC, datetime
+
+    from sams.core.notify import NO_CHANNEL
+
+    user = container.users.create("trader", PASSWORD)
+    node = container.channels_store.create(
+        user.id, "wecom", "主群", {"url": "https://x/y?key=secret-do-not-print"}
+    )
+    alert = container.alerts_store.create(
+        user.id,
+        rule_id=None,
+        rule_name="PR 低",
+        account_id=None,
+        account_name="",
+        market="A",
+        code="601088",
+        symbol_name="中国神华",
+        severity="mid",
+        stage="入池",
+        value_text="PR=0.31",
+        threshold_text="PR≤0.4",
+        action_note="",
+        triggered_at=datetime.now(UTC),
+        channel_ids=[node.id],
+    )
+    for outcome in outcomes:
+        channel_id = None if outcome == NO_CHANNEL else node.id
+        container.alerts_store.record(alert.id, channel_id, outcome, error="errcode=93000")
+
+
+def test_health_prints_the_notify_counts(container, capsys) -> None:
+    from sams.core.notify import FAILED, SENT
+
+    _one_channel_with_deliveries(container, SENT, FAILED)
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "[通知]" in out
+    assert "通道 1（启用 1）" in out
+    assert "sent 1 / failed 1" in out
+    assert "secret-do-not-print" not in out
+
+
+def test_health_says_there_is_no_channel_yet(container, capsys) -> None:
+    """0 条通道是「告警发不出去」最直接的一种，那一屏必须给出口而不是给一个 0。"""
+    container.users.create("trader", PASSWORD)
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "0 条通道" in out and "sams channel add" in out
+
+
+def test_health_keeps_suppressed_separate_from_failed(container, capsys) -> None:
+    """压制与失败混成一句，用户就会去修一个他自己让开的东西。"""
+    from sams.core.notify import SUPPRESSED
+
+    _one_channel_with_deliveries(container, SUPPRESSED)
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "failed 0" in out and "压制 1" in out
+
+
+def test_health_names_a_channel_kind_this_build_cannot_send(container, capsys) -> None:
+    """库里有一行工厂不认识的 kind：路由静默跳过它，只有这一屏会说。"""
+    user = container.users.create("trader", PASSWORD)
+    container.db.execute(
+        "INSERT INTO channels (id, user_id, kind, name, config_encrypted, enabled)"
+        " VALUES ('legacy-1', ?, 'telegram', '旧通道', NULL, TRUE)",
+        [user.id],
+    )
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "不认识的 kind" in out and "telegram" in out
+
+
+def test_health_reports_the_local_channels_it_cannot_use(container, capsys) -> None:
+    """远程终端上 desktop/voice 发不出去：这一屏要说「为什么」，而不是显示它们可用。
+
+    探测器不给假机器造结论，所以这里换掉 `HealthService.local_status` 那个注入点——
+    这一枚验的是排版，「探测本身对不对」在 `tests/monitor/test_env.py`。
+    """
+    _one_channel_with_deliveries(container)
+    container.health.local_status = lambda: {"desktop": "远程终端：没有 DISPLAY", "voice": ""}
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    out = capsys.readouterr().out
+    assert "desktop 发不出去：远程终端：没有 DISPLAY" in out
+    assert "voice" not in out, "可用的那一个不占一行"

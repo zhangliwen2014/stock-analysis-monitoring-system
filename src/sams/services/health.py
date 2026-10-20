@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -13,6 +14,7 @@ from sams.core.calendar import CalendarStore
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.funds import FX_STALE_DAYS
+from sams.core.notify import FAILED, KINDS, NO_CHANNEL, SENT, SUPPRESSED
 from sams.core.sources import SourceHealthView, SourceRecord
 from sams.storage.db import Database
 from sams.storage.migrate import pending
@@ -43,6 +45,10 @@ KEY_TABLES = (
     "valuation_daily",
     "funding_flow",
     "scan_results",
+    # 通知这一路的三张表：通道是配置、alerts 是事实、notify_log 是结果
+    "channels",
+    "alerts",
+    "notify_log",
 )
 
 
@@ -111,6 +117,32 @@ class LedgerData:
 
 
 @dataclass(frozen=True)
+class NotifyData:
+    """通知这一节：有几条通道、四种结果各发生过几次、本机那两个通道发得出去吗。
+
+    `channels=None` 表示「库里还不是 0015 的形状」，与 0 是两句话：0 意思是「一个通道
+    都没配」（用户该去配），None 意思是「该跑迁移」。把 None 写成 0，运维会去查
+    「为什么通道没了」而真正的问题是版本。六个数**一起**可空：只让前两列可空的话，
+    「0 次投递」这一句在未迁移的库上仍然是谎话。
+    """
+
+    channels: int | None = None
+    enabled: int | None = None
+    #: 四态各一个数（§11）。压制与「没有通道」分开数：那两个的修法不一样。
+    sent: int | None = None
+    failed: int | None = None
+    suppressed: int | None = None
+    no_channel: int | None = None
+    #: 本机那两个通道的可用性：**None 是「没接入探测」**（这一层不认识 monitor），
+    #: 空串是「这台机器发得出去」，其余就是那一句原因。三个状态必须分得开——
+    #: 把「没接入」显示成「可用」，健康页就在替一个从没试过的通道打包票。
+    desktop: str | None = None
+    voice: str | None = None
+    #: 库里有、工厂不认识的 kind：路由会静默跳过，所以必须在这里出声
+    unknown_kinds: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class HealthReport:
     db_path: str
     tables: dict[str, int] = field(default_factory=dict)
@@ -121,6 +153,8 @@ class HealthReport:
     fundamentals: dict[str, FundamentalsCoverage] = field(default_factory=dict)
     #: 没接线时也给一节全 0，而不是让这一节从屏幕上消失：缺席会被读成「账本没在用」
     ledger: LedgerData = field(default_factory=LedgerData)
+    #: 未迁移的库里这一节全是 None（不是 0）：见 `NotifyData`
+    notify: NotifyData = field(default_factory=NotifyData)
 
     @property
     def degraded_sources(self) -> list[SourceRecord]:
@@ -189,6 +223,7 @@ class HealthService:
         sim_accounts: SimAccountRepo | None = None,
         sim_ledger: SimOrderRepo | None = None,
         fx: FxRepo | None = None,
+        local_status: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self.db = db
         self.registry = registry
@@ -201,6 +236,10 @@ class HealthService:
         self.sim_accounts = sim_accounts
         self.sim_ledger = sim_ledger
         self.fx = fx
+        #: 「本机发得出去吗」那两句话由 monitor 探测，这里只转述：services 不许 import
+        #: monitor（守卫），所以来的是一个函数而不是一个 monitor 对象。不传就是空串，
+        #: 屏幕上那一行会写「未接入」而不是「可用」
+        self.local_status = local_status
 
     def report(self) -> HealthReport:
         tables = {
@@ -215,6 +254,44 @@ class HealthService:
             market_data=self._market_data(),
             fundamentals=self._fundamentals_coverage(),
             ledger=self._ledger_data(),
+            notify=self._notify_data(),
+        )
+
+    def _notify_data(self) -> NotifyData:
+        """通道数 + 四态计数 + 本机那两个通道的可用性 + 工厂不认识的 kind。
+
+        这里不写「最近一条告警是什么时候」：那一句的答案要跨 `alerts`/`notify_log` 两张表
+        做 join，而计数已经回答了运维真正会问的那个问题（「有没有在发、发失败了几次」）。
+        """
+        names = set(self.db.table_names())
+        if not {"channels", "alerts", "notify_log"} <= names:
+            return NotifyData()
+        if "outcome" not in self.db.columns("notify_log"):
+            # 护栏在 SQL 之前：不许对一张不存在的列发查询。`channels`/`notify_log` 是 0001
+            # 就有的表，所以「表在不在」不足以决定——0015 缺的那一列才是真正没跑到的东西
+            return NotifyData()
+        counts = {
+            str(row["o"]): int(row["n"])
+            for row in self.db.query(
+                "SELECT coalesce(outcome, 'failed') AS o, count(*) AS n"
+                " FROM notify_log GROUP BY o"
+            ).to_dicts()
+        }
+        kinds = {
+            str(row["kind"])
+            for row in self.db.query("SELECT DISTINCT kind FROM channels").to_dicts()
+        }
+        status = self.local_status() if self.local_status is not None else {}
+        return NotifyData(
+            channels=int(self.db.scalar("SELECT count(*) FROM channels") or 0),
+            enabled=int(self.db.scalar("SELECT count(*) FROM channels WHERE enabled") or 0),
+            sent=counts.get(SENT, 0),
+            failed=counts.get(FAILED, 0),
+            suppressed=counts.get(SUPPRESSED, 0),
+            no_channel=counts.get(NO_CHANNEL, 0),
+            desktop=status.get("desktop"),
+            voice=status.get("voice"),
+            unknown_kinds=tuple(sorted(kinds - set(KINDS))),
         )
 
     def _ledger_data(self) -> LedgerData:

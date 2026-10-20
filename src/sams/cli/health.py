@@ -110,6 +110,37 @@ def _print_ledger(report) -> None:
         )
 
 
+def _print_notify(report) -> None:
+    """通知那一节：通道有几条能用、四种结果各几次、本机那两个到底发得出去吗。
+
+    「投递 failed N 次」必须和「压制 M 次」分开打：把它们合成一句「N 次没成」，
+    用户会去修一个其实是他自己让开的东西（免打扰窗口）。
+    陌生 kind 单独一行——路由会静默跳过它，那一行是唯一会说这件事的地方。
+    """
+    notify = report.notify
+    print("[通知]")
+    if notify.channels is None:
+        print("  库里还没有 0015 的形状：sams db migrate")
+        return
+    if notify.channels == 0:
+        print("  0 条通道：任何告警都发不出去（`sams channel add --user … --kind wecom …`）")
+        return
+    print(
+        f"  通道 {notify.channels}（启用 {notify.enabled}）"
+        f" · 投递 sent {notify.sent} / failed {notify.failed}"
+        f" / 压制 {notify.suppressed} / 无通道 {notify.no_channel}"
+    )
+    for kind in ("desktop", "voice"):
+        reason = getattr(notify, kind)
+        if reason is None:
+            print(f"  {kind:<7} 未接入探测")
+        elif reason:
+            print(f"  {kind:<7} 发不出去：{reason}")
+    if notify.unknown_kinds:
+        shown = ", ".join(notify.unknown_kinds)
+        print(f"  ⚠ 库里有不认识的 kind（{shown}）：路由会跳过它们，`sams channel remove` 清掉")
+
+
 def show(container: Container, args: argparse.Namespace) -> int:
     report = container.health.report()
     print(f"库: {report.db_path}")
@@ -121,6 +152,7 @@ def show(container: Container, args: argparse.Namespace) -> int:
     _print_data(report)
     _print_fundamentals(container, report)
     _print_ledger(report)
+    _print_notify(report)
     print("[日历覆盖]")
     for market, years in report.calendar_years.items():
         shown = ", ".join(str(y) for y in years) or "（无）"

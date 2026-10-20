@@ -298,5 +298,7 @@ def build_container(
             sim_accounts=sim_accounts,
             sim_ledger=sim_orders,
             fx=fx_store,
+            # 本机通道的可用性由 monitor 探测，health 只接这一个函数：多一条 import 就红了
+            local_status=notify.local_status,
         ),
     )

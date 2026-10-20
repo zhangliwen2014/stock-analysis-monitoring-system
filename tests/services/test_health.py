@@ -5,13 +5,15 @@ from datetime import UTC, date, datetime
 import polars as pl
 import pytest
 from support import FrozenClock, StubAdapter, sample_bars
+from support_valuation import make_container
 
 from sams.core.errors import DatasourceError, RateLimited
+from sams.core.notify import FAILED, NO_CHANNEL, SENT, SUPPRESSED
 from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.datasource.registry import AdapterRegistry
 from sams.services.health import KEY_TABLES, HealthService
 from sams.storage.db import Database
-from sams.storage.migrate import discover
+from sams.storage.migrate import apply_migrations, discover
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
@@ -24,13 +26,13 @@ D = date(2024, 1, 2)
 PASSWORD = "correct horse battery"
 
 
-def service(db, settings, *adapters) -> HealthService:
+def service(db, settings, *adapters, local_status=None) -> HealthService:
     registry = AdapterRegistry(
         adapters={a.name: a for a in adapters},
         market_sources={"A": tuple(a.name for a in adapters)},
         sleep=lambda seconds: None,
     )
-    return HealthService(db, registry, CalendarRepo(db), settings)
+    return HealthService(db, registry, CalendarRepo(db), settings, local_status=local_status)
 
 
 def test_report_covers_every_key_table(db, settings):
@@ -440,3 +442,123 @@ def test_the_ledger_section_survives_a_database_without_migration_0014(tmp_path,
         assert any(name.startswith("0014") for name in report.pending_migrations)
     finally:
         fresh.close()
+
+
+# ---------- 通知那一节：四态各几个、本机发得出去吗、有没有工厂不认识的 kind ----------
+
+
+def alert_with_deliveries(container, *outcomes):
+    """一条告警 + 它名下若干次投递。返回那条通道，用例只数健康页给的那几个数。"""
+    user = container.users.create("trader", PASSWORD)
+    node = container.channels_store.create(
+        user.id, "wecom", "主群", {"url": "https://x/y?key=secret-do-not-print"}
+    )
+    alert = container.alerts_store.create(
+        user.id,
+        rule_id="r",
+        rule_name="PR 低",
+        account_id=None,
+        account_name="主账户",
+        market="A",
+        code="601088",
+        symbol_name="中国神华",
+        severity="mid",
+        stage="入池",
+        value_text="PR=0.31",
+        threshold_text="PR≤0.4",
+        action_note="",
+        triggered_at=datetime.now(UTC),
+        channel_ids=[node.id],
+    )
+    for outcome in outcomes:
+        # no_channel 的意思是「一个通道都没选到」，仓库层拒绝给它配 id
+        channel_id = None if outcome == NO_CHANNEL else node.id
+        container.alerts_store.record(alert.id, channel_id, outcome, error="errcode=93000")
+    return node
+
+
+def test_notify_section_reports_counts_per_outcome(db, settings):
+    container = make_container(db, settings)
+    alert_with_deliveries(container, SENT, FAILED)
+    report = container.health.report()
+    assert report.notify.channels == 1 and report.notify.enabled == 1
+    assert (report.notify.sent, report.notify.failed) == (1, 1)
+    assert report.notify.suppressed == 0 and report.notify.no_channel == 0
+    assert "secret-do-not-print" not in repr(report.notify), "健康页不许把凭据带进报告"
+
+
+def test_suppressed_and_no_channel_are_counted_separately(db, settings):
+    """压制与「没有通道」都是 0 个投递成功，但修法相反：一个改窗口，一个改通道表。"""
+    container = make_container(db, settings)
+    node = alert_with_deliveries(container, SUPPRESSED, NO_CHANNEL)
+    report = container.health.report()
+    assert (report.notify.suppressed, report.notify.no_channel) == (1, 1)
+    assert (report.notify.sent, report.notify.failed) == (0, 0)
+    assert node.is_default
+
+
+def test_local_status_strings_come_from_the_injected_callable(db, settings):
+    """`desktop`/`voice` 那两句话是 monitor 层探测出来的，health 只转述。
+
+    直接在这层 `import sams.monitor.env` 会让 services 长出对 monitor 的依赖
+    （守卫不允许，而理由写在 `test_monitor_may_only_reach_core_and_storage`），
+    所以这里接一个函数：屏幕上要的那两句从函数里来，函数是谁给的它不问。
+    """
+    svc = service(
+        db,
+        settings,
+        StubAdapter("akshare", ["A"], sample_bars()),
+        local_status=lambda: {"desktop": "远程终端，没有桌面", "voice": ""},
+    )
+    report = svc.report()
+    assert report.notify.desktop == "远程终端，没有桌面"
+    assert report.notify.voice == "", "空串就是可用"
+
+
+def test_a_service_without_local_status_says_not_wired(db, settings):
+    """没接入探测时那两个数是 None，不是空串：空串的意思是「试过了，发得出去」。"""
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+    assert report.notify.desktop is None and report.notify.voice is None
+
+
+def test_notify_section_is_not_ready_before_the_migration(tmp_path, settings):
+    """库里还不是 0015 的形状时，这一节报 `None` 而不是 0，且整份报告不许崩。
+
+    未迁移的库里 `channels`/`notify_log` **已经存在**（它们是 0001 建的），缺的是
+    `notify_log.outcome` 那一列——所以「表在不在」不足以决定，还得问列。用一个只到
+    0014 的迁移目录来造这个形状，比手工 `DROP COLUMN` 诚实：它验的是「迁移没跑」，
+    而列被删掉是另一件事。
+    """
+    partial = tmp_path / "migrations"
+    partial.mkdir()
+    for path in discover():
+        if not path.name.startswith("0015"):
+            (partial / path.name).symlink_to(path)
+    fresh = Database.open(tmp_path / "pre-0015.duckdb")
+    try:
+        apply_migrations(fresh, partial)
+        svc = service(fresh, settings, StubAdapter("akshare", ["A"], sample_bars()))
+        report = svc.report()
+        assert "notify_log" in fresh.table_names(), "前置条件：表在，缺的是那一列"
+        assert "outcome" not in fresh.columns("notify_log")
+        assert report.notify.channels is None, "None 是「这张表还不是这个样子」，不是 0"
+        assert report.notify.sent is None and report.notify.failed is None
+        assert any(name.startswith("0015") for name in report.pending_migrations)
+    finally:
+        fresh.close()
+
+
+def test_unknown_kind_is_loud(db, settings):
+    """库里有一行 `kind='telegram'`（别的版本留下的）时，路由会跳过它——
+    健康页必须把那一条数出来，否则「为什么我没收到」会被说成「收到了」。"""
+    container = make_container(db, settings)
+    user = container.users.create("trader", PASSWORD)
+    # 绕过 `ChannelRepo.create`：它按 `KINDS` 校验，而这一行要演的就是校验之前写进去的库
+    db.execute(
+        "INSERT INTO channels (id, user_id, kind, name, config_encrypted, enabled)"
+        " VALUES ('legacy-1', ?, 'telegram', '旧通道', 'not-a-fernet-token', TRUE)",
+        [user.id],
+    )
+    report = container.health.report()
+    assert report.notify.unknown_kinds == ("telegram",)
+    assert report.notify.channels == 1, "它仍然是一条通道，只是这一版发不出去"

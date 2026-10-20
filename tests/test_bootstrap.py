@@ -189,6 +189,9 @@ def test_the_container_carries_the_notify_parts(container):
     assert built.notify.channels is built.channels_store
     assert built.notify.alerts is built.alerts_store
     assert built.notify.users is built.users
+    # 健康页那两个「本机发得出去吗」的句子来自 monitor：services 不许 import 它，
+    # 所以组装根给的是一个函数。没接上的话屏幕上那两格会是 None（未接入探测）。
+    assert built.health.local_status == built.notify.local_status
 
 
 def test_the_sim_repos_are_named_for_what_they_are(container):
