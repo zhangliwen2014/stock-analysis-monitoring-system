@@ -107,12 +107,3 @@ class LocalEnv:
         if not self.has_display:
             return "这里没有图形会话（DISPLAY 为空），notify-send 无处可弹。"
         return None
-
-
-def local_env() -> LocalEnv:
-    """进程内一次探测，处处复用。
-
-    缓存的理由不是「环境不会变」，而是「变了对这一批投递也没意义」：一条告警的两次通道
-    投递必须用同一个答案。测试用 `LocalEnv.detect(...)` 直接构造，不经过这里。
-    """
-    return LocalEnv.detect()
