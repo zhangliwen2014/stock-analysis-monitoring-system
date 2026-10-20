@@ -157,3 +157,15 @@ def gap_days(
         days.append(cursor)
         cursor += timedelta(days=1)
     return days
+
+
+def format_utc_moment(value: datetime) -> str:
+    """把任意时刻折到 UTC 后写成 `2026-10-20 14:30:00 UTC`。
+
+    `TIMESTAMPTZ` 的回读在本库不稳定：有的表给 UTC，有的表给会话本地时区（Asia/Shanghai）。
+    两者是同一个瞬间，按原样 `strftime` 会在同一屏上印出「立论 15:00 / 时间线 23:00」。
+    到秒：两步落在同一分钟里时（脚本、M3 的触发器），分分辨不出先后。
+    """
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC)
+    return f"{value:%Y-%m-%d %H:%M:%S} UTC"

@@ -10,10 +10,11 @@ import getpass
 import json
 import re
 from argparse import _SubParsersAction
-from datetime import UTC, date
+from datetime import date
 
 from sams.core.errors import ValidationError
 from sams.core.fundamentals import RATIO_BOUNDS, out_of_caliber
+from sams.core.timeutil import format_utc_moment
 
 
 def exit_for(exc: Exception) -> int:
@@ -39,19 +40,8 @@ def refused(args: argparse.Namespace, exc: Exception, code: int) -> int:
 
 
 def stamp(value) -> str:
-    """时间戳统一到 UTC 再落屏，并把时区说出来。
-
-    DuckDB 对 `TIMESTAMPTZ` 的回读不稳定：`theses.created_at` 回来是 UTC，
-    `thesis_events.ts` 与 `sim_orders.ts` 回来是会话本地时区（Asia/Shanghai）。两者是同一个
-    瞬间，但按原样 `strftime` 会在同一屏上印出「立论 15:00 / 时间线 23:00」——看着像事件比
-    记录晚八小时，而这一屏的用意正是回看「什么时候走了哪一步」（D80）。
-    到秒：两步落在同一分钟里时（脚本、M3 的触发器），分是分辨不出先后的。
-    """
-    if value is None:
-        return "–"
-    if value.tzinfo is not None:
-        value = value.astimezone(UTC)
-    return f"{value:%Y-%m-%d %H:%M:%S} UTC"
+    """时间戳的统一落屏格式；怎么折 UTC、为什么要到秒，见 `core.timeutil.format_utc_moment`。"""
+    return "–" if value is None else format_utc_moment(value)
 
 
 def group(subparsers: _SubParsersAction, name: str, help_text: str) -> _SubParsersAction:
