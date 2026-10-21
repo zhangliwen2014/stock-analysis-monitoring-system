@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError, ValidationError
 from sams.storage.repos.rules import RuleRepo
 
 
@@ -58,6 +58,42 @@ def test_a_non_position_rule_may_stay_out_of_any_account(repo):
     row = add(repo, user, kind="price.cross_below", params={"price": 10.0},
               target_type="symbol", target_ref="A/601088", account_id=None)
     assert row.account_id is None
+
+
+def test_a_position_target_needs_an_account_even_when_the_kind_does_not(repo):
+    """`price.cross_below` 不读成本，但挂在持仓上时去重键仍要 account_id：
+    缺了它，这条规则每次求值都在 `expand()` 里抛（T-6），而不是报一次警。"""
+    user = seed_user(repo.db)
+    with pytest.raises(ValidationError, match="account_id"):
+        add(repo, user, kind="price.cross_below", params={"price": 10.0},
+            target_type="position", target_ref="*", account_id=None)
+
+
+def test_a_thesis_target_checks_the_thesis_even_without_a_thesis_id(repo):
+    """`expand()` 对 thesis 目标读的是 `thesis_id or target_ref`：只校验前者时，
+    一条把 `target_ref` 指向不存在的论、`thesis_id` 留空的规则会静默地不响。"""
+    user = seed_user(repo.db)
+    with pytest.raises(ValidationError, match="观点"):
+        add(repo, user, kind="price.cross_below", params={"price": 10.0},
+            target_type="thesis", target_ref="does-not-exist", account_id=None)
+
+
+def test_a_thesis_target_resolves_the_thesis_id_from_the_ref(repo):
+    """指向论就是派生规则：即使调用方只给了 `target_ref`，也要按 §9.2 只能停用。"""
+    user = seed_user(repo.db)
+    thesis = seed_thesis(repo.db, user)
+    made = add(repo, user, kind="price.cross_below", params={"price": 10.0},
+               target_type="thesis", target_ref=thesis.id, account_id=None)
+    assert made.thesis_id == thesis.id
+    with pytest.raises(ValidationError, match="停用"):
+        repo.remove(made.id, user_id=user)
+
+
+def test_the_stored_target_ref_is_trimmed(repo):
+    user = seed_user(repo.db)
+    made = add(repo, user, kind="price.cross_below", params={"price": 10.0},
+               target_type="symbol", target_ref=" A/601088 ", account_id=None)
+    assert made.target_ref == "A/601088"
 
 
 def test_unknown_params_are_refused_before_the_insert(repo):
@@ -167,8 +203,57 @@ def test_switching_the_kind_rejects_params_that_do_not_fit(repo):
     留着它屏幕上那条规则会带着一个没人读的键，而 `validate_params` 本来会拒它。"""
     user = seed_user(repo.db)
     made = add(repo, user)
-    with pytest.raises(ValidationError, match="basis"):
+    with pytest.raises(ValidationError, match="新的 params"):
         repo.update(made.id, changed_by=user, kind="stop.ma")
+
+
+def test_switching_the_kind_with_new_params_is_accepted(repo):
+    user = seed_user(repo.db)
+    made = add(repo, user)
+    changed = repo.update(made.id, changed_by=user, kind="stop.ma",
+                          params={"basis": "daily_ma60"})
+    assert changed.kind == "stop.ma"
+    assert changed.params == {"basis": "daily_ma60"}
+
+
+def test_an_update_with_nothing_to_change_is_refused(repo):
+    user = seed_user(repo.db)
+    made = add(repo, user)
+    with pytest.raises(ValidationError, match="什么都没要改"):
+        repo.update(made.id, changed_by=user)
+
+
+def test_an_update_records_the_other_fields_in_both_snapshots(repo):
+    user = seed_user(repo.db)
+    made = add(repo, user)
+    repo.update(made.id, changed_by=user, name="新的名字", severity="weak",
+                channel_ids=["c9"], cooldown_min=5)
+    row = repo.revisions(made.id)[0]
+    assert row.before["name"] == "止损 8%"
+    assert row.before["severity"] == "strong"
+    assert row.before["channel_ids"] == []
+    assert row.after["name"] == "新的名字"
+    assert row.after["severity"] == "weak"
+    assert row.after["channel_ids"] == ["c9"]
+    assert row.after["cooldown_min"] == 5
+
+
+def test_a_failed_revision_write_rolls_back_the_rule_update(repo, monkeypatch):
+    """§4.2 的用途是「查得到改过什么」：规则改了而审计行没写成，比没改更糟。"""
+    user = seed_user(repo.db)
+    made = add(repo, user)
+    real_execute = repo.db.execute
+
+    def explode(sql, params=None):
+        if "INSERT INTO rule_revisions" in sql:
+            raise StorageError("磁盘满了")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(repo.db, "execute", explode)
+    with pytest.raises(StorageError, match="磁盘满了"):
+        repo.update(made.id, changed_by=user, params={"pct": 0.12})
+    assert repo.get(made.id).params == {"pct": 0.08}
+    assert repo.revisions(made.id) == []
 
 
 def test_a_thesis_bound_rule_cannot_be_deleted(repo):

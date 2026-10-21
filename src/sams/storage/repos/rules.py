@@ -140,7 +140,7 @@ def _to_checked(row: Rule) -> dict:
 def _deltas(before: dict, checked: dict) -> dict:
     """两个形状相同的字典之间，哪些字段真的变了。
 
-    只比 `update` 改得到的那些字段：`enabled` 走 `set_enabled`，时间戳每次都在动，
+    只比 `_validate` 返回的那些键：`enabled` 走 `set_enabled`，时间戳每次都在动，
     把它们算进「实质变化」就等于每条规则每天都有一条修订史。
     """
     return {key: value for key, value in checked.items() if before.get(key) != value}
@@ -218,9 +218,6 @@ class RuleRepo:
         assert created is not None
         return created
 
-    #: 允许挂在整个组合上的 kind（现在一个都没有：组合级指标缺输入，U28）
-    _PORTFOLIO_KINDS: tuple[str, ...] = ()
-
     def _validate(
         self,
         *,
@@ -266,21 +263,20 @@ class RuleRepo:
                 "名单收在模板表里而不是放开全部五种，因为 `expand()` 要能对每一种给出确定的"
                 "展开方式——挂错对象的规则不会报错，只会静默地不响（§1 那张表的第一行）"
             )
-        self._require_target_shape(target_type, target_ref)
-        if built.needs_position and not account_id:
+        ref = (target_ref or "").strip()
+        self._require_target_shape(target_type, ref)
+        if (built.needs_position or target_type == "position") and not account_id:
             raise ValidationError(
                 f"{kind}（{built.label}）必须挂在某个账户上：去重键含 account_id，"
                 "缺了它，同一只票在两个账户里的破位会互相吞（§10.1）"
             )
-        if target_type == "portfolio" and not account_id:
-            raise ValidationError("组合类规则必须说明是哪个账户的组合")
-        if kind not in self._PORTFOLIO_KINDS and target_type == "portfolio":
-            raise ValidationError(
-                f"{kind} 不支持挂在整个组合上：这一层没有组合级指标的输入（U28）"
-            )
+        if target_type == "thesis":
+            # `expand()` 对 thesis 目标读的是 `thesis_id or target_ref`：这里就把它落成
+            # `thesis_id`，否则一条指向论、却能被 `remove` 删掉的规则会绕过 §9.2
+            thesis_id = thesis_id or ref
         if built.needs_thesis and not thesis_id:
             raise ValidationError(f"{kind} 必须挂在一条论上：它读的是那条论的价位与分项")
-        if target_type == "thesis" and thesis_id is not None and target_ref != thesis_id:
+        if target_type == "thesis" and thesis_id is not None and ref != thesis_id:
             raise ValidationError(
                 "target_type=thesis 时 target_ref 就是那条论的 id："
                 "两者不一致会让 expand() 取到一条论而校验另一条"
@@ -298,7 +294,7 @@ class RuleRepo:
             "name": label,
             "kind": kind,
             "target_type": target_type,
-            "target_ref": target_ref,
+            "target_ref": ref,
             "params": checked_params,
             "filters": checked_filters,
             "severity": level,
@@ -370,38 +366,40 @@ class RuleRepo:
             # 一次「改成同样的值」不在修订史里留一行：§4.2 那张表要能回答「这条线改过几次」，
             # 把空改动算进去就是在数橡皮擦的印子
             return before
-        self.db.execute(
-            "UPDATE rules SET name = ?, kind = ?, target_type = ?, target_ref = ?,"
-            " params_json = ?, filters_json = ?, severity = ?, cooldown_min = ?,"
-            " channel_ids = ?, updated_at = ? WHERE id = ?",
-            [
-                checked["name"],
-                checked["kind"],
-                checked["target_type"],
-                checked["target_ref"],
-                json.dumps(checked["params"], ensure_ascii=False),
-                json.dumps(checked["filters"], ensure_ascii=False),
-                checked["severity"],
-                checked["cooldown_min"],
-                json.dumps(checked["channel_ids"], ensure_ascii=False),
-                self.clock.now_utc(),
-                before.id,
-            ],
-        )
-        after = self.get(before.id)
-        assert after is not None
-        self.db.execute(
-            "INSERT INTO rule_revisions (id, rule_id, changed_by, before_json, after_json,"
-            " changed_at) VALUES (?, ?, ?, ?, ?, ?)",
-            [
-                new_id(),
-                before.id,
-                changed_by,
-                json.dumps(_snapshot(before), ensure_ascii=False),
-                json.dumps(_snapshot(after), ensure_ascii=False),
-                self.clock.now_utc(),
-            ],
-        )
+        now = self.clock.now_utc()
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE rules SET name = ?, kind = ?, target_type = ?, target_ref = ?,"
+                " params_json = ?, filters_json = ?, severity = ?, cooldown_min = ?,"
+                " channel_ids = ?, updated_at = ? WHERE id = ?",
+                [
+                    checked["name"],
+                    checked["kind"],
+                    checked["target_type"],
+                    checked["target_ref"],
+                    json.dumps(checked["params"], ensure_ascii=False),
+                    json.dumps(checked["filters"], ensure_ascii=False),
+                    checked["severity"],
+                    checked["cooldown_min"],
+                    json.dumps(checked["channel_ids"], ensure_ascii=False),
+                    now,
+                    before.id,
+                ],
+            )
+            after = self.get(before.id)
+            assert after is not None
+            self.db.execute(
+                "INSERT INTO rule_revisions (id, rule_id, changed_by, before_json, after_json,"
+                " changed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    new_id(),
+                    before.id,
+                    changed_by,
+                    json.dumps(_snapshot(before), ensure_ascii=False),
+                    json.dumps(_snapshot(after), ensure_ascii=False),
+                    now,
+                ],
+            )
         return after
 
     def set_enabled(self, rule_id: str, enabled: bool, *, user_id: str | None = None) -> Rule:
@@ -419,8 +417,9 @@ class RuleRepo:
                 f"规则 {row.name} 是从一条观点派生出来的，不能删除，只能停用"
                 "（`sams rule disable`）：「悄悄关掉止损提醒」必须留下一条能查到的记录（§9.2）"
             )
-        self.db.execute("DELETE FROM rule_revisions WHERE rule_id = ?", [row.id])
-        self.db.execute("DELETE FROM rules WHERE id = ?", [row.id])
+        with self.db.transaction():
+            self.db.execute("DELETE FROM rule_revisions WHERE rule_id = ?", [row.id])
+            self.db.execute("DELETE FROM rules WHERE id = ?", [row.id])
         return True
 
     # --- 读 -----------------------------------------------------------------------------
