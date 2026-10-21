@@ -179,3 +179,66 @@ def test_a_rule_id_may_be_absent(repo, seeded_user):
     alert = repo.create(seeded_user, **{**CREATE_KW, "rule_id": None})
     assert alert.rule_id is None
     assert repo.get(alert.id).rule_id is None
+
+
+# --- 冷却与去重的查询（§10.1 的键 / D94 的上一档）------------------------------------------
+
+
+def seed_hit(
+    repo, seeded_user, *, minutes_ago=0, rule="r1", code="601088", account="acc1", stage="pre"
+):
+    """按「距现在多少分钟」种一条告警：断言里不写日期，跑在什么时候都一样。"""
+    from datetime import timedelta
+
+    from sams.core.clock import SYSTEM_CLOCK
+
+    moment = SYSTEM_CLOCK.now_utc() - timedelta(minutes=minutes_ago)
+    return repo.create(
+        seeded_user,
+        **{
+            **CREATE_KW,
+            "rule_id": rule,
+            "account_id": account,
+            "code": code,
+            "stage": stage,
+            "triggered_at": moment,
+        },
+    )
+
+
+def test_latest_for_picks_the_newest_row_on_the_dedupe_key(repo, seeded_user):
+    older = seed_hit(repo, seeded_user, minutes_ago=120, stage="pre")
+    newer = seed_hit(repo, seeded_user, minutes_ago=10, stage="hit")
+    seed_hit(repo, seeded_user, minutes_ago=5, rule="r2")  # 别的规则，不算这条的上一档
+
+    # 去重键里账户也占一维（默认种的是 acc1），漏了它问的就是另一条键
+    got = repo.latest_for("r1", "A", "601088", account_id="acc1")
+
+    assert got is not None
+    assert got.id == newer.id, f"该拿最近那一条，拿到了 {older.id}"
+    assert got.stage == "hit"
+
+
+def test_latest_for_does_not_let_another_accounts_hit_silence_this_one(repo, seeded_user):
+    """§1 那张表的第三行：同一只票两个账户，A 的破位不能把 B 的吃掉。"""
+    seed_hit(repo, seeded_user, account="acc-a", minutes_ago=5, stage="hit")
+
+    assert repo.latest_for("r1", "A", "601088", account_id="acc-b") is None
+    assert repo.latest_for("r1", "A", "601088", account_id="acc-a") is not None
+
+
+def test_latest_for_matches_a_missing_account(repo, seeded_user):
+    """非持仓类规则的 `account_id` 是 NULL，而 SQL 里 `NULL = NULL` 不成立。
+
+    这一枚钉的是 DuckDB 那一侧：写成 `account_id = ?` 时这类规则永远查不到自己的上一次
+    命中，于是每一趟都「穿过冷却」——症状是同一条止损每跑一次重发一遍，而库里全是它
+    自己刚写的那些行。
+    """
+    seed_hit(repo, seeded_user, account=None, minutes_ago=30, stage="pre")
+
+    assert repo.latest_for("r1", "A", "601088") is not None
+    assert repo.latest_for("r1", "A", "601088", account_id=None) is not None
+
+
+def test_latest_for_is_empty_when_nothing_was_raised(repo, seeded_user):
+    assert repo.latest_for("r1", "A", "000001") is None

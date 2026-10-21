@@ -152,6 +152,34 @@ class AlertRepo:
         params.append(int(limit))
         return [self._to_alert(row) for row in self.db.query(sql, params).to_dicts()]
 
+    def latest_for(
+        self,
+        rule_id: str,
+        market: str,
+        code: str,
+        *,
+        account_id: str | None = None,
+    ) -> Alert | None:
+        """这条去重键上最近的一次命中（§10.1 的键 + D94 的判据都从它取）。
+
+        问「最近一条」而不是「冷却窗口内有没有」：引擎要知道的是**上一档是什么**，
+        而 `EXISTS` 只回答有没有——「有没有」决定不了要不要穿过冷却。一次问清还省掉
+        第二次查询；这一层是单进程同步一趟，没有并发插入要担心。
+
+        `account_id` 参与匹配，且**不是**「给了才过滤」：`IS NOT DISTINCT FROM` 让
+        NULL 与 NULL 算同一件事。写成 `= ?` 的话，所有非持仓类规则（`account_id` 为
+        NULL）永远查不到自己的上一次命中，于是每一趟都放行。
+        走的正是 `idx_alerts_throttle (rule_id, market, code, triggered_at)`。
+        """
+        rows = self.db.query(
+            f"SELECT {_ALERT_COLUMNS} FROM alerts"
+            " WHERE rule_id = ? AND market = ? AND code = ?"
+            " AND account_id IS NOT DISTINCT FROM ?"
+            " ORDER BY triggered_at DESC, id DESC LIMIT 1",
+            [rule_id, market, code, account_id],
+        )
+        return self._to_alert(rows.to_dicts()[0]) if rows.height else None
+
     def record(
         self,
         alert_id: str,
