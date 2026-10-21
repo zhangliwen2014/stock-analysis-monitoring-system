@@ -31,7 +31,10 @@ from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
 from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
+from sams.services.rules.derive import RuleDeriver
 from sams.services.rules.engine import RuleEngine
+from sams.services.rules.maintenance import RuleService
+from sams.services.rules.recheck import Rechecker
 from sams.services.rules.snapshot import RuleData
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
@@ -141,6 +144,12 @@ class Container:
     rule_data: RuleData
     #: 一趟求值（`sams rule check` 的出口，T-18 的命令行按它接线）
     rule_engine: RuleEngine
+    #: 规则的维护面（T-17）：四样仓库层看不见的检查 + 改参数时回写论上那一列
+    rule_service: RuleService
+    #: §9.2 建仓派生（`sams rule derive`）
+    rule_deriver: RuleDeriver
+    #: 周复检（§9.3，`sams rule recheck`）
+    rule_rechecker: Rechecker
 
     def close(self) -> None:
         self.db.close()
@@ -302,6 +311,23 @@ def build_container(
         settings=cfg,
         clock=clock,
     )
+    # 三个规则服务排在最后：它们吃的就是上面那些已经装好的仓库与取数处，
+    # 而 `RuleService` 要的是 `rule_data`（notes 里那句「展开成零个对象」由它算）
+    rule_service = RuleService(
+        rules=rules_store,
+        theses=theses_store,
+        accounts=sim_accounts,
+        channels=channels_store,
+        users=users,
+        data=rule_data,
+        db=database,
+        settings=cfg,
+        clock=clock,
+    )
+    rule_deriver = RuleDeriver(rules_store, theses_store)
+    rule_rechecker = Rechecker(
+        theses=theses_store, data=rule_data, bus=event_bus, clock=clock
+    )
 
     return Container(
         settings=cfg,
@@ -354,6 +380,9 @@ def build_container(
         rules_store=rules_store,
         rule_data=rule_data,
         rule_engine=rule_engine,
+        rule_service=rule_service,
+        rule_deriver=rule_deriver,
+        rule_rechecker=rule_rechecker,
         cipher=cipher,
         notify=notify,
         health=HealthService(
