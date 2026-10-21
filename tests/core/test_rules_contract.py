@@ -95,6 +95,8 @@ def test_tiers_must_increase_and_end_at_the_target() -> None:
         validate_params("tp.tiered", {"tiers": "1.0,0.5"})
     with pytest.raises(ValidationError, match="递增"):
         validate_params("tp.tiered", {"tiers": "0.5,0.5"})
+    with pytest.raises(ValidationError, match="有限数"):
+        validate_params("tp.tiered", {"tiers": "0.5,nan"})
 
 
 def test_validation_accepts_its_own_output() -> None:

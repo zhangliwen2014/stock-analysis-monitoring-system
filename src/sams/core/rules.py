@@ -241,6 +241,9 @@ def _as_tiers(param: Param, raw: object) -> list[float]:
             raise ValidationError(
                 f"{param.name} 里 {piece!r} 不是数字：要的是 0.5,1.0 这种比例串"
             ) from None
+    if any(not math.isfinite(step) for step in steps):
+        # nan/inf 过得了下面的 >0 与递增检查（比较恒为 False），然后那条规则永远不响
+        raise ValidationError(f"{param.name} 的每一档都要是有限数（收到 {steps}）")
     if any(step <= 0 for step in steps):
         raise ValidationError(f"{param.name} 的每一档都要大于 0（收到 {steps}）")
     if any(b <= a for a, b in zip(steps, steps[1:], strict=False)):
