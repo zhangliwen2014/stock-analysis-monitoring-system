@@ -5,7 +5,8 @@
 
 * **现价只有一个出处**。`valuation_daily` 没有价格列（D60），那个数只能来自过闸的日线；
   同一条序列里裸价与后复权价并存，四个价位全都与**现价**比大小，所以喂进合成的每一个
-  技术值都要先折回现价口径（见 `_fold`）。少了这一步，一次除权就把止损抬到现价之上。
+  技术值都要先折回现价口径（见 `sams.services._fold` 模块）。少了这一步，一次除权就把
+  止损抬到现价之上。
 * **模板没问的不算**。`composite` 会拒收权重表里没有的分项；而买入闸门吃的是 PR 分位，
   它与「这个模板有没有给这一项分权重」无关（见 `_wants_pr_curve`）——闸门是那条入场规则
   唯一的否决条件，删掉权重不能顺便把它删掉。
@@ -24,7 +25,6 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any
 
 import polars as pl
 
@@ -55,6 +55,15 @@ from sams.analysis.valuation.styles import Style, get_style, style_names
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
+from sams.services._fold import (
+    before_last,
+    fold,
+    fold_to_price_basis,
+    last,
+    pct_change,
+    weekly_line,
+    window_high,
+)
 from sams.services.analysis import AnalysisService
 from sams.services.fundamentals import FundamentalRead, FundamentalService
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
@@ -161,9 +170,9 @@ class ValuationService:
             end=until,
             indicators=_daily_indicators(template),
         )
-        price = _last(daily.table, "close")
-        price_on = _last(daily.table, "date")
-        daily_fold = _fold(price, _last(daily.table, "close_hfq"))
+        price = last(daily.table, "close")
+        price_on = last(daily.table, "date")
+        daily_fold = fold(price, last(daily.table, "close_hfq"))
 
         weekly = (
             self.analysis.series(
@@ -177,7 +186,7 @@ class ValuationService:
             if _wants_weekly(template)
             else None
         )
-        weekly_ma20 = _weekly_line(weekly) if weekly is not None else None
+        weekly_ma20 = weekly_line(weekly.table) if weekly is not None else None
         pending = weekly.pending_periods if weekly is not None else []
         notes: list[str] = []
         if pending:
@@ -189,7 +198,7 @@ class ValuationService:
         if daily_fold is not None and abs(daily_fold - 1.0) > 1e-12:
             notes.append(
                 f"{'、'.join(_FOLDED_KEYS)} 由后复权序列按当日因子折回现价口径"
-                f"（现价 {price:g} ÷ 当日后复权收盘 {_last(daily.table, 'close_hfq'):g} = "
+                f"（现价 {price:g} ÷ 当日后复权收盘 {last(daily.table, 'close_hfq'):g} = "
                 f"{daily_fold:.6f}）：不折回来，它们与现价不在同一个价空间上"
             )
 
@@ -226,8 +235,8 @@ class ValuationService:
             basis=read.pr.basis,
             pr_percentile=_gate_reading(percentiles),
             weekly_ma20=weekly_ma20,
-            atr=_folded(_last(daily.table, "atr"), daily_fold),
-            recent_high=_folded(_window_high(daily.table, used), daily_fold),
+            atr=fold_to_price_basis(last(daily.table, "atr"), daily_fold),
+            recent_high=fold_to_price_basis(window_high(daily.table, used), daily_fold),
             lookback_days=used,
         )
         return ValuationRead(
@@ -243,8 +252,8 @@ class ValuationService:
             price_age_days=None if price_on is None else (until - price_on).days,
             percentiles=tuple(percentiles),
             weekly_ma20=weekly_ma20,
-            atr=_folded(_last(daily.table, "atr"), daily_fold),
-            recent_high=_folded(_window_high(daily.table, used), daily_fold),
+            atr=fold_to_price_basis(last(daily.table, "atr"), daily_fold),
+            recent_high=fold_to_price_basis(window_high(daily.table, used), daily_fold),
             open_weekly_period=pending[-1] if pending else None,
             flow_days=flow_days,
             notes=tuple(notes),
@@ -350,29 +359,29 @@ def _items(
     if "ma_position" in asked:
         items.append(
             ma_position(
-                close=_last(table, "close_hfq"),
-                ma20=_last(table, "ma20"),
-                ma60=_last(table, "ma60"),
+                close=last(table, "close_hfq"),
+                ma20=last(table, "ma20"),
+                ma60=last(table, "ma60"),
             )
         )
     if "weekly_trend" in asked and weekly is not None:
         items.append(
             weekly_trend(
-                _last(weekly.table, "close_hfq"),
-                _last(weekly.table, "ma20"),
-                _before_last(weekly.table, "ma20"),
+                last(weekly.table, "close_hfq"),
+                last(weekly.table, "ma20"),
+                before_last(weekly.table, "ma20"),
             )
         )
     if "boll_position" in asked:
         items.append(
             boll_position(
-                _last(table, "close_hfq"), _last(table, "boll_up"), _last(table, "boll_low")
+                last(table, "close_hfq"), last(table, "boll_up"), last(table, "boll_low")
             )
         )
     if "volume_follow" in asked:
         items.append(
             volume_follow(
-                _pct_change(table, "close_hfq"), _last(table, "volume"), _last(table, "volume_ma5")
+                pct_change(table, "close_hfq"), last(table, "volume"), last(table, "volume_ma5")
             )
         )
     no_flow = _no_flow_row(flow, flow_days)
@@ -400,61 +409,6 @@ def _no_flow_row(frame: pl.DataFrame, days: tuple[date, ...]) -> str:
 
 
 # --- 价空间与取数小工具 -------------------------------------------------------------------
-
-
-def _fold(price: float | None, hfq_last: float | None) -> float | None:
-    """后复权 → 现价的换算系数。两个数齐了才有它，否则 None（合成侧自己会拒）。"""
-    if price is None or hfq_last is None or hfq_last <= 0 or price <= 0:
-        return None
-    return price / hfq_last
-
-
-def _folded(value: float | None, factor: float | None) -> float | None:
-    if value is None or factor is None:
-        return None
-    return value * factor
-
-
-def _weekly_line(weekly) -> float | None:
-    """周 MA20 折回现价口径：用它**自己那条序列**的当日因子，不借日线的。
-
-    后复权的绝对水平跟着读取窗口的锚走（`anchored_on`），两条序列的锚可能不同一天；
-    而 `现价 ÷ 当日后复权收盘` 这个比值在同一序列内自洽，折出来的数与锚无关。
-    """
-    return _folded(
-        _last(weekly.table, "ma20"),
-        _fold(_last(weekly.table, "close"), _last(weekly.table, "close_hfq")),
-    )
-
-
-def _window_high(table, bars: int) -> float | None:
-    """窗口内最高的那根后复权收盘（还没折回现价口径）。
-
-    用复权而不是裸价：跨除权日的裸收盘价不可比——那次「下跌」是分红，不是有人付过更低的价。
-    """
-    if table.height == 0 or bars <= 0 or "close_hfq" not in table.columns:
-        return None
-    return table["close_hfq"].tail(bars).max()
-
-
-def _last(table, column: str) -> Any:
-    if table.height == 0 or column not in table.columns:
-        return None
-    return table[column][-1]
-
-
-def _before_last(table, column: str) -> Any:
-    if table.height < 2 or column not in table.columns:
-        return None
-    return table[column][-2]
-
-
-def _pct_change(table, column: str) -> float | None:
-    """最后一根相对上一根的涨跌幅（在后复权口径里算：跨除权日时裸价那个差是分红）。"""
-    now, before = _last(table, column), _before_last(table, column)
-    if now is None or before is None or before <= 0:
-        return None
-    return now / before - 1.0
 
 
 def _valuation_days(frame) -> list[ValuationDay]:
