@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 import support_valuation
@@ -24,14 +24,12 @@ AS_OF = support_valuation.DAYS[-1]
 NOW = datetime(2024, 10, 26, 6, 30, tzinfo=UTC)
 
 
-@pytest.fixture
-def data(db, settings):
+def as_data(container, settings) -> RuleData:
     """从容器字段直接装配：构造参数与 `bootstrap.py` 里那些服务是同一批对象。
 
     故意不在这里重新 `XxxRepo(db)` 一遍——那会造出第二个仓库实例，而用例要验的正是
     「引擎读到的数与屏幕上那个数是同一个」。
     """
-    container = support_valuation.make_container(db, settings)
     return RuleData(
         valuation=container.valuation,
         analysis=container.analysis,
@@ -43,6 +41,12 @@ def data(db, settings):
         watchlists=container.watchlists,
         settings=settings,
     )
+
+
+@pytest.fixture
+def data(db, settings):
+    container = support_valuation.make_container(db, settings)
+    return as_data(container, settings)
 
 
 def make_rule(db, **over) -> Rule:
@@ -71,6 +75,7 @@ def test_a_watchlist_rule_expands_over_the_owners_list(db, data):
 
     WatchlistRepo(db).add("u1", "A", CODE)
     WatchlistRepo(db).add("u1", "A", "600000")
+    WatchlistRepo(db).add("u2", "A", "000001")
     rule = make_rule(
         db,
         kind="price.cross_below",
@@ -112,6 +117,27 @@ def test_a_position_rule_expands_over_that_account_only(db, data):
         fee=0.0,
         currency="CNY",
         ts=datetime(2024, 10, 25, 6, 30, tzinfo=UTC),  # 建仓日在 `AS_OF` 前一天
+    )
+    # 第二个账户也持有一只：不铺这一行的话，「只收 A 账户」与「谁都收进来」这一枚都绿
+    accounts.adjust_cash(
+        second.id,
+        "CNY",
+        100_000.0,
+        reason="初始资金",
+        actor_id="u1",
+        ts=datetime(2024, 10, 24, 6, 30, tzinfo=UTC),
+    )
+    orders.record_fill(
+        user_id="u1",
+        account_id=second.id,
+        market="A",
+        code="600000",
+        side="buy",
+        qty=100.0,
+        price=10.0,
+        fee=0.0,
+        currency="CNY",
+        ts=datetime(2024, 10, 25, 6, 30, tzinfo=UTC),
     )
     rule = make_rule(
         db,
@@ -208,6 +234,89 @@ def test_read_gives_none_not_zero_when_there_is_no_position(db, data):
     assert snap.avg_cost is None
     assert snap.qty is None
     assert snap.opened_on is None
+    assert snap.holding_high is None
+    assert snap.holding_days is None
+
+
+def test_read_expands_a_position_into_the_holding_columns(db, data):
+    """持仓那一半也要真读一次：`holdings()` 的形状与 `read(position=...)` 是两处代码。
+
+    样本收盘在 2024-07-19 摸到 19.97（不是上涨段最后一根 19.95），bar high 是
+    close+0.10 ⇒ 持仓期最高价 20.07。这一枚同时钉住「用 high_hfq」与「按建仓日过滤」。
+    """
+    from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+
+    accounts = SimAccountRepo(db)
+    first = accounts.open("u1", "甲券商", market_scope=("A",))
+    accounts.adjust_cash(
+        first.id,
+        "CNY",
+        100_000.0,
+        reason="初始资金",
+        actor_id="u1",
+        ts=datetime(2024, 4, 10, 6, 30, tzinfo=UTC),
+    )
+    SimOrderRepo(db).record_fill(
+        user_id="u1",
+        account_id=first.id,
+        market="A",
+        code=CODE,
+        side="buy",
+        qty=100.0,
+        price=10.0,
+        fee=0.0,
+        currency="CNY",
+        ts=datetime(2024, 4, 10, 6, 30, tzinfo=UTC),
+    )
+    position = next(row for row in data.holdings(first.id) if row.code == CODE)
+
+    snap = data.read(Target("u1", "A", CODE, first.id, None), as_of=AS_OF, position=position)
+
+    assert snap.qty == 100.0
+    assert snap.avg_cost == 10.0
+    assert snap.opened_on == date(2024, 4, 10)
+    assert snap.holding_days == 199  # AS_OF 是 2024-10-26
+    assert snap.currency == "CNY"
+    assert snap.account_name == "甲券商"
+    assert snap.margin_enabled is False
+    assert snap.holding_high == pytest.approx(20.07)
+
+
+def test_a_dirty_high_low_bar_takes_down_atr_not_the_whole_read(db, data):
+    """一根 high/low 拒收的 K 只该让 ATR 退成 None：它已经把价格类判断排除在外了，
+    而整趟求值不该因为一条规则不需要的那一列而全线不响（T-14 只兜 NotAdjustable）。"""
+    from sams.storage.repos.bars import BarRepo
+
+    # `load` 带出来的 `adjust` 列是库里的口径标记，`_prepare` 拒收它（口径由仓库层固定）
+    frame = BarRepo(db).load("A", [CODE], start=AS_OF, end=AS_OF).drop("adjust")
+    BarRepo(db).upsert(frame.with_columns(high=0.0, low=0.0))
+
+    snap = data.read(Target("u1", "A", CODE, None, None), as_of=AS_OF)
+    assert snap.daily_ma60 is not None
+    assert snap.atr is None
+    assert any("ATR" in note for note in snap.missing)
+
+
+def test_the_technical_lines_are_folded_when_a_dividend_sits_inside_the_window(db, settings):
+    """常数 10 元 + 早期一次 10 派 1.0：后复权序列会抬到 11.11，折回之后每条线仍是 10.0。
+
+    删掉任何一个 `fold_to_price_basis`，这一枚就会红——现价口径不是「数量级对」就够。
+    """
+    flat = [10.0] * len(support_valuation.DAYS)
+    container = support_valuation.make_container(
+        db,
+        settings,
+        closes=flat,
+        actions=support_valuation.dividend(support_valuation.DAYS[10]),
+    )
+    data = as_data(container, settings)
+
+    snap = data.read(Target("u1", "A", CODE, None, None), as_of=AS_OF)
+    assert snap.price == pytest.approx(10.0)
+    assert snap.prev_close == pytest.approx(10.0)
+    assert snap.daily_ma60 == pytest.approx(10.0)
+    assert snap.weekly_ma20 == pytest.approx(10.0)
+    assert snap.atr == pytest.approx(0.2)
 
 
 def test_a_thesis_line_wins_over_the_synthesized_one(db, data):
@@ -235,6 +344,7 @@ def test_a_thesis_line_wins_over_the_synthesized_one(db, data):
 
     snap = data.read(Target("u1", "A", CODE, None, thesis.id), as_of=AS_OF)
     assert snap.stop_line == 9.99
+    assert snap.target_price == 30.0
 
 
 def test_day_open_and_prev_close_come_from_the_daily_bars(db, data):

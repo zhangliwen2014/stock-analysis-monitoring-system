@@ -17,11 +17,18 @@ from datetime import date, timedelta
 
 import polars as pl
 
+from sams.analysis.indicators import metrics
 from sams.core.codes import canonical_code, canonical_market
+from sams.core.config import Settings
 from sams.core.errors import ValidationError
-from sams.services._fold import fold, fold_to_price_basis, last, window_high
+from sams.services._fold import before_last, fold, fold_to_price_basis, high_water, last
+from sams.services.analysis import AnalysisService, SeriesRead
+from sams.services.valuation import ValuationService
+from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.ledger import Account, Position, SimAccountRepo, SimOrderRepo
+from sams.storage.repos.symbols import SymbolRepo
 from sams.storage.repos.theses import Thesis, ThesisRepo
+from sams.storage.repos.watchlists import WatchlistRepo
 
 #: 日线一次取多少天：盖住 MA60（60 个交易日）与一段正常持有期。
 #: 与 `valuation` 的窗口无关，所以它自己算一次：那边只带它合成结论要的那几路出门。
@@ -33,10 +40,9 @@ TRAILING_MIN_BARS = 3
 #: MA60 要哪一列：`indicators=("ma",)` 产出 ma5/ma10/ma20/ma60/ma120/ma250
 _MA_COLUMN = "ma60"
 
-#: 这一路要算的指标组。ATR 也在这里要一次：`ValuationService` 只算它那套风格问到的指标
-#: （价值型的 `stop_kind` 是 `pct`，不问 ATR），而规则模板与估值风格是两件事——
-#: `stop.atr` 挂在符号上时照样要有一个现价口径的 ATR。
-_DAILY_INDICATORS = ("ma", "atr")
+#: 这一路要算的指标组。ATR 不在这里：它给自己留了一条别人没有的失败闸（最高/最低价
+#: 缺数），与均线同批算的话，一根脏 K 会让整趟读取对这条规则全线不响。单独一路见 `_atr`。
+_DAILY_INDICATORS = ("ma",)
 
 
 @dataclass(frozen=True)
@@ -106,15 +112,15 @@ class RuleData:
     def __init__(
         self,
         *,
-        valuation,
-        analysis,
-        bars,
-        symbols,
+        valuation: ValuationService,
+        analysis: AnalysisService,
+        bars: BarRepo,
+        symbols: SymbolRepo,
         accounts: SimAccountRepo,
         ledger: SimOrderRepo,
         theses: ThesisRepo,
-        watchlists,
-        settings,
+        watchlists: WatchlistRepo,
+        settings: Settings,
     ) -> None:
         self.valuation = valuation
         self.analysis = analysis
@@ -164,7 +170,8 @@ class RuleData:
                 return []
             return [Target(rule.user_id, thesis.market, thesis.code, rule.account_id, thesis.id)]
         raise ValidationError(
-            f"target_type={kind} 这一层没有展开方式：组合级规则要的是每日组合快照（U28），"
+            f"target_type={kind} 这一层没有展开方式：目前只认 "
+            "symbol/watchlist/position/thesis；组合级规则要的是每日组合快照（U28），"
             "而库里还没有那张表"
         )
 
@@ -213,6 +220,7 @@ class RuleData:
         missing: list[str] = []
         if valuation.price is None:
             missing.append("没有过闸的现价：这一趟不判任何价格类条件")
+        atr = _atr(daily, valuation.price, missing)
         return Snapshot(
             market=target.market,
             code=target.code,
@@ -235,14 +243,12 @@ class RuleData:
             avg_cost=None if position is None else position.avg_cost,
             opened_on=None if position is None else _date_of(position.open_ts),
             holding_days=_holding_days(position, as_of),
-            holding_high=_holding_high(daily.table, valuation.price, position, as_of),
+            holding_high=_holding_high(daily.series.frame, valuation.price, position),
             weekly_ma20=valuation.weekly_ma20,
             daily_ma60=_fold_line(daily.table, _MA_COLUMN, valuation.price),
-            # 不用 `valuation.atr`：它只在估值风格要 ATR 时才被算出来（`_daily_indicators`），
-            # 价值型的止损是 `pct`，那个字段于是是 None——而规则这一侧照样要判 `stop.atr`
-            atr=_fold_line(daily.table, "atr", valuation.price),
+            atr=atr,
             stop_line=_stop_line(thesis, valuation),
-            target_price=valuation.plan.target.low if valuation.plan.target.ok else None,
+            target_price=_target_price(thesis, valuation),
             odds=valuation.plan.odds.value,
             score=valuation.composite.score,
             items=tuple(
@@ -287,10 +293,12 @@ class RuleData:
 
     def _prev_close(self, table: pl.DataFrame, price: float | None) -> float | None:
         """前收盘折回现价口径：跨除权日时裸价那个「昨天」不是今天可比的那个「昨天」。"""
-        if table.height < 2 or "close_hfq" not in table.columns:
+        if "close_hfq" not in table.columns:
             return None
-        before = float(table["close_hfq"][-2])
-        return fold_to_price_basis(before, fold(price, last(table, "close_hfq")))
+        before = before_last(table, "close_hfq")
+        if before is None:
+            return None
+        return fold_to_price_basis(float(before), fold(price, last(table, "close_hfq")))
 
 
 # --- 纯算式（没有 IO，所以模块级）-------------------------------------------------------------
@@ -301,8 +309,26 @@ def _fold_line(table: pl.DataFrame, column: str, price: float | None) -> float |
     return fold_to_price_basis(last(table, column), fold(price, last(table, "close_hfq")))
 
 
+def _atr(read: SeriesRead, price: float | None, missing: list[str]) -> float | None:
+    """ATR 单独一路算：它有一条别人没有的失败闸（最高/最低价缺数）。
+
+    那一根脏 K 已经被价格类的判断排除在外了；让 ATR 也退成 None 是诚实的，
+    拉着同一条规则其他判据一起不响不是。
+    """
+    try:
+        frame = metrics(read.series, ("atr",))
+    except ValidationError:
+        missing.append(
+            "ATR 缺数：这段日线里有不过闸的最高/最低价，跳过它继续递推会让整条 ATR 与正解不同"
+        )
+        return None
+    return fold_to_price_basis(
+        last(frame, "atr"), fold(price, last(read.series.frame, "close_hfq"))
+    )
+
+
 def _holding_high(
-    table: pl.DataFrame, price: float | None, position: Position | None, as_of: date
+    table: pl.DataFrame, price: float | None, position: Position | None
 ) -> float | None:
     """持仓期最高价（现价口径）。没有持仓、没有建仓时刻、或不足三根 ⇒ None（见常量注释）。"""
     if position is None or position.open_ts is None or table.height == 0:
@@ -311,7 +337,7 @@ def _holding_high(
     if window.height < TRAILING_MIN_BARS:
         return None
     factor = fold(price, last(table, "close_hfq"))
-    return fold_to_price_basis(window_high(window, window.height), factor)
+    return fold_to_price_basis(high_water(window, window.height), factor)
 
 
 def _stop_line(thesis: Thesis | None, valuation) -> float | None:
@@ -323,6 +349,13 @@ def _stop_line(thesis: Thesis | None, valuation) -> float | None:
     if thesis is not None and thesis.stop_price is not None:
         return thesis.stop_price
     return valuation.plan.stop.low if valuation.plan.stop.ok else None
+
+
+def _target_price(thesis: Thesis | None, valuation) -> float | None:
+    """目标价与止损线同一条优先级：论上那一列是用户确认过的数，没有才退回本次合成。"""
+    if thesis is not None and thesis.target_price is not None:
+        return thesis.target_price
+    return valuation.plan.target.low if valuation.plan.target.ok else None
 
 
 def _date_of(moment) -> date | None:

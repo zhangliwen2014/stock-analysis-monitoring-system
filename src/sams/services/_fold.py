@@ -53,6 +53,17 @@ def window_high(table: pl.DataFrame, bars: int) -> float | None:
     return table["close_hfq"].tail(bars).max()
 
 
+def high_water(table: pl.DataFrame, bars: int) -> float | None:
+    """窗口内最高的那根后复权**最高价**：持仓期 peak 用它（spec §9.4 说的是 bars.high）。
+
+    与 `window_high` 一样**还没**折回现价口径；调用方拿自己那条序列的因子折它。
+    用后复权而不是裸价：跨除权日时裸价那个「下跌」是分红，不是有人付过更低的价。
+    """
+    if table.height == 0 or bars <= 0 or "high_hfq" not in table.columns:
+        return None
+    return table["high_hfq"].tail(bars).max()
+
+
 def pct_change(table: pl.DataFrame, column: str) -> float | None:
     """最后一根相对上一根的涨跌幅（在后复权口径里算：跨除权日时裸价那个差是分红）。"""
     now, prior = last(table, column), before_last(table, column)

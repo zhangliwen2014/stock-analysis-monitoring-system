@@ -5,7 +5,7 @@
 （`core/notify.py::AlertSender`，T-14），`bootstrap` 把 `NotifyService.dispatch` 接上去——
 与 D93 里 `HealthService` 收 `local_status` 同一个形状。
 
-这里只转出 `RuleData`，其余逐个任务补（转出名单的终点见 T-17）。
+这里转出取数这一层的三个名字；其余逐个任务补（转出名单的终点见 T-17）。
 """
 
 from sams.services.rules.snapshot import RuleData, Snapshot, Target

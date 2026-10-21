@@ -13,6 +13,7 @@ from sams.services._fold import (
     before_last,
     fold,
     fold_to_price_basis,
+    high_water,
     last,
     pct_change,
     weekly_line,
@@ -63,6 +64,13 @@ def test_window_high_walks_the_adjusted_column() -> None:
     assert window_high(table, 0) is None
     assert window_high(pl.DataFrame({"close": [1.0]}), 3) is None
     assert window_high(pl.DataFrame({"close_hfq": []}), 3) is None
+
+
+def test_high_water_walks_the_adjusted_high_column() -> None:
+    table = pl.DataFrame({"high_hfq": [1.0, 5.0, 2.0, 4.0]})
+    assert high_water(table, 3) == 5.0
+    assert high_water(table, 0) is None
+    assert high_water(pl.DataFrame({"close_hfq": [1.0]}), 3) is None
 
 
 def test_pct_change_is_the_ratio_minus_one_on_the_adjusted_series() -> None:
