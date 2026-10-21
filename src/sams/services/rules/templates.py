@@ -171,8 +171,105 @@ def stop_trailing(ask: Ask) -> Outcome:
     )
 
 
+def stop_atr(ask: Ask) -> Outcome:
+    """`stop.atr`：成本 − 倍数×ATR14。ATR 由 T-6 折回现价口径，这里只做算术。"""
+    snapshot = ask.snapshot
+    if snapshot.price is None:
+        return Outcome(why_not=_no_price(snapshot))
+    if snapshot.avg_cost is None or snapshot.avg_cost <= 0:
+        return Outcome(why_not="没有成本就没有这条线：`stop.atr` 是从成本往下量倍数")
+    if snapshot.atr is None:
+        return Outcome(
+            why_not="这一路没有 ATR14（日 K 不足 14 根，或那几根没过数据闸）："
+            "把它当 0 会让线正好贴在成本上，现价低一分都报止损"
+        )
+    multiple = float(ask.params["multiple"])
+    line = snapshot.avg_cost - multiple * snapshot.atr
+    if line <= 0:
+        return Outcome(
+            why_not=f"倍数 {multiple:g} 把线算到了 {money(line, snapshot.currency)}："
+            "一条在 0 以下的线永远不会触发，这条规则等于没写"
+        )
+    stage = stop_stage(snapshot, line)
+    if stage is None:
+        return Outcome()
+    return _hit(
+        snapshot,
+        line,
+        stage,
+        f"成本 {money(snapshot.avg_cost, snapshot.currency)} − {multiple:g}×ATR14"
+        f"（{money(snapshot.atr, snapshot.currency)}，已从后复权折回现价口径）"
+        f" ⇒ 线 {money(line, snapshot.currency)}",
+    )
+
+
+#: `basis` 那两个取值 → (取 `Snapshot` 的哪个字段, 那句话里的名字)
+#: 名字写在这里而不是拼出来：「日 MA60」是给人读的词，字段名是给代码读的，
+#: 把 `daily_ma60` 直接上屏等于让用户去猜那是什么意思。
+_MA_LINES = {
+    "weekly_ma20": ("weekly_ma20", "周 MA20"),
+    "daily_ma60": ("daily_ma60", "日 MA60"),
+}
+
+
+def stop_ma(ask: Ask) -> Outcome:
+    """`stop.ma`：跌破均线。两条线都在 T-6 折回过，用哪一条由参数说。"""
+    snapshot = ask.snapshot
+    if snapshot.price is None:
+        return Outcome(why_not=_no_price(snapshot))
+    field, label = _MA_LINES[str(ask.params["basis"])]
+    line = getattr(snapshot, field)
+    if line is None:
+        return Outcome(
+            why_not=f"没有 {label}：这一路的窗口不够长，或那几根日 K 没过数据闸"
+        )
+    stage = stop_stage(snapshot, line)
+    if stage is None:
+        return Outcome()
+    return _hit(
+        snapshot, line, stage, f"现价跌破 {label} {money(line, snapshot.currency)}"
+    )
+
+
+def stop_breakeven(ask: Ask) -> Outcome:
+    """`stop.breakeven`：浮盈曾经到过 x% 之后，把线抬到成本。
+
+    触发判据是**持仓期最高价**而不是今天的现价（上面那枚测试的理由）：这一条的意义就是
+    「已经赚过，别把利润全还回去」，而赚过的那一刻是唯一可查的事实。
+    线抬到成本 ⇒ 现价只要低于成本就 `hit`，正是字面意思。
+    """
+    snapshot = ask.snapshot
+    if snapshot.price is None:
+        return Outcome(why_not=_no_price(snapshot))
+    if snapshot.avg_cost is None or snapshot.avg_cost <= 0:
+        return Outcome(why_not="保本止损要把线抬到成本，而这一笔没有成本可读")
+    if snapshot.holding_high is None:
+        return Outcome(
+            why_not="没有持仓期最高价：判不出「曾经到过 x%」，宁可不报也不猜"
+        )
+    trigger = float(ask.params["trigger_pct"])
+    reached = snapshot.holding_high / snapshot.avg_cost - 1.0
+    if reached < trigger:
+        return Outcome()
+    line = snapshot.avg_cost
+    stage = stop_stage(snapshot, line)
+    if stage is None:
+        return Outcome()
+    return _hit(
+        snapshot,
+        line,
+        stage,
+        f"持仓期最高 {money(snapshot.holding_high, snapshot.currency)}"
+        f"（成本上方 {reached:.1%}，已过 {trigger:.1%}）⇒ 线已抬到成本 "
+        f"{money(line, snapshot.currency)}",
+    )
+
+
 TABLE: dict[str, Callable[[Ask], Outcome]] = {
     "stop.fixed": stop_fixed,
     "stop.pct": stop_pct,
     "stop.trailing": stop_trailing,
+    "stop.atr": stop_atr,
+    "stop.ma": stop_ma,
+    "stop.breakeven": stop_breakeven,
 }
