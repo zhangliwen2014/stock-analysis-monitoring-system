@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
@@ -135,6 +134,11 @@ def action_for(kind: str, name: str) -> str:
     return f"{head}（{name}）"
 
 
+def _no_impl(kind: str) -> str:
+    """这一层没有这个 kind 的那句话（`Skipped.reason` 的一个出处）。"""
+    return f"这一层没有 {kind} 的求值实现：名单的唯一出处是 core/rules.py"
+
+
 @dataclass
 class _Cache:
     """一趟里的三张临时表。它们只在一趟内有效：跨趟复用持仓会把「今天新买的那笔」漏掉。"""
@@ -248,6 +252,14 @@ class RuleEngine:
         dry_run: bool,
         cache: _Cache,
     ) -> Raised | Suppressed | Skipped | None:
+        # 这道检查排在 `template_for` 之前：kind 的名单有两份（`TEMPLATES` 在 `core/rules.py`、
+        # `TABLE` 在这里），野 kind 原本会先在 `template_for` 那里抛出去——抛出去就是整趟崩，
+        # 而这里的取向是「库里已经躺着的那种行不该把整趟拖崩」（与 `NotAdjustable`
+        # 那一支同一个理由）。检查因此只做一次，做在最前面：过了它再去 `template_for`
+        # 不会再抛，两张名单由 `test_the_table_covers_every_declared_kind` 钉成同一份。
+        evaluate = TABLE.get(rule.kind)
+        if evaluate is None:
+            return self._skipped(rule, target.market, target.code, _no_impl(rule.kind))
         built = template_for(rule.kind)
         try:
             snapshot = self.data.read(target, as_of=day, position=position)
@@ -255,14 +267,10 @@ class RuleEngine:
             # 「读不到这个对象」与「判不了」是同一类（`Skipped`），而不是整趟崩：
             # 只兜 `NotAdjustable` 这一种，不兜 `SamsError`——后者会把「取数链上有一个
             # 真 bug」也折成屏幕上的一句 skipped，而那一趟看起来是成功的。
-            return Skipped(
-                rule_id=rule.id,
-                rule_name=rule.name,
-                market=target.market,
-                code=target.code,
-                reason=f"读不到这个对象：{exc}",
+            return self._skipped(
+                rule, target.market, target.code, f"读不到这个对象：{exc}"
             )
-        verdict = self._verdict(rule, target, snapshot)
+        verdict = self._verdict(rule, target, snapshot, evaluate)
         if isinstance(verdict, Skipped):
             return verdict
         if verdict is None:
@@ -284,38 +292,25 @@ class RuleEngine:
         return self._dispatch(rule, snapshot, verdict, built, now)
 
     def _verdict(
-        self, rule: Rule, target: Target, snapshot: Snapshot
+        self, rule: Rule, target: Target, snapshot: Snapshot, evaluate
     ) -> Verdict | Skipped | None:
-        """查表、求值。表里没有这个 kind ⇒ 判不了：仓库那道闸拦的是写入，
-        这一头是第二道——库里已经躺着的那种行不该把整趟拖崩。
+        """求值。`evaluate` 是 `_one` 查过表的那一个函数：名单只在那里查一次，
+        查不到就已经折成 `Skipped` 出门了（库里躺着野 kind 不该把整趟拖崩）。
 
         `thesis` 从引擎这里递进去而不是让模板自己去查库：`data.read` 已经查过一次，
         两次之间规则还能被改，那样算出来的价位与屏幕上那一条不是同一个数（`Ask` 的注释）。
         """
-        evaluate = TABLE.get(rule.kind)
-        if evaluate is None:
-            return Skipped(
-                rule_id=rule.id,
-                rule_name=rule.name,
-                market=snapshot.market,
-                code=snapshot.code,
-                reason=f"这一层没有 {rule.kind} 的求值实现：名单的唯一出处是 core/rules.py",
-            )
         thesis = self.data.thesis_for(target)
         outcome = evaluate(Ask(snapshot=snapshot, params=rule.params, thesis=thesis))
         # 判「命中」看 `hit is not None` 而不是 `verdict.ok`：状态型命中（`stop.thesis_drift`
         # 那类只报状态、不比数值）的 `Verdict.ok` 是 False，用 `.ok` 会让那一类告警永不投出。
+        # 那一类告警不读现价、也没有第二个数可比，退化在别处抓不到——钉它的是
+        # `test_a_state_only_hit_still_reaches_the_sender`。
         if outcome.hit is not None:
             return outcome.hit
         if outcome.why_not:
-            return Skipped(
-                rule_id=rule.id,
-                rule_name=rule.name,
-                market=snapshot.market,
-                code=snapshot.code,
-                reason=outcome.why_not,
-            )
-        return None
+            return self._skipped(rule, snapshot.market, snapshot.code, outcome.why_not)
+        return None  # 判过了，没到
 
     # --- 闸门（§10.1）--------------------------------------------------------------------
 
@@ -325,7 +320,8 @@ class RuleEngine:
         """四开关的输入。本地日按**标的市场**的时区算：拿 UTC 日推美股时段恒错一天。"""
         day = self._local_day(target.market, now)
         if day is None:
-            return Gate(now=now)  # 市场不在配置里 ⇒ 三个要日历的开关都读不到输入
+            # 市场不在配置里、或那一行的时区名写坏了 ⇒ 三个要日历的开关都读不到输入
+            return Gate(now=now)
         sessions = self._sessions(target.market, day, cache)
         open_alert = self.alerts.latest_open(rule.user_id, snapshot.market, snapshot.code)
         return Gate(
@@ -343,7 +339,10 @@ class RuleEngine:
 
     def _local_day(self, market: str, now: datetime) -> date | None:
         try:
-            zone = ZoneInfo(self.settings.market_cfg(market).tz)
+            # 走 `MarketCfg.zone()` 而不是自己 `ZoneInfo(...)`：坏时区名抛的是
+            # `ZoneInfoNotFoundError`（`KeyError` 的子类），这一支只接 `ValidationError`——
+            # 那一头已经把两种错转译好了，配置写错不该崩整趟。
+            zone = self.settings.market_cfg(market).zone()
         except ValidationError:
             return None
         return now.astimezone(zone).date()
@@ -378,7 +377,15 @@ class RuleEngine:
         )
         if last is None:
             return ""
-        if escalates(last.stage, verdict.stage):
+        try:
+            louder = escalates(last.stage, verdict.stage)
+        except ValidationError:
+            # `alerts.stage` 那一列没有词表 CHECK，而写它的那一头（`monitor/router.py`）把
+            # 文本原样写进去：入池那类历史行的 stage 是词表外的词。认不出上一档有多响
+            # 就是判不出来，而这里的取向是判不出来⇒放行（同 `filters.no_open_alert`，T-12）：
+            # 让它抛出去等于让一条脏历史把整趟求值打掉。
+            return ""
+        if louder:
             return ""  # 更响的那一档：止损真破了，降噪不能替它做决定
         gap = now - last.triggered_at
         window = timedelta(minutes=rule.cooldown_min)
@@ -447,6 +454,15 @@ class RuleEngine:
             action_note=action_for(rule.kind, rule.name),
         )
 
+    def _skipped(self, rule: Rule, market: str, code: str, reason: str) -> Skipped:
+        return Skipped(
+            rule_id=rule.id,
+            rule_name=rule.name,
+            market=market,
+            code=code,
+            reason=reason,
+        )
+
     def _suppressed(
         self, rule: Rule, snapshot: Snapshot, verdict: Verdict, reason: str
     ) -> Suppressed:
@@ -489,7 +505,9 @@ class RuleEngine:
             lines.append(pnl)
         lines.extend(constraint_lines(snapshot))
         if snapshot.missing:
-            lines.append("缺的输入：" + "、".join(snapshot.missing))
+            # 每条本身已经是一句完整的话（「没有过闸的现价：这一趟不判任何价格类条件」），
+            # 再加一句「缺的输入：」是同一件事的两件外套。一条一行，读的人自己数得过来。
+            lines.extend(snapshot.missing)
         lines.append(f"规则 `{rule.name}`（{rule.kind}）· 去重键 {rule.id}/{snapshot.market}/"
                      f"{snapshot.code}/{snapshot.account_id or '-'}")
         return "\n".join(lines)

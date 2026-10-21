@@ -6,10 +6,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from sams.core.config import MarketCfg
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage
@@ -18,6 +20,7 @@ from sams.services.rules.snapshot import Snapshot, Target
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.rules import RuleRepo
+from sams.storage.repos.theses import INVALIDATED, ThesisRepo
 
 USER = "u-rule"
 MARKET = "A"
@@ -25,14 +28,20 @@ CODE = "601088"
 #: 北京时间 15:30，A 股已收盘：`price_on` 与「今天」是同一天
 NOW = datetime(2026, 10, 20, 7, 30, tzinfo=UTC)
 TODAY = NOW.date()
+#: 同一个 UTC 时刻的另一种读法：北京已经跨到 10-21 凌晨。
+#: 「引擎问日历的是哪一天」只有这种时刻才分得清本地日与 UTC 日。
+LATE_EVENING_UTC = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
 
 
 class FixedClock:
+    def __init__(self, now: datetime = NOW) -> None:
+        self.now = now
+
     def now_utc(self) -> datetime:
-        return NOW
+        return self.now
 
     def today(self) -> date:
-        return TODAY
+        return self.now.date()
 
 
 class StubCalendar:
@@ -70,9 +79,10 @@ class RecordingSender:
 class StubData:
     """`RuleData` 的替身：引擎只用到 `expand` / `holdings` / `thesis_for` / `read`。"""
 
-    def __init__(self, snapshot: Snapshot, holdings=()) -> None:
+    def __init__(self, snapshot: Snapshot, holdings=(), thesis=None) -> None:
         self.snapshot = snapshot
         self.held = list(holdings)
+        self.thesis = thesis
         #: 装上它，`read` 就抛：一条挂了错代码的规则不该把整趟拖崩
         self.read_raises: Exception | None = None
 
@@ -90,7 +100,7 @@ class StubData:
         return list(self.held)
 
     def thesis_for(self, target: Target):
-        return None
+        return self.thesis
 
     def read(self, target: Target, *, as_of: date, position=None) -> Snapshot:
         if self.read_raises is not None:
@@ -122,6 +132,7 @@ class Harness:
         self.settings = settings
         self.rules = RuleRepo(db, clock=FixedClock())
         self.alerts = AlertRepo(db, clock=FixedClock())
+        self.fx = FxRepo(db)
         self.sender = RecordingSender()
         self.hits: list[RuleHit] = []
         self.triggered: list[AlertTriggered] = []
@@ -129,15 +140,17 @@ class Harness:
         self.bus.subscribe(RuleHit, self.hits.append)
         self.bus.subscribe(AlertTriggered, self.triggered.append)
         self.calendar = StubCalendar()
+        self.clock = FixedClock()
         self.snapshot = snap()
         self.held: list = []
+        self.thesis = None
         self.data: StubData | None = None
         self.read_raises: Exception | None = None
         #: `seed_hit` 默认挂在哪条规则上：用例先 `h.add()` 再 `h.seed_hit()` 就对得上
         self.added_id = "r-seed"
 
     def engine(self) -> RuleEngine:
-        data = StubData(self.snapshot, self.held)
+        data = StubData(self.snapshot, self.held, self.thesis)
         data.read_raises = self.read_raises
         self.data = data
         return RuleEngine(
@@ -145,8 +158,8 @@ class Harness:
             alerts=self.alerts,
             data=data,
             calendar=self.calendar,
-            fx=FxRepo(self.db),
-            clock=FixedClock(),
+            fx=self.fx,
+            clock=self.clock,
             bus=self.bus,
             sender=self.sender,
             settings=self.settings,
@@ -223,6 +236,62 @@ def test_the_body_carries_the_pnl_the_constraint_and_the_reason(h) -> None:
     assert "绝对价止损线 10.00 CNY" in body
 
 
+def test_a_state_only_hit_still_reaches_the_sender(h) -> None:
+    """状态型命中（`stop.thesis_drift` 那类只报状态、不比数值）的 `Verdict.ok` 是 False。
+
+    这一枚是「判命中用 `hit is not None`」那道锁的唯一证据：把判据换成 `.ok`，
+    这一类告警就永远不会投出去，而其余用例全是 `stop.fixed`（它的 `.ok` 恰好为 True）。
+    """
+    theses = ThesisRepo(h.db)
+    made = theses.create(
+        user_id=USER, market=MARKET, code=CODE, style="value", actor_id="u1", now=NOW
+    )
+    #: 论被判死、没有基线分、没有赔率 ⇒ 只有「状态」那一条成立，数值那一侧全空
+    h.thesis = theses.advance(USER, made.id, INVALIDATED, actor_id="u1", now=NOW)
+    assert h.thesis.baseline_score is None and h.thesis.reward_risk is None
+    h.added_id = h.add(
+        kind="stop.thesis_drift",
+        name="理由没了就喊我",
+        target_type="position",
+        target_ref="*",
+        account_id="acc-1",
+        thesis_id=made.id,
+        params={},
+    ).id
+    h.snapshot = snap(account_id="acc-1")
+    report = h.engine().check(USER)
+    assert len(report.raised) == 1
+    assert report.raised[0].value_text == "—"  # 没有数值可报，那一条照样推了出去
+    assert len(h.sender.sent) == 1
+
+
+def test_a_cross_currency_position_shows_the_converted_number(h) -> None:
+    """折 CNY 那一支的常驻用例：方向是 1 USD = 7.2 CNY（标的 → 汇总，`notes.Fx`）。
+
+    库里只种了 USD→CNY 这一侧：参数传反 ⇒ 读的是 CNY→USD ⇒ 读不到 ⇒ 那句折合数消失，
+    这一枚就红。方向写反的症状本来是「大约对」——那是最难查的错，所以它得有人常盯着。
+    """
+    h.add()
+    h.fx.put(TODAY, "USD", "CNY", 7.2)
+    h.snapshot = snap(currency="USD", report_currency="CNY", qty=100.0, avg_cost=12.0)
+    h.engine().check(USER)
+    body = h.sender.sent[0].body
+    assert "浮亏 250.00 USD" in body
+    assert "折 CNY 1,800.00" in body
+    assert f"（{TODAY} 汇率 7.2）" in body
+
+
+def test_a_cross_currency_position_without_a_rate_says_so(h) -> None:
+    """读不到汇率时明写「没读到」，而不是把那一行悄悄省掉（省略 ⇒ 用户按标的币种加总）。"""
+    h.add()
+    h.snapshot = snap(currency="USD", report_currency="CNY", qty=100.0, avg_cost=12.0)
+    h.engine().check(USER)
+    body = h.sender.sent[0].body
+    assert "浮亏 250.00 USD" in body
+    assert "没读到 USD→CNY" in body
+    assert "折 CNY" not in body
+
+
 def test_an_above_line_price_leaves_the_run_quiet(h) -> None:
     h.add()
     h.snapshot = snap(price=11.0)
@@ -288,6 +357,33 @@ def test_a_hit_beyond_the_window_reports_again(h) -> None:
     assert len(h.engine().check(USER).raised) == 1
 
 
+def test_a_hit_exactly_at_the_window_edge_reports(h) -> None:
+    """边界：`gap >= window`，恰好 30 分钟就是窗口已过（31 与 0 钉了，这个点没钉）。"""
+    h.added_id = h.add().id
+    h.seed_hit(minutes_ago=30, stage="hit")
+    assert len(h.engine().check(USER).raised) == 1
+
+
+def test_an_unrecognized_stage_in_the_history_punches_through(h) -> None:
+    """一条脏历史不该把整趟求值打掉（与 `filters.no_open_alert` 同一条取向，T-12）。
+
+    `alerts.stage` 那一列没有词表 CHECK，而生产里写它的那一头（`monitor/router.py`）把文本
+    原样写进去：入池那类历史行的 stage 是「入池」这种词，`escalates` 认不出就抛。
+    认不出上一档有多响 ⇒ 判不出来 ⇒ 穿冷却放行——冷却那句压制的话不说，这一条投出去。
+    """
+    h.added_id = h.add().id
+    h.db.execute(
+        "INSERT INTO alerts (id, user_id, rule_id, account_id, market, code, stage,"
+        " triggered_at, status, payload_json, severity)"
+        " VALUES ('dirty-row', ?, ?, NULL, ?, ?, '入池', ?, 'new', '{}', 'mid')",
+        [USER, h.added_id, MARKET, CODE, NOW - timedelta(minutes=5)],
+    )
+    report = h.engine().check(USER)
+    assert len(report.raised) == 1
+    assert report.suppressed == ()
+    assert len(h.sender.sent) == 1
+
+
 def test_the_cooldown_window_is_the_rules_own_number(h) -> None:
     """`cooldown_min = 0` 的意思是「每一次都报」（§10.1 那个默认值不是命令）。"""
     h.added_id = h.add(cooldown_min=0).id
@@ -327,9 +423,20 @@ def test_no_open_alert_suppresses_a_quieter_repeat_on_the_same_symbol(h) -> None
 
 
 def test_the_gate_asks_the_calendar_for_the_targets_own_market(h) -> None:
+    """问的是谁的日历、问的是哪一天。
+
+    时刻挑在北京已经跨日、UTC 还没跨日的那一格（10-20T20:00Z = 北京 10-21 04:00）：
+    拿 UTC 日去问日历的话，回走的起点会是 10-20，这一枚就红。
+    """
     h.add()
+    h.clock = FixedClock(LATE_EVENING_UTC)
     h.engine().check(USER)
-    assert h.calendar.day_calls[0][0] == MARKET
+    assert h.calendar.day_calls, "引擎一次日历都没问：三个要日历的开关全在读空气"
+    assert {market for market, _ in h.calendar.day_calls} == {MARKET}
+    probed = [day for _, day in h.calendar.day_calls]
+    #: 起点是**标的市场本地的那一天**，之后逐日往回退（`_last_session` 的回走）
+    assert probed[0] == TODAY + timedelta(days=1)
+    assert probed == [probed[0] - timedelta(days=n) for n in range(len(probed))]
 
 
 def test_the_last_session_is_walked_back_from_the_local_day(h) -> None:
@@ -341,6 +448,45 @@ def test_the_last_session_is_walked_back_from_the_local_day(h) -> None:
 
 
 # --- 一趟的形状：一条坏规则不拖整列（§1 第五行）--------------------------------------------
+
+def test_a_wild_kind_in_the_db_is_skipped_and_the_run_finishes(h) -> None:
+    """库里躺着这一层没实现的 kind：判不了 ⇒ 说这一路（而不是整趟崩）。
+
+    取向是「已经躺在库里的那种行不该把整趟拖崩」，而检查必须排在 `template_for` 之前：
+    kind 的名单有两份（`TEMPLATES` 在 core、`TABLE` 在这里），原本野 kind 会先在
+    `template_for` 那里抛出去——抛出去就成了一句话不说清自己。
+    """
+    good = h.add(name="好的那条")
+    h.db.execute(
+        "INSERT INTO rules (id, user_id, name, enabled, target_type, target_ref,"
+        " kind, condition_kind, params_json, filters_json, cooldown_min, severity,"
+        " channel_ids, created_at, updated_at)"
+        " VALUES ('wild-row', ?, '没实现的那种', TRUE, 'symbol', ?, 'stop.lunar',"
+        " 'template', '{}', '{}', 30, 'mid', '[]', ?, ?)",
+        [USER, f"{MARKET}/{CODE}", NOW, NOW],
+    )
+    report = h.engine().check(USER)
+    assert [got.rule_id for got in report.raised] == [good.id]
+    assert len(report.skipped) == 1
+    assert report.skipped[0].rule_id == "wild-row"
+    assert "求值实现" in report.skipped[0].reason
+
+
+def test_a_broken_timezone_in_the_config_does_not_kill_the_run(h) -> None:
+    """坏时区名走的是 `MarketCfg.zone()`：它把 `ZoneInfoNotFoundError` 转成 `ValidationError`。
+
+    引擎自己 `ZoneInfo(...)` 的那一支只接 `ValidationError`，而配置里一个拼错的时区名抛的是
+    `KeyError` 的子类 ⇒ 整趟崩。这里钉的是「配置写错时这一条照样投出去」。
+    """
+    h.add()
+    h.settings = replace(
+        h.settings,
+        markets={"A": MarketCfg("A", "Mars/Phobos", "CNY", 30, ("akshare",))},
+    )
+    report = h.engine().check(USER)
+    assert len(report.raised) == 1
+    assert len(h.sender.sent) == 1
+
 
 def test_a_rule_that_cannot_expand_blocks_only_itself(h) -> None:
     good = h.add(name="好的那条")
