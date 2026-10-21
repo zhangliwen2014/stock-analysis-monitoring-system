@@ -264,6 +264,16 @@ def test_latest_open_finds_the_newest_unhandled_alert_on_that_symbol(repo, seede
         },
     )
     repo.set_status(first.id, "handled")
+    # 同票上**还有一条更早的 `new`**：只留一条 `new` 的话，删掉 `ORDER BY` 也全绿，
+    # 「取最新」这半句根本没被钉住。
+    repo.create(
+        user_id=seeded_user,
+        **{
+            **CREATE_KW,
+            "stage": "pre",
+            "triggered_at": now - timedelta(days=3),
+        },
+    )
     second = repo.create(
         user_id=seeded_user,
         **{

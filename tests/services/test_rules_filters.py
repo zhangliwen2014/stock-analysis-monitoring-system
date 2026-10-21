@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from sams.core.rules import HIT, PRE, URGENT, Verdict, template_for
+from sams.core.rules import FILTER_KEYS, HIT, PRE, URGENT, Verdict, template_for
 from sams.core.timeutil import Session
 from sams.services.rules.filters import Gate, OpenAlert, run_filters
 from sams.services.rules.snapshot import Snapshot
@@ -140,6 +140,17 @@ def test_exclude_halt_passes_when_the_bar_is_current() -> None:
     assert run({"exclude_halt": True}, Gate(last_session_on=date(2026, 10, 20))) == ""
 
 
+def test_exclude_halt_leaves_a_non_price_kind_alone() -> None:
+    """披露日那条读的是日期，不是「今天有没有行」：日线缺一天压不掉一条「该复核这条论」。
+
+    这一枚专门盯 `price_class` 那个守卫：另外三枚的同类守卫各有专钉测试，只有这一枚
+    删掉守卫也全绿——因为 `Gate` 里那两个缺省值恰好让别的开关先放行。
+    """
+    gate = Gate(last_session_on=date(2026, 10, 20))
+    stale_bar = snap(price_on=date(2026, 10, 16))
+    assert run({"exclude_halt": True}, gate, stale_bar, kind="scheduled.reevaluate") == ""
+
+
 def test_no_open_alert_suppresses_a_repeat_of_the_same_stage() -> None:
     gate = Gate(open_alert=OpenAlert(id="al-1", stage=HIT, on=date(2026, 10, 20)))
     got = run({"no_open_alert": True}, gate)
@@ -164,21 +175,34 @@ def test_no_open_alert_passes_when_nothing_is_open() -> None:
     assert run({"no_open_alert": True}, Gate()) == ""
 
 
+def test_no_open_alert_passes_on_a_stage_word_it_does_not_know() -> None:
+    """`alerts.stage` 那一列没有词表约束：一条历史行写着「入池」时不许把整趟求值打掉。
+
+    这一枚盯的不是容差而是取向：认不出上一档有多响 ⇒ 判不出来 ⇒ 放行。让它从
+    `escalates` 抛出去，代价是一条脏历史让所有票在这一步全体沉默——那正是 §1 表里
+    最贵的一行（屏幕上「一切正常」，实际是一条真止损没人听见）。
+    """
+    gate = Gate(open_alert=OpenAlert(id="al-legacy", stage="入池", on=date(2026, 10, 20)))
+    assert run({"no_open_alert": True}, gate) == ""
+
+
 def test_the_first_matching_switch_wins_and_says_which() -> None:
     """两个开关同时命中时只回一句：`suppressed` 的投递记录只有一行，理由要能读。"""
     gate = Gate(
         open_alert=OpenAlert(id="al-1", stage=HIT, on=date(2026, 10, 20)),
         last_session_on=date(2026, 10, 27),
     )
-    got = run({"exclude_halt": True, "no_open_alert": True}, gate)
-    assert got.startswith("该市场")  # `exclude_halt` 在 `FILTER_KEYS` 里排在前面
+    got = run({"no_open_alert": True, "exclude_halt": True}, gate)
+    assert got.startswith("该市场")  # 键序反过来写：`exclude_halt` 在 `FILTER_KEYS` 里排在前面
 
 
-@pytest.mark.parametrize(
-    "switch", ["time_window", "data_freshness", "exclude_halt", "no_open_alert"]
-)
+@pytest.mark.parametrize("switch", FILTER_KEYS)
 def test_every_declared_switch_has_an_implementation(switch: str) -> None:
-    """名单来自 `core.rules.FILTER_KEYS`：这里少一个实现，那一头就能配出一个恒真的开关。"""
+    """名单来自 `core.rules.FILTER_KEYS`：这里少一个实现，那一头就能配出一个恒真的开关。
+
+    名单不硬编码：写死四个名字时，`core` 那边加第五个开关这里照样「全绿」，
+    而 `run_filters` 会在真跑到那一枚时 `KeyError`。
+    """
     assert run({switch: True}, Gate()) == ""  # 空 Gate ⇒ 全部放行，函数不抛
 
 

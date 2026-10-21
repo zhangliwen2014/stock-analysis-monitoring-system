@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+from sams.core.errors import ValidationError
 from sams.core.rules import (
     FILTER_KEYS,
     FILTER_MINUTES,
@@ -103,7 +104,14 @@ def no_open_alert(snapshot: Snapshot, gate: Gate, verdict: Verdict, built: Templ
     open_alert = gate.open_alert
     if open_alert is None:
         return ""
-    if escalates(open_alert.stage, verdict.stage):
+    try:
+        louder = escalates(open_alert.stage, verdict.stage)
+    except ValidationError:
+        # `alerts.stage` 那一列没有词表约束（选股入池那类历史行写的是别的词），认不出
+        # 「上一档有多响」就是判不出来，而这里的取向是判不出来⇒放行。
+        # 让它抛出去等于让一条脏历史把整趟求值打掉。
+        return ""
+    if louder:
         return ""
     return (
         f"已有一条未处理的 {open_alert.stage} 告警（{open_alert.id}，"
