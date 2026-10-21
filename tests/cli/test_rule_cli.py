@@ -17,7 +17,7 @@ import json
 from datetime import UTC, date, datetime
 
 import pytest
-from support_valuation import CODE, make_container, seed_calendar
+from support_valuation import CODE, TODAY, make_container, seed_calendar
 
 import sams.cli as cli
 
@@ -696,3 +696,91 @@ def test_recheck_is_incomplete_when_a_baseline_item_was_not_computed(container, 
     )
     code, row = payload(container, capsys, "recheck", "--user", USER)
     assert code == 1 and row["status"] == "incomplete" and row["counts"]["partial"] >= 1
+
+
+# ---------- 除权那一屏的锚（0017）----------------------------------------------------------
+
+
+def test_a_new_rule_stamps_today_as_its_price_anchor(container, capsys):
+    """命令行建的那条规则，锚就是填它的那一天：那一刻写下的价属于那一刻的价空间。
+
+    直接打 `add` 而不借 `add_rule` 那个助手：它把 `--name` 与 `--param price=100000` 写在
+    前面，覆盖它靠的是 `_params` 折叠时的「后者胜出」，而这一枚要的 10 元不该建在那条
+    实现细节上。
+    """
+    code, row = payload(
+        container,
+        capsys,
+        "add",
+        "--user",
+        USER,
+        "--kind",
+        "stop.fixed",
+        "--name",
+        "跌破 10 元",
+        "--target-type",
+        "symbol",
+        "--target-ref",
+        f"A/{CODE}",
+        "--param",
+        "price=10",
+    )
+    assert code == 0, row
+    assert row["rule"]["params_on"] == str(TODAY)
+
+    code, text = out(container, capsys, "show", row["rule"]["id"], "--user", USER)
+    assert code == 0
+    assert f"锚    {TODAY} 写下" in text
+
+
+def test_a_row_without_an_anchor_shows_it_and_names_the_fix(container, capsys):
+    """那一列是 NULL 的一行在屏幕上自己说这件事，并且给出下一步。
+
+    屏幕上什么都不写的话，用户要到除权日才知道自己有一条规则从此不判——那一天它报的是
+    一句「不判」，不是一句止损。走仓库建它是因为维护面照样盖戳：NULL 那一行要么是
+    0017 之前留下的，要么是从一条手填价位的论派生出来的（那一头没有测量日）。
+    """
+    old = container.rules_store.create(
+        uid(container),
+        kind="stop.fixed",
+        name="老规则",
+        target_type="symbol",
+        target_ref=f"A/{CODE}",
+        params={"price": 10.0},
+    )
+    code, row = payload(container, capsys, "show", old.id, "--user", USER)
+    assert code == 0
+    assert row["rule"]["params_on"] is None
+
+    code, text = out(container, capsys, "show", old.id, "--user", USER)
+    assert code == 0
+    assert "无日期戳" in text and "rule edit" in text
+
+
+def test_the_anchor_line_is_quiet_for_rules_that_move_nothing(container, capsys):
+    """`thesis.drift` 没有要搬的数 ⇒ 那一行不印：给一条不判价的规则念「这屏的数属于哪一天的
+    价空间」，念的是一个不指任何价位的日期，而那一屏的噪音会把真有问题的这一行淹掉。
+    """
+    code, row = payload(
+        container,
+        capsys,
+        "add",
+        "--user",
+        USER,
+        "--kind",
+        "thesis.drift",
+        "--name",
+        "观点漂移",
+        "--target-type",
+        "thesis",
+        "--target-ref",
+        make_thesis(container).id,
+    )
+    assert code == 0, row
+    # 库里那一列照样有戳（维护面盖的是 `clock.today()`，不分 kind）：屏幕上那一行不印，
+    # 靠的是「这条模板没有要搬的数」，不是靠「这里没有日期」
+    assert row["rule"]["params_on"] == str(TODAY)
+
+    code, text = out(container, capsys, "show", row["rule"]["id"], "--user", USER)
+    assert code == 0
+    assert "锚" not in text

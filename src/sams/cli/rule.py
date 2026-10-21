@@ -237,6 +237,8 @@ def _rule_payload(view) -> dict:
         "account_id": rule.account_id,
         "thesis_id": rule.thesis_id,
         "params": dict(rule.params),
+        # 0017 那一列：除权换算的锚。看不见它的地方，就等于没有它
+        "params_on": None if rule.params_on is None else str(rule.params_on),
         "filters": dict(rule.filters),
         "severity": rule.severity,
         "cooldown_min": rule.cooldown_min,
@@ -259,6 +261,24 @@ def _params_line(rule) -> str:
     return "；".join(parts) if parts else "无参数"
 
 
+def _anchor_line(rule) -> str:
+    """那一屏参数属于哪一天的价空间——除权换算的锚（0017）。
+
+    没有日期戳的那一版把下一步写在那句话里（D55）：这一行什么时候变成「不判」，
+    取决于库里哪一天出现一次除权，用户看见那一句的时候再去找命令就晚了。
+    留空的来源不止「0017 之前建的那一行」：从一条手填价位的论派生出来的规则照样是 NULL
+    （那一头没有测量日），所以这句话只陈述「不知道属于哪天」，不猜它是哪条路留下的。
+    """
+    if rule.params_on is None:
+        return (
+            "无日期戳：这一屏的数不知道属于哪一天的价空间，"
+            "库里一旦有除权就整条不判——跑一次 `sams rule edit` 重填它就盖上"
+        )
+    # 不说「除权日一定按它换算」：`anchor.py` 只搬那一屏里真存在的金额参数，
+    # 老模板写下的一行可能根本没有那个键
+    return f"{rule.params_on} 写下 · 除权换算的锚"
+
+
 def _filters_line(rule) -> str:
     on = [key for key, value in rule.filters.items() if value]
     return f"开：{'、'.join(on)}" if on else "全关（默认不降噪）"
@@ -278,6 +298,8 @@ def _print_view(view, username: str) -> None:
     if rule.channel_ids:
         print(f"  通道  {'、'.join(rule.channel_ids)}")
     print(f"  参数  {_params_line(rule)}")
+    if template_for(rule.kind).money_params():
+        print(f"  锚    {_anchor_line(rule)}")
     print(f"  过滤  {_filters_line(rule)}")
     for note in view.notes:
         print(f"  注意  {note}")

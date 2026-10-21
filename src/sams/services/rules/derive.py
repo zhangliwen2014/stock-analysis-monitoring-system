@@ -159,7 +159,7 @@ def carries_price(kind: str) -> bool:
     `within_days` 是这一份文件给的常量，给它们盖一个「论上那天填的」的戳，说的是一个
     不指任何价位的日期。手填那条路不走这里，它盖的本来就是「人刚刚敲过」的那一天。
     """
-    return any(param.unit == "元" for param in template_for(kind).params)
+    return bool(template_for(kind).money_params())
 
 
 class RuleDeriver:
