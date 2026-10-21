@@ -215,9 +215,35 @@ def test_only_the_highest_reached_tier_is_named_when_several_are_behind_us() -> 
     got = tp_tiered(
         ask({"tiers": [0.3, 0.5, 1.0]}, {"price": 13.8, "target_price": 15.0})
     )  # 进度 0.6 ⇒ 越过 30% 和 50%，没到 100%
+    assert got.hit is not None
     assert got.hit.threshold_text == "50%"
     assert got.hit.stage == PRE
     assert "还剩 1 档" in got.hit.why
+    assert "不替你平仓" in got.hit.why  # §9.3：分批止盈也是「卖」的提醒，同样只提示
+
+
+def test_a_progress_that_rounds_to_exactly_a_tier_is_not_lost_to_float() -> None:
+    """成本 11.3 → 目标 15.9 走到 13.6：那是不折不扣的一半，除法却给出 0.49999…
+
+    按字面 `>=` 判的话第一档在精确点位上哑掉，而这一条的意义就是「走到那一档要说一声」。
+    """
+    got = tp_tiered(
+        ask({"tiers": [0.5, 1.0]}, {"price": 13.6, "avg_cost": 11.3, "target_price": 15.9})
+    )
+    assert got.hit is not None
+    assert got.hit.threshold_text == "50%"
+    assert got.hit.stage == PRE
+
+
+def test_a_last_tier_below_one_does_not_claim_the_target_price_was_reached() -> None:
+    """末档填 0.5 ⇒ 走完最后一档是真的，「到目标价」是假的：`validate_params` 不要求末档为 1。"""
+    got = tp_tiered(
+        ask({"tiers": [0.3, 0.5]}, {"price": 13.8, "target_price": 15.0})
+    )  # 进度 0.6 ⇒ 已过末档 0.5
+    assert got.hit is not None
+    assert got.hit.stage == HIT
+    assert "已到最后一档" in got.hit.why
+    assert "⇒ 目标价" not in got.hit.why
 
 
 def test_a_gain_below_the_first_tier_says_nothing() -> None:

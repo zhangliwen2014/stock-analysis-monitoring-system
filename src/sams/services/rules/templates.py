@@ -416,17 +416,27 @@ def tp_tiered(ask: Ask) -> Outcome:
         )
     tiers = ask.params["tiers"]  # `validate_params` 已保证递增且每档 > 0
     progress = (snapshot.price - snapshot.avg_cost) / span
-    reached = [tier for tier in tiers if progress >= tier]
+    # 阈值处一律留 ±1e-9：进度是除法结果，成本 11.3 → 目标 15.9 走到 13.6 时算出
+    # 0.49999999999999983，那正是一半——按字面 `>=` 判的话第一档在精确点上哑掉。
+    reached = [tier for tier in tiers if progress >= tier - 1e-9]
     if not reached:
         return Outcome()
     top = reached[-1]
-    final = progress >= tiers[-1]
+    final = progress >= tiers[-1] - 1e-9
     remaining = len(tiers) - len(reached)
-    tail = "已到最后一档 ⇒ 目标价" if final else f"还剩 {remaining} 档"
+    # 末档不必是 1.0（`validate_params` 只保证递增且 > 0）：末档填 0.5 时「走完最后一档」
+    # 是真的，声称「到目标价」是假的。那句话只有刻度终点才是目标价时才说得出口。
+    at_target = tiers[-1] >= 1.0 - 1e-9
+    if not final:
+        tail = f"还剩 {remaining} 档"
+    elif at_target:
+        tail = "已到最后一档 ⇒ 目标价"
+    else:
+        tail = "已到最后一档"
     # 进度可以超过 100%（现价已在目标价上方），那句「走完 250.0%」没人读得懂。
     over = (
-        f"（现价 {money(snapshot.price, snapshot.currency)} 已越过目标价）"
-        if progress > 1.0
+        f"，现价 {money(snapshot.price, snapshot.currency)} 已越过目标价"
+        if snapshot.price > snapshot.target_price
         else ""
     )
     return Outcome(
