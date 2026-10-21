@@ -512,3 +512,64 @@ def test_setting_the_baseline_does_not_write_an_event(db):
     assert got.status == thesis.status
     assert len(repo.events(USER, thesis.id)) == 1  # 只有开局那一跳
 
+
+def test_setting_the_baseline_twice_is_refused(db):
+    """基线是「建仓时那一眼」：悄悄改掉它，`thesis.drift` 就再也说不清掉的是哪一档。"""
+    repo = ThesisRepo(db)
+    thesis = make(db)
+    repo.set_baseline(USER, thesis.id, score=50.0, items={}, on=date(2024, 7, 1), now=T0)
+
+    with pytest.raises(StorageError, match="已经有基线"):
+        repo.set_baseline(USER, thesis.id, score=60.0, items={}, on=date(2024, 7, 2), now=T1)
+
+
+def test_a_baseline_for_an_archived_thesis_is_refused(db):
+    repo = ThesisRepo(db)
+    thesis = make(db)
+    thesis = walk(
+        repo, thesis, PROPOSED, OPENED, TRACKING, HIT_TARGET, ARCHIVED,
+        entry_low=30.0, entry_high=32.0, stop_price=28.0, target_price=40.0, reward_risk=2.0,
+    )
+
+    with pytest.raises(StorageError, match="已经归档"):
+        repo.set_baseline(USER, thesis.id, score=50.0, items={}, on=date(2024, 7, 1), now=T1)
+
+
+def test_a_baseline_requires_a_number_not_a_bool_or_string(db):
+    thesis = make(db)
+
+    for bad in (True, "50"):
+        with pytest.raises(ValidationError, match="一个数"):
+            ThesisRepo(db).set_baseline(
+                USER, thesis.id, score=bad, items={}, on=date(2024, 7, 1), now=T0
+            )
+
+
+def test_a_non_finite_baseline_score_is_refused(db):
+    thesis = make(db)
+
+    with pytest.raises(ValidationError, match="0~100"):
+        ThesisRepo(db).set_baseline(
+            USER, thesis.id, score=float("nan"), items={}, on=date(2024, 7, 1), now=T0
+        )
+
+
+@pytest.mark.parametrize("items", [{"pr": float("nan")}, {"pr": 7200.0}, {"pr": True}])
+def test_baseline_items_are_held_to_the_same_scale(db, items):
+    """分项分要能进 JSON 又读得回来：NaN 连 JSON 都不是，7200 会被 `tier_of` 按 100 处理。"""
+    thesis = make(db)
+
+    with pytest.raises(ValidationError, match="pr"):
+        ThesisRepo(db).set_baseline(
+            USER, thesis.id, score=50.0, items=items, on=date(2024, 7, 1), now=T0
+        )
+
+
+def test_a_baseline_cannot_be_written_for_another_users_thesis(db):
+    thesis = make(db)
+
+    with pytest.raises(StorageError, match="不存在"):
+        ThesisRepo(db).set_baseline(
+            OTHER, thesis.id, score=50.0, items={}, on=date(2024, 7, 1), now=T0
+        )
+

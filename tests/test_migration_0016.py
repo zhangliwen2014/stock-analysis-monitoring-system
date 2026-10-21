@@ -34,7 +34,7 @@ def test_applying_migrations_twice_adds_nothing(tmp_path):
 
 
 def test_an_old_row_reads_back_with_no_baseline(tmp_path):
-    """0013 之前建的那条论没有基线，读回来必须是 None 而不是 0 分。
+    """0016 之前建的那条论没有基线，读回来必须是 None 而不是 0 分。
 
     0 分是「这项最差」，None 是「没比过」——把后者读成前者，`thesis.drift` 会在一条
     从没复检过的论上永远报「掉到底了」。

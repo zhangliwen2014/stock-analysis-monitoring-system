@@ -178,6 +178,16 @@ def _samples(value: int | None) -> int | None:
     return int(value)
 
 
+def _score(label: str, value: object) -> float:
+    """0~100 的分项分：`True` 与 `"50"` 不是数，NaN 写进 JSON 之后连读都读不回来。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"{label} 要是一个数（收到 {value!r}）")
+    number = float(value)
+    if not isfinite(number) or not 0.0 <= number <= 100.0:
+        raise ValidationError(f"{label} 要在 0~100（收到 {value}）：分项分就是这个刻度")
+    return number
+
+
 def _check_levels(values: dict) -> dict:
     """把七列各过各自的闸，再查买入区两端的顺序（写反了屏幕上是一个空区间）。"""
     cleaned: dict = {}
@@ -427,7 +437,7 @@ class ThesisRepo:
         on: date,
         now: datetime,
     ) -> Thesis:
-        """写下复检的基准（0016）。只有 `recheck` 在**还没有基线**时调它，所以没有「改基线」的入口。
+        """写下复检的基准（0016）。写一次就不再改：已经有基线的那条直接拒。
 
         `score=None` 会被拒：那不是「0 分」而是「这一趟没算出分」，把它写成基线等于给一条
         论钉死一个永远达不到的基准——此后每趟掉档都是它的错。
@@ -435,19 +445,23 @@ class ThesisRepo:
         """
         if score is None:
             raise ValidationError("基线分数不能是空的：那是「没比过」，不是「最差」")
-        if not 0.0 <= float(score) <= 100.0:
-            raise ValidationError(f"基线分数要在 0~100（收到 {score}）：分项分就是这个刻度")
+        number = _score("基线分数", score)
         current = self.require(user_id, thesis_id)
         if current.status == ARCHIVED:
             raise StorageError(
                 f"{thesis_id} 已经归档：基线是「建仓时那一眼」，归档的论不再有那一眼"
             )
-        cleaned = {str(key): float(value) for key, value in items.items()}
+        if current.baseline_score is not None:
+            raise StorageError(
+                f"{thesis_id} 已经有基线（{current.baseline_on}）：改基线等于改历史，"
+                "要换基准就另开一条论"
+            )
+        cleaned = {str(key): _score(f"分项 {key}", value) for key, value in items.items()}
         self.db.execute(
             "UPDATE theses SET baseline_score = ?, baseline_items = ?, baseline_on = ?,"
-            " updated_at = ? WHERE user_id = ? AND id = ?",
+            " updated_at = ? WHERE user_id = ? AND id = ? AND baseline_score IS NULL",
             [
-                float(score),
+                number,
                 json.dumps(cleaned, ensure_ascii=False, sort_keys=True),
                 on,
                 now,
