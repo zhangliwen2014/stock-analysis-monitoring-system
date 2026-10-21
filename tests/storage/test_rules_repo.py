@@ -226,6 +226,16 @@ def test_list_for_orders_by_creation_and_can_filter_enabled(repo):
     assert [row.id for row in repo.list_for(user, enabled_only=True)] == [second.id]
 
 
+def test_counts_splits_total_from_enabled(repo):
+    """`on` 是 DuckDB 的保留字：别名撞上它时 `counts()` 每次都是 Parser Error，
+    而仪表盘那一格只是空着——没有这条用例就没人会发现。"""
+    user = seed_user(repo.db)
+    stopped = add(repo, user, name="停用的")
+    add(repo, user, name="在用的")
+    repo.set_enabled(stopped.id, False, user_id=user)
+    assert repo.counts(user) == {"total": 2, "enabled": 1}
+
+
 def test_by_thesis_finds_the_derived_rules_in_creation_order(repo):
     user = seed_user(repo.db)
     thesis = seed_thesis(repo.db, user)

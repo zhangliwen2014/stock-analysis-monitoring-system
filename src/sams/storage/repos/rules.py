@@ -469,11 +469,12 @@ class RuleRepo:
 
     def counts(self, user_id: str) -> dict[str, int]:
         rows = self.db.query(
-            "SELECT count(*) total, coalesce(sum(CASE WHEN enabled THEN 1 ELSE 0 END), 0) on"
+            "SELECT count(*) total,"
+            " coalesce(sum(CASE WHEN enabled THEN 1 ELSE 0 END), 0) enabled_n"
             " FROM rules WHERE user_id = ?",
             [user_id],
         ).to_dicts()[0]
-        return {"total": int(rows["total"]), "enabled": int(rows["on"])}
+        return {"total": int(rows["total"]), "enabled": int(rows["enabled_n"])}
 
     # --- 内部 ---------------------------------------------------------------------------
 
