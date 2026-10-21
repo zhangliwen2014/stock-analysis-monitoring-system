@@ -8,13 +8,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from sams.core.calendar import CalendarProvider
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.events import EventBus, SystemAlarm
+from sams.core.notify import AlertMessage
 from sams.datasource.base import BarAdapter
 from sams.datasource.calendar_providers import default_providers
 from sams.datasource.registry import AdapterRegistry
@@ -30,6 +31,8 @@ from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
 from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
+from sams.services.rules.engine import RuleEngine
+from sams.services.rules.snapshot import RuleData
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
@@ -48,6 +51,7 @@ from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
@@ -131,6 +135,12 @@ class Container:
     notify: NotifyService
     health: HealthService
     source_admin: SourceAdminService
+    #: 规则仓库：`rules` 那个名字留给 T-17 的服务，仓库带 `_store`（与 theses/fx 同一命名法）
+    rules_store: RuleRepo
+    #: 规则引擎的取数装配（spec §10）
+    rule_data: RuleData
+    #: 一趟求值（`sams rule check` 的出口，T-18 的命令行按它接线）
+    rule_engine: RuleEngine
 
     def close(self) -> None:
         self.db.close()
@@ -144,6 +154,35 @@ class Container:
 
     def applied_migrations(self) -> set[str]:
         return applied(self.db)
+
+
+class _NotifyAlertSender:
+    """把 `NotifyService.dispatch` 的 `DispatchResult` 折成 id 串（D95）。
+
+    只有四行的适配器不是多余的一层：`services` 不许 import `monitor`，而
+    `DispatchResult` 住在那里。引擎要的只有 `alert_id`，别的那些（每条通道的
+    `DeliveryReport`）留在 `monitor` 那一头，由 `sams alert show` 去查。
+    """
+
+    def __init__(self, notify: NotifyService) -> None:
+        self._notify = notify
+
+    def dispatch(
+        self,
+        message: AlertMessage,
+        *,
+        user_id: str,
+        channel_ids: Sequence[str] = (),
+        rule_id: str | None = None,
+        account_id: str | None = None,
+    ) -> str:
+        return self._notify.dispatch(
+            message,
+            user_id=user_id,
+            channel_ids=channel_ids,
+            rule_id=rule_id,
+            account_id=account_id,
+        ).alert_id
 
 
 def _registry(
@@ -239,6 +278,31 @@ def build_container(
         factory=notifier_factory if notifier_factory is not None else build_notifier_factory(),
     )
 
+    watchlists = WatchlistRepo(database)
+    rules_store = RuleRepo(database, clock=clock)
+    rule_data = RuleData(
+        valuation=valuation,
+        analysis=analysis,
+        bars=bars,
+        symbols=symbols,
+        accounts=sim_accounts,
+        ledger=sim_orders,
+        theses=theses_store,
+        watchlists=watchlists,
+        settings=cfg,
+    )
+    rule_engine = RuleEngine(
+        rules=rules_store,
+        alerts=alerts_store,
+        data=rule_data,
+        calendar=calendar,
+        fx=fx_store,
+        bus=event_bus,
+        sender=_NotifyAlertSender(notify),
+        settings=cfg,
+        clock=clock,
+    )
+
     return Container(
         settings=cfg,
         db=database,
@@ -255,7 +319,7 @@ def build_container(
         flow_store=flow_store,
         scan_store=scan_store,
         theses_store=theses_store,
-        watchlists=WatchlistRepo(database),
+        watchlists=watchlists,
         fx_store=fx_store,
         calendar_store=calendar_store,
         source_health=source_health,
@@ -287,6 +351,9 @@ def build_container(
         sim_ledger=sim_orders,
         channels_store=channels_store,
         alerts_store=alerts_store,
+        rules_store=rules_store,
+        rule_data=rule_data,
+        rule_engine=rule_engine,
         cipher=cipher,
         notify=notify,
         health=HealthService(

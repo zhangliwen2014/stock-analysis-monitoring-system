@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol, runtime_checkable
 
 from sams.core.errors import ValidationError
 from sams.core.timeutil import format_utc_moment
@@ -148,3 +150,27 @@ def trim(text: str, *, limit: int) -> str:
     room = max(0, limit - len("…".encode()))
     kept = encoded[:room].decode(errors="ignore")
     return kept + "…"
+
+
+@runtime_checkable
+class AlertSender(Protocol):
+    """规则引擎唯一的发送出口（D95）。`services` 不许 import `monitor`，而投递必须发生。
+
+    返回的是 `alerts` 那一行的 **id**，不是 `DispatchResult`：那个结果类型住在
+    `monitor/router.py`，`core` 引用它就是反向依赖。引擎拿 id 做两件 `monitor` 之外也能做的
+    事——发 `AlertTriggered`（M3-D 的调度按它数当日已推送）与把 id 报回屏幕。
+    `bootstrap` 用四行把 `NotifyService.dispatch` 的 `DispatchResult.alert_id` 折成这个串。
+
+    参数表与 `NotifyService.dispatch` 逐字对齐（`tests/core/test_notify_alert_sender.py`
+    钉这一条）：差一个参数名，红的是 M3-D 挂机跑到某条规则时，而不是这里。
+    """
+
+    def dispatch(
+        self,
+        message: AlertMessage,
+        *,
+        user_id: str,
+        channel_ids: Sequence[str] = (),
+        rule_id: str | None = None,
+        account_id: str | None = None,
+    ) -> str: ...
