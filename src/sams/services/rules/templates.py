@@ -276,10 +276,6 @@ def stop_time(ask: Ask) -> Outcome:
     它是 §10.2 说的「阴跌不触发价格线时的兜底」——价格类模板全沉默时唯一会说话的一条。
     """
     snapshot = ask.snapshot
-    if snapshot.price is None:
-        return Outcome(why_not=_no_price(snapshot))
-    if snapshot.avg_cost is None or snapshot.avg_cost <= 0:
-        return Outcome(why_not="时间止损要比「现在的涨幅」，而这一笔没有成本可读")
     if snapshot.holding_days is None:
         return Outcome(
             why_not="没有建仓时间：`holding_days` 来自持仓的 open_ts，"
@@ -288,11 +284,15 @@ def stop_time(ask: Ask) -> Outcome:
     days = int(ask.params["days"])
     if snapshot.holding_days < days:
         return Outcome()
+    if snapshot.price is None:
+        return Outcome(why_not=_no_price(snapshot))
+    if snapshot.avg_cost is None or snapshot.avg_cost <= 0:
+        return Outcome(why_not="时间止损要比「现在的涨幅」，而这一笔没有成本可读")
     ceiling = float(ask.params["max_gain_pct"])
     gain = snapshot.price / snapshot.avg_cost - 1.0
-    if gain >= ceiling:
+    if gain >= ceiling - 1e-9:
         return Outcome()
-    opened = f"（{snapshot.opened_on} 建仓）" if snapshot.opened_on else ""
+    opened = f"，{snapshot.opened_on} 建仓" if snapshot.opened_on else ""
     return Outcome(
         Verdict(
             stage=HIT,
@@ -301,8 +301,8 @@ def stop_time(ask: Ask) -> Outcome:
             value_text=f"{gain:.1%}",
             threshold_text=f"{ceiling:.1%}",
             why=f"持有 {snapshot.holding_days} 天{opened}（自然日口径），涨幅 {gain:.1%} "
-            f"没到 {ceiling:.1%}：价格线一条都没破，这一条是兜底 ⇒ 请复核理由还在不在"
-            "（系统只提示，不替你平仓，§9.3）",
+            f"没到 {ceiling:.1%}：这一条只看时间与涨幅，不替代价格线"
+            " ⇒ 请复核理由还在不在（系统只提示，不替你平仓，§9.3）",
         )
     )
 
@@ -336,36 +336,36 @@ def stop_thesis_drift(ask: Ask) -> Outcome:
     threshold_text = "—"
 
     if thesis.status in _DEAD_STATUSES:
-        findings.append(
-            f"这条论已被记为 {thesis.status}：价格没跌，但账上写着的理由已经没了"
-        )
+        findings.append(f"这条论已被记为 {thesis.status}：账上写着的理由已经没了")
 
     base_tier = tier_of(thesis.baseline_score)
     new_tier = tier_of(snapshot.score)
-    if base_tier is not None:
-        if new_tier is None:
-            unknowns.append("有建仓时的基线分，这一趟却没合成出新分数（掉档判不了）")
-        elif new_tier < base_tier:
-            findings.append(
-                f"打分从 {thesis.baseline_score:g} 掉到 {snapshot.score:g}"
-                f"（{base_tier} 档 → {new_tier} 档）"
-            )
-            value, threshold = snapshot.score, thesis.baseline_score
-            value_text = f"{snapshot.score:g} 分"
-            threshold_text = f"{thesis.baseline_score:g} 分"
+    if base_tier is None:
+        unknowns.append("这条论没有建仓时的基线分：掉档与否判不了")
+    elif new_tier is None:
+        unknowns.append("有建仓时的基线分，这一趟却没合成出新分数（掉档判不了）")
+    elif new_tier < base_tier:
+        findings.append(
+            f"打分从 {thesis.baseline_score:g} 掉到 {snapshot.score:g}"
+            f"（{base_tier} 档 → {new_tier} 档）"
+        )
+        value, threshold = snapshot.score, thesis.baseline_score
+        value_text = f"{snapshot.score:g} 分"
+        threshold_text = f"{thesis.baseline_score:g} 分"
 
-    if thesis.reward_risk and snapshot.odds is not None:
-        if snapshot.odds < thesis.reward_risk:
-            findings.append(
-                f"赔率从建仓时的 {thesis.reward_risk:g} 倍掉到 {snapshot.odds:g} 倍："
-                "同一个止损位下，这笔仓的期望已经支撑不住"
-            )
-            if value is None:
-                value, threshold = snapshot.odds, thesis.reward_risk
-                value_text = f"{snapshot.odds:g} 倍"
-                threshold_text = f"{thesis.reward_risk:g} 倍"
-    elif thesis.reward_risk and not unknowns:
-        unknowns.append("建仓时记着赔率，这一趟没有合成出来（崩塌与否判不了）")
+    if thesis.reward_risk is None:
+        unknowns.append("这条论没有记下赔率：崩塌与否判不了")
+    elif snapshot.odds is None:
+        unknowns.append("论上记着赔率，这一趟没有合成出来（崩塌与否判不了）")
+    elif snapshot.odds < thesis.reward_risk:
+        findings.append(
+            f"赔率从论上记着的 {thesis.reward_risk:g} 倍掉到 {snapshot.odds:g} 倍："
+            "同一个止损位下，这笔仓的期望已经支撑不住"
+        )
+        if value is None:
+            value, threshold = snapshot.odds, thesis.reward_risk
+            value_text = f"{snapshot.odds:g} 倍"
+            threshold_text = f"{thesis.reward_risk:g} 倍"
 
     if findings:
         return Outcome(

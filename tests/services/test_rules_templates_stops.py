@@ -267,3 +267,45 @@ def test_time_stop_asks_for_a_review_and_not_for_a_sell() -> None:
     got = stop_time(ask({"days": 30, "max_gain_pct": 0.0}, holding_days=45))
     assert "复核" in got.hit.why
     assert "不替你平仓" in got.hit.why
+
+
+def test_time_stop_does_not_fire_when_the_gain_lands_exactly_on_the_line() -> None:
+    """成本 12、现价 13.2 恰好 +10%：浮点算出来是 9.999999999999987%，不能因此报「没到」。"""
+    got = stop_time(
+        ask({"days": 30, "max_gain_pct": 0.1}, holding_days=45, price=13.2)
+    )
+    assert got == Outcome()
+
+
+def test_time_stop_not_due_is_quiet_even_when_the_price_is_missing() -> None:
+    """还没到期时，缺现价不该被说成「判不了」：这一趟本来就轮不到它说话。"""
+    got = stop_time(
+        ask({"days": 30, "max_gain_pct": 0.0}, holding_days=12, price=None, avg_cost=None)
+    )
+    assert got == Outcome()
+
+
+def test_time_stop_names_a_missing_price() -> None:
+    got = stop_time(ask({"days": 30, "max_gain_pct": 0.0}, holding_days=45, price=None))
+    assert got.hit is None
+    assert "现价" in got.why_not
+
+
+def test_time_stop_without_a_position_has_no_cost_to_measure_gain_from() -> None:
+    got = stop_time(
+        ask({"days": 30, "max_gain_pct": 0.0}, holding_days=45, avg_cost=None, qty=None)
+    )
+    assert got.hit is None
+    assert "成本" in got.why_not
+
+
+def test_time_stop_names_the_open_date_and_counts_calendar_days() -> None:
+    got = stop_time(
+        ask(
+            {"days": 30, "max_gain_pct": 0.0},
+            holding_days=45,
+            opened_on=date(2026, 9, 1),
+        )
+    )
+    assert "2026-09-01" in got.hit.why
+    assert "自然日" in got.hit.why

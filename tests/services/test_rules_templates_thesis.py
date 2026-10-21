@@ -13,7 +13,7 @@ from datetime import date
 from sams.core.rules import HIT
 from sams.services.rules.snapshot import Snapshot
 from sams.services.rules.templates import Ask, stop_thesis_drift
-from sams.storage.repos.theses import INVALIDATED, TRACKING, Thesis
+from sams.storage.repos.theses import HIT_STOP, INVALIDATED, TRACKING, Thesis
 
 
 def snap(**over) -> Snapshot:
@@ -132,3 +132,40 @@ def test_a_baseline_without_a_new_score_is_a_gap_not_a_pass() -> None:
     )
     assert got.hit is None
     assert "判不了" in got.why_not
+
+
+def test_a_stopped_out_thesis_is_drift_too() -> None:
+    got = stop_thesis_drift(ask(DRIFT, {}, the=thesis(status=HIT_STOP)))
+    assert got.hit is not None
+    assert HIT_STOP in got.hit.why
+
+
+def test_a_single_tier_drop_is_enough() -> None:
+    """60 → 40 只掉一档，仍然是掉档：判据不是「掉两档」。"""
+    got = stop_thesis_drift(ask(DRIFT, {"score": 40.0}))
+    assert got.hit is not None
+    assert "掉到 40" in got.hit.why
+
+
+def test_a_thesis_without_a_baseline_is_a_gap_not_a_pass() -> None:
+    """没有基线分就判不了掉档：静默会把「从没比过」显示成「没触发」。"""
+    got = stop_thesis_drift(
+        ask(DRIFT, {"score": 62.0, "odds": 2.6}, the=thesis(baseline_score=None))
+    )
+    assert got.hit is None
+    assert "基线" in got.why_not
+
+
+def test_a_thesis_without_a_recorded_odds_is_a_gap_not_a_pass() -> None:
+    got = stop_thesis_drift(ask(DRIFT, {"score": 62.0}, the=thesis(reward_risk=None)))
+    assert got.hit is None
+    assert "赔率" in got.why_not
+
+
+def test_two_gaps_are_both_named_not_collapsed_into_one() -> None:
+    """基线与赔率同时缺数时两句都要说：只报一句会让另一半的「从没比过」继续隐身。"""
+    got = stop_thesis_drift(
+        ask(DRIFT, {"score": None, "odds": None}, the=thesis(reward_risk=2.5))
+    )
+    assert got.hit is None
+    assert "掉档" in got.why_not and "赔率" in got.why_not
