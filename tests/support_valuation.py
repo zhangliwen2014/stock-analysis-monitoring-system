@@ -23,6 +23,7 @@ import support
 from support_fundamentals import StubFundamentalsAdapter
 
 from sams.bootstrap import build_container
+from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
@@ -215,3 +216,19 @@ def seed(
         ValuationRepo(db).upsert(valuation(days, market=market, code=code))
     if flow is not None:
         FundingFlowRepo(db).upsert(flow)
+
+
+#: 锚点那条文案要说「这三天休市」，就得真有一条日历行撑着；空日历时它只能说「无法判断」
+_ASESSIONS = (SessionWindow("regular", "09:30", "15:00"),)
+
+
+def seed_calendar(container, *, closed=()):
+    """把 2024 年的工作日铺成开市日，`closed` 里的那些例外（不写行 = 已覆盖且休市）。"""
+    closed = set(closed)
+    days = []
+    cursor = date(2024, 1, 1)
+    while cursor <= date(2024, 12, 31):
+        if cursor.weekday() < 5 and cursor not in closed:
+            days.append(CalendarDay("A", cursor, True, False, "Asia/Shanghai", _ASESSIONS))
+        cursor += timedelta(days=1)
+    container.calendar_store.save(days, source="test")

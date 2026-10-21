@@ -6,12 +6,12 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 from support import StubActionsAdapter, StubAdapter, sample_bars
+from support_valuation import seed_calendar
 
 import sams.cli as cli
 from sams.bootstrap import build_container
 from sams.core.config import Settings
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited
-from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.storage.db import Database
 from sams.storage.migrate import apply_migrations, discover
 from sams.storage.repos.bars import BarRepo
@@ -617,22 +617,6 @@ def seed_crossing_ex_date(container, *, cover=True, cash=2.10):
             full_history=False,
             src="akshare",
         )
-
-
-#: 锚点那条文案要说「这三天休市」，就得真有一条日历行撑着；空日历时它只能说「无法判断」
-_ASESSIONS = (SessionWindow("regular", "09:30", "15:00"),)
-
-
-def seed_calendar(container, *, closed=()):
-    """把 2024 年的工作日铺成开市日，`closed` 里的那些例外（不写行 = 已覆盖且休市）。"""
-    closed = set(closed)
-    days = []
-    cursor = date(2024, 1, 1)
-    while cursor <= date(2024, 12, 31):
-        if cursor.weekday() < 5 and cursor not in closed:
-            days.append(CalendarDay("A", cursor, True, False, "Asia/Shanghai", _ASESSIONS))
-        cursor += timedelta(days=1)
-    container.calendar_store.save(days, source="test")
 
 
 def test_analysis_return_prints_both_calibers_and_which_one_to_trust(container, capsys):

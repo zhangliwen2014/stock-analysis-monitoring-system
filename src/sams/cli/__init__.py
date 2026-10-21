@@ -18,6 +18,7 @@ from sams.cli import (
     db,
     health,
     ledger,
+    rule,
     screen,
     source,
     sync,
@@ -39,6 +40,7 @@ COMMAND_MODULES = (
     thesis,
     ledger,
     channel,
+    rule,
 )
 
 
