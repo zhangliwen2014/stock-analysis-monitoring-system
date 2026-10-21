@@ -180,6 +180,22 @@ class AlertRepo:
         )
         return self._to_alert(rows.to_dicts()[0]) if rows.height else None
 
+    def latest_open(self, user_id: str, market: str, code: str) -> Alert | None:
+        """该 (用户, 市场, 代码) 上最新一条**未处理**告警——`no_open_alert` 的输入（§10.1）。
+
+        刻意不带 `account_id`：这一条过滤器的语义是「这个用户在这只票上已经有一条没点掉的
+        提醒」，把账户算进去的话，A 账户里那条未处理的止损会挡不住 B 账户的第二条推送，
+        用户收到两条内容一样、只有账户名不同的告警。
+        与 `latest_for` 的分工也在这里：那一头管冷却（同键同账户），这一头管刷屏（同票同人）。
+        """
+        rows = self.db.query(
+            f"SELECT {_ALERT_COLUMNS} FROM alerts"
+            " WHERE user_id = ? AND market = ? AND code = ? AND status = 'new'"
+            " ORDER BY triggered_at DESC, id DESC LIMIT 1",
+            [user_id, market, code],
+        )
+        return self._to_alert(rows.to_dicts()[0]) if rows.height else None
+
     def record(
         self,
         alert_id: str,

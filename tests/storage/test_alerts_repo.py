@@ -242,3 +242,58 @@ def test_latest_for_matches_a_missing_account(repo, seeded_user):
 
 def test_latest_for_is_empty_when_nothing_was_raised(repo, seeded_user):
     assert repo.latest_for("r1", "A", "000001") is None
+
+
+# --- 刷屏的查询（§10.1 的 `no_open_alert`：同票同人，不管账户）------------------------------
+
+
+def test_latest_open_finds_the_newest_unhandled_alert_on_that_symbol(repo, seeded_user) -> None:
+    """三条各给不同时刻，并且**别只种一条 `new`**：只留一条时「取最新」这半句没被钉住。
+
+    另一只票那一条是三者里最新的——漏了 `code` 这一维就会拿到它，而不是这一只票上那条。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    first = repo.create(
+        user_id=seeded_user,
+        **{
+            **CREATE_KW,
+            "stage": "pre",
+            "triggered_at": now - timedelta(minutes=30),
+        },
+    )
+    repo.set_status(first.id, "handled")
+    second = repo.create(
+        user_id=seeded_user,
+        **{
+            **CREATE_KW,
+            "stage": "hit",
+            "triggered_at": now - timedelta(minutes=10),
+        },
+    )
+    # 另一只票的一条，且更新：不该被算进来
+    repo.create(
+        user_id=seeded_user,
+        **{
+            **CREATE_KW,
+            "code": "600519",
+            "stage": "urgent",
+            "triggered_at": now,
+        },
+    )
+    found = repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"])
+    assert found is not None and found.id == second.id and found.stage == "hit"
+
+
+def test_latest_open_returns_none_once_the_last_one_is_dismissed(repo, seeded_user) -> None:
+    got = repo.create(user_id=seeded_user, **CREATE_KW)
+    assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is not None
+    repo.set_status(got.id, "dismissed", note="误报")
+    assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is None
+
+
+def test_latest_open_ignores_another_users_alerts(repo, seeded_user, other_user) -> None:
+    """`no_open_alert` 挡的是「这个人已经有一条没点掉的」：别人的那条不算（§10.1）。"""
+    repo.create(user_id=other_user, **CREATE_KW)
+    assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is None
