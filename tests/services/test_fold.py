@@ -6,9 +6,12 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import polars as pl
 import pytest
 
+from sams.analysis.adjust import DayFactor
 from sams.services._fold import (
     before_last,
     fold,
@@ -16,6 +19,8 @@ from sams.services._fold import (
     high_water,
     last,
     pct_change,
+    shift,
+    steps_after,
     weekly_line,
     window_high,
 )
@@ -89,3 +94,33 @@ def test_weekly_line_folds_with_its_own_series() -> None:
     assert weekly_line(weekly) == 132.0  # 120 × (110 / 100)
     assert weekly_line(pl.DataFrame({"ma20": [120.0], "close": [110.0]})) is None
     assert weekly_line(pl.DataFrame()) is None
+
+
+def test_steps_after_excludes_the_ex_date_itself() -> None:
+    """写在除权当天的那个数，说的就是除权之后那根 K 线 ⇒ 不该再搬一次。
+
+    `hfq_frame` 的累乘口径是「除权日 ≤ t」，当天那根已经带上当天的因子了（D34）。
+    """
+    factors = (
+        DayFactor(ex_date=date(2024, 6, 1), prev_close=10.0, ex_ref=9.0, factor=10 / 9),
+        DayFactor(ex_date=date(2024, 10, 26), prev_close=10.0, ex_ref=9.0, factor=10 / 9),
+    )
+    assert steps_after(factors, after=date(2024, 6, 1)) == (factors[1],)
+    assert steps_after(factors, after=date(2024, 10, 26)) == ()
+    assert len(steps_after(factors, after=date(2024, 1, 1))) == 2
+
+
+def test_shift_divides_by_every_factor_after_that_day() -> None:
+    """两次 10 派 1 累乘：10.00 站到今天应该是 8.10，不是 9.00。
+
+    少除一档 = 线偏高 = 提前误报，所以这一枚量的是「跨两档」而不是「跨一档」。
+    """
+    factors = (
+        DayFactor(ex_date=date(2024, 6, 1), prev_close=10.0, ex_ref=9.0, factor=10 / 9),
+        DayFactor(ex_date=date(2024, 10, 26), prev_close=9.0, ex_ref=8.1, factor=10 / 9),
+    )
+    assert shift(10.0, factors) == pytest.approx(8.1)
+
+
+def test_shift_with_nothing_to_cross_is_the_identity() -> None:
+    assert shift(10.0, ()) == 10.0

@@ -86,6 +86,18 @@ class Template:
     #: 允许的 target_type（写成元组而不是全放开：一条 `stop.pct` 挂在整个自选股清单上
     #: 会读成「每个账户的每笔持仓」，而它得先知道自己挂的是谁的仓）
     targets: tuple[str, ...] = TARGET_TYPES
+    #: 这一条拿快照里**哪几列人填的价**做判断（§10.2）。`anchor.py` 靠它定「搬不动时
+    #: 的后果」：拿它做判断 ⇒ 整条不判，只用于显示 ⇒ 屏幕上注明那一列可能偏高。
+    #: 与 `needs_position` 不是一件事：`stop.thesis_drift` 要账户，看的是打分掉档
+    judged: frozenset[str] = frozenset()
+
+    def money_params(self) -> tuple[Param, ...]:
+        """声明为「元」的那几个参数——只有它们是价，需要按除权搬（§10.2）。
+
+        认单位而不是认参数名：新加一个 `--param line=…` 的模板不必去 `anchor.py` 里登记名字，
+        而 `unit="元"` 本来就是创建时那句「这是多少钱」的声明（§5.4 规则 3）。
+        """
+        return tuple(param for param in self.params if param.unit == "元")
 
     def describe(self) -> str:
         parts = [p.describe() for p in self.params]
@@ -114,6 +126,7 @@ TEMPLATES: dict[str, Template] = {
         "stop.pct", "成本下浮 x%",
         (_number("pct", "回撤比例", required=True, minimum=0.0, maximum=0.9),),
         severity="strong", stages=True, needs_position=True,
+        judged=frozenset({"avg_cost"}),
         targets=("position", "thesis"),
     ),
     "stop.trailing": Template(
@@ -124,7 +137,9 @@ TEMPLATES: dict[str, Template] = {
     "stop.atr": Template(
         "stop.atr", "成本 − 倍数×ATR14",
         (_number("multiple", "ATR 倍数", default=2.0, minimum=0.1, maximum=10.0, unit="倍"),),
-        severity="strong", stages=True, needs_position=True, targets=("position", "thesis"),
+        severity="strong", stages=True, needs_position=True,
+        judged=frozenset({"avg_cost"}),
+        targets=("position", "thesis"),
     ),
     "stop.ma": Template(
         "stop.ma", "跌破均线",
@@ -134,14 +149,18 @@ TEMPLATES: dict[str, Template] = {
     "stop.breakeven": Template(
         "stop.breakeven", "浮盈超 x% 后把线抬到成本",
         (_number("trigger_pct", "触发浮盈", required=True, minimum=0.01, maximum=2.0),),
-        severity="strong", stages=True, needs_position=True, targets=("position", "thesis"),
+        severity="strong", stages=True, needs_position=True,
+        judged=frozenset({"avg_cost"}),
+        targets=("position", "thesis"),
     ),
     "stop.time": Template(
         "stop.time", "持仓 N 天未达预期 → 复核",
         (_number("days", "持有天数", required=True, minimum=1.0, maximum=3000.0, unit="天"),
          _number("max_gain_pct", "低于此涨幅算未达预期", default=0.0, minimum=-0.9,
                  maximum=1.0)),
-        severity="mid", stages=False, needs_position=True, targets=("position", "thesis"),
+        severity="mid", stages=False, needs_position=True,
+        judged=frozenset({"avg_cost"}),
+        targets=("position", "thesis"),
     ),
     "stop.thesis_drift": Template(
         "stop.thesis_drift", "价格没跌但理由已失效",
@@ -152,7 +171,9 @@ TEMPLATES: dict[str, Template] = {
         "tp.tiered", "目标价分批提醒",
         (Param(name="tiers", label="分档（递增的比例，英文逗号分隔）", shape="tiers",
                default="0.5,1.0"),),
-        severity="mid", stages=True, needs_position=True, targets=("position", "thesis"),
+        severity="mid", stages=True, needs_position=True,
+        judged=frozenset({"avg_cost", "target_price"}),
+        targets=("position", "thesis"),
     ),
     "price.cross_below": Template(
         "price.cross_below", "下穿指定价",

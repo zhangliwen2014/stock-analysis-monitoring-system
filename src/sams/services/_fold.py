@@ -13,9 +13,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from datetime import date
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
+
+if TYPE_CHECKING:
+    from sams.analysis.adjust import DayFactor
 
 
 def fold(price: float | None, hfq_last: float | None) -> float | None:
@@ -78,3 +83,25 @@ def weekly_line(weekly_table: pl.DataFrame) -> float | None:
         last(weekly_table, "ma20"),
         fold(last(weekly_table, "close"), last(weekly_table, "close_hfq")),
     )
+
+
+def steps_after(factors: Sequence[DayFactor], *, after: date) -> tuple[DayFactor, ...]:
+    """除权日历里落在某天**之后**的那些档，`after` 当天除外。
+
+    一个数写在 X 日，指的是 X 日那根 K 线的坐标系，而 X 日当天的除权已经反映在那根 K 线里
+    （`hfq_frame` 的累乘口径是「除权日 ≤ t」）。留着它再搬一次，等于把同一次派息除了两遍。
+    """
+    return tuple(step for step in factors if step.ex_date > after)
+
+
+def shift(value: float, steps: Sequence[DayFactor]) -> float:
+    """把一个数搬进今天那侧：除以它之后每一个除权日的因子。
+
+    因子说「今天的价要乘多少才连得上昨天」（D34：当日因子 = 前收 / 除权参考价），
+    所以昨天写下的一个价要往**反方向**走。10 派 1、前收 10.00 的那天因子是 1.1111，
+    写在它之前的「10 元」于是站在 9.00——券商在除权日调整成本价是同一个动作。
+    """
+    arrived = value
+    for step in steps:
+        arrived /= step.factor
+    return arrived

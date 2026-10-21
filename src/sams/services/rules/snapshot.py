@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import TYPE_CHECKING
 
 import polars as pl
 
@@ -29,6 +30,10 @@ from sams.storage.repos.ledger import Account, Position, SimAccountRepo, SimOrde
 from sams.storage.repos.symbols import SymbolRepo
 from sams.storage.repos.theses import Thesis, ThesisRepo
 from sams.storage.repos.watchlists import WatchlistRepo
+
+if TYPE_CHECKING:
+    from sams.analysis.adjust import DayFactor
+    from sams.services.rules.anchor import Moved
 
 #: 日线一次取多少天：盖住 MA60（60 个交易日）与一段正常持有期。
 #: 与 `valuation` 的窗口无关，所以它自己算一次：那边只带它合成结论要的那几路出门。
@@ -102,8 +107,22 @@ class Snapshot:
     disclosed_on: date | None = None
     #: 保证金账户：`notes` 据此说「爆仓线可能先到」
     margin_enabled: bool = False
-    #: 这一路缺了什么（进告警正文、`--explain` 与 `--json`）
+    #: 这一路缺了什么（进告警正文那几行，`engine.py` 把它们逐条列在结论后面）
     missing: tuple[str, ...] = ()
+    #: 本次读到的那段 K 线里记录在案的除权日。**空是常态**：库里那段没有除权时，
+    #: 两个价空间是同一个，`anchor.py` 因此一个数都不动（它的口径 2）
+    factors: tuple[DayFactor, ...] = ()
+    #: 那段 K 线最早到哪天。锚比它早 ⇒ 中间那段的除权没记进来，搬它会少搬（`anchor.py` 的口径 1）
+    bars_from: date | None = None
+    #: 下面两列说的是**那一个数出自哪天**，取数处按来源给：抄自论上那一列就填那次读数日
+    #: （0013 的 `levels_on`，手填的为空），本次合成的就填本趟那一天——
+    #: 后者跨不过任何除权日，所以天然不搬（§10.2）
+    #: 论上那条止损线属于哪天
+    stop_on: date | None = None
+    #: 论上那个目标价属于哪天
+    target_on: date | None = None
+    #: 这一趟搬了哪几个数（每个都带它跨了哪些除权日，见 `anchor.Moved`）
+    moved: tuple[Moved, ...] = ()
 
 
 class RuleData:

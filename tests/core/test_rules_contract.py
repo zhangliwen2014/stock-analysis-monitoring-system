@@ -17,6 +17,7 @@ from sams.core.rules import (
     RULE_KINDS,
     STAGE_RANK,
     STAGES,
+    TEMPLATES,
     URGENT,
     Verdict,
     escalates,
@@ -163,3 +164,40 @@ def test_escalation_is_a_strict_rank_increase() -> None:
     assert escalates(URGENT, HIT) is False
     with pytest.raises(ValidationError, match="bogus"):
         escalates(PRE, "bogus")
+
+
+def test_the_two_price_declarations_cover_exactly_the_templates_that_need_moving() -> None:
+    """`judged` 与 `unit="元"` 都是声明，声明会写歪，而两边写歪的代价不对称。
+
+    漏标 `judged` 的那条会拿除权前的价做判断（误报，屏幕上看不出来）；多标的那条只是不响。
+    所以名单在这里显式列出：改模板的人必须同时改这一行。`money_params` 同理——
+    它决定哪些数字是价。
+    """
+    assert {kind for kind, tpl in TEMPLATES.items() if "avg_cost" in tpl.judged} == {
+        "stop.pct",
+        "stop.atr",
+        "stop.breakeven",
+        "stop.time",
+        "tp.tiered",
+    }
+    # 只有 `tp.tiered` 拿目标价做刻度（那一段的终点），别的模板读它是为了显示
+    assert {kind for kind, tpl in TEMPLATES.items() if "target_price" in tpl.judged} == {
+        "tp.tiered"
+    }
+    # `stop_line` 是纯显示列：要盯那条线的人建的是 `stop.fixed`（锚 = `params_on`），
+    # 所以搬不动时它永远只是「屏幕上注明」，不会变成一句假的「不判」
+    assert not any("stop_line" in tpl.judged for tpl in TEMPLATES.values())
+    assert {
+        kind: tuple(param.name for param in tpl.money_params())
+        for kind, tpl in TEMPLATES.items()
+        if tpl.money_params()
+    } == {
+        "stop.fixed": ("price",),
+        "price.cross_below": ("price",),
+        "price.cross_above": ("price",),
+    }
+    # 拿人填的价做判断的，必须先挂得上账户：`avg_cost` 只有持仓才有，
+    # 一个不挂持仓的模板声明了它，说的是一句它自己取不到数的话
+    assert {kind for kind, tpl in TEMPLATES.items() if tpl.judged} <= {
+        kind for kind, tpl in TEMPLATES.items() if tpl.needs_position
+    }
