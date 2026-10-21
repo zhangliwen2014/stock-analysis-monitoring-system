@@ -85,7 +85,7 @@ def test_a_state_only_hit_still_reaches_the_sender(h) -> None:
     #: 论被判死、没有基线分、没有赔率 ⇒ 只有「状态」那一条成立，数值那一侧全空
     h.thesis = theses.advance(USER, made.id, INVALIDATED, actor_id="u1", now=NOW)
     assert h.thesis.baseline_score is None and h.thesis.reward_risk is None
-    h.added_id = h.add(
+    h.add(
         kind="stop.thesis_drift",
         name="理由没了就喊我",
         target_type="position",
@@ -93,7 +93,7 @@ def test_a_state_only_hit_still_reaches_the_sender(h) -> None:
         account_id="acc-1",
         thesis_id=made.id,
         params={},
-    ).id
+    )
     h.snapshot = snap(account_id="acc-1")
     report = h.engine().check(USER)
     assert len(report.raised) == 1
@@ -147,7 +147,7 @@ def test_a_missing_price_is_reported_as_unable_not_as_quiet(h) -> None:
 
 
 def test_a_dry_run_judges_everything_and_sends_nothing(h) -> None:
-    h.added_id = h.add().id
+    h.add()
     report = h.engine().check(USER, dry_run=True)
     assert report.dry_run is True
     assert len(report.raised) == 1
@@ -169,7 +169,7 @@ def test_an_unreadable_target_is_skipped_instead_of_killing_the_run(h) -> None:
 # --- 冷却（D94）--------------------------------------------------------------------------
 
 def test_cooldown_swallows_a_repeat_of_the_same_stage(h) -> None:
-    h.added_id = h.add().id
+    h.add()
     h.seed_hit(minutes_ago=5, stage="hit")
     report = h.engine().check(USER)
     assert h.sender.sent == []
@@ -180,7 +180,7 @@ def test_cooldown_swallows_a_repeat_of_the_same_stage(h) -> None:
 
 def test_an_escalation_punches_through_the_cooldown(h) -> None:
     """D94：`pre` 报过之后 30 分钟内的 `hit` 是真跌破，不能被降噪吞掉。"""
-    h.added_id = h.add().id
+    h.add()
     h.seed_hit(minutes_ago=5, stage="pre")
     report = h.engine().check(USER)
     assert len(h.sender.sent) == 1
@@ -188,14 +188,14 @@ def test_an_escalation_punches_through_the_cooldown(h) -> None:
 
 
 def test_a_hit_beyond_the_window_reports_again(h) -> None:
-    h.added_id = h.add().id
+    h.add()
     h.seed_hit(minutes_ago=31, stage="hit")
     assert len(h.engine().check(USER).raised) == 1
 
 
 def test_a_hit_exactly_at_the_window_edge_reports(h) -> None:
     """边界：`gap >= window`，恰好 30 分钟就是窗口已过（31 与 0 钉了，这个点没钉）。"""
-    h.added_id = h.add().id
+    h.add()
     h.seed_hit(minutes_ago=30, stage="hit")
     assert len(h.engine().check(USER).raised) == 1
 
@@ -207,7 +207,7 @@ def test_an_unrecognized_stage_in_the_history_punches_through(h) -> None:
     原样写进去：入池那类历史行的 stage 是「入池」这种词，`escalates` 认不出就抛。
     认不出上一档有多响 ⇒ 判不出来 ⇒ 穿冷却放行——冷却那句压制的话不说，这一条投出去。
     """
-    h.added_id = h.add().id
+    h.add()
     h.db.execute(
         "INSERT INTO alerts (id, user_id, rule_id, account_id, market, code, stage,"
         " triggered_at, status, payload_json, severity)"
@@ -222,7 +222,7 @@ def test_an_unrecognized_stage_in_the_history_punches_through(h) -> None:
 
 def test_the_cooldown_window_is_the_rules_own_number(h) -> None:
     """`cooldown_min = 0` 的意思是「每一次都报」（§10.1 那个默认值不是命令）。"""
-    h.added_id = h.add(cooldown_min=0).id
+    h.add(cooldown_min=0)
     h.seed_hit(minutes_ago=0, stage="hit")
     assert len(h.engine().check(USER).raised) == 1
 
@@ -233,7 +233,7 @@ def test_another_accounts_hit_does_not_silence_this_one(h) -> None:
     两头都钉：A 账户那条拦不住 B 账户的破位；同一条 B 的才拦得住。
     只钉前一头的话，把键写成「不含 account_id」也能过——因为那时谁也拦不住谁。
     """
-    h.added_id = h.add(account_id="acc-b").id
+    h.add(account_id="acc-b")
     h.snapshot = snap(account_id="acc-b")
     h.seed_hit(minutes_ago=5, stage="hit", account_id="acc-a")
     assert len(h.engine().check(USER).raised) == 1
@@ -244,7 +244,7 @@ def test_another_accounts_hit_does_not_silence_this_one(h) -> None:
 # --- 四个开关在这一趟里的位置（§10.1）------------------------------------------------------
 
 def test_a_switch_suppresses_and_says_which_one(h) -> None:
-    h.added_id = h.add(filters={"data_freshness": True}).id
+    h.add(filters={"data_freshness": True})
     h.snapshot = snap(price_age_days=10)
     report = h.engine().check(USER)
     assert h.sender.sent == []
@@ -252,7 +252,7 @@ def test_a_switch_suppresses_and_says_which_one(h) -> None:
 
 
 def test_no_open_alert_suppresses_a_quieter_repeat_on_the_same_symbol(h) -> None:
-    h.added_id = h.add(filters={"no_open_alert": True}).id
+    h.add(filters={"no_open_alert": True})
     h.seed_hit(minutes_ago=5, stage="urgent")
     report = h.engine().check(USER)
     assert "未处理" in report.suppressed[0].reason
@@ -349,7 +349,7 @@ def test_disabled_rules_are_skipped_unless_named(h) -> None:
 
 
 def test_as_of_moves_the_reading_day_without_moving_the_clock(h) -> None:
-    h.added_id = h.add().id
+    h.add()
     report = h.engine().check(USER, as_of=date(2026, 10, 16))
     assert report.as_of == date(2026, 10, 16)
     assert len(report.raised) == 1

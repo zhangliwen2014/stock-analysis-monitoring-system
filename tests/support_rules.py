@@ -1,4 +1,4 @@
-"""规则引擎那四个替身：`test_rules_engine.py` 与对抗面共用同一台假引擎。
+"""规则引擎那几套替身：`test_rules_engine.py` 与对抗面共用同一台假引擎。
 
 搬出来是因为对抗面要验的是「跨层的说谎路径」，而它必须与单元用例用**同一套**替身：
 两份替身一旦分叉，一边验过的形状就管不到另一边。
@@ -182,15 +182,13 @@ class Harness:
         self.snapshot = snap()
         self.held: list = []
         self.thesis = None
-        self.data: StubData | None = None
         self.read_raises: Exception | None = None
-        #: `seed_hit` 默认挂在哪条规则上：用例先 `h.add()` 再 `h.seed_hit()` 就对得上
+        #: `seed_hit` 默认挂在哪条规则上：`add()` 每建一条就把它改成那一条的 id
         self.added_id = "r-seed"
 
     def engine(self, *, sender=None) -> RuleEngine:
         data = StubData(self.snapshot, self.held, self.thesis)
         data.read_raises = self.read_raises
-        self.data = data
         return RuleEngine(
             rules=self.rules,
             alerts=self.alerts,
@@ -218,18 +216,33 @@ class Harness:
             "params": {"price": 10.0},
         }
         kw.update(over)
-        return self.rules.create(USER, **kw)
+        rule = self.rules.create(USER, **kw)
+        self.added_id = rule.id
+        return rule
 
-    def seed_hit(self, *, minutes_ago=0, stage="hit", rule_id=None, account_id=None):
-        """在去重键上种一条**已经推过**的告警：冷却与 `no_open_alert` 的输入。"""
+    def seed_hit(
+        self,
+        *,
+        minutes_ago=0,
+        stage="hit",
+        rule_id=None,
+        account_id=None,
+        user_id: str = USER,
+        code: str = CODE,
+    ):
+        """在去重键上种一条**已经推过**的告警：冷却与 `no_open_alert` 的输入。
+
+        用户与代码可由调用方给：对抗面要验的正是「换个人、换个代码还挡不挡」，
+        写死的那一版只能服务单层用例。
+        """
         return self.alerts.create(
-            USER,
+            user_id,
             rule_id=rule_id or self.added_id,
             rule_name="跌破 10 元",
             account_id=account_id,
             account_name="SIM-1",
             market=MARKET,
-            code=CODE,
+            code=code,
             symbol_name="中国神华",
             severity="strong",
             stage=stage,

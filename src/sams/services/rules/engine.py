@@ -89,7 +89,7 @@ class Suppressed:
 
 @dataclass(frozen=True)
 class Skipped:
-    """判不了：模板缺哪一路输入就说哪一路（与「没到」分开计数）。"""
+    """这一条这一趟没有结论：`reason` 单独上屏，不与「没到」混在一摞。"""
 
     rule_id: str
     rule_name: str
@@ -310,15 +310,17 @@ class RuleEngine:
         try:
             outcome = evaluate(Ask(snapshot=snapshot, params=rule.params, thesis=thesis))
         except KeyError as exc:
-            # 库里那一行是**上一个版本的模板**写的：模板后来多要一个必填参数，老行就少了
-            # 那个键。`KeyError` 不是 `SamsError`，命令层那句 `except SamsError` 兜不住它——
-            # 折成一句说得出键名的 skipped，屏幕上出现的是一句话而不是一段栈。
+            # 那一行是**上一个版本的模板**写的：老行要么缺了模板要的那个键，要么带着模板
+            # 词表里已经没有了的取值（`stop_ma` 查 `_MA_LINES` 就是后面那种）。
+            # `KeyError` 不是 `SamsError`，命令层那句 `except SamsError` 兜不住它——
+            # 折成一句带名字的 skipped，屏幕上出现的是一句话而不是一段栈。
+            # 名字取自 `exc.args[0]`：两种情况都是它，所以这里不说是「参数」还是「取值」。
             return self._skipped(
                 rule,
                 snapshot.market,
                 snapshot.code,
-                f"这条规则缺参数 {exc.args[0]!r}：那一行是老模板写的，"
-                "`sams rule edit` 补上它（要哪几个见 `sams rule kinds`）",
+                f"这条规则用不了 {exc.args[0]!r}：那一行是老模板写的，"
+                "`sams rule edit` 改它（要哪几个、能取哪些值见 `sams rule kinds`）",
             )
         # 判「命中」看 `hit is not None` 而不是 `verdict.ok`：状态型命中（`stop.thesis_drift`
         # 那类只报状态、不比数值）的 `Verdict.ok` 是 False，用 `.ok` 会让那一类告警永不投出。
@@ -473,6 +475,11 @@ class RuleEngine:
         )
 
     def _skipped(self, rule: Rule, market: str, code: str, reason: str) -> Skipped:
+        """「这一条这一趟没有结论」的共同形状：判不了与送不出去，屏幕上同一摞。
+
+        合成一摞是刻意的：多一摞就要多一份 CLI、多一份 JSON 字段、多一条退出码规则，
+        而现在没人能回答「判不了」与「送不出去」该有什么不同的处置。分辨靠 `reason`。
+        """
         return Skipped(
             rule_id=rule.id,
             rule_name=rule.name,
