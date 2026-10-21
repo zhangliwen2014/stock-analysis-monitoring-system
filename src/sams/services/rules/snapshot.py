@@ -3,7 +3,7 @@
 拆成两个动作：`expand` 回答「这条规则覆盖哪些对象」，`read` 回答「那个对象此刻是什么数」。
 分开的理由是冷却：去重键里有 `account_id`，所以展开必须带着账户出门。
 
-这一层是全套规则里**唯一**允许碰 IO 的地方。模板因此是纯函数（T-7 起），除权日那种错
+这一层是全套规则里**唯一**允许碰 IO 的地方。模板因此是纯函数，除权日那种错
 在手搓的 `Snapshot` 上就能复现，不必等网络。
 
 不认识的 target_type 一律抛，不返回空列表：空列表在屏幕上长成「这条规则没触发」，
@@ -240,6 +240,9 @@ class RuleData:
         if valuation.price is None:
             missing.append("没有过闸的现价：这一趟不判任何价格类条件")
         atr = _atr(daily, valuation.price, missing)
+        # 那两条线上的数与它的日期必须出自同一次分支判断（见 `_stop` / `_target`）
+        stop_line, stop_on = _stop(thesis, valuation)
+        target_price, target_on = _target(thesis, valuation)
         return Snapshot(
             market=target.market,
             code=target.code,
@@ -266,8 +269,8 @@ class RuleData:
             weekly_ma20=valuation.weekly_ma20,
             daily_ma60=_fold_line(daily.table, _MA_COLUMN, valuation.price),
             atr=atr,
-            stop_line=_stop_line(thesis, valuation),
-            target_price=_target_price(thesis, valuation),
+            stop_line=stop_line,
+            target_price=target_price,
             odds=valuation.plan.odds.value,
             score=valuation.composite.score,
             items=tuple(
@@ -281,8 +284,8 @@ class RuleData:
             # 这里只转递，不自己查 `corp_actions` 拼一份——拼出来的那份没有那次校验
             factors=daily.series.factors,
             bars_from=daily.anchored_on,
-            stop_on=_stop_on(thesis, valuation),
-            target_on=_target_on(thesis, valuation),
+            stop_on=stop_on,
+            target_on=target_on,
             disclosed_on=valuation.fundamental.published_on,
             margin_enabled=bool(account is not None and account.margin_enabled),
             missing=tuple(missing),
@@ -365,50 +368,41 @@ def _holding_high(
     return fold_to_price_basis(high_water(window, window.height), factor)
 
 
-def _stop_line(thesis: Thesis | None, valuation) -> float | None:
-    """止损线优先用**论上那一列**（用户确认过的数），没有才退回本次合成的那一条。
+def _stop(thesis: Thesis | None, valuation) -> tuple[float | None, date | None]:
+    """那条止损线**与它属于哪天**，一次给全。
 
-    顺序反过来的话，用户手工把线抬到成本（`stop.breakeven` 之后常见）会被下一次自动
-    合成覆盖——屏幕上那条线就不是他填的那一条了。
-    """
-    if thesis is not None and thesis.stop_price is not None:
-        return thesis.stop_price
-    return valuation.plan.stop.low if valuation.plan.stop.ok else None
-
-
-def _stop_on(thesis: Thesis | None, valuation) -> date | None:
-    """`stop_line` 那一列属于哪一天的读数——与 `_stop_line` 严格同一条优先级。
+    一个函数返回两个值而不是两个函数各查一遍，是因为那两个值必须出自同一条优先级：
+    分两处写就要有人记得同时改两处，而漏掉的那一处不会报错——它只是让 `anchor.py`
+    拿一个不属于那天的日期去搬一个数，屏幕上多出一句假的「可能偏高」。
 
     两个分支各有各的理由：
 
-    - 论上那一列的日期在 0013（`levels_on`）。手填就是 None，`anchor.py` 据此**注明**而
-      不拒绝——那一列只用于显示。
+    - 论上那一列是用户确认过的数，所以优先。顺序反过来的话，用户手工把线抬到成本
+      （`stop.breakeven` 之后常见）会被下一次自动合成覆盖——屏幕上那条线就不是他填的那一条了。
+      它的日期在 0013 的 `levels_on`，手填就是 None：`anchor.py` 据此**注明**而不关掉规则，
+      因为没有任何求值模板拿这一列做判断（`Template.judged` 那一摞里没有 `stop_line`）。
     - 本次合成的那条线是**今天**读的数，已经在现价坐标系里。给它读数日而不是 None，
       `steps_after` 因此算出一张空表、一步都不搬；写成 None 反而会让它带上「可能偏高」
       那句假话。
     """
     if thesis is not None and thesis.stop_price is not None:
-        return thesis.levels_on
-    return valuation.price_on if valuation.plan.stop.ok else None
+        return thesis.stop_price, thesis.levels_on
+    if not valuation.plan.stop.ok:
+        return None, None
+    return valuation.plan.stop.low, valuation.price_on
 
 
-def _target_price(thesis: Thesis | None, valuation) -> float | None:
-    """目标价与止损线同一条优先级：论上那一列是用户确认过的数，没有才退回本次合成。"""
-    if thesis is not None and thesis.target_price is not None:
-        return thesis.target_price
-    return valuation.plan.target.low if valuation.plan.target.ok else None
+def _target(thesis: Thesis | None, valuation) -> tuple[float | None, date | None]:
+    """那个目标价与它属于哪天——与 `_stop` 同一条纪律，一次给全。
 
-
-def _target_on(thesis: Thesis | None, valuation) -> date | None:
-    """`target_price` 那一列属于哪天——与 `_target_price` 严格同一条优先级。
-
-    它必须紧跟在上面那个函数后面，与 `_stop_on` 同一条纪律：改优先级的人一眼要看见
-    伴生那句。写歪的方向是固定的那一个——把今天读来的数当成手填的，屏幕上就多一句
-    假的「可能偏高」。`tp.tiered` 拿这一列当刻度终点，所以它也要搬（§10.2）。
+    写歪的方向是固定的那一个：把今天读来的数当成手填的。`tp.tiered` 拿这一列当刻度
+    终点（`judged` 里有它），所以搬不动时它会让那条规则整条不判，与止损线那一列不同。
     """
     if thesis is not None and thesis.target_price is not None:
-        return thesis.levels_on
-    return valuation.price_on if valuation.plan.target.ok else None
+        return thesis.target_price, thesis.levels_on
+    if not valuation.plan.target.ok:
+        return None, None
+    return valuation.plan.target.low, valuation.price_on
 
 
 def _date_of(moment) -> date | None:

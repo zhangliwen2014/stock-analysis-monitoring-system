@@ -151,9 +151,15 @@ def move_prices(rule: Rule, built: Template, snapshot: Snapshot) -> Relocation:
         return f"{reason}：搬它会少搬，屏幕上那一列按原值显示，可能偏高。{fix}"
 
     for param in built.money_params():
+        raw = params.get(param.name)
+        if raw is None:
+            # 「这一行压根没有这个键」不是这里的话：`_verdict` 那张 `KeyError` 网就是为
+            # 老模板写下的那一行准备的，屏幕上那一句已经写着去哪个命令补。在这里再报一遍
+            # 是两件外套，而两处「搬不动」里只有一处带着正确的下一步
+            continue
         # 参数是人自己填的阈值，所以「搬不动」在这里只有不判这一种后果
         arrived, reason, fix = carry(
-            float(params[param.name]),
+            float(raw),
             on=rule.params_on,
             label=param.label,
             column=f"params.{param.name}",

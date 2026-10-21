@@ -15,8 +15,9 @@ import pytest
 import support_valuation
 
 from sams.core.errors import NotAdjustable, ValidationError
-from sams.services.rules.snapshot import RuleData, Target
+from sams.services.rules.snapshot import RuleData, Snapshot, Target
 from sams.storage.repos.rules import Rule, RuleRepo
+from sams.storage.repos.theses import ThesisRepo
 
 CODE = support_valuation.CODE  # "601088"
 AS_OF = support_valuation.DAYS[-1]
@@ -61,6 +62,41 @@ def make_rule(db, **over) -> Rule:
     }
     args.update(over)
     return RuleRepo(db).create(**args)
+
+
+def seed_thesis(db, *, on: date | None = None) -> str:
+    """铺一条带那两个价位的论，返回它的 id：`on` 就是 0013 的 `levels_on`。
+
+    写成 `None` 是这一枚的意思所在——手填的数没有测量日，仓库那道默认值故意不是今天。
+    """
+    theses = ThesisRepo(db)
+    thesis = theses.create(
+        user_id="u1", market="A", code=CODE, style="value", actor_id="u1", now=NOW
+    )
+    theses.set_levels(
+        "u1",
+        thesis.id,
+        actor_id="u1",
+        now=NOW,
+        stop_price=9.99,
+        target_price=30.0,
+        reward_risk=2.0,
+        levels_on=on,
+    )
+    return thesis.id
+
+
+def read_thesis(db, settings, *, on: date | None = None) -> Snapshot:
+    """铺一条论（`on` 是它那两个价位的测量日）然后读一次那个对象。
+
+    四枚用例用的是同一个世界，只差要断言的那一列：`levels_on` 填与不填各是一半，
+    止损线与目标价又各有各的伴生函数。
+    """
+    container = support_valuation.make_container(db, settings)
+    thesis_id = seed_thesis(db, on=on)
+    return as_data(container, settings).read(
+        Target("u1", "A", CODE, None, thesis_id), as_of=AS_OF
+    )
 
 
 # --- 展开 --------------------------------------------------------------------------------
@@ -155,8 +191,6 @@ def test_a_position_rule_expands_over_that_account_only(db, data):
 
 
 def test_a_thesis_rule_expands_to_that_thesis_symbol(db, data):
-    from sams.storage.repos.theses import ThesisRepo
-
     thesis = ThesisRepo(db).create(
         user_id="u1", market="A", code="600000", style="value", actor_id="u1", now=NOW
     )
@@ -321,29 +355,10 @@ def test_the_technical_lines_are_folded_when_a_dividend_sits_inside_the_window(d
 
 
 def test_a_thesis_line_wins_over_the_synthesized_one(db, data):
-    """止损线优先用论上那一列（用户确认过的数），没有才退回本次合成（见 `_stop_line`）。"""
-    from sams.storage.repos.theses import ThesisRepo
+    """止损线优先用论上那一列（用户确认过的数），没有才退回本次合成（见 `_stop`）。"""
+    thesis_id = seed_thesis(db)
 
-    theses = ThesisRepo(db)
-    thesis = theses.create(
-        user_id="u1",
-        market="A",
-        code=CODE,
-        style="value",
-        actor_id="u1",
-        now=NOW,
-    )
-    theses.set_levels(
-        "u1",
-        thesis.id,
-        actor_id="u1",
-        now=NOW,
-        stop_price=9.99,
-        target_price=30.0,
-        reward_risk=2.0,
-    )
-
-    snap = data.read(Target("u1", "A", CODE, None, thesis.id), as_of=AS_OF)
+    snap = data.read(Target("u1", "A", CODE, None, thesis_id), as_of=AS_OF)
     assert snap.stop_line == 9.99
     assert snap.target_price == 30.0
 
@@ -395,26 +410,7 @@ def test_read_leaves_the_calendar_empty_when_nothing_was_recorded(data):
 
 def test_a_thesis_line_carries_its_reading_day(db, settings):
     """论上那一列的日期在 0013：填了 `levels_on`，快照就得把它带出门。"""
-    from sams.storage.repos.theses import ThesisRepo
-
-    container = support_valuation.make_container(db, settings)
-    theses = ThesisRepo(db)
-    thesis = theses.create(
-        user_id="u1",
-        market="A",
-        code=CODE,
-        style="value",
-        actor_id="u1",
-        now=NOW,
-    )
-    theses.set_levels(
-        "u1", thesis.id, actor_id="u1", now=NOW, stop_price=9.99, target_price=30.0,
-        reward_risk=2.0, levels_on=support_valuation.DAYS[0]
-    )
-
-    got = as_data(container, settings).read(
-        Target("u1", "A", CODE, None, thesis.id), as_of=AS_OF
-    )
+    got = read_thesis(db, settings, on=support_valuation.DAYS[0])
     assert got.stop_line == 9.99
     assert got.stop_on == support_valuation.DAYS[0]
 
@@ -425,26 +421,7 @@ def test_a_hand_typed_thesis_line_has_no_reading_day(db, settings):
     拿 `now` 当测量日是这一路最顺手的一种假：那是这一行被写下的时刻，不是那个数属于
     哪一天的读数（0013 的注释管这个叫「把填数说成量数」）。
     """
-    from sams.storage.repos.theses import ThesisRepo
-
-    container = support_valuation.make_container(db, settings)
-    theses = ThesisRepo(db)
-    thesis = theses.create(
-        user_id="u1",
-        market="A",
-        code=CODE,
-        style="value",
-        actor_id="u1",
-        now=NOW,
-    )
-    theses.set_levels(
-        "u1", thesis.id, actor_id="u1", now=NOW, stop_price=9.99, target_price=30.0,
-        reward_risk=2.0
-    )
-
-    got = as_data(container, settings).read(
-        Target("u1", "A", CODE, None, thesis.id), as_of=AS_OF
-    )
+    got = read_thesis(db, settings)
     assert got.stop_line == 9.99
     assert got.stop_on is None
 
@@ -452,8 +429,8 @@ def test_a_hand_typed_thesis_line_has_no_reading_day(db, settings):
 def test_a_synthesized_line_is_anchored_to_the_day_it_was_read(data):
     """没有论时那条线是本次合成的 ⇒ 锚就是这次的读数日，不是 None。
 
-    这一枚与上一枚是同一条优先级的两面（`_stop_on` 必须跟着 `_stop_line` 走）。写成
-    None 会给一条本来就在现价坐标系里的数加一句假的「可能偏高」。
+    这一枚与上一枚是同一条优先级的两面（`_stop` 一次给回那两个值）。写成 None 会给
+    一条本来就在现价坐标系里的数加一句假的「可能偏高」。
     """
     got = data.read(Target("u1", "A", CODE, None, None), as_of=AS_OF)
 
@@ -464,55 +441,17 @@ def test_a_synthesized_line_is_anchored_to_the_day_it_was_read(data):
 def test_a_thesis_target_carries_its_reading_day(db, settings):
     """目标价与止损线同住 0013 那几列：填了 `levels_on`，它也得带日期出门。
 
-    两条列分开写用例，是因为它们的伴生函数是两处代码（`_stop_on` / `_target_on`），
-    只钉一边的话，另一边写成 `levels_on` 以外的一切都还是绿的。
+    两条列分开写用例，是因为取数处对它们是两个函数（`_stop` / `_target`），只钉一边的话，
+    另一边写成 `levels_on` 以外的一切都还是绿的。
     """
-    from sams.storage.repos.theses import ThesisRepo
-
-    container = support_valuation.make_container(db, settings)
-    theses = ThesisRepo(db)
-    thesis = theses.create(
-        user_id="u1",
-        market="A",
-        code=CODE,
-        style="value",
-        actor_id="u1",
-        now=NOW,
-    )
-    theses.set_levels(
-        "u1", thesis.id, actor_id="u1", now=NOW, stop_price=9.99, target_price=30.0,
-        reward_risk=2.0, levels_on=support_valuation.DAYS[0]
-    )
-
-    got = as_data(container, settings).read(
-        Target("u1", "A", CODE, None, thesis.id), as_of=AS_OF
-    )
+    got = read_thesis(db, settings, on=support_valuation.DAYS[0])
     assert got.target_price == 30.0
     assert got.target_on == support_valuation.DAYS[0]
 
 
 def test_a_hand_typed_target_has_no_reading_day(db, settings):
     """手填的那个目标价同样没有测量日：带 None 出门，让 `anchor.py` 去注明。"""
-    from sams.storage.repos.theses import ThesisRepo
-
-    container = support_valuation.make_container(db, settings)
-    theses = ThesisRepo(db)
-    thesis = theses.create(
-        user_id="u1",
-        market="A",
-        code=CODE,
-        style="value",
-        actor_id="u1",
-        now=NOW,
-    )
-    theses.set_levels(
-        "u1", thesis.id, actor_id="u1", now=NOW, stop_price=9.99, target_price=30.0,
-        reward_risk=2.0
-    )
-
-    got = as_data(container, settings).read(
-        Target("u1", "A", CODE, None, thesis.id), as_of=AS_OF
-    )
+    got = read_thesis(db, settings)
     assert got.target_price == 30.0
     assert got.target_on is None
 
@@ -521,7 +460,7 @@ def test_a_synthesized_target_is_anchored_to_the_day_it_was_read(data):
     """本次合成的那个目标价（`tp.tiered` 拿它当刻度终点）锚在这次的读数日。
 
     先量过一次：样本世界里没有论时 `plan.target.ok` 为真，所以这一枚走的是「有数」
-    那一支。写成 None 会让一条今天读来的数带上「可能偏高」那句假话（与 `_stop_on`
+    那一支。写成 None 会让一条今天读来的数带上「可能偏高」那句假话（与 `_stop`
     的同一条理由）。
     """
     got = data.read(Target("u1", "A", CODE, None, None), as_of=AS_OF)

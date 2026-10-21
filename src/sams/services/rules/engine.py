@@ -143,9 +143,9 @@ def _no_impl(kind: str) -> str:
 def _moved_payload(snapshot: Snapshot) -> list[dict[str, object]]:
     """`RuleHit.payload` 里那一串搬运：给数，不给格式化后的句子。
 
-    日期一律成串——`payload` 要进 JSON，`date` 对象在那一列会变成 `null`，比没有更糟。
-    文本在 `Moved.line` 那里已经有了：命令行与手机上读那一行，M4 的统计读这几个数，
-    两头都不许去 parse 对方。
+    文本在 `Moved.line` 那里已经有了，那一行是给屏幕读的；这几个数是给事件订阅方读的，
+    两头都不许去 parse 对方。日期一律成串：`payload` 是要出进程的机器读数，而
+    `json.dumps` 的默认编码器装不下一个 `date`（要么炸，要么被手写编码器换成别的东西）。
     """
     return [
         {
@@ -292,10 +292,11 @@ class RuleEngine:
             )
         placed = move_prices(rule, built, snapshot)
         if placed.blocked:
-            # 「搬不动就整条不判」（口径 1 写在 `anchor.py` 的开头）。只报第一个理由：它们同属
-            # 这一段 K 线里的除权，而每一句后面跟着的都是同一条下一步命令
+            # 「搬不动就整条不判」（口径 1 写在 `anchor.py` 的开头）。一个对象可能同时缺
+            # 两处（成本太老加线没有日期戳），而每一句后面跟着的是**它自己**那条下一步命令，
+            # 所以全部带上，只并成一条结论：屏幕上分两行写会让读的人以为是两条规则
             return self._skipped(
-                rule, snapshot.market, snapshot.code, placed.blocked[0]
+                rule, snapshot.market, snapshot.code, "；".join(placed.blocked)
             )
         snapshot = placed.snapshot  # 从这一行起，`_one` 往后只认搬完的那一份
         verdict = self._verdict(rule, target, snapshot, evaluate, placed.params)
@@ -432,7 +433,7 @@ class RuleEngine:
         except ValidationError:
             # `alerts.stage` 那一列没有词表 CHECK，而写它的那一头（`monitor/router.py`）把
             # 文本原样写进去：入池那类历史行的 stage 是词表外的词。认不出上一档有多响
-            # 就是判不出来，而这里的取向是判不出来⇒放行（同 `filters.no_open_alert`，T-12）：
+            # 就是判不出来，而这里的取向是判不出来⇒放行（同 `filters.no_open_alert`）：
             # 让它抛出去等于让一条脏历史把整趟求值打掉。
             return ""
         if louder:
@@ -559,7 +560,7 @@ class RuleEngine:
         再说这一笔今天动不了——反过来的话，读到第二句的人以为自己已经没有损失可言。
 
         「换算」紧跟判据：那一行说的是上一行用的那个数从哪儿来。放到盈亏之后，人是先读到
-        结论、再读到出处，而出处那一句是要改变结论的（那条线比看上去低 10%）。没搬的时候
+        结论、再读到出处，而出处那一句是要改变结论的（那条线其实比看上去低）。没搬的时候
         这里为空——不写「无除权」，那是一句没有人要的噪音。
         """
         lines = [f"{built.label}：{verdict.why}" if verdict.why else built.label]

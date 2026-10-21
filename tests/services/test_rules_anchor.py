@@ -104,6 +104,18 @@ def test_the_day_it_was_filled_is_measured_at_that_close() -> None:
     assert got.moves == ()
 
 
+def test_a_row_without_that_key_is_left_for_the_next_net() -> None:
+    """那一行压根没有这个键 ⇒ 这里一个数都不搬、也一句都不报。
+
+    「缺参数」不是搬运这一段的结论：求值那一头的 `KeyError` 网早就有一句写着去哪个命令补，
+    这里再报一句是同一件事的两件外套——而两处「搬不动」里只有一处带着正确的下一步。
+    """
+    rule = make_rule({}, params_on=date(2024, 3, 1))
+    got = move_prices(rule, template_for("stop.fixed"), snap())
+    assert got.params == {}
+    assert got.blocked == () and got.moves == ()
+
+
 def test_an_unknown_fill_day_refuses_to_judge_a_price_rule() -> None:
     """0017 之前建的那一行没有锚：不搬、也不判，并且说出该跑哪条命令。
 
@@ -194,10 +206,10 @@ def test_the_thesis_line_moves_when_it_has_a_reading_day() -> None:
 
 
 def test_a_hand_typed_thesis_line_is_annotated_not_blocked() -> None:
-    """手填的价位没有测量日（0013），而这一列只用于显示：注明，不关掉规则。
+    """手填的价位没有测量日（0013）：注明，不关掉规则。
 
     没有任何模板拿 `stop_line` 做判断（要盯那条线的人建的是 `stop.fixed`，它的锚是
-    `params_on`）。为一条显示用的列拒绝出数，报出来的「不判」是假的。
+    `params_on`）。为一条不参与判断的列拒绝出数，报出来的「不判」是假的。
     """
     got = move_prices(
         make_rule({"basis": "weekly_ma20"}, kind="stop.ma"),
@@ -213,7 +225,7 @@ def test_a_hand_typed_thesis_line_is_annotated_not_blocked() -> None:
 def test_the_target_price_copied_from_the_thesis_moves_too() -> None:
     """`tp.tiered` 量的是「成本 → 目标价」那一段，两个端点得站在同一个价空间里。
 
-    这一列有两个来源（`snapshot._target_price`：论上那一列优先，没有才是本次合成的），
+    这一列有两个来源（`snapshot._target`：论上那一列优先，没有才是本次合成的），
     抄来的那一个和成本一样是某天写下的裸价：10 派 1 之后，当年写的 20.00 说的是今天的 18.00。
     """
     got = move_prices(

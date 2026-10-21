@@ -429,3 +429,54 @@ def test_a_move_shows_up_in_the_body_and_the_event(h) -> None:
     assert moved[0]["after"] == pytest.approx(9.9)
     assert moved[0]["on"] == "2024-03-01"
     assert moved[0]["ex_dates"] == ["2024-10-26"]
+
+
+def test_a_row_missing_its_param_is_reported_not_a_crash(h) -> None:
+    """库里那一行压根没有这个键（老模板写的）：报「缺参数」，别让整趟崩。
+
+    搬运跑在求值之前，所以它若不认「键不在」这一种缺，`KeyError` 会一路抛出 `check`——
+    `_verdict` 那张网本来接的就是这种行，而 `check` 外面没有兜底的 `try`：一条脏行会
+    让屏幕上其他那几条一起消失。
+    """
+    h.snapshot = snap(**MOVED)
+    h.db.execute(
+        "INSERT INTO rules (id, user_id, name, enabled, target_type, target_ref,"
+        " kind, condition_kind, params_json, filters_json, cooldown_min, severity,"
+        " channel_ids, params_on, created_at, updated_at)"
+        " VALUES ('no-price', ?, '键都没有的那条', TRUE, 'symbol', ?, 'stop.fixed',"
+        " 'template', '{}', '{}', 30, 'strong', '[]', ?, ?, ?)",
+        [USER, f"{MARKET}/{CODE}", STAMPED, NOW, NOW],
+    )
+    report = h.engine().check(USER)
+
+    assert report.raised == () and len(report.skipped) == 1
+    assert "那一行是老模板写的" in report.skipped[0].reason
+
+
+def test_two_gaps_report_both_commands(h) -> None:
+    """两个缺口同时存在 ⇒ 一条结论里两句都带上，各自那条下一步命令都不许掉。
+
+    屏幕上「判不了」一行就是一条规则（`_print_check`），所以两段合成一条而不是两行；
+    只报第一个的话，人跑完 `ledger buy` 要等下一趟才看见第二句，而 D55 要的是当场说全。
+    """
+    h.snapshot = snap(
+        **MOVED,
+        avg_cost=12.0,
+        opened_on=None,
+        target_price=20.0,
+        target_on=None,
+    )
+    h.add(
+        kind="tp.tiered",
+        target_type="position",
+        target_ref="*",
+        account_id="sim-1",
+        # 这一种只认 `tiers`（有默认值），`add` 那份默认的 `price` 它不认
+        params={},
+        params_on=STAMPED,
+    )
+    report = h.engine().check(USER)
+
+    assert report.raised == () and len(report.skipped) == 1
+    reason = report.skipped[0].reason
+    assert "ledger buy" in reason and "thesis revise" in reason
