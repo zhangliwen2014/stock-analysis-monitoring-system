@@ -256,6 +256,10 @@ class RuleRepo:
             raise ValidationError(
                 f"未知对象类型 target_type={target_type!r}：只有 {', '.join(TARGET_TYPES)}"
             )
+        if target_type == "portfolio":
+            raise ValidationError(
+                "组合级规则这一层还没有输入（U28）：等每日组合快照落地再接"
+            )
         if target_type not in built.targets:
             allowed = "/".join(built.targets)
             raise ValidationError(
@@ -310,6 +314,7 @@ class RuleRepo:
         rule_id: str,
         *,
         changed_by: str,
+        user_id: str | None = None,
         name: str | None = None,
         kind: str | None = None,
         params: Mapping[str, object] | None = None,
@@ -321,7 +326,7 @@ class RuleRepo:
         target_ref: str | None = None,
     ) -> Rule:
         """一次改动写一条修订史（§4.2）。没有实质变化 ⇒ 不写。"""
-        before = self._require(rule_id)
+        before = self._require(rule_id, user_id=user_id)
         patch = {
             key: value
             for key, value in {
@@ -354,7 +359,7 @@ class RuleRepo:
             "thesis_id": before.thesis_id,
             "channel_ids": patch.get("channel_ids", before.channel_ids),
         }
-        if kind is not None and params is None:
+        if kind is not None and kind != before.kind and params is None:
             # 换 kind 而不给新参数：旧参数对新 kind 多半是野键，让它在这里就红，
             # 而不是带着一个没人读的键进库（屏幕上那条规则于是显示着一个不生效的数）
             raise ValidationError(
@@ -371,7 +376,7 @@ class RuleRepo:
             self.db.execute(
                 "UPDATE rules SET name = ?, kind = ?, target_type = ?, target_ref = ?,"
                 " params_json = ?, filters_json = ?, severity = ?, cooldown_min = ?,"
-                " channel_ids = ?, updated_at = ? WHERE id = ?",
+                " channel_ids = ?, thesis_id = ?, updated_at = ? WHERE id = ?",
                 [
                     checked["name"],
                     checked["kind"],
@@ -382,6 +387,7 @@ class RuleRepo:
                     checked["severity"],
                     checked["cooldown_min"],
                     json.dumps(checked["channel_ids"], ensure_ascii=False),
+                    checked["thesis_id"],
                     now,
                     before.id,
                 ],
@@ -497,11 +503,13 @@ class RuleRepo:
                     f"target_type={target_type} 时 target_ref 要写 `*`（整个集合），收到 {ref!r}"
                 )
             return
-        if target_type == "symbol" and "/" not in ref:
-            raise ValidationError(
-                f"target_ref 要写成 市场/代码（例如 A/601088），收到 {ref!r}："
-                "只有代码时 A 股与港股会撞同一个键"
-            )
+        if target_type == "symbol":
+            market, sep, code = ref.partition("/")
+            if not sep or not market or not code or "/" in code:
+                raise ValidationError(
+                    f"target_ref 要写成 市场/代码（例如 A/601088），收到 {ref!r}："
+                    "只有代码时 A 股与港股会撞同一个键"
+                )
 
     def _require_thesis(self, user_id: str, thesis_id: str | None) -> None:
         if thesis_id is None:

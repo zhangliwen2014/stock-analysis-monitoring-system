@@ -134,6 +134,23 @@ def test_a_symbol_target_ref_must_carry_the_market(repo):
             kind="price.cross_below", params={"price": 1.0})
 
 
+@pytest.mark.parametrize("ref", ["A/", "/601088", "A/B/C"])
+def test_a_symbol_target_ref_needs_both_halves(repo, ref):
+    user = seed_user(repo.db)
+    with pytest.raises(ValidationError, match="市场/代码"):
+        add(repo, user, kind="price.cross_below", params={"price": 1.0},
+            target_type="symbol", target_ref=ref, account_id=None)
+
+
+def test_a_portfolio_target_is_refused_until_u28(repo):
+    """`price.cross_*` 的模板认得住 portfolio，但这一层没有组合级输入：
+    收进来只会得到一条每次求值都抛的规则。"""
+    user = seed_user(repo.db)
+    with pytest.raises(ValidationError, match="U28"):
+        add(repo, user, kind="price.cross_below", params={"price": 10.0},
+            target_type="portfolio", target_ref="*")
+
+
 def test_the_template_decides_which_target_types_are_allowed(repo):
     user = seed_user(repo.db)
     with pytest.raises(ValidationError, match="position"):
@@ -168,6 +185,16 @@ def test_reading_another_users_rule_gives_nothing(repo):
     made = add(repo, mine)
     assert repo.get(made.id, user_id=theirs) is None
     assert repo.list_for(theirs) == []
+
+
+def test_updating_another_users_rule_gives_nothing(repo):
+    from sams.storage.repos.users import UserRepo
+
+    mine = seed_user(repo.db)
+    theirs = UserRepo(repo.db).create("other", "correct-horse-battery").id
+    made = add(repo, mine)
+    with pytest.raises(StorageError, match="不存在"):
+        repo.update(made.id, changed_by=theirs, user_id=theirs, name="别人的")
 
 
 def test_an_update_writes_one_revision_with_both_full_snapshots(repo):
@@ -214,6 +241,29 @@ def test_switching_the_kind_with_new_params_is_accepted(repo):
                           params={"basis": "daily_ma60"})
     assert changed.kind == "stop.ma"
     assert changed.params == {"basis": "daily_ma60"}
+
+
+def test_an_update_to_the_same_kind_is_not_treated_as_a_missing_params_change(repo):
+    user = seed_user(repo.db)
+    made = add(repo, user)
+    repo.update(made.id, changed_by=user, kind="stop.pct")
+    assert repo.revisions(made.id) == []
+
+
+def test_an_update_to_a_thesis_target_persists_the_resolved_id(repo):
+    """`create` 把 `target_ref` 落成 `thesis_id`，`update` 必须做同一件事：
+    否则改完的那条规则还能被 `remove` 删掉，下一次同样的改动又写一条空修订。"""
+    user = seed_user(repo.db)
+    thesis = seed_thesis(repo.db, user)
+    made = add(repo, user, kind="price.cross_below", params={"price": 10.0},
+               target_type="symbol", target_ref="A/601088", account_id=None)
+    changed = repo.update(made.id, changed_by=user, target_type="thesis",
+                          target_ref=thesis.id)
+    assert changed.thesis_id == thesis.id
+    repo.update(made.id, changed_by=user, target_type="thesis", target_ref=thesis.id)
+    assert len(repo.revisions(made.id)) == 1
+    with pytest.raises(ValidationError, match="停用"):
+        repo.remove(made.id, user_id=user)
 
 
 def test_an_update_with_nothing_to_change_is_refused(repo):
@@ -272,6 +322,24 @@ def test_an_ordinary_rule_can_be_removed(repo):
     made = add(repo, user)
     assert repo.remove(made.id, user_id=user) is True
     assert repo.get(made.id, user_id=user) is None
+
+
+def test_a_failed_rule_delete_keeps_the_rule_and_its_revisions(repo, monkeypatch):
+    user = seed_user(repo.db)
+    made = add(repo, user)
+    repo.update(made.id, changed_by=user, params={"pct": 0.12})
+    real_execute = repo.db.execute
+
+    def explode(sql, params=None):
+        if sql.startswith("DELETE FROM rules"):
+            raise StorageError("磁盘满了")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(repo.db, "execute", explode)
+    with pytest.raises(StorageError, match="磁盘满了"):
+        repo.remove(made.id, user_id=user)
+    assert repo.get(made.id) is not None
+    assert len(repo.revisions(made.id)) == 1
 
 
 def test_the_default_channel_list_is_stored_as_json_and_read_back(repo):
