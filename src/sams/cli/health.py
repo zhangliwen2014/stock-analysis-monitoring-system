@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 from sams.bootstrap import Container
+from sams.cli.common import stamp
 
 
 def add_to(subparsers) -> None:
@@ -110,6 +111,22 @@ def _print_ledger(report) -> None:
         )
 
 
+def _print_backlog(notify) -> None:
+    """积压那一行：`None` 时什么都不打，因为「库里还没有 0015 的形状」由上面那句说过了。"""
+    if notify.unhandled is None:
+        return
+    if not notify.unhandled:
+        print("  未处理告警 0 条")
+        return
+    oldest = (
+        f"（最早 {stamp(notify.unhandled_oldest)}）" if notify.unhandled_oldest else ""
+    )
+    print(
+        f"  ⚠ 未处理告警 {notify.unhandled} 条{oldest}"
+        "：`sams alert list --user … --status new`"
+    )
+
+
 def _print_notify(report) -> None:
     """通知那一节：通道有几条能用、四种结果各几次、本机那两个到底发得出去吗。
 
@@ -122,6 +139,7 @@ def _print_notify(report) -> None:
     if notify.channels is None:
         print("  库里还没有 0015 的形状：sams db migrate")
         return
+    _print_backlog(notify)
     if notify.channels == 0:
         print("  0 条通道：任何告警都发不出去（`sams channel add --user … --kind wecom …`）")
         return

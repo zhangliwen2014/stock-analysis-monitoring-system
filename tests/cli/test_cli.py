@@ -1301,3 +1301,49 @@ def test_health_reports_the_local_channels_it_cannot_use(container, capsys) -> N
     out = capsys.readouterr().out
     assert "desktop 发不出去：远程终端：没有 DISPLAY" in out
     assert "voice" not in out, "可用的那一个不占一行"
+
+
+def _three_unhandled(container) -> None:
+    """三条没人看过的告警：那个数只需要 `alerts` 一张表，不需要通道、不需要投递。"""
+    from datetime import UTC, datetime
+
+    user = container.users.create("trader", PASSWORD)
+    for _ in range(3):
+        container.alerts_store.create(
+            user.id,
+            rule_id=None,
+            rule_name="跌破止损",
+            account_id=None,
+            account_name="",
+            market="A",
+            code="601088",
+            symbol_name="中国神华",
+            severity="strong",
+            stage="破位",
+            value_text="12.30",
+            threshold_text="13.00",
+            action_note="",
+            triggered_at=datetime.now(UTC),
+        )
+
+
+def test_health_screen_shows_the_backlog_before_the_channels(container, capsys) -> None:
+    """那条「响了多少没人看」排在通道之前，而且在 0 条通道时也要打出来。
+
+    0 条通道正是积压最容易被漏掉的那种机器：告警一条条写进了库，一条都没出发。
+    """
+    _three_unhandled(container)
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    text = capsys.readouterr().out
+
+    waiting = next(line for line in text.splitlines() if "未处理告警" in line)
+    assert "3 条" in waiting and "sams alert list" in waiting
+    assert text.index(waiting) < text.index("0 条通道")
+
+
+def test_health_screen_says_nothing_is_waiting(container, capsys) -> None:
+    """0 是一个答案：这一行不许只在有积压时出现，否则「没有那一行」有两读。"""
+    capsys.readouterr()
+    assert cli_run_on(container, ["health"]) == 0
+    assert "未处理告警 0 条" in capsys.readouterr().out

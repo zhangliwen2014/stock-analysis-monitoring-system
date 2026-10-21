@@ -22,6 +22,7 @@ logger = logging.getLogger("sams.storage.alerts")
 
 #: 与 0001 的 `alerts.status` 一致：人对这条告警做了什么，不是发没发出去
 STATUS = ("new", "handled", "dismissed")
+NEW, HANDLED, DISMISSED = STATUS
 
 _ERROR_MAX_CHARS = 400
 
@@ -61,6 +62,12 @@ class Alert:
     triggered_at: datetime
     status: str
     payload: dict
+    #: 「人做了什么」那三列（0001 就有，此前没有读它们的人）。
+    #: 库里没有「谁按的」那一列——`user_id` 是收件人，不是操作者；这三列答的是
+    #: 按成了什么、什么时候按的、留了哪一句
+    handled_at: datetime | None = None
+    handle_note: str | None = None
+    dismiss_reason: str | None = None
     #: 下面几个来自 `payload_json`：它们是要显示的文字，不是可查询的事实，
     #: 所以不占列（占列的话，措辞改版就要动表）
     rule_name: str = ""
@@ -259,24 +266,47 @@ class AlertRepo:
             for row in rows.to_dicts()
         ]
 
-    def set_status(self, alert_id: str, status: str, *, note: str = "") -> None:
-        """人对这条告警的处理。router 永远不调它（§11 的那条分离）。"""
+    def set_status(
+        self, alert_id: str, status: str, *, user_id: str, note: str = ""
+    ) -> Alert:
+        """人对这条告警做了什么。router 永远不调它（§11 的那条分离），所以没有内部调用方。
+
+        `user_id` 必填：归属闸只有恒传才成立。M3-D 的调度器与 M4 的后台都不经过命令层（D81），
+        而一个可选的归属参数会被下一个调用方忘传——忘传的那一刻屏幕上看不出来。
+        `handled` 与 `dismissed` 各写自己那一列：两列问的是两件事（「打算怎么处理」与
+        「为什么不处理」），同一句话写两遍，忽略率就会把按错的也算进去。
+        """
         if status not in STATUS:
             raise ValidationError(f"未知状态 {status!r}：只有 {list(STATUS)}")
-        if self.get(alert_id) is None:
-            raise StorageError(f"告警 {alert_id} 不存在")
+        row = self.get(alert_id)
+        if row is None:
+            raise StorageError(f"告警 {alert_id} 不存在（处理动作必须落在一条真实告警上）")
+        if row.user_id != user_id:
+            raise StorageError(
+                f"告警 {alert_id} 不属于 {user_id}：那条是发给另一个人的，"
+                "你把它标成已处理，那个人就再也看不到它了"
+            )
+        text = (note or "").strip()
+        if status == DISMISSED and not text:
+            raise ValidationError(
+                "dismissed 必须带原因：那一列是「忽略率」唯一的输入，"
+                "空着的那一条统计不出来，也回答不了「这条规则是不是在瞎报」"
+            )
         moment = self.clock.now_utc()
         self.db.execute(
             "UPDATE alerts SET status = ?, handled_at = ?, handle_note = ?, dismiss_reason = ?"
             " WHERE id = ?",
             [
                 status,
-                moment if status != "new" else None,
-                note or None,
-                note if status == "dismissed" else None,
+                moment if status != NEW else None,
+                text if status == HANDLED else None,
+                text if status == DISMISSED else None,
                 alert_id,
             ],
         )
+        moved = self.get(alert_id)
+        assert moved is not None  # 刚写完，同一条连接里一定读得回来
+        return moved
 
     def _to_alert(self, row: Mapping[str, object]) -> Alert:
         raw = row["payload_json"]
@@ -297,6 +327,9 @@ class AlertRepo:
             triggered_at=row["triggered_at"],
             status=str(row["status"] or "new"),
             payload=payload,
+            handled_at=row["handled_at"],
+            handle_note=row["handle_note"],
+            dismiss_reason=row["dismiss_reason"],
             rule_name=str(payload.get("rule_name") or ""),
             account_name=str(payload.get("account_name") or ""),
             symbol_name=str(payload.get("symbol_name") or ""),

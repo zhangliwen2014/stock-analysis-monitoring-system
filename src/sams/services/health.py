@@ -133,6 +133,10 @@ class NotifyData:
     failed: int | None = None
     suppressed: int | None = None
     no_channel: int | None = None
+    #: 未处理（`status='new'`）的条数与**最早**那一条的时刻。跨全部用户数：健康页是运维视角，
+    #: 「响了多少没人看」与「谁该看」是两件事。`None` 沿用上面那几个数的同一条线（D93）
+    unhandled: int | None = None
+    unhandled_oldest: datetime | None = None
     #: 本机那两个通道的可用性：**None 是「没接入探测」**（这一层不认识 monitor），
     #: 空串是「这台机器发得出去」，其余就是那一句原因。三个状态必须分得开——
     #: 把「没接入」显示成「可用」，健康页就在替一个从没试过的通道打包票。
@@ -258,10 +262,10 @@ class HealthService:
         )
 
     def _notify_data(self) -> NotifyData:
-        """通道数 + 四态计数 + 本机那两个通道的可用性 + 工厂不认识的 kind。
+        """通道数 + 四态计数 + 积压 + 本机那两个通道的可用性 + 工厂不认识的 kind。
 
-        这里不写「最近一条告警是什么时候」：那一句的答案要跨 `alerts`/`notify_log` 两张表
-        做 join，而计数已经回答了运维真正会问的那个问题（「有没有在发、发失败了几次」）。
+        积压跨全部用户：这一屏要回答的是「这套系统在响而有没有人看」，不是「你名下有几条」。
+        「最早那一条」排在「条数」后面是因为只有那个数说不清紧急程度——40 条与 40 天是两回事。
         """
         names = set(self.db.table_names())
         if not {"channels", "alerts", "notify_log"} <= names:
@@ -282,6 +286,14 @@ class HealthService:
             for row in self.db.query("SELECT DISTINCT kind FROM channels").to_dicts()
         }
         status = self.local_status() if self.local_status is not None else {}
+        unhandled = int(
+            self.db.scalar("SELECT count(*) FROM alerts WHERE status = 'new'") or 0
+        )
+        oldest = (
+            self.db.scalar("SELECT min(triggered_at) FROM alerts WHERE status = 'new'")
+            if unhandled
+            else None
+        )
         return NotifyData(
             channels=int(self.db.scalar("SELECT count(*) FROM channels") or 0),
             enabled=int(self.db.scalar("SELECT count(*) FROM channels WHERE enabled") or 0),
@@ -289,6 +301,8 @@ class HealthService:
             failed=counts.get(FAILED, 0),
             suppressed=counts.get(SUPPRESSED, 0),
             no_channel=counts.get(NO_CHANNEL, 0),
+            unhandled=unhandled,
+            unhandled_oldest=oldest,
             desktop=status.get("desktop"),
             voice=status.get("voice"),
             unknown_kinds=tuple(sorted(kinds - set(KINDS))),

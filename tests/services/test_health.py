@@ -562,3 +562,75 @@ def test_unknown_kind_is_loud(db, settings):
     report = container.health.report()
     assert report.notify.unknown_kinds == ("telegram",)
     assert report.notify.channels == 1, "它仍然是一条通道，只是这一版发不出去"
+
+
+def make_alerts(container, statuses):
+    """按给定的状态建几条告警。返回建出来的那些，用例只数健康页给的那几个数。"""
+    from datetime import timedelta
+
+    user = container.users.create("trader", PASSWORD)
+    made = []
+    for index, status in enumerate(statuses):
+        alert = container.alerts_store.create(
+            user.id,
+            rule_id="r",
+            rule_name="PR 低",
+            account_id=None,
+            account_name="主账户",
+            market="A",
+            code="601088",
+            symbol_name="中国神华",
+            severity="mid",
+            stage="入池",
+            value_text="PR=0.31",
+            threshold_text="PR≤0.4",
+            action_note="",
+            # 每条往前推一天：那一列「最早的一条」要有新旧可分
+            triggered_at=datetime.now(UTC) - timedelta(days=index),
+        )
+        if status != "new":
+            container.alerts_store.set_status(
+                alert.id, status, user_id=user.id, note="测试"
+            )
+        made.append(container.alerts_store.get(alert.id))
+    return made
+
+
+def test_unhandled_counts_only_the_ones_nobody_has_looked_at(db, settings):
+    """`new` 才是积压：handled/dismissed 已经在人的清单上销掉了，再数一遍就是虚报。"""
+    container = make_container(db, settings)
+    make_alerts(container, ["new", "new", "handled", "dismissed"])
+
+    report = container.health.report()
+    assert report.notify.unhandled == 2
+
+
+def test_an_empty_backlog_is_an_answer_and_not_a_missing_migration(db, settings):
+    """0 与 None 是两句话（D93 的同一条线）：0 是好消息，None 是「该跑迁移」。"""
+    container = make_container(db, settings)
+    assert container.health.report().notify.unhandled == 0
+
+
+def test_the_oldest_unhandled_is_the_one_that_has_been_waiting_longest(db, settings):
+    """积压 40 条与积压 40 天是两个完全不同的运维结论，只靠那个数分不出来。"""
+    container = make_container(db, settings)
+    made = make_alerts(container, ["new", "new"])
+    oldest = min(row.triggered_at for row in made)
+
+    report = container.health.report()
+    assert report.notify.unhandled_oldest == oldest
+
+
+def test_a_dismissed_alert_needs_no_channel_to_leave_the_backlog(db, settings):
+    """这条钉的是那两个数的**接缝**：处理动作不碰通道，也不新增投递。"""
+    container = make_container(db, settings)
+    made = make_alerts(container, ["new"])
+    # 通道是这条用例的**对照**而不是道具：断言里 `channels == 1` 才说得清它没被算进积压
+    container.channels_store.create(made[0].user_id, "desktop", "本机", {})
+    container.alerts_store.set_status(
+        made[0].id, "dismissed", user_id=made[0].user_id, note="不需要通道也能销掉"
+    )
+
+    report = container.health.report()
+    assert report.notify.unhandled == 0 and report.notify.channels == 1
+    assert (report.notify.sent, report.notify.failed) == (0, 0)
