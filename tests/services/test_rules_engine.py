@@ -10,190 +10,26 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from support_rules import (
+    CODE,
+    MARKET,
+    NOW,
+    TODAY,
+    USER,
+    FixedClock,
+    Harness,
+    StubCalendar,
+    snap,
+)
 
 from sams.core.config import MarketCfg
-from sams.core.errors import NotAdjustable, ValidationError
-from sams.core.events import AlertTriggered, EventBus, RuleHit
-from sams.core.notify import AlertMessage
-from sams.services.rules.engine import SESSION_LOOKBACK_DAYS, RuleEngine
-from sams.services.rules.snapshot import Snapshot, Target
-from sams.storage.repos.alerts import AlertRepo
-from sams.storage.repos.fx import FxRepo
-from sams.storage.repos.rules import RuleRepo
+from sams.core.errors import NotAdjustable
+from sams.services.rules.engine import SESSION_LOOKBACK_DAYS
 from sams.storage.repos.theses import INVALIDATED, ThesisRepo
 
-USER = "u-rule"
-MARKET = "A"
-CODE = "601088"
-#: 北京时间 15:30，A 股已收盘：`price_on` 与「今天」是同一天
-NOW = datetime(2026, 10, 20, 7, 30, tzinfo=UTC)
-TODAY = NOW.date()
 #: 同一个 UTC 时刻的另一种读法：北京已经跨到 10-21 凌晨。
 #: 「引擎问日历的是哪一天」只有这种时刻才分得清本地日与 UTC 日。
 LATE_EVENING_UTC = datetime(2026, 10, 20, 20, 0, tzinfo=UTC)
-
-
-class FixedClock:
-    def __init__(self, now: datetime = NOW) -> None:
-        self.now = now
-
-    def now_utc(self) -> datetime:
-        return self.now
-
-    def today(self) -> date:
-        return self.now.date()
-
-
-class StubCalendar:
-    """日历的替身：只有 10-20 开市，其余日子全闭。时段给空元组 ⇒ `time_window` 不拦。"""
-
-    def __init__(self, *, open_days=(TODAY,)) -> None:
-        self.open_days = set(open_days)
-        self.day_calls: list[tuple[str, date]] = []
-
-    def is_trading_day(self, market: str, day: date) -> bool:
-        self.day_calls.append((market, day))
-        return day in self.open_days
-
-    def sessions(self, market: str, day: date) -> tuple:
-        return ()
-
-
-class RecordingSender:
-    def __init__(self) -> None:
-        self.sent: list[AlertMessage] = []
-
-    def dispatch(
-        self,
-        message: AlertMessage,
-        *,
-        user_id: str,
-        channel_ids=(),
-        rule_id=None,
-        account_id=None,
-    ) -> str:
-        self.sent.append(message)
-        return f"alert-{len(self.sent)}"
-
-
-class StubData:
-    """`RuleData` 的替身：引擎只用到 `expand` / `holdings` / `thesis_for` / `read`。"""
-
-    def __init__(self, snapshot: Snapshot, holdings=(), thesis=None) -> None:
-        self.snapshot = snapshot
-        self.held = list(holdings)
-        self.thesis = thesis
-        #: 装上它，`read` 就抛：一条挂了错代码的规则不该把整趟拖崩
-        self.read_raises: Exception | None = None
-
-    def expand(self, rule) -> list[Target]:
-        # 真实 `RuleData.expand` 对「持仓类却没有账户」抛：去重键含 account_id，缺了它
-        # 同一只票在两个账户里的破位会互相吞。替身只复刻这一条形状检查，让引擎的
-        # `Blocked` 那一摞能被钉住（库里已经躺着这种行时，一趟照旧出别的面）。
-        if rule.target_type == "position" and rule.account_id is None:
-            raise ValidationError(
-                f"规则 {rule.name} 是持仓类却没有账户：去重键含 account_id"
-            )
-        return [Target(rule.user_id, MARKET, CODE, rule.account_id, rule.thesis_id)]
-
-    def holdings(self, account_id: str) -> list:
-        return list(self.held)
-
-    def thesis_for(self, target: Target):
-        return self.thesis
-
-    def read(self, target: Target, *, as_of: date, position=None) -> Snapshot:
-        if self.read_raises is not None:
-            raise self.read_raises
-        return self.snapshot
-
-
-def snap(**over) -> Snapshot:
-    base = {
-        "market": MARKET,
-        "code": CODE,
-        "name": "中国神华",
-        "currency": "CNY",
-        "report_currency": "CNY",
-        "account_name": "SIM-1",
-        "price": 9.5,
-        "price_on": TODAY,
-        "price_age_days": 0,
-    }
-    base.update(over)
-    return Snapshot(**base)
-
-
-class Harness:
-    """一台装好替身的引擎：用例只改「库里有什么」与「快照是什么」。"""
-
-    def __init__(self, db, settings) -> None:
-        self.db = db
-        self.settings = settings
-        self.rules = RuleRepo(db, clock=FixedClock())
-        self.alerts = AlertRepo(db, clock=FixedClock())
-        self.fx = FxRepo(db)
-        self.sender = RecordingSender()
-        self.hits: list[RuleHit] = []
-        self.triggered: list[AlertTriggered] = []
-        self.bus = EventBus()
-        self.bus.subscribe(RuleHit, self.hits.append)
-        self.bus.subscribe(AlertTriggered, self.triggered.append)
-        self.calendar = StubCalendar()
-        self.clock = FixedClock()
-        self.snapshot = snap()
-        self.held: list = []
-        self.thesis = None
-        self.data: StubData | None = None
-        self.read_raises: Exception | None = None
-        #: `seed_hit` 默认挂在哪条规则上：用例先 `h.add()` 再 `h.seed_hit()` 就对得上
-        self.added_id = "r-seed"
-
-    def engine(self) -> RuleEngine:
-        data = StubData(self.snapshot, self.held, self.thesis)
-        data.read_raises = self.read_raises
-        self.data = data
-        return RuleEngine(
-            rules=self.rules,
-            alerts=self.alerts,
-            data=data,
-            calendar=self.calendar,
-            fx=self.fx,
-            clock=self.clock,
-            bus=self.bus,
-            sender=self.sender,
-            settings=self.settings,
-        )
-
-    def add(self, **over):
-        kw = {
-            "kind": "stop.fixed",
-            "name": "跌破 10 元",
-            "target_type": "symbol",
-            "target_ref": f"{MARKET}/{CODE}",
-            "params": {"price": 10.0},
-        }
-        kw.update(over)
-        return self.rules.create(USER, **kw)
-
-    def seed_hit(self, *, minutes_ago=0, stage="hit", rule_id=None, account_id=None):
-        """在去重键上种一条**已经推过**的告警：冷却与 `no_open_alert` 的输入。"""
-        return self.alerts.create(
-            USER,
-            rule_id=rule_id or self.added_id,
-            rule_name="跌破 10 元",
-            account_id=account_id,
-            account_name="SIM-1",
-            market=MARKET,
-            code=CODE,
-            symbol_name="中国神华",
-            severity="strong",
-            stage=stage,
-            value_text="9.50 CNY",
-            threshold_text="10.00 CNY",
-            action_note="止损位到了",
-            triggered_at=NOW - timedelta(minutes=minutes_ago),
-        )
 
 
 @pytest.fixture

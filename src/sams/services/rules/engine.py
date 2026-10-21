@@ -20,7 +20,7 @@ from datetime import date, datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
-from sams.core.errors import NotAdjustable, ValidationError
+from sams.core.errors import NotAdjustable, SamsError, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage, AlertSender
 from sams.core.rules import Verdict, escalates, template_for
@@ -289,7 +289,13 @@ class RuleEngine:
             return self._suppressed(rule, snapshot, verdict, cooled)
         if dry_run:
             return self._raised("", rule, snapshot, verdict, now)
-        return self._dispatch(rule, snapshot, verdict, built, now)
+        try:
+            return self._dispatch(rule, snapshot, verdict, built, now)
+        except SamsError as exc:
+            # 端口后面是 `NotifyService.dispatch`：它会抛 `StorageError`（库写不进）与
+            # `ValidationError`（用户不存在），两者都在 `SamsError` 底下。兜住它们意味着
+            # 「这一条这一趟没有结论」（落进 skipped），而不是「这一趟结束了」。
+            return self._skipped(rule, snapshot.market, snapshot.code, f"送不出去：{exc}")
 
     def _verdict(
         self, rule: Rule, target: Target, snapshot: Snapshot, evaluate
@@ -301,7 +307,19 @@ class RuleEngine:
         两次之间规则还能被改，那样算出来的价位与屏幕上那一条不是同一个数（`Ask` 的注释）。
         """
         thesis = self.data.thesis_for(target)
-        outcome = evaluate(Ask(snapshot=snapshot, params=rule.params, thesis=thesis))
+        try:
+            outcome = evaluate(Ask(snapshot=snapshot, params=rule.params, thesis=thesis))
+        except KeyError as exc:
+            # 库里那一行是**上一个版本的模板**写的：模板后来多要一个必填参数，老行就少了
+            # 那个键。`KeyError` 不是 `SamsError`，命令层那句 `except SamsError` 兜不住它——
+            # 折成一句说得出键名的 skipped，屏幕上出现的是一句话而不是一段栈。
+            return self._skipped(
+                rule,
+                snapshot.market,
+                snapshot.code,
+                f"这条规则缺参数 {exc.args[0]!r}：那一行是老模板写的，"
+                "`sams rule edit` 补上它（要哪几个见 `sams rule kinds`）",
+            )
         # 判「命中」看 `hit is not None` 而不是 `verdict.ok`：状态型命中（`stop.thesis_drift`
         # 那类只报状态、不比数值）的 `Verdict.ok` 是 False，用 `.ok` 会让那一类告警永不投出。
         # 那一类告警不读现价、也没有第二个数可比，退化在别处抓不到——钉它的是
