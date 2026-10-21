@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import inspect
 from datetime import date
 
 import pytest
@@ -350,7 +351,36 @@ def test_a_dropped_item_is_named_by_label_with_both_scores() -> None:
     )
     assert got.hit is not None
     assert "市赚率 PR 80 → 40" in got.hit.why
-    assert "roe" not in got.hit.why  # 没掉的那一项不出现在句子里
+    # 没掉的那一项不许出现在句子里——用它的**标签**断，而不是键名：
+    # 实现把未掉项也拼进去时拼的是「净资产收益率」，断 `"roe" not in` 照样过。
+    assert "净资产收益率" not in got.hit.why
+
+
+def test_an_item_that_barely_moved_within_a_tier_is_not_a_drop() -> None:
+    """分项分的刻度顶在 20 的整倍数上：100.0 与 100.0-1e-14 分属 5 档与 4 档。
+
+    只比档位的话，浮点噪声会发出一条「100 → 100（5 档 → 4 档）」的自相矛盾告警。
+    """
+    got = thesis_drift(
+        ask(DRIFT, {"items": (("pr", 100.0 - 1e-14),), "score": 100.0},
+            the=thesis(baseline_items=(("pr", 100.0),), baseline_score=60.0))
+    )
+    assert got.hit is None
+    assert got.why_not == ""
+
+
+def test_a_total_baseline_without_items_is_still_never_having_compared() -> None:
+    """只有 `baseline_score`、分项为空 ⇒ 还是「从没比过」：`set_baseline` 收得下这种论。
+
+    这一枚钉的是守卫别写成「两个都缺才算没基线」——那样这条规则会在该论上永远沉默，
+    而屏幕上读起来是「观点未漂移」。
+    """
+    got = thesis_drift(
+        ask(DRIFT, {"items": (("pr", 40.0),), "score": 40.0},
+            the=thesis(baseline_items=(), baseline_score=60.0))
+    )
+    assert got.hit is None
+    assert "基线" in got.why_not
 
 
 def test_a_drift_sentence_asks_for_a_review_not_a_close() -> None:
@@ -358,6 +388,7 @@ def test_a_drift_sentence_asks_for_a_review_not_a_close() -> None:
         ask(DRIFT, {"items": (("pr", 20.0),)},
             the=thesis(baseline_items=(("pr", 80.0),), baseline_score=60.0))
     )
+    assert got.hit is not None
     assert "复核" in got.hit.why and "不替你平仓" in got.hit.why
 
 
@@ -406,6 +437,32 @@ def test_a_disclosure_date_in_the_future_is_refused_not_reported() -> None:
     assert "未来" in got.why_not
 
 
+def test_a_disclosure_on_the_last_day_of_the_window_is_still_in_it() -> None:
+    """`age == within` 在窗口内：写成 `>=` 的话窗口静默少一天，而全绿的测试读不出这件事。"""
+    got = scheduled_reevaluate(
+        ask({"within_days": 5}, {"disclosed_on": date(2026, 10, 15)})
+    )  # price_on = 2026-10-20 ⇒ 整 5 天
+    assert got.hit is not None
+    assert got.hit.value_text == "5 天前"
+
+
+def test_a_disclosure_one_day_past_the_window_is_silent() -> None:
+    got = scheduled_reevaluate(
+        ask({"within_days": 5}, {"disclosed_on": date(2026, 10, 14)})
+    )
+    assert got.hit is None
+    assert got.why_not == ""
+
+
+def test_both_missing_dates_are_named_rather_than_the_first_one_found() -> None:
+    """两个都缺时只报披露日 ⇒ 用户去修基本面链，而真因是这一趟没有价。"""
+    got = scheduled_reevaluate(
+        ask({"within_days": 5}, {"disclosed_on": None, "price_on": None})
+    )
+    assert got.hit is None
+    assert "披露" in got.why_not and "基准日" in got.why_not
+
+
 def test_no_disclosure_date_names_the_missing_input() -> None:
     got = scheduled_reevaluate(ask({"within_days": 5}, {"disclosed_on": None}))
     assert got.hit is None
@@ -420,7 +477,13 @@ def test_the_table_covers_every_declared_kind() -> None:
     assert set(TABLE) == set(RULE_KINDS)
 
 
-def test_every_table_entry_is_a_one_argument_callable() -> None:
+def test_every_table_entry_takes_exactly_one_argument() -> None:
+    """签名单方面收一个 `ask`：写成两个参数的话这一枚要等到引擎求值才 `TypeError`。
+
+    名字检查（`kind.replace(".", "_")`）钉的是「键与函数对得上」， arity 钉的是「能被
+    `TABLE[kind](ask)` 调起来」——这两件事各自会漏不同的错。
+    """
     for kind, fn in TABLE.items():
-        assert callable(fn), kind
         assert fn.__name__ == kind.replace(".", "_"), kind
+        params = list(inspect.signature(fn).parameters)
+        assert params == ["ask"], f"{kind} 的签名是 {params}，引擎只会按 `fn(ask)` 调它"

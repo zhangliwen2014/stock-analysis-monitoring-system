@@ -358,7 +358,7 @@ def stop_thesis_drift(ask: Ask) -> Outcome:
         unknowns.append("这条论没有记下赔率：崩塌与否判不了")
     elif snapshot.odds is None:
         unknowns.append("论上记着赔率，这一趟没有合成出来（崩塌与否判不了）")
-    elif snapshot.odds < thesis.reward_risk:
+    elif snapshot.odds < thesis.reward_risk - 1e-9:
         findings.append(
             f"赔率从论上记着的 {thesis.reward_risk:g} 倍掉到 {snapshot.odds:g} 倍："
             "同一个止损位下，这笔仓的期望已经支撑不住"
@@ -545,9 +545,9 @@ def thesis_drift(ask: Ask) -> Outcome:
             "没有基线在手就没有「漂移」可判"
         )
     baseline = dict(thesis.baseline_items)
-    if not baseline and thesis.baseline_score is None:
+    if not baseline:
         return Outcome(
-            why_not="这条论还没有基线（周复检第一次跑时建立，T-16）："
+            why_not="这条论还没有分项基线（周复检第一次跑时建立，T-16）："
             "从没比过不等于没漂移，在这里报「观点未漂移」是一句没人验证过的谎（D96）"
         )
     snapshot = ask.snapshot
@@ -563,7 +563,10 @@ def thesis_drift(ask: Ask) -> Outcome:
         if was is None or new is None:
             unseen.append(label)
             continue
-        if new < was:
+        # 只比档位（整数）不够：分项分的刻度顶在 20 的整倍数上，100.0 与 100.0-1e-14
+        # 分属 5 档与 4 档，而 `%g` 把两个数都印成 `100` —— 那是一句「100 → 100 掉了档」
+        # 的自相矛盾的告警。数值上也留本仓库那 ±1e-9。
+        if new < was and now[key] < base - 1e-9:
             dropped.append(f"{label} {base:g} → {now[key]:g}（{was} 档 → {new} 档）")
     if dropped:
         return Outcome(
@@ -602,13 +605,17 @@ def scheduled_reevaluate(ask: Ask) -> Outcome:
     「已处理」或新告警来清。
     """
     snapshot = ask.snapshot
+    gaps: list[str] = []
     if snapshot.disclosed_on is None:
-        return Outcome(
-            why_not="没有财报披露日（这一路基本面没读到 published_on）："
-            "事件驱动的那一端没有事件"
-        )
+        gaps.append("没有财报披露日（这一路基本面没读到 published_on）")
     if snapshot.price_on is None:
-        return Outcome(why_not="这一趟没有基准日：比较披露日需要「今天是哪天」")
+        gaps.append("这一趟没有基准日：比较披露日需要「今天是哪天」")
+    if gaps:
+        # 两个都缺时只报一句会让人去修基本面链，而真因是没价（同族 `stop_thesis_drift`
+        # 也是「有几处判不了就说几处」）。
+        return Outcome(
+            why_not="；".join(gaps) + "：事件驱动的那一端没有事件"
+        )
     within = int(ask.params["within_days"])
     age = (snapshot.price_on - snapshot.disclosed_on).days
     if age < 0:
