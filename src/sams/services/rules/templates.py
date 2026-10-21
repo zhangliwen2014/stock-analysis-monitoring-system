@@ -13,8 +13,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from sams.core.rules import HIT, PRE, URGENT, Verdict
+from sams.core.rules import HIT, PRE, URGENT, Verdict, tier_of
 from sams.services.rules.snapshot import Snapshot
+from sams.storage.repos.theses import HIT_STOP, INVALIDATED
 
 #: 「快到了」那一档有多近：现价离止损线不到 3% 就报 `pre`（§10.2 点名的那个刻度）。
 #: 写成一处而不是每个模板的参数：九种止损各配一个 `pre_band`，用户要回答一个他自己
@@ -265,6 +266,123 @@ def stop_breakeven(ask: Ask) -> Outcome:
     )
 
 
+def stop_time(ask: Ask) -> Outcome:
+    """`stop.time`：持仓 N 天没到预期涨幅 ⇒ 提醒复核。
+
+    天数是**自然日**（`holding_days` = as_of − 建仓日）而不是交易日：判据来自持仓的
+    `open_ts`，换成交易日要引 `CalendarService`，而 T-6 刻意没让取数依赖日历。
+    保守方向也在这里：自然日永远不少于交易日，所以这一条只会**早**响不会晚响。
+
+    它是 §10.2 说的「阴跌不触发价格线时的兜底」——价格类模板全沉默时唯一会说话的一条。
+    """
+    snapshot = ask.snapshot
+    if snapshot.price is None:
+        return Outcome(why_not=_no_price(snapshot))
+    if snapshot.avg_cost is None or snapshot.avg_cost <= 0:
+        return Outcome(why_not="时间止损要比「现在的涨幅」，而这一笔没有成本可读")
+    if snapshot.holding_days is None:
+        return Outcome(
+            why_not="没有建仓时间：`holding_days` 来自持仓的 open_ts，"
+            "缺了它「拿了多久」无从判起（当 0 会让这条规则永远不响）"
+        )
+    days = int(ask.params["days"])
+    if snapshot.holding_days < days:
+        return Outcome()
+    ceiling = float(ask.params["max_gain_pct"])
+    gain = snapshot.price / snapshot.avg_cost - 1.0
+    if gain >= ceiling:
+        return Outcome()
+    opened = f"（{snapshot.opened_on} 建仓）" if snapshot.opened_on else ""
+    return Outcome(
+        Verdict(
+            stage=HIT,
+            value=gain,
+            threshold=ceiling,
+            value_text=f"{gain:.1%}",
+            threshold_text=f"{ceiling:.1%}",
+            why=f"持有 {snapshot.holding_days} 天{opened}（自然日口径），涨幅 {gain:.1%} "
+            f"没到 {ceiling:.1%}：价格线一条都没破，这一条是兜底 ⇒ 请复核理由还在不在"
+            "（系统只提示，不替你平仓，§9.3）",
+        )
+    )
+
+
+#: 「理由已经没了」的两个状态。名字从 `storage` 引，不在这里抄一遍字符串：
+#: 词表在 0001 与 `theses.py` 里各有一份的时候，漂移就是这么来的。
+_DEAD_STATUSES = (INVALIDATED, HIT_STOP)
+
+
+def stop_thesis_drift(ask: Ask) -> Outcome:
+    """`stop.thesis_drift`：打分掉档 / 赔率崩塌 / 论已被判死——三条里任意一条成立即报。
+
+    这一条与 `thesis.drift`（T-11，周复检掉档）读同一份基线，但**级别不同、时机不同**：
+    那一头的意义是「每周有一次人来看一眼」，所以只有掉档；这一头是止损位的替代判断，
+    所以论一旦被判死（状态）也立刻算数——价格还没跌，而记账的理由已经没了。
+
+    三个数都读不到时不是「没触发」而是 `why_not` 有话：`Outcome` 的两句话在这里最值钱。
+    """
+    thesis = ask.thesis
+    if thesis is None:
+        return Outcome(
+            why_not="这条规则要求挂一条论（`needs_thesis`），而这一趟没读到它："
+            "没有「理由」在手，就不存在「理由失效」——这是取数出了问题，不是判过没事"
+        )
+    snapshot = ask.snapshot
+    findings: list[str] = []
+    unknowns: list[str] = []
+    value: float | None = None
+    threshold: float | None = None
+    value_text = "—"
+    threshold_text = "—"
+
+    if thesis.status in _DEAD_STATUSES:
+        findings.append(
+            f"这条论已被记为 {thesis.status}：价格没跌，但账上写着的理由已经没了"
+        )
+
+    base_tier = tier_of(thesis.baseline_score)
+    new_tier = tier_of(snapshot.score)
+    if base_tier is not None:
+        if new_tier is None:
+            unknowns.append("有建仓时的基线分，这一趟却没合成出新分数（掉档判不了）")
+        elif new_tier < base_tier:
+            findings.append(
+                f"打分从 {thesis.baseline_score:g} 掉到 {snapshot.score:g}"
+                f"（{base_tier} 档 → {new_tier} 档）"
+            )
+            value, threshold = snapshot.score, thesis.baseline_score
+            value_text = f"{snapshot.score:g} 分"
+            threshold_text = f"{thesis.baseline_score:g} 分"
+
+    if thesis.reward_risk and snapshot.odds is not None:
+        if snapshot.odds < thesis.reward_risk:
+            findings.append(
+                f"赔率从建仓时的 {thesis.reward_risk:g} 倍掉到 {snapshot.odds:g} 倍："
+                "同一个止损位下，这笔仓的期望已经支撑不住"
+            )
+            if value is None:
+                value, threshold = snapshot.odds, thesis.reward_risk
+                value_text = f"{snapshot.odds:g} 倍"
+                threshold_text = f"{thesis.reward_risk:g} 倍"
+    elif thesis.reward_risk and not unknowns:
+        unknowns.append("建仓时记着赔率，这一趟没有合成出来（崩塌与否判不了）")
+
+    if findings:
+        return Outcome(
+            Verdict(
+                stage=HIT,
+                value=value,
+                threshold=threshold,
+                value_text=value_text,
+                threshold_text=threshold_text,
+                why="；".join(findings) + " ⇒ 请复核这条论（系统只提示，不替你平仓，§9.3）",
+            )
+        )
+    if unknowns:
+        return Outcome(why_not="；".join(unknowns))
+    return Outcome()
+
+
 TABLE: dict[str, Callable[[Ask], Outcome]] = {
     "stop.fixed": stop_fixed,
     "stop.pct": stop_pct,
@@ -272,4 +390,6 @@ TABLE: dict[str, Callable[[Ask], Outcome]] = {
     "stop.atr": stop_atr,
     "stop.ma": stop_ma,
     "stop.breakeven": stop_breakeven,
+    "stop.time": stop_time,
+    "stop.thesis_drift": stop_thesis_drift,
 }

@@ -23,6 +23,7 @@ from sams.services.rules.templates import (
     stop_ma,
     stop_pct,
     stop_stage,
+    stop_time,
     stop_trailing,
 )
 
@@ -231,3 +232,38 @@ def test_breakeven_is_quiet_when_the_high_never_exceeded_cost() -> None:
     """持仓期最高价还低于成本：那 15% 从没到过，静默是正确状态，不是缺输入。"""
     got = stop_breakeven(ask({"trigger_pct": 0.15}, holding_high=11.0))
     assert got == Outcome()
+
+
+def test_time_stop_fires_after_n_days_without_the_expected_gain() -> None:
+    got = stop_time(ask({"days": 30, "max_gain_pct": 0.0}, holding_days=45))
+    assert got.hit is not None
+    assert got.hit.stage == HIT
+    assert got.hit.threshold_text == "0.0%"
+    assert "45" in got.hit.why
+
+
+def test_time_stop_stays_quiet_while_the_position_is_younger_than_the_window() -> None:
+    got = stop_time(ask({"days": 30, "max_gain_pct": 0.0}, holding_days=12))
+    assert got.hit is None
+    assert got.why_not == ""  # 没到期不是「判不了」，是这件事还没到
+
+
+def test_time_stop_does_not_fire_when_the_gain_was_reached() -> None:
+    got = stop_time(
+        ask({"days": 30, "max_gain_pct": 0.0}, holding_days=45, price=12.5)
+    )  # 成本 12 ⇒ +4.2%，已达预期
+    assert got.hit is None
+
+
+def test_time_stop_names_a_missing_open_date_instead_of_counting_zero_days() -> None:
+    """`holding_days=None` 时不许当 0：那条规则会永远不响，而屏幕上写着「启用」。"""
+    got = stop_time(ask({"days": 30, "max_gain_pct": 0.0}, holding_days=None))
+    assert got.hit is None
+    assert "建仓" in got.why_not
+
+
+def test_time_stop_asks_for_a_review_and_not_for_a_sell() -> None:
+    """§9.3：系统只提示，不替用户决定平仓。这一条的文案就是它的实现。"""
+    got = stop_time(ask({"days": 30, "max_gain_pct": 0.0}, holding_days=45))
+    assert "复核" in got.hit.why
+    assert "不替你平仓" in got.hit.why
