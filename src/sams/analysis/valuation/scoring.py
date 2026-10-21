@@ -146,6 +146,12 @@ def _item(key: str, value: float | None, evidence: str, reason: str = "") -> Ite
     return Item(key, _ITEM_LABELS[key], value, evidence, reason)
 
 
+def item_label(key: str) -> str:
+    """分项键 → 给人读的名字。认不出的键原样返回：那说明加了一项却没登记名字，
+    屏幕上宁可看到 `main_inflow` 也不要看到空白或者一个猜出来的中文词。"""
+    return _ITEM_LABELS.get(key, key)
+
+
 def _refused(key: str, evidence: str, missing: str) -> Item:
     return _item(key, None, evidence, f"{missing}：这一项没有数据，不给分也不补一个「中性」的 50")
 

@@ -13,9 +13,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from sams.analysis.valuation.scoring import item_label
 from sams.core.rules import HIT, PRE, URGENT, Verdict, tier_of
 from sams.services.rules.snapshot import Snapshot
-from sams.storage.repos.theses import HIT_STOP, INVALIDATED
+from sams.storage.repos.theses import HIT_STOP, INVALIDATED, Thesis
 
 #: 「快到了」那一档有多近：现价离止损线不到 3% 就报 `pre`（§10.2 点名的那个刻度）。
 #: 写成一处而不是每个模板的参数：九种止损各配一个 `pre_band`，用户要回答一个他自己
@@ -31,7 +32,7 @@ class Ask:
     params: Mapping[str, object]
     #: 这条规则挂着的那条论（若有）。模板读它的价位与状态时**只**从这里读，不自己去查库：
     #: `Snapshot` 已经查过一次，两次之间规则还能被改
-    thesis: object | None = None
+    thesis: Thesis | None = None
 
 
 @dataclass(frozen=True)
@@ -489,6 +490,137 @@ def price_cross_above(ask: Ask) -> Outcome:
     return _cross(ask, upward=True)
 
 
+def thesis_odds_below(ask: Ask) -> Outcome:
+    """`thesis.odds_below`：合成出来的赔率跌破阈值（§9.2 派生默认 1.5 倍）。
+
+    阈值来自参数而不是 `thesis.reward_risk`：后者是**建仓时**的赔率（那是历史事实），
+    这一条要判的是「现在还算不算得过来」，两者相减的部分归 `stop.thesis_drift`。
+    """
+    snapshot = ask.snapshot
+    if snapshot.odds is None:
+        return Outcome(
+            why_not="这一趟没合成出赔率（止损位或目标价缺一个就算不出）："
+            "把它当 0 会让所有赔率规则在数据缺的那天全体触发"
+        )
+    threshold = float(ask.params["threshold"])
+    # 阈值处带 ±1e-9 容差：赔率是除出来的，「真值恰好等于阈值」会读成 1.4999999999…
+    if snapshot.odds >= threshold - 1e-9:
+        return Outcome()
+    return Outcome(
+        Verdict(
+            stage=HIT,
+            value=snapshot.odds,
+            threshold=threshold,
+            value_text=f"{snapshot.odds:g} 倍",
+            threshold_text=f"{threshold:g} 倍",
+            why=f"现价口径下赔率 {snapshot.odds:g} 倍，低于阈值 {threshold:g} 倍："
+            "往上到目标价的空间已经换不起往下到止损位的空间了",
+        )
+    )
+
+
+def thesis_drift(ask: Ask) -> Outcome:
+    """`thesis.drift`：§9.3 周复检那一半的判据——**分项**掉过一档就算漂移。
+
+    读的是 `baseline_items`（T-4 那三列之一）而不是总分：spec 的原话是「分项打分下滑
+    超过一档」。总分只用来进 `Verdict.value`（`--json` 那边要一个数），因为总分掉一档
+    可能是一个大权重项掉了 3 分，而分项那句话说的是「哪一项变了」。
+
+    与 `stop.thesis_drift` 的分工写在那一头的 docstring 里：同一份基线，两个时机两个级别。
+    """
+    thesis = ask.thesis
+    if thesis is None:
+        return Outcome(
+            why_not="这一条要比的是这条论的基线，而这一趟没读到论本身："
+            "没有基线在手就没有「漂移」可判"
+        )
+    baseline = dict(thesis.baseline_items)
+    if not baseline and thesis.baseline_score is None:
+        return Outcome(
+            why_not="这条论还没有基线（周复检第一次跑时建立，T-16）："
+            "从没比过不等于没漂移，在这里报「观点未漂移」是一句没人验证过的谎（D96）"
+        )
+    snapshot = ask.snapshot
+    now = dict(snapshot.items)
+    dropped: list[str] = []
+    unseen: list[str] = []
+    for key, base in sorted(baseline.items()):
+        label = item_label(key)
+        if key not in now:
+            unseen.append(label)
+            continue
+        was, new = tier_of(base), tier_of(now[key])
+        if was is None or new is None:
+            unseen.append(label)
+            continue
+        if new < was:
+            dropped.append(f"{label} {base:g} → {now[key]:g}（{was} 档 → {new} 档）")
+    if dropped:
+        return Outcome(
+            Verdict(
+                stage=HIT,
+                value=snapshot.score,
+                threshold=thesis.baseline_score,
+                value_text=(
+                    f"{snapshot.score:g} 分" if snapshot.score is not None else "—"
+                ),
+                threshold_text=(
+                    f"{thesis.baseline_score:g} 分"
+                    if thesis.baseline_score is not None
+                    else "—"
+                ),
+                why="；".join(dropped)
+                + " ⇒ 观点漂移，请复核（系统只提示，不替你平仓，§9.3）",
+            )
+        )
+    if unseen:
+        return Outcome(
+            why_not="这些分项这一趟没合成出来，比不了：" + "、".join(unseen)
+        )
+    return Outcome()
+
+
+def scheduled_reevaluate(ask: Ask) -> Outcome:
+    """`scheduled.reevaluate`：最近 `within_days` 天内出了新财报 ⇒ 提醒复核这条论。
+
+    「这一趟是哪一天」用 `Snapshot.price_on`：引擎按 `as_of` 取数，而那一天最后一个过闸
+    读数的日子就是它——再引一个日期字段会让两个「天」有机会不一致。
+
+    窗口内每个交易日都会各判中一次，这不是漏：§10.1 的 `cooldown_min` 管的是刷屏，
+    不是「提醒到用户看过为止」。T-15 派生这一条时默认带 `no_open_alert`（T-12 的过滤器：
+    同一只票已有未处理告警就不重复推），于是这一段窗口实际只响第一次，之后由用户的
+    「已处理」或新告警来清。
+    """
+    snapshot = ask.snapshot
+    if snapshot.disclosed_on is None:
+        return Outcome(
+            why_not="没有财报披露日（这一路基本面没读到 published_on）："
+            "事件驱动的那一端没有事件"
+        )
+    if snapshot.price_on is None:
+        return Outcome(why_not="这一趟没有基准日：比较披露日需要「今天是哪天」")
+    within = int(ask.params["within_days"])
+    age = (snapshot.price_on - snapshot.disclosed_on).days
+    if age < 0:
+        return Outcome(
+            why_not=f"披露日 {snapshot.disclosed_on} 晚于这一趟的基准日 "
+            f"{snapshot.price_on}：宁可不报，也不报一条来自未来的提醒"
+        )
+    if age > within:
+        return Outcome()
+    return Outcome(
+        Verdict(
+            stage=HIT,
+            value=float(age),
+            threshold=float(within),
+            value_text=f"{age} 天前",
+            threshold_text=f"{within} 天窗口",
+            why=f"{snapshot.disclosed_on} 披露了新财报（{age} 天前，在 {within} 天窗口内）"
+            " ⇒ 该用新数据复核这条论：ROE、增速、PR 的输入都换了",
+        )
+    )
+
+
 TABLE: dict[str, Callable[[Ask], Outcome]] = {
     "stop.fixed": stop_fixed,
     "stop.pct": stop_pct,
@@ -501,4 +633,7 @@ TABLE: dict[str, Callable[[Ask], Outcome]] = {
     "tp.tiered": tp_tiered,
     "price.cross_below": price_cross_below,
     "price.cross_above": price_cross_above,
+    "thesis.odds_below": thesis_odds_below,
+    "thesis.drift": thesis_drift,
+    "scheduled.reevaluate": scheduled_reevaluate,
 }

@@ -12,13 +12,18 @@ from datetime import date
 
 import pytest
 
-from sams.core.rules import HIT, PRE
+from sams.analysis.valuation.scoring import item_label
+from sams.core.rules import HIT, PRE, RULE_KINDS
 from sams.services.rules.snapshot import Snapshot
 from sams.services.rules.templates import (
+    TABLE,
     Ask,
     price_cross_above,
     price_cross_below,
+    scheduled_reevaluate,
     stop_thesis_drift,
+    thesis_drift,
+    thesis_odds_below,
     tp_tiered,
 )
 from sams.storage.repos.theses import HIT_STOP, INVALIDATED, TRACKING, Thesis
@@ -268,3 +273,128 @@ def test_cross_above_is_the_mirror_image() -> None:
 def test_cross_above_stays_quiet_when_we_were_already_above() -> None:
     got = price_cross_above(ask({"price": 10.5}, {"prev_close": 10.9, "price": 11.0}))
     assert got.hit is None
+
+
+def test_item_label_names_the_known_items_and_falls_back_to_the_key() -> None:
+    """屏幕上要写「市赚率 PR」而不是 `pr`：键是身份，标签是给人读的词。
+
+    这个函数是 T-11 唯一碰 `analysis` 的地方，而它存在的原因就是「不许在 `templates.py`
+    里再抄一份 `_ITEM_LABELS`」——两份名单必然有一天不一样。
+    """
+    assert item_label("pr") == "市赚率 PR"
+    assert item_label("unknown_key") == "unknown_key"
+
+
+def test_odds_below_reports_with_the_multiplier_unit() -> None:
+    got = thesis_odds_below(ask({"threshold": 1.5}, {"odds": 1.1}))
+    assert got.hit is not None
+    assert got.hit.stage == HIT
+    assert got.hit.threshold_text == "1.5 倍"
+    assert got.hit.value_text == "1.1 倍"
+
+
+def test_odds_at_the_threshold_is_not_below_it() -> None:
+    got = thesis_odds_below(ask({"threshold": 1.5}, {"odds": 1.5}))
+    assert got.hit is None
+    assert got.why_not == ""
+
+
+def test_odds_a_hair_under_the_threshold_is_still_not_below_it() -> None:
+    """±1e-9 容差在这里同样成立：赔率是 (目标 − 现价) / (现价 − 止损) 除出来的，
+    「真值恰好 1.5」的那一笔读回来可能是 1.4999999999999996——阈值处差一个浮点
+    噪声不该触发，而真跌破（下面 1e-6 那半枚）仍要触发。"""
+    quiet = thesis_odds_below(ask({"threshold": 1.5}, {"odds": 1.5 - 1e-12}))
+    assert quiet.hit is None
+    assert quiet.why_not == ""
+    lit = thesis_odds_below(ask({"threshold": 1.5}, {"odds": 1.5 - 1e-6}))
+    assert lit.hit is not None
+
+
+def test_a_missing_odds_is_never_read_as_zero() -> None:
+    """赔率算不出来时不许当 0：0 < 1.5 ⇒ 数据一缺，所有 odds 规则全体触发。"""
+    got = thesis_odds_below(ask({"threshold": 1.5}, {"odds": None}))
+    assert got.hit is None
+    assert "赔率" in got.why_not
+
+
+def test_a_dropped_item_is_named_by_label_with_both_scores() -> None:
+    got = thesis_drift(
+        ask(DRIFT, {"items": (("pr", 40.0), ("roe", 80.0))},
+            the=thesis(baseline_items=(("pr", 80.0), ("roe", 80.0)), baseline_score=60.0))
+    )
+    assert got.hit is not None
+    assert "市赚率 PR 80 → 40" in got.hit.why
+    assert "roe" not in got.hit.why  # 没掉的那一项不出现在句子里
+
+
+def test_a_drift_sentence_asks_for_a_review_not_a_close() -> None:
+    got = thesis_drift(
+        ask(DRIFT, {"items": (("pr", 20.0),)},
+            the=thesis(baseline_items=(("pr", 80.0),), baseline_score=60.0))
+    )
+    assert "复核" in got.hit.why and "不替你平仓" in got.hit.why
+
+
+def test_no_baseline_is_named_as_never_having_compared() -> None:
+    """D96：从没比过 ≠ 没漂移。这一枚断言的就是那句谎不许被说出来。"""
+    got = thesis_drift(
+        ask(DRIFT, {"items": (("pr", 40.0),), "score": 40.0},
+            the=thesis(baseline_items=(), baseline_score=None))
+    )
+    assert got.hit is None
+    assert "基线" in got.why_not
+
+
+def test_an_item_that_was_not_composed_this_time_is_a_gap_not_a_pass() -> None:
+    got = thesis_drift(
+        ask(DRIFT, {"items": (("roe", 80.0),)},
+            the=thesis(baseline_items=(("pr", 80.0), ("roe", 80.0)), baseline_score=60.0))
+    )
+    assert got.hit is None
+    assert "市赚率 PR" in got.why_not
+
+
+def test_a_fresh_disclosure_is_a_reevaluate_reminder() -> None:
+    got = scheduled_reevaluate(
+        ask({"within_days": 5}, {"disclosed_on": date(2026, 10, 18)})
+    )  # price_on = 2026-10-20 ⇒ 2 天前
+    assert got.hit is not None
+    assert got.hit.stage == HIT
+    assert "复核" in got.hit.why
+
+
+def test_an_old_disclosure_is_silent() -> None:
+    got = scheduled_reevaluate(
+        ask({"within_days": 5}, {"disclosed_on": date(2026, 8, 1)})
+    )
+    assert got.hit is None
+    assert got.why_not == ""
+
+
+def test_a_disclosure_date_in_the_future_is_refused_not_reported() -> None:
+    """披露日晚于这一趟的基准日 ⇒ 那是脏数据，报出来是一条来自未来的提醒。"""
+    got = scheduled_reevaluate(
+        ask({"within_days": 5}, {"disclosed_on": date(2026, 11, 1)})
+    )
+    assert got.hit is None
+    assert "未来" in got.why_not
+
+
+def test_no_disclosure_date_names_the_missing_input() -> None:
+    got = scheduled_reevaluate(ask({"within_days": 5}, {"disclosed_on": None}))
+    assert got.hit is None
+    assert "披露" in got.why_not
+
+
+def test_the_table_covers_every_declared_kind() -> None:
+    """少一个 kind 就是那条规则永远不会被求值：`RuleRepo` 收得下它，引擎只会沉默。
+
+    这一枚是 T-7 许下的那个承诺的兑现（「`TABLE` 在 T-8 ~ T-11 里逐段补全」）。
+    """
+    assert set(TABLE) == set(RULE_KINDS)
+
+
+def test_every_table_entry_is_a_one_argument_callable() -> None:
+    for kind, fn in TABLE.items():
+        assert callable(fn), kind
+        assert fn.__name__ == kind.replace(".", "_"), kind
