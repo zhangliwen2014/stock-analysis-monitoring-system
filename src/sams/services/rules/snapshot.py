@@ -277,6 +277,12 @@ class RuleData:
                     if item.value is not None
                 )
             ),
+            # 除权那四列（§10.2）：因子表与它的下界出自 `adjusted_series` 那一条闸门，
+            # 这里只转递，不自己查 `corp_actions` 拼一份——拼出来的那份没有那次校验
+            factors=daily.series.factors,
+            bars_from=daily.anchored_on,
+            stop_on=_stop_on(thesis, valuation),
+            target_on=_target_on(thesis, valuation),
             disclosed_on=valuation.fundamental.published_on,
             margin_enabled=bool(account is not None and account.margin_enabled),
             missing=tuple(missing),
@@ -370,11 +376,39 @@ def _stop_line(thesis: Thesis | None, valuation) -> float | None:
     return valuation.plan.stop.low if valuation.plan.stop.ok else None
 
 
+def _stop_on(thesis: Thesis | None, valuation) -> date | None:
+    """`stop_line` 那一列属于哪一天的读数——与 `_stop_line` 严格同一条优先级。
+
+    两个分支各有各的理由：
+
+    - 论上那一列的日期在 0013（`levels_on`）。手填就是 None，`anchor.py` 据此**注明**而
+      不拒绝——那一列只用于显示。
+    - 本次合成的那条线是**今天**读的数，已经在现价坐标系里。给它读数日而不是 None，
+      `steps_after` 因此算出一张空表、一步都不搬；写成 None 反而会让它带上「可能偏高」
+      那句假话。
+    """
+    if thesis is not None and thesis.stop_price is not None:
+        return thesis.levels_on
+    return valuation.price_on if valuation.plan.stop.ok else None
+
+
 def _target_price(thesis: Thesis | None, valuation) -> float | None:
     """目标价与止损线同一条优先级：论上那一列是用户确认过的数，没有才退回本次合成。"""
     if thesis is not None and thesis.target_price is not None:
         return thesis.target_price
     return valuation.plan.target.low if valuation.plan.target.ok else None
+
+
+def _target_on(thesis: Thesis | None, valuation) -> date | None:
+    """`target_price` 那一列属于哪天——与 `_target_price` 严格同一条优先级。
+
+    它必须紧跟在上面那个函数后面，与 `_stop_on` 同一条纪律：改优先级的人一眼要看见
+    伴生那句。写歪的方向是固定的那一个——把今天读来的数当成手填的，屏幕上就多一句
+    假的「可能偏高」。`tp.tiered` 拿这一列当刻度终点，所以它也要搬（§10.2）。
+    """
+    if thesis is not None and thesis.target_price is not None:
+        return thesis.levels_on
+    return valuation.price_on if valuation.plan.target.ok else None
 
 
 def _date_of(moment) -> date | None:

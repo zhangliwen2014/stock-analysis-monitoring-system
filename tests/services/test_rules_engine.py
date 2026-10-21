@@ -22,6 +22,7 @@ from support_rules import (
     snap,
 )
 
+from sams.analysis.adjust import DayFactor
 from sams.core.config import MarketCfg
 from sams.core.errors import NotAdjustable
 from sams.services.rules.engine import SESSION_LOOKBACK_DAYS
@@ -353,3 +354,78 @@ def test_as_of_moves_the_reading_day_without_moving_the_clock(h) -> None:
     report = h.engine().check(USER, as_of=date(2026, 10, 16))
     assert report.as_of == date(2026, 10, 16)
     assert len(report.raised) == 1
+
+
+# --- 除权换算（§10.2 在引擎这一头的四个形状）----------------------------------------------
+
+#: 10 派 1、前收 10.00 ⇒ 因子 10/9，写在它之前的「10 元」今天站在 9.00。
+#: 数与 `test_rules_anchor.py` 那一枚同一个来源：券商在除权日调整成本价是同一个动作。
+DIVIDEND = DayFactor(
+    ex_date=date(2024, 10, 26), prev_close=10.0, ex_ref=9.0, factor=10.0 / 9.0, cash=1.0
+)
+#: `bars_from` 比 `params_on` 早，中间那段才是完整的：搬得起
+MOVED = {"factors": (DIVIDEND,), "bars_from": date(2024, 1, 1)}
+STAMPED = date(2024, 3, 1)
+
+
+def test_the_line_is_moved_before_it_is_judged(h) -> None:
+    """除权那天不许误报跌破止损：规则开着、现价低于人填的那条线，就是不响。
+
+    搬之前 10.00 > 9.50 ⇒ 响；搬之后 9.00 < 9.50 ⇒ 安静。这一枚与下一枚合起来是 §10.2
+    那句话的两个方向——少搬会误报，搬过头会漏报。
+    """
+    h.snapshot = snap(**MOVED)
+    h.add(params_on=STAMPED)
+    report = h.engine().check(USER)
+
+    assert report.raised == () and report.quiet == 1
+    assert h.sender.sent == []
+
+
+def test_the_same_rule_still_fires_when_the_calendar_is_empty(h) -> None:
+    """同一份参数、同一条线，库里那段没有除权 ⇒ 照旧响，阈值还是写着的那一个。
+
+    这一枚是上一枚的对照组。少了它，「不响」可能来自任何一个别的原因（现价读不到、
+    过滤拦了、冷却挡了），而 §10.2 要钉的是「除权这一件事造成的差别」。
+    """
+    h.add(params_on=STAMPED)
+    report = h.engine().check(USER)
+
+    assert len(report.raised) == 1
+    assert h.sender.sent[0].threshold_text == "10.00 CNY"
+
+
+def test_a_line_without_a_date_stamp_is_skipped_and_names_the_command(h) -> None:
+    """有除权、没有锚 ⇒ 整条不判，落进 skipped，并且说得出下一步跑什么。
+
+    用例走的是仓库（`h.add` → `RuleRepo.create`），不是维护面，所以那一行没有日期戳——
+    这正是 0017 之前建的那些行的形状。拿原值判是误报，搬又怕搬少了。
+    """
+    h.snapshot = snap(**MOVED)
+    h.add()
+    report = h.engine().check(USER)
+
+    assert report.raised == () and len(report.skipped) == 1
+    assert report.judged == 1
+    assert "rule edit" in report.skipped[0].reason
+
+
+def test_a_move_shows_up_in_the_body_and_the_event(h) -> None:
+    """搬过的数自带出处：正文那一行说清跨了哪天，事件那份 payload 给的是数不是句子。
+
+    线 11.00 搬到 9.90，现价 9.50 ⇒ 仍然响。这一枚同时钉住「搬过头也不漏报」的反面：
+    9.90 比 11.00 低，而 9.50 还在它下面，报出来的阈值必须是搬完的那一个。
+    """
+    h.snapshot = snap(**MOVED)
+    h.add(params={"price": 11.0}, params_on=STAMPED)
+    report = h.engine().check(USER)
+
+    assert len(report.raised) == 1
+    message = h.sender.sent[0]
+    assert message.threshold_text == "9.90 CNY"
+    assert "换算" in message.body and "2024-10-26" in message.body
+    moved = h.hits[0].payload["moved"]
+    assert moved[0]["column"] == "params.price"
+    assert moved[0]["after"] == pytest.approx(9.9)
+    assert moved[0]["on"] == "2024-03-01"
+    assert moved[0]["ex_dates"] == ["2024-10-26"]

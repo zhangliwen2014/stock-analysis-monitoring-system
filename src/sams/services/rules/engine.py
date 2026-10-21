@@ -24,6 +24,7 @@ from sams.core.errors import NotAdjustable, SamsError, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage, AlertSender
 from sams.core.rules import Verdict, escalates, template_for
+from sams.services.rules.anchor import move_prices
 from sams.services.rules.filters import Gate, OpenAlert, run_filters
 from sams.services.rules.notes import Fx, constraint_lines, holding_pnl
 from sams.services.rules.snapshot import RuleData, Snapshot, Target
@@ -137,6 +138,25 @@ def action_for(kind: str, name: str) -> str:
 def _no_impl(kind: str) -> str:
     """这一层没有这个 kind 的那句话（`Skipped.reason` 的一个出处）。"""
     return f"这一层没有 {kind} 的求值实现：名单的唯一出处是 core/rules.py"
+
+
+def _moved_payload(snapshot: Snapshot) -> list[dict[str, object]]:
+    """`RuleHit.payload` 里那一串搬运：给数，不给格式化后的句子。
+
+    日期一律成串——`payload` 要进 JSON，`date` 对象在那一列会变成 `null`，比没有更糟。
+    文本在 `Moved.line` 那里已经有了：命令行与手机上读那一行，M4 的统计读这几个数，
+    两头都不许去 parse 对方。
+    """
+    return [
+        {
+            "column": move.column,
+            "before": move.before,
+            "after": move.after,
+            "on": str(move.on),
+            "ex_dates": [str(day) for day in move.ex_dates],
+        }
+        for move in snapshot.moved
+    ]
 
 
 @dataclass
@@ -270,7 +290,15 @@ class RuleEngine:
             return self._skipped(
                 rule, target.market, target.code, f"读不到这个对象：{exc}"
             )
-        verdict = self._verdict(rule, target, snapshot, evaluate)
+        placed = move_prices(rule, built, snapshot)
+        if placed.blocked:
+            # 「搬不动就整条不判」（口径 1 写在 `anchor.py` 的开头）。只报第一个理由：它们同属
+            # 这一段 K 线里的除权，而每一句后面跟着的都是同一条下一步命令
+            return self._skipped(
+                rule, snapshot.market, snapshot.code, placed.blocked[0]
+            )
+        snapshot = placed.snapshot  # 从这一行起，`_one` 往后只认搬完的那一份
+        verdict = self._verdict(rule, target, snapshot, evaluate, placed.params)
         if isinstance(verdict, Skipped):
             return verdict
         if verdict is None:
@@ -298,17 +326,19 @@ class RuleEngine:
             return self._skipped(rule, snapshot.market, snapshot.code, f"送不出去：{exc}")
 
     def _verdict(
-        self, rule: Rule, target: Target, snapshot: Snapshot, evaluate
+        self, rule: Rule, target: Target, snapshot: Snapshot, evaluate, params: dict
     ) -> Verdict | Skipped | None:
         """求值。`evaluate` 是 `_one` 查过表的那一个函数：名单只在那里查一次，
         查不到就已经折成 `Skipped` 出门了（库里躺着野 kind 不该把整趟拖崩）。
 
         `thesis` 从引擎这里递进去而不是让模板自己去查库：`data.read` 已经查过一次，
         两次之间规则还能被改，那样算出来的价位与屏幕上那一条不是同一个数（`Ask` 的注释）。
+        `params` 是搬过的那一份：模板自己去取 `rule.params` 是第二处没搬的数，
+        除权日会算出一条比现价还高的旧线。
         """
         thesis = self.data.thesis_for(target)
         try:
-            outcome = evaluate(Ask(snapshot=snapshot, params=rule.params, thesis=thesis))
+            outcome = evaluate(Ask(snapshot=snapshot, params=params, thesis=thesis))
         except KeyError as exc:
             # 那一行是**上一个版本的模板**写的：老行要么缺了模板要的那个键，要么带着模板
             # 词表里已经没有了的取值（`stop_ma` 查 `_MA_LINES` 就是后面那种）。
@@ -444,6 +474,7 @@ class RuleEngine:
                     "threshold": verdict.threshold,
                     "value_text": verdict.value_text,
                     "threshold_text": verdict.threshold_text,
+                    "moved": _moved_payload(snapshot),
                 },
                 ts=now,
             )
@@ -475,10 +506,13 @@ class RuleEngine:
         )
 
     def _skipped(self, rule: Rule, market: str, code: str, reason: str) -> Skipped:
-        """「这一条这一趟没有结论」的共同形状：判不了与送不出去，屏幕上同一摞。
+        """「这一条这一趟没有结论」的共同形状：判不了、搬不动、送不出去，屏幕上同一摞。
 
         合成一摞是刻意的：多一摞就要多一份 CLI、多一份 JSON 字段、多一条退出码规则，
         而现在没人能回答「判不了」与「送不出去」该有什么不同的处置。分辨靠 `reason`。
+
+        收 `market`/`code` 而不是 `snapshot`：`NotAdjustable` 那一头根本没有快照，而它
+        与「缺参数」、「搬不动」在屏幕上必须是同一摞。
         """
         return Skipped(
             rule_id=rule.id,
@@ -523,8 +557,13 @@ class RuleEngine:
 
         「能不能执行」放在盈亏之后（§10.2 要求每条告警都带）：先让人知道这笔亏多少，
         再说这一笔今天动不了——反过来的话，读到第二句的人以为自己已经没有损失可言。
+
+        「换算」紧跟判据：那一行说的是上一行用的那个数从哪儿来。放到盈亏之后，人是先读到
+        结论、再读到出处，而出处那一句是要改变结论的（那条线比看上去低 10%）。没搬的时候
+        这里为空——不写「无除权」，那是一句没有人要的噪音。
         """
         lines = [f"{built.label}：{verdict.why}" if verdict.why else built.label]
+        lines.extend(move.line for move in snapshot.moved)
         pnl = holding_pnl(snapshot, fx=self._fx(snapshot))
         if pnl:
             lines.append(pnl)
