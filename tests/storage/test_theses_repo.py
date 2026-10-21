@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -450,4 +450,65 @@ def test_the_opened_gate_lists_what_is_missing_from_the_row(db):
     assert missing_levels_for_opened(
         make(db, code="000001", stop_price=27.0, target_price=40.0, reward_risk=2.5)
     ) == ()
+
+
+# --- 复检基线（0016 / D96）-----------------------------------------------------------------
+
+
+def test_the_baseline_round_trips_score_items_and_day(db):
+    thesis = make(db)
+
+    got = ThesisRepo(db).set_baseline(
+        USER,
+        thesis.id,
+        score=72.5,
+        items={"pr": 80.0, "percentile": 61.0},
+        on=date(2024, 7, 1),
+        now=T0,
+    )
+
+    assert got.baseline_score == 72.5
+    assert got.baseline_on == date(2024, 7, 1)
+    assert got.baseline_items == (("percentile", 61.0), ("pr", 80.0))
+
+
+def test_a_thesis_without_a_baseline_reads_back_as_never_compared(db):
+    """None 不是 0：D96 那句「从没比过 ≠ 没漂移」在仓库层的钉子。"""
+    thesis = make(db)
+
+    assert thesis.baseline_score is None
+    assert thesis.baseline_items == ()
+    assert thesis.baseline_on is None
+
+
+def test_an_empty_baseline_score_is_refused(db):
+    thesis = make(db)
+
+    with pytest.raises(ValidationError, match="不能是空的"):
+        ThesisRepo(db).set_baseline(
+            USER, thesis.id, score=None, items={}, on=date(2024, 7, 1), now=T0
+        )
+
+
+def test_a_baseline_outside_the_item_scale_is_refused(db):
+    """分项分是 0~100 的刻度：7200 分那种数进来，`tier_of` 会把它按 100 处理而看不出不对。"""
+    thesis = make(db)
+
+    with pytest.raises(ValidationError, match="0~100"):
+        ThesisRepo(db).set_baseline(
+            USER, thesis.id, score=7200.0, items={}, on=date(2024, 7, 1), now=T0
+        )
+
+
+def test_setting_the_baseline_does_not_write_an_event(db):
+    """价位与基线都不是状态跳转：`thesis_events` 里不该因此多出一跳。"""
+    repo = ThesisRepo(db)
+    thesis = make(db)
+
+    got = repo.set_baseline(
+        USER, thesis.id, score=50.0, items={}, on=date(2024, 7, 1), now=T0
+    )
+
+    assert got.status == thesis.status
+    assert len(repo.events(USER, thesis.id)) == 1  # 只有开局那一跳
 

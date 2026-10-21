@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from math import isfinite
@@ -62,7 +64,7 @@ PRICES = ("entry_low", "entry_high", "stop_price", "target_price")
 _COLUMNS = (
     "id, user_id, market, code, style, status, entry_low, entry_high, stop_price, "
     "target_price, reward_risk, win_rate, win_rate_samples, levels_on, created_at, updated_at, "
-    "archived_at"
+    "archived_at, baseline_score, baseline_items, baseline_on"
 )
 
 
@@ -94,6 +96,11 @@ class Thesis:
     levels_on: date | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: 周复检的基线（0016 / D96）：建仓时那一个总分、那几路分项、属于哪一天。
+    #: 三者同进同出，所以 `recheck` 只判 `baseline_score is None`。
+    baseline_score: float | None = None
+    baseline_items: tuple[tuple[str, float], ...] = ()
+    baseline_on: date | None = None
     archived_at: datetime | None = None
 
 
@@ -410,6 +417,48 @@ class ThesisRepo:
         assert found is not None  # 同一个库里刚 UPDATE 过
         return found
 
+    def set_baseline(
+        self,
+        user_id: str,
+        thesis_id: str,
+        *,
+        score: float | None,
+        items: Mapping[str, float],
+        on: date,
+        now: datetime,
+    ) -> Thesis:
+        """写下复检的基准（0016）。只有 `recheck` 在**还没有基线**时调它，所以没有「改基线」的入口。
+
+        `score=None` 会被拒：那不是「0 分」而是「这一趟没算出分」，把它写成基线等于给一条
+        论钉死一个永远达不到的基准——此后每趟掉档都是它的错。
+        归档那条也拒，理由与 `set_levels` 同一条：`archived` 是终点，改它是在重写历史。
+        """
+        if score is None:
+            raise ValidationError("基线分数不能是空的：那是「没比过」，不是「最差」")
+        if not 0.0 <= float(score) <= 100.0:
+            raise ValidationError(f"基线分数要在 0~100（收到 {score}）：分项分就是这个刻度")
+        current = self.require(user_id, thesis_id)
+        if current.status == ARCHIVED:
+            raise StorageError(
+                f"{thesis_id} 已经归档：基线是「建仓时那一眼」，归档的论不再有那一眼"
+            )
+        cleaned = {str(key): float(value) for key, value in items.items()}
+        self.db.execute(
+            "UPDATE theses SET baseline_score = ?, baseline_items = ?, baseline_on = ?,"
+            " updated_at = ? WHERE user_id = ? AND id = ?",
+            [
+                float(score),
+                json.dumps(cleaned, ensure_ascii=False, sort_keys=True),
+                on,
+                now,
+                current.user_id,
+                current.id,
+            ],
+        )
+        found = self.get(user_id, thesis_id)
+        assert found is not None  # 同一个库里刚 UPDATE 过
+        return found
+
     def advance(
         self,
         user_id: str,
@@ -530,6 +579,14 @@ def _to_theses(rows) -> list[Thesis]:
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             archived_at=r["archived_at"],
+            baseline_score=r["baseline_score"],
+            baseline_items=tuple(
+                sorted(
+                    (str(key), float(value))
+                    for key, value in json.loads(r["baseline_items"] or "{}").items()
+                )
+            ),
+            baseline_on=r["baseline_on"],
         )
         for r in rows.to_dicts()
     ]
