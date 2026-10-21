@@ -308,4 +308,4 @@ def test_time_stop_names_the_open_date_and_counts_calendar_days() -> None:
         )
     )
     assert "2026-09-01" in got.hit.why
-    assert "自然日" in got.hit.why
+    assert "，2026-09-01 建仓（自然日口径）" in got.hit.why
