@@ -143,8 +143,20 @@ class AlertRepo:
         assert created is not None  # 刚写完，同一条连接里一定读得回来
         return created
 
-    def get(self, alert_id: str) -> Alert | None:
-        rows = self.db.query(f"SELECT {_ALERT_COLUMNS} FROM alerts WHERE id = ?", [alert_id])
+    def get(self, alert_id: str, *, user_id: str | None = None) -> Alert | None:
+        """按 id 读那一条；给了 `user_id` 就只读那一个用户名下的。
+
+        默认不挡，因为 `record`/`set_status` 内部那次读要的就是「先把行读出来，归属另外判」：
+        那两处各自有一条更准的拒绝话。挡在仓库层而不是命令层（D81）：M3-D 的调度器与 M4 的
+        后台都不经过命令层，而挡在命令层的闸对它们是空的。
+        """
+        clauses, params = ["id = ?"], [alert_id]
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        rows = self.db.query(
+            f"SELECT {_ALERT_COLUMNS} FROM alerts WHERE {' AND '.join(clauses)}", params
+        )
         return self._to_alert(rows.to_dicts()[0]) if rows.height else None
 
     def list_for(self, user_id: str, *, status: str | None = None, limit: int = 50) -> list[Alert]:

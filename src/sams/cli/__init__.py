@@ -12,6 +12,7 @@ import sys
 
 from sams.bootstrap import build_container
 from sams.cli import (
+    alert,
     analysis,
     calendar,
     channel,
@@ -41,6 +42,7 @@ COMMAND_MODULES = (
     ledger,
     channel,
     rule,
+    alert,
 )
 
 

@@ -386,3 +386,22 @@ def test_handling_does_not_stamp_a_moment_for_a_new_one(repo, seeded_user):
 
     assert moved.handled_at is not None
     assert back.handled_at is None and back.status == "new"
+
+
+# ---------- 按用户读（屏幕上那串 id 不能变成一个跨用户的读取口）----------
+
+
+def test_get_can_scope_to_a_user(repo, seeded_user, other_user):
+    """`alert show <id>` 的输入就是那串 id：不挡就等于任何人问任何人都能读。"""
+    alert = repo.create(seeded_user, **CREATE_KW)
+    assert repo.get(alert.id, user_id=seeded_user) is not None
+    assert repo.get(alert.id, user_id=other_user) is None
+
+
+def test_get_without_a_user_still_reads_any_row(repo, seeded_user):
+    """默认不挡，且这一条要测住：`record`/`set_status` 内部那次读靠的就是它。
+
+    把默认改成「挡」不会报错，只会让那两处把自己的告警读成不存在。
+    """
+    alert = repo.create(seeded_user, **CREATE_KW)
+    assert repo.get(alert.id) is not None
