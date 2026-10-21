@@ -1,8 +1,10 @@
 """`sams rule ...` —— 十四个模板的维护面，加三条同步出口（§10、§9.2、§9.3）。
 
-`check` 与 `recheck` 都是**同步一趟**：M3-D 的调度器将来调的就是这里这两个 handler，所以
-「退出码按这一趟有没有说清楚、不按有没有告警」那条线（D94 之后的唯一一条）在这里定一次，
-别处不许再抄第二处。
+`check` 与 `recheck` 都是**同步一趟**：M3-D 的调度器将来调的就是这里这两个 handler。它们
+的退出码判的是「这一趟有没有说清楚」，不是「有没有告警」——`check` 看 `blocked`/`skipped`
+是否非空，`recheck` 看 `PARTIAL`/`NO_SCORE` 是否非空，各自算各自的 `code`、屏幕上各说一句。
+把「有告警」做成非零，调度器就会把每一次正常命中当成一次故障去重试，而防刷屏是生死线（§10.1）。
+别的地方不得再为这两条同步出口立第三种说法。
 
 这一整个模块不许 import `sams.storage.*`：`tests/test_layering.py` 里 `ALLOWED["cli"]`
 只有 `core` 与 `services`。库里的对象一律走 `Container` 上那些装配好的字段。
@@ -368,15 +370,11 @@ def run_edit(container: Container, args) -> int:
         user = resolve_actor(container.users, args.user)
         given = _params(args.param)
         wanted = _filters(args.filter)
-        if not _anything_to_change(args, given, wanted):
-            raise ValidationError(
-                "edit 什么都没要改：给 --name/--kind/--param/--filter/--severity/"
-                "--channel/--cooldown/--target-* 里的至少一个"
-            )
-        now = container.rule_service.show(user.id, args.rule_id)
         if args.kind is None:
             # 仓库那头的 `update` 是整包替换（它必须这样，否则改 kind 时旧键会留在库里），
-            # 而「把 60 天改成 90 天」不该让 max_gain_pct 悄悄回到默认值。
+            # 而「把 60 天改成 90 天」不该让 max_gain_pct 悄悄回到默认值。现值只在要合的时候
+            # 才读：改了 kind 就不合（旧键多半对新 kind 是野键），那一次库读也就没必要。
+            now = container.rule_service.show(user.id, args.rule_id)
             given = {**now.rule.params, **given} if given else None
             wanted = {**now.rule.filters, **wanted} if wanted else None
         report = container.rule_service.edit(
@@ -411,23 +409,6 @@ def run_edit(container: Container, args) -> int:
         label = _COLUMN_LABELS.get(column, column)
         print(f"  回写    {label} → {value:g}（改这条的价与改论上是同一个数）")
     return 0
-
-
-def _anything_to_change(args, given: dict | None, wanted: dict | None) -> bool:
-    return any(
-        value is not None and value != ()
-        for value in (
-            args.name,
-            args.kind,
-            given,
-            wanted,
-            args.severity,
-            args.channel or None,
-            args.cooldown,
-            args.target_type,
-            args.target_ref,
-        )
-    )
 
 
 # ---------- 启停与删除 ----------

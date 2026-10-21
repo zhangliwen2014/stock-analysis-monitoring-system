@@ -20,7 +20,6 @@ import pytest
 from support_valuation import CODE, make_container, seed_calendar
 
 import sams.cli as cli
-from sams.core.errors import ValidationError
 
 USER = "trader"
 PWD = "correct-horse-battery"
@@ -146,7 +145,27 @@ def test_kinds_names_every_template_and_its_required_params(container, capsys):
         item["kind"] for item in row["kinds"]
     }
     assert row["targets"] == ["symbol", "watchlist", "thesis", "position"]
-    assert "market_rel" not in row["filters"]
+    # 名单外的过滤器键：`--filter market_rel=1` 交给 `validate_filters` 的键就是 `market_rel=1`，
+    # 既不在四个键的名单上、也不是裸 `market_rel`（那一条由 `add` 用例单独钉），
+    # 于是走 `validate_filters` 那句「不认这些过滤器 / 可用的只有」——屏幕点名可用的是哪四个。
+    bad = payload(
+        container,
+        capsys,
+        "add",
+        "--user",
+        USER,
+        "--kind",
+        "stop.fixed",
+        "--target-type",
+        "symbol",
+        "--target-ref",
+        f"A/{CODE}",
+        "--param",
+        "price=10",
+        "--filter",
+        "market_rel=1",
+    )
+    assert bad[0] == 2 and "可用的只有" in bad[1]["reason"]
     fixed = next(item for item in row["kinds"] if item["kind"] == "stop.fixed")
     assert fixed["required"] == ["price"]
 
@@ -155,7 +174,25 @@ def test_kinds_text_screen_reads_like_a_manual(container, capsys):
     code, text = out(container, capsys, "kinds")
     assert code == 0
     assert "stop.fixed（跌破绝对价即报）" in text
-    assert "组合" not in text  # portfolio 进不了库（U28），屏幕上也不该出现它
+    # 屏幕上打的是英文类型名：四个可入库的都得到，多打/少打一个都会红
+    assert "可挂对象：symbol/watchlist/thesis/position" in text
+    assert "portfolio" not in text  # portfolio 进不了库（U28），屏幕上也不列它
+
+
+def test_kinds_one_kind_lists_just_that_templates_params(container, capsys):
+    """`--kind` 认得时只回那一条：必填键表、可挂对象、describe 都从这一支出。"""
+    code, row = payload(container, capsys, "kinds", "--kind", "stop.time")
+    assert code == 0
+    kind = row["kind"]
+    assert kind["kind"] == "stop.time"
+    assert kind["required"] == ["days"]
+    assert "position" in kind["targets"]
+
+
+def test_kinds_refuses_an_unknown_kind_by_naming_the_list(container, capsys):
+    """`--kind` 不认得时也走 JSON 拒绝：理由点名整张名单，而不是 argparse 的一段 stderr。"""
+    code, row = payload(container, capsys, "kinds", "--kind", "stop.magic")
+    assert code == 2 and "未知规则类型" in row["reason"] and "tp.tiered" in row["reason"]
 
 
 # ---------- add ----------
@@ -164,11 +201,35 @@ def test_kinds_text_screen_reads_like_a_manual(container, capsys):
 def test_add_lands_the_shape_the_repo_validated(container, capsys):
     row = add_rule(container, capsys)
     assert row["params"] == {"price": 100000.0}
-    assert row["severity"] == "strong" and row["enabled"] is True
-    assert row["cooldown_min"] == 30 and row["targets"] == 1
-    assert row["filters"] == dict.fromkeys(
-        ["time_window", "data_freshness", "exclude_halt", "no_open_alert"], False
+    assert row["enabled"] is True
+    assert row["targets"] == 1
+
+
+def test_add_uses_the_severity_cooldown_and_filter_given_on_the_line(container, capsys):
+    """命令行给的这三个值必须原样落库：把命令行到仓库那三次传递删掉，它就红。
+
+    30 与 all-False 与 `strong` 都是别处的默认值（`--cooldown`/`--filter` 不给时会拿它们兜底），
+    所以这一枚给的三个数是 `weak`/`7`/`no_open_alert=True`：都不同于模板默认（`strong`）、
+    `Settings.cooldown_min` 默认（30）、`validate_filters` 默认（四个键全 False）。
+    """
+    row = add_rule(
+        container,
+        capsys,
+        "--severity",
+        "weak",
+        "--cooldown",
+        "7",
+        "--filter",
+        "no_open_alert",
     )
+    assert row["severity"] == "weak"
+    assert row["cooldown_min"] == 7
+    assert row["filters"] == {
+        "time_window": False,
+        "data_freshness": False,
+        "exclude_halt": False,
+        "no_open_alert": True,
+    }
 
 
 def test_add_gives_a_default_name_from_the_template(container, capsys):
@@ -255,6 +316,8 @@ def test_list_counts_the_targets_and_marks_the_silent_one(container, capsys):
     code, text = out(container, capsys, "list", "--user", USER)
     assert code == 0
     assert "跌破十万" in text and "对象 1" in text
+    # 「那条不响的」要在屏幕上被点名：查无此码那一行带的是 `RuleService._notes` 那句「库里没有」
+    assert "查无此码" in text and "库里没有" in text
 
 
 def test_show_prints_which_filters_are_on_and_why_it_cannot_fire(container, capsys):
@@ -307,20 +370,28 @@ def test_edit_text_screen_says_which_column_it_wrote_back(container, capsys):
 
 
 def test_a_write_back_refusal_leaves_the_rule_untouched(container, capsys):
-    """那条事务的验收线：止损 60 会越过目标 52，论被拒 ⇒ 规则也回到 28。"""
+    """从命令行看这一改：止损改到 60 会越过目标 52 ⇒ `edit` exit 2，规则与论都还是 28。
+
+    屏幕上没写成的那一改，库里也不能留下那一行——所以这条命令行用例读的是 `exit`、`reason`、
+    库里那一列，以及那一趟有没有往 `rule_revisions` 添一行。
+    """
     thesis = make_thesis(container)
     derive(container, capsys, thesis.id)
     stop = kinds_of(container, capsys)["stop.fixed"]
-    with pytest.raises(ValidationError, match="不在目标"):
-        container.rule_service.edit(uid(container), stop["id"], params={"price": 60.0})
+    code, got = payload(
+        container, capsys, "edit", stop["id"], "--user", USER, "--param", "price=60"
+    )
+    assert code == 2 and "不在目标" in got["reason"]
     assert container.rules_store.get(stop["id"]).params["price"] == 28.0
     assert container.theses_store.get(uid(container), thesis.id).stop_price == 28.0
+    assert container.rules_store.revisions(stop["id"]) == []
 
 
 def test_edit_without_anything_to_change_is_refused(container, capsys):
+    """不带任何旗标的 edit 走到仓库那道合并比较才被拒（保护 `rule_revisions` 的那道）。"""
     row = add_rule(container, capsys)
     code, got = payload(container, capsys, "edit", row["id"], "--user", USER)
-    assert code == 2 and "什么都没要改" in got["reason"]
+    assert code == 2 and "至少给一个参数" in got["reason"]
 
 
 def test_edit_kind_without_new_params_is_refused(container, capsys):
@@ -329,6 +400,74 @@ def test_edit_kind_without_new_params_is_refused(container, capsys):
         container, capsys, "edit", row["id"], "--user", USER, "--kind", "stop.pct"
     )
     assert code == 2 and "新的 params" in got["reason"]
+
+
+def test_edit_moves_the_target_ref_to_a_new_one(container, capsys):
+    """改一条规则挂的目标引用：payload 里要看得见那一个新的。"""
+    row = add_rule(container, capsys)  # symbol A/{CODE}
+    code, got = payload(
+        container,
+        capsys,
+        "edit",
+        row["id"],
+        "--user",
+        USER,
+        "--target-ref",
+        f"A/{BAD_CODE}",
+    )
+    assert code == 0 and got["rule"]["target_ref"] == f"A/{BAD_CODE}"
+
+
+def test_edit_to_a_target_type_the_kind_rejects_is_refused_by_the_repo(container, capsys):
+    """改 `--target-type` 到这一 kind 不许挂的类型：那句拒绝出自仓库（`_validate`），不是命令行。
+
+    `stop.pct` 只认 position/thesis，改到 symbol 时屏幕上那句要点名它只认哪两种。
+    """
+    account = open_account(container)
+    code, made = payload(
+        container,
+        capsys,
+        "add",
+        "--user",
+        USER,
+        "--kind",
+        "stop.pct",
+        "--target-type",
+        "position",
+        "--target-ref",
+        "*",
+        "--account",
+        account,
+        "--param",
+        "pct=0.1",
+    )
+    assert code == 0
+    code, got = payload(
+        container,
+        capsys,
+        "edit",
+        made["rule"]["id"],
+        "--user",
+        USER,
+        "--target-type",
+        "symbol",
+    )
+    assert code == 2 and "不能挂在" in got["reason"]
+
+
+def test_channel_lands_on_add_and_survives_an_edit_that_does_not_name_it(container, capsys):
+    """`--channel` 落库要在 payload 里看得到；下一枚 edit 不给 `--channel` 时不许清空它。
+
+    后一半走的是 `run_edit` 里那句 `channel_ids=... if args.channel else None`：把它写成
+    `else ()` 时这一枚变红——不给旗标 = 不动那一列，而不是抹掉已有通道。
+    """
+    channel = container.channels_store.create(uid(container), "desktop", "桌面", {})
+    row = add_rule(container, capsys, "--channel", channel.id)
+    assert row["channel_ids"] == [channel.id]
+    code, got = payload(
+        container, capsys, "edit", row["id"], "--user", USER, "--name", "改了个名"
+    )
+    assert code == 0 and got["rule"]["channel_ids"] == [channel.id]
 
 
 # ---------- 启停与删除 ----------
@@ -368,7 +507,7 @@ def test_a_derived_rule_cannot_be_removed_and_points_at_disable(container, capsy
 # ---------- derive ----------
 
 
-def test_derive_builds_the_stack_and_the_screen_lists_all_three_kinds(container, capsys):
+def test_derive_builds_the_stack_and_the_screen_lists_two_created_kinds(container, capsys):
     thesis = make_thesis(container)
     code, text = out(container, capsys, "derive", thesis.id, "--user", USER)
     assert code == 0
@@ -466,6 +605,23 @@ def test_dry_run_does_not_warn_about_channels(container, capsys):
     assert code == 0 and "没有任何通道" not in text
 
 
+def test_check_with_an_as_of_judges_that_day(container, capsys):
+    """`--as-of` 给一个冻结世界里合法的交易日：payload 里的 as_of 就是那一天，那一趟照判。"""
+    add_rule(container, capsys)
+    code, row = payload(
+        container, capsys, "check", "--user", USER, "--as-of", "2024-10-25"
+    )
+    assert code == 0 and row["as_of"] == "2024-10-25" and len(row["raised"]) == 1
+
+
+def test_check_refuses_a_malformed_as_of_before_running(container, capsys):
+    """日期形状写错（不是引擎的账）：命令行这一层就把它拒了，exit 2，也不去跑那一趟。"""
+    code, row = payload(
+        container, capsys, "check", "--user", USER, "--as-of", "2024-13-45"
+    )
+    assert code == 2 and "YYYY-MM-DD" in row["reason"]
+
+
 # ---------- recheck ----------
 
 
@@ -522,3 +678,21 @@ def test_recheck_returns_one_when_the_score_did_not_come_out(db, settings, capsy
     )
     code, row = payload(sparse, capsys, "recheck", "--user", USER)
     assert code == 1 and row["counts"]["no_score"] == 1
+
+
+def test_recheck_is_incomplete_when_a_baseline_item_was_not_computed(container, capsys):
+    """基线里有主力净流入、这一趟那一路没数 ⇒ 比不全：`PARTIAL` 那半个判据也得出 exit 1。
+
+    `set_baseline` 第二次写会被仓库拒（一条论只写一次），所以这里只对这一条论铺一次基线。
+    """
+    thesis = open_thesis(container)
+    container.theses_store.set_baseline(
+        uid(container),
+        thesis.id,
+        score=95.0,
+        items={"main_inflow": 90.0},
+        on=date(2024, 7, 1),
+        now=T0,
+    )
+    code, row = payload(container, capsys, "recheck", "--user", USER)
+    assert code == 1 and row["status"] == "incomplete" and row["counts"]["partial"] >= 1
