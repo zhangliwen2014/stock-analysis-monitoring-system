@@ -44,7 +44,10 @@ def before_last(table: pl.DataFrame, column: str) -> Any:
 
 
 def window_high(table: pl.DataFrame, bars: int) -> float | None:
-    """窗口内最高的那根后复权收盘（**还没**折回现价口径：调用方拿自己那条序列的因子折它）。"""
+    """窗口内最高的那根后复权收盘（**还没**折回现价口径：调用方拿自己那条序列的因子折它）。
+
+    用后复权而不是裸价：跨除权日时裸价那个「下跌」是分红，不是有人付过更低的价。
+    """
     if table.height == 0 or bars <= 0 or "close_hfq" not in table.columns:
         return None
     return table["close_hfq"].tail(bars).max()
