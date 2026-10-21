@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -202,6 +203,9 @@ def _as_number(param: Param, raw: object) -> float:
         raise ValidationError(
             f"{param.name} 要的是数字（{param.label}），收到 {raw!r}"
         ) from None
+    if not math.isfinite(value):
+        # nan 与任何阈值比较都是 False ⇒ 那条规则永远不会响，而屏幕上写着「启用」
+        raise ValidationError(f"{param.name} 要的是有限数（{param.label}），收到 {raw!r}")
     if param.minimum is not None and value < param.minimum:
         raise ValidationError(
             f"{param.name} 不能低于 {param.minimum:g}{param.unit}（收到 {value:g}）"
@@ -214,17 +218,26 @@ def _as_number(param: Param, raw: object) -> float:
 
 
 def _as_tiers(param: Param, raw: object) -> list[float]:
-    text = param.default if raw is None else raw
-    if isinstance(text, (int, float)):
-        raise ValidationError(f"{param.name} 要的是比例串（例如 0.5,1.0），收到 {raw!r}")
-    parts = [piece.strip() for piece in str(text).replace("，", ",").split(",") if piece.strip()]
-    if not parts:
+    if isinstance(raw, (list, tuple)):
+        # 库里的 `params_json` 读回来就是 list[float]：`update` 改名时会把旧参数
+        # 原样再校验一遍，这里必须接受自己的输出（否则改个名字都过不去）
+        pieces: list[object] = list(raw)
+    else:
+        text = param.default if raw is None else raw
+        if isinstance(text, (int, float)):
+            raise ValidationError(f"{param.name} 要的是比例串（例如 0.5,1.0），收到 {raw!r}")
+        pieces = [
+            piece.strip()
+            for piece in str(text).replace("，", ",").split(",")
+            if piece.strip()
+        ]
+    if not pieces:
         raise ValidationError(f"{param.name} 不能是空的：至少给一档")
     steps: list[float] = []
-    for piece in parts:
+    for piece in pieces:
         try:
             steps.append(float(piece))
-        except ValueError:
+        except (TypeError, ValueError):
             raise ValidationError(
                 f"{param.name} 里 {piece!r} 不是数字：要的是 0.5,1.0 这种比例串"
             ) from None

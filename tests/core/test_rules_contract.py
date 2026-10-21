@@ -19,6 +19,7 @@ from sams.core.rules import (
     STAGES,
     URGENT,
     Verdict,
+    escalates,
     template_for,
     tier_of,
     validate_filters,
@@ -96,9 +97,17 @@ def test_tiers_must_increase_and_end_at_the_target() -> None:
         validate_params("tp.tiered", {"tiers": "0.5,0.5"})
 
 
+def test_validation_accepts_its_own_output() -> None:
+    """仓库层 update 会把读回来的 `params_json` 再校验一遍：自己的输出必须吃得下。"""
+    once = validate_params("tp.tiered", {})
+    assert validate_params("tp.tiered", once) == once
+
+
 def test_a_non_numeric_param_says_what_it_expected() -> None:
     with pytest.raises(ValidationError, match="数字"):
         validate_params("stop.fixed", {"price": "十块"})
+    with pytest.raises(ValidationError, match="有限数"):
+        validate_params("stop.fixed", {"price": "nan"})  # nan 与任何线比都是 False
 
 
 def test_filters_are_boolean_switches_from_a_closed_list() -> None:
@@ -141,3 +150,14 @@ def test_drift_tier_is_twenty_points() -> None:
     # 档位是 floor(总分 / 20)：100 分落在第 5 档（0~5 六档），不是封顶在第 4 档
     assert (tier_of(78.0), tier_of(61.0), tier_of(100.0)) == (3, 3, 5)
     assert tier_of(None) is None
+
+
+def test_escalation_is_a_strict_rank_increase() -> None:
+    """D94 的那道闸：同档与降档都不穿冷却，只有更响的一档穿。"""
+    assert escalates(None, PRE) is True
+    assert escalates(PRE, HIT) is True
+    assert escalates(HIT, URGENT) is True
+    assert escalates(HIT, HIT) is False
+    assert escalates(URGENT, HIT) is False
+    with pytest.raises(ValidationError, match="bogus"):
+        escalates(PRE, "bogus")
