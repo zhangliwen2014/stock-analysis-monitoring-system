@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from sams.core.rules import template_for
 from sams.storage.repos.rules import Rule, RuleRepo
 from sams.storage.repos.theses import Thesis, ThesisRepo
 
@@ -151,6 +152,16 @@ def blueprints_for(
     return tuple(out)
 
 
+def carries_price(kind: str) -> bool:
+    """这一种的参数里有没有一个以「元」计价的数（0017 的日期戳只管它们）。
+
+    派生出来的那六条里只有 `price.cross_below` 与 `stop.fixed` 带绝对价；`tiers`、`threshold`、
+    `within_days` 是这一份文件给的常量，给它们盖一个「论上那天填的」的戳，说的是一个
+    不指任何价位的日期。手填那条路不走这里，它盖的本来就是「人刚刚敲过」的那一天。
+    """
+    return any(param.unit == "元" for param in template_for(kind).params)
+
+
 class RuleDeriver:
     """把蓝图落到库里。幂等：同一 (论, kind) 已存在就不再建——**跳过而不是覆盖**，
     用户改过的那条参数不能在一次重复派生里被悄悄写回蓝图值。
@@ -191,6 +202,9 @@ class RuleDeriver:
                     filters=item.filters,
                     account_id=owner,
                     thesis_id=thesis_id,
+                    # 抄自论上那几列的规则，锚是那一次读数的那一天（0013 的 `levels_on`）；
+                    # 手填的价位没有测量日，跟着留 None 而不是盖今天
+                    params_on=thesis.levels_on if carries_price(item.kind) else None,
                 )
             )
             have.add((item.kind, owner))

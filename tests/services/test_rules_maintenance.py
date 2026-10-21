@@ -7,10 +7,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import polars as pl
 import pytest
+import support
 import support_valuation
 
 from sams.core.errors import StorageError, ValidationError
@@ -309,3 +310,16 @@ def test_removing_a_plain_rule_leaves_it_gone(container, uid) -> None:
     made = add(container, uid)
     assert make_service(container).remove(uid, made.rule.id) is True
     assert container.rules_store.list_for(uid) == []
+
+
+def test_a_hand_built_rule_carves_today_into_the_anchor(container, uid) -> None:
+    """人在命令行填的那个价，说的就是「今天的价空间里 10 元」⇒ 戳必须是今天。
+
+    它与派生那一处**故意**盖不同的日期：手填的数属于此刻，从论上抄来的数属于那次读数。
+    两处都盖今天的话，那条三个月前算出来的止损线会在除权日被原样搬去比今天的价。
+
+    时钟冻在一个不是今天的日子：期望值取自容器真正被注入的那一个时钟，实现里换成
+    `date.today()` 就会红，而不是跟着墙钟一起绿。
+    """
+    frozen = replace(container, clock=support.FrozenClock(datetime(2026, 4, 9, 1, 0, tzinfo=UTC)))
+    assert add(frozen, uid).rule.params_on == date(2026, 4, 9)

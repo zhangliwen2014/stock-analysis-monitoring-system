@@ -118,6 +118,8 @@ class RuleService:
             cooldown_min=(
                 self.settings.cooldown_min if cooldown_min is None else int(cooldown_min)
             ),
+            # 人在命令行填的价属于此刻的价空间；派生那条路盖的是论上的读数日（derive.py）
+            params_on=self.clock.today(),
             enabled=enabled,
         )
         return self.view(rule)

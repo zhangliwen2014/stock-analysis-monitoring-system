@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import StorageError, ValidationError
@@ -29,7 +29,7 @@ CONDITION_KIND = "template"
 _COLUMNS = (
     "id, user_id, account_id, name, enabled, target_type, target_ref, kind,"
     " condition_kind, params_json, filters_json, cooldown_min, severity, channel_ids,"
-    " thesis_id, created_at, updated_at"
+    " thesis_id, params_on, created_at, updated_at"
 )
 
 #: 这些 target 的 `target_ref` 恒为「整个集合」，写法里带上 `*` 是为了让它可断言
@@ -56,6 +56,9 @@ class Rule:
     condition_kind: str = CONDITION_KIND
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: 那一屏里那些以「元」计价的数属于哪一天的价空间（0017），UTC 日历日。
+    #: `None` 是「不知道哪天填的」，不是「今天填的」：谁拿它做除权换算都不许把前者读成后者
+    params_on: date | None = None
 
     @property
     def describe(self) -> str:
@@ -91,6 +94,7 @@ def _to_rule(row: Mapping[str, object]) -> Rule:
         thesis_id=row["thesis_id"],
         condition_kind=str(row["condition_kind"]),
         created_at=row["created_at"],
+        params_on=row["params_on"],
         updated_at=row["updated_at"],
     )
 
@@ -170,6 +174,7 @@ class RuleRepo:
         cooldown_min: int = 30,
         enabled: bool = True,
         condition_kind: str = CONDITION_KIND,
+        params_on: date | None = None,
     ) -> Rule:
         checked = self._validate(
             user_id=user_id,
@@ -192,8 +197,8 @@ class RuleRepo:
             "INSERT INTO rules"
             " (id, user_id, account_id, name, enabled, target_type, target_ref, kind,"
             " condition_kind, params_json, filters_json, cooldown_min, severity, channel_ids,"
-            " thesis_id, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " thesis_id, params_on, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 rule_id,
                 checked["user_id"],
@@ -210,6 +215,7 @@ class RuleRepo:
                 checked["severity"],
                 json.dumps(checked["channel_ids"], ensure_ascii=False),
                 checked["thesis_id"],
+                params_on,
                 now,
                 now,
             ],
@@ -372,11 +378,16 @@ class RuleRepo:
             # 把空改动算进去就是在数橡皮擦的印子
             return before
         now = self.clock.now_utc()
+        # 只有这一次把参数重新填过才盖章：调用方没提 `params` 就是没动那条线，改个名字
+        # 不该把它说成「今天填的」（那在除权换算里等于免搬）。判据是 `patch` 里有没有
+        # `params`，不是合并后的那一份等不等：人把同一个数再敲一遍，说的还是「今天这里是
+        # 这个数」。整份都没动时上面那句空改动闸先把这一趟退回去，锚跟着原样留着
+        stamped = now.date() if "params" in patch else before.params_on
         with self.db.transaction():
             self.db.execute(
                 "UPDATE rules SET name = ?, kind = ?, target_type = ?, target_ref = ?,"
                 " params_json = ?, filters_json = ?, severity = ?, cooldown_min = ?,"
-                " channel_ids = ?, thesis_id = ?, updated_at = ? WHERE id = ?",
+                " channel_ids = ?, thesis_id = ?, params_on = ?, updated_at = ? WHERE id = ?",
                 [
                     checked["name"],
                     checked["kind"],
@@ -388,6 +399,7 @@ class RuleRepo:
                     checked["cooldown_min"],
                     json.dumps(checked["channel_ids"], ensure_ascii=False),
                     checked["thesis_id"],
+                    stamped,
                     now,
                     before.id,
                 ],

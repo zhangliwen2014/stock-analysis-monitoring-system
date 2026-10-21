@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from sams.storage.db import Database
-from sams.storage.migrate import apply_migrations
+from sams.storage.migrate import apply_migrations, discover
 
 
 def fresh(tmp_path) -> Database:
@@ -30,7 +30,9 @@ def test_applying_migrations_twice_adds_nothing(tmp_path):
     before = db.query("SELECT count(*) AS n FROM schema_migrations").to_dicts()[0]["n"]
     apply_migrations(db)
     after = db.query("SELECT count(*) AS n FROM schema_migrations").to_dicts()[0]["n"]
-    assert before == after == 16
+    # 条数从迁移目录推，不写死：写死成 `== 16` 的话，0017 加进来就把这一枚判红，而它
+    # 说的还是同一件事。这一枚要钉的是「重跑不多也不少」，那个「多少」本来就属于迁移目录
+    assert before == after == len(discover())
 
 
 def test_an_old_row_reads_back_with_no_baseline(tmp_path):

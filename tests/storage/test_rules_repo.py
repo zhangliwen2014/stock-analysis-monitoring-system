@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
+import support
 
 from sams.core.errors import StorageError, ValidationError
 from sams.storage.repos.rules import RuleRepo
@@ -396,3 +397,85 @@ def test_by_thesis_finds_the_derived_rules_in_creation_order(repo):
     b = add(repo, user, name="到价", thesis_id=thesis.id, kind="price.cross_above",
             params={"price": 60.0}, target_type="thesis", target_ref=thesis.id)
     assert [row.id for row in repo.by_thesis(thesis.id)] == [a.id, b.id]
+
+
+ANCHOR = date(2026, 3, 5)
+#: 一条「三月五号画在 10 元」的线：用它的用例各不相同的只有后来怎么动它
+STAMPED = {
+    "kind": "stop.fixed",
+    "params": {"price": 10.0},
+    "target_type": "symbol",
+    "target_ref": "A/601088",
+    "account_id": None,
+    "params_on": ANCHOR,
+}
+
+
+def add_stamped(repo, user_id, **over):
+    kw = dict(STAMPED)
+    kw.update(over)
+    return add(repo, user_id, **kw)
+
+
+def test_create_stamps_the_anchor_when_the_caller_says_the_day(repo):
+    """派生那条路要拿论上的读数日当锚（0013 的 `levels_on`），所以日期由调用方给。"""
+    assert add_stamped(repo, seed_user(repo.db)).params_on == ANCHOR
+
+
+def test_a_rule_without_an_anchor_reads_back_none_not_today(repo):
+    assert add(repo, seed_user(repo.db)).params_on is None
+
+
+def test_editing_the_params_re_stamps_the_day(repo):
+    """改参数 = 人在今天的价空间里重新画了这条线 ⇒ 锚必须跟着走。
+
+    时钟冻在一个不是今天的日子：拿墙钟当期望值的话，实现里把 `today()` 写成
+    `date.today()` 也照样绿，而那一写就把这一列的来源从注入的时钟挪走了。
+    """
+    user = seed_user(repo.db)
+    made = add_stamped(repo, user)
+    clocked = RuleRepo(repo.db, clock=support.FrozenClock(datetime(2026, 4, 9, 1, 0, tzinfo=UTC)))
+    assert clocked.update(made.id, changed_by=user, params={"price": 9.0}).params_on == (
+        date(2026, 4, 9)
+    )
+
+
+def test_toggling_enabled_leaves_the_anchor_alone(repo):
+    """这一枚与上一枚合起来才说明白为什么不复用 `updated_at`：启停会碰它，而启停不改价。"""
+    user = seed_user(repo.db)
+    made = add_stamped(repo, user)
+    assert repo.set_enabled(made.id, False, user_id=user).params_on == ANCHOR
+
+
+def test_renaming_a_rule_does_not_claim_the_line_was_filled_today(repo):
+    user = seed_user(repo.db)
+    made = add_stamped(repo, user)
+    assert repo.update(made.id, changed_by=user, name="改个名字").params_on == ANCHOR
+
+
+def test_re_typing_the_same_price_moves_nothing_at_all(repo):
+    """整份都没变时那一趟被空改动闸退回：锚不动，也不留修订。
+
+    `test_editing_the_params_re_stamps_the_day` 钉的是另一端——改了参数就必须盖章。
+    这一枚钉「整份都没动时一个字都不动」：把盖章挪到空改动闸之前，红的就是它。
+    """
+    user = seed_user(repo.db)
+    made = add_stamped(repo, user)
+    again = repo.update(made.id, changed_by=user, params={"price": 10.0})
+    assert again.params_on == ANCHOR
+    assert repo.revisions(made.id) == []
+
+
+def test_a_rename_next_to_a_re_typed_price_still_moves_the_day(repo):
+    """判据是「这一趟有没有把参数重新填过」，不是「填出来的数等不等」。
+
+    拿合并后的等不等做判据的话，这一趟会被认成「只改了名字」，锚留在三月五号——而人
+    今天确实重新敲过那个价位。上一枚与这一枚合起来才把「重新填过」说清楚：一个人
+    再敲一遍同一个数，单独提回来是空改动（不盖章、不留修订），搭着别的改动提回来
+    就是今天重新画过这条线（盖章）。
+    """
+    user = seed_user(repo.db)
+    made = add_stamped(repo, user)
+    clocked = RuleRepo(repo.db, clock=support.FrozenClock(datetime(2026, 4, 9, 1, 0, tzinfo=UTC)))
+    again = clocked.update(made.id, changed_by=user, name="改个名字", params={"price": 10.0})
+    assert again.params_on == date(2026, 4, 9)

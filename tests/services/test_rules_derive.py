@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -337,3 +337,46 @@ def test_editing_the_tiers_writes_back_no_target(theses, rules) -> None:
     made = RuleDeriver(rules, theses).derive(USER, thesis.id, account_id="acc-1").created
     tier = one(made, "tp.tiered")
     assert write_back(tier, {"tiers": [0.5, 1.0]}, {"tiers": [0.3, 0.8]}) == {}
+
+
+def test_a_derived_rule_carries_the_thesis_reading_day(theses, rules) -> None:
+    """派生出来的那条线属于论上那次读数，不属于派生它的那一天。
+
+    盖上今天等于宣布它不用搬（§10.2 的换算），而它其实是 `levels_on` 那天的行情算的。
+    """
+    thesis = theses.create(
+        user_id=USER,
+        market="A",
+        code="601088",
+        style="value",
+        actor_id=USER,
+        now=T0,
+        status="proposed",
+        levels_on=date(2026, 10, 19),
+        **LEVELS,
+    )
+    made = RuleDeriver(rules, theses).derive(USER, thesis.id).created
+    stop = next(row for row in made if row.kind == "stop.fixed")
+    assert stop.params_on == date(2026, 10, 19)
+
+
+def test_a_derived_rule_with_no_price_gets_no_anchor(theses, rules) -> None:
+    """`scheduled.reevaluate` 的那几个天数是这一份文件给的常量，不属于论上那次读数。
+
+    给它盖一个日期戳就是在给一个不指任何价位的锚：除权换算要搬的是「元」那一列，
+    而这一条压根没有价可搬，戳躺在那里等着被误当成依据。
+    """
+    thesis = make_thesis(theses, levels_on=date(2026, 10, 19))
+    assert thesis.levels_on == date(2026, 10, 19)
+    made = RuleDeriver(rules, theses).derive(USER, thesis.id).created
+    again = next(row for row in made if row.kind == "scheduled.reevaluate")
+    assert again.params_on is None
+
+
+def test_a_hand_typed_thesis_leaves_the_derived_rule_without_an_anchor(theses, rules) -> None:
+    """手填的价位没有测量日（0013），派生出来的规则因此也没有：「不知道」不许被写成「今天」。"""
+    thesis = make_thesis(theses)
+    assert thesis.levels_on is None
+    made = RuleDeriver(rules, theses).derive(USER, thesis.id).created
+    stop = next(row for row in made if row.kind == "stop.fixed")
+    assert stop.params_on is None
