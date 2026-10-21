@@ -196,7 +196,23 @@ def test_the_target_price_itself_is_a_hit_not_a_pre() -> None:
     got = tp_tiered(ask({"tiers": [0.5, 1.0]}, {"price": 15.2, "target_price": 15.0}))
     assert got.hit is not None
     assert got.hit.stage == HIT
-    assert "目标价" in got.hit.why
+    assert "已到最后一档" in got.hit.why
+    # 现价 15.2 已在目标价 15.0 上方 ⇒ 那句「走完 106.7%」得说清它不是算错
+    assert "已越过目标价" in got.hit.why
+
+
+def test_only_the_highest_reached_tier_is_named_when_several_are_behind_us() -> None:
+    """三档走到 60% ⇒ 报 50% 那一档，而不是 30% 那一档，也不是两档各报一次。
+
+    「只报最高一档」是这句决定的实现（一趟求值发两条同键告警会被冷却吃掉第二条），
+    而上面那几枚用例每枚最多只到一档，钉不住这里：档位列表给三个，进度卡在中间。
+    """
+    got = tp_tiered(
+        ask({"tiers": [0.3, 0.5, 1.0]}, {"price": 13.8, "target_price": 15.0})
+    )  # 进度 0.6 ⇒ 越过 30% 和 50%，没到 100%
+    assert got.hit.threshold_text == "50%"
+    assert got.hit.stage == PRE
+    assert "还剩 1 档" in got.hit.why
 
 
 def test_a_gain_below_the_first_tier_says_nothing() -> None:

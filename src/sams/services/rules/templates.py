@@ -422,6 +422,12 @@ def tp_tiered(ask: Ask) -> Outcome:
     final = progress >= tiers[-1]
     remaining = len(tiers) - len(reached)
     tail = "已到最后一档 ⇒ 目标价" if final else f"还剩 {remaining} 档"
+    # 进度可以超过 100%（现价已在目标价上方），那句「走完 250.0%」没人读得懂。
+    over = (
+        f"（现价 {money(snapshot.price, snapshot.currency)} 已越过目标价）"
+        if progress > 1.0
+        else ""
+    )
     return Outcome(
         Verdict(
             stage=HIT if final else PRE,
@@ -431,7 +437,8 @@ def tp_tiered(ask: Ask) -> Outcome:
             threshold_text=f"{top:.0%}",
             why=f"成本 {money(snapshot.avg_cost, snapshot.currency)} 到目标价 "
             f"{money(snapshot.target_price, snapshot.currency)} 这一段走完 {progress:.1%}"
-            f"（已达 {top:.0%} 那一档，{tail}）",
+            f"{over}（已达 {top:.0%} 那一档，{tail}）⇒ 请复核是否分批止盈"
+            "（系统只提示，不替你平仓，§9.3）",
         )
     )
 
