@@ -383,6 +383,105 @@ def stop_thesis_drift(ask: Ask) -> Outcome:
     return Outcome()
 
 
+def tp_tiered(ask: Ask) -> Outcome:
+    """`tp.tiered`：把「成本 → 目标价」这一段切成几档，走到哪一档报哪一档。
+
+    刻度是**那一段涨幅**而不是目标价本身：0.5 的意思是「目标涨幅走了一半」，
+    与 §10.2 那句「解决涨一半不敢拿」对上。只报**已达到的最高一档**（不是每一档各报一次），
+    因为一趟求值发两条同键告警会被冷却吃掉第二条，屏幕上看到的是「只报了一条」——
+    与其让人猜，不如一次只说一格，下一格由下一趟来说。
+
+    档位用 `pre`/`hit` 两个阶段而不是一律 `hit`：这是 D94 唯一的非止损用法——
+    中间档报 `hit` 的话，真到目标价那一条会被半小时前的中间档吞掉。
+    中间档之间仍共用一个去重键，30 分钟内第二档会被压——那是 §10.1
+    的节流语义（键里没有档位），而两档之间通常隔着几天，不是半小时。
+    """
+    snapshot = ask.snapshot
+    if snapshot.price is None:
+        return Outcome(why_not=_no_price(snapshot))
+    if snapshot.avg_cost is None or snapshot.avg_cost <= 0:
+        return Outcome(why_not="分批止盈的刻度从成本起算，而这一笔没有成本可读")
+    if snapshot.target_price is None:
+        return Outcome(
+            why_not="没有目标价：分档量的是「成本 → 目标价」那一段，缺终点就没有刻度"
+            "（拿现价当终点会让进度恒为 1，每趟都报到了）"
+        )
+    span = snapshot.target_price - snapshot.avg_cost
+    if span <= 0:
+        return Outcome(
+            why_not=f"目标价 {money(snapshot.target_price, snapshot.currency)} 不高于成本 "
+            f"{money(snapshot.avg_cost, snapshot.currency)}：那一段是 0 或负的，"
+            "百分比刻度在这里没有意义（要盯跌到某个价请用 stop.fixed）"
+        )
+    tiers = ask.params["tiers"]  # `validate_params` 已保证递增且每档 > 0
+    progress = (snapshot.price - snapshot.avg_cost) / span
+    reached = [tier for tier in tiers if progress >= tier]
+    if not reached:
+        return Outcome()
+    top = reached[-1]
+    final = progress >= tiers[-1]
+    remaining = len(tiers) - len(reached)
+    tail = "已到最后一档 ⇒ 目标价" if final else f"还剩 {remaining} 档"
+    return Outcome(
+        Verdict(
+            stage=HIT if final else PRE,
+            value=progress,
+            threshold=top,
+            value_text=f"{progress:.1%}",
+            threshold_text=f"{top:.0%}",
+            why=f"成本 {money(snapshot.avg_cost, snapshot.currency)} 到目标价 "
+            f"{money(snapshot.target_price, snapshot.currency)} 这一段走完 {progress:.1%}"
+            f"（已达 {top:.0%} 那一档，{tail}）",
+        )
+    )
+
+
+def _cross(ask: Ask, *, upward: bool) -> Outcome:
+    """两个 `price.cross_*` 的共用体：穿过去 = 前一根还在另一侧，这一根到了这一侧。
+
+    `>=` / `<=` 里带等号：前收盘**正好**压在线上也算在另一侧起跳——那是最典型的
+    回踩确认，把它算成「已经穿过了」会让这一天不报。
+    """
+    snapshot = ask.snapshot
+    if snapshot.price is None:
+        return Outcome(why_not=_no_price(snapshot))
+    if snapshot.prev_close is None:
+        return Outcome(
+            why_not="没有前收盘：「穿」说的是从今天上一根到今天的这一跳，"
+            "只用现价判的话，一条早就在下面的线每个交易日都会重报一次"
+        )
+    line = float(ask.params["price"])
+    if upward:
+        crossed = snapshot.prev_close <= line < snapshot.price
+    else:
+        crossed = snapshot.prev_close >= line > snapshot.price
+    if not crossed:
+        return Outcome()
+    verb = "上穿" if upward else "下穿"
+    return Outcome(
+        Verdict(
+            stage=HIT,
+            value=snapshot.price,
+            threshold=line,
+            value_text=money(snapshot.price, snapshot.currency),
+            threshold_text=money(line, snapshot.currency),
+            why=f"前收盘 {money(snapshot.prev_close, snapshot.currency)} 在线 "
+            f"{money(line, snapshot.currency)} 的另侧，现价 "
+            f"{money(snapshot.price, snapshot.currency)} 已{verb}",
+        )
+    )
+
+
+def price_cross_below(ask: Ask) -> Outcome:
+    """`price.cross_below`：跌穿指定价（§9.2 派生的「进入买入区间」用它）。"""
+    return _cross(ask, upward=False)
+
+
+def price_cross_above(ask: Ask) -> Outcome:
+    """`price.cross_above`：涨穿指定价（§9.2 派生的「达到目标价」用它）。"""
+    return _cross(ask, upward=True)
+
+
 TABLE: dict[str, Callable[[Ask], Outcome]] = {
     "stop.fixed": stop_fixed,
     "stop.pct": stop_pct,
@@ -392,4 +491,7 @@ TABLE: dict[str, Callable[[Ask], Outcome]] = {
     "stop.breakeven": stop_breakeven,
     "stop.time": stop_time,
     "stop.thesis_drift": stop_thesis_drift,
+    "tp.tiered": tp_tiered,
+    "price.cross_below": price_cross_below,
+    "price.cross_above": price_cross_above,
 }

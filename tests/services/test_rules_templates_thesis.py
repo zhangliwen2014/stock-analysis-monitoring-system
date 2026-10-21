@@ -10,9 +10,17 @@ from __future__ import annotations
 
 from datetime import date
 
-from sams.core.rules import HIT
+import pytest
+
+from sams.core.rules import HIT, PRE
 from sams.services.rules.snapshot import Snapshot
-from sams.services.rules.templates import Ask, stop_thesis_drift
+from sams.services.rules.templates import (
+    Ask,
+    price_cross_above,
+    price_cross_below,
+    stop_thesis_drift,
+    tp_tiered,
+)
 from sams.storage.repos.theses import HIT_STOP, INVALIDATED, TRACKING, Thesis
 
 
@@ -169,3 +177,78 @@ def test_two_gaps_are_both_named_not_collapsed_into_one() -> None:
     )
     assert got.hit is None
     assert "掉档" in got.why_not and "赔率" in got.why_not
+
+
+def test_a_halfway_gain_is_a_pre_warning_with_the_tier_named() -> None:
+    """成本 12 → 目标 15 这一段走了 60%：报「到 50% 那一档」，级别是 `pre`。"""
+    got = tp_tiered(
+        ask({"tiers": [0.5, 1.0]}, {"price": 13.8, "target_price": 15.0})
+    )
+    assert got.hit is not None
+    assert got.hit.stage == PRE
+    assert "50%" in got.hit.why
+    assert got.hit.value == pytest.approx((13.8 - 12.0) / (15.0 - 12.0))
+
+
+def test_the_target_price_itself_is_a_hit_not_a_pre() -> None:
+    """最后一档必须是 `hit`：同一去重键上只有更响的一档能穿冷却（D94），
+    两档都记 `hit` 的话，到了目标价那一条会被半小时前的 50% 吞掉。"""
+    got = tp_tiered(ask({"tiers": [0.5, 1.0]}, {"price": 15.2, "target_price": 15.0}))
+    assert got.hit is not None
+    assert got.hit.stage == HIT
+    assert "目标价" in got.hit.why
+
+
+def test_a_gain_below_the_first_tier_says_nothing() -> None:
+    got = tp_tiered(ask({"tiers": [0.5, 1.0]}, {"price": 12.6, "target_price": 15.0}))
+    assert got.hit is None
+    assert got.why_not == ""
+
+
+def test_a_target_at_or_below_cost_is_refused_as_a_scale_that_cannot_be_divided() -> None:
+    got = tp_tiered(ask({"tiers": [0.5, 1.0]}, {"price": 10.0, "target_price": 12.0}))
+    assert got.hit is None
+    assert "成本" in got.why_not
+
+
+def test_no_target_price_is_named_instead_of_defaulting_to_the_price() -> None:
+    """拿现价当目标价 ⇒ 进度恒为 1 ⇒ 每趟都报「到了目标价」。"""
+    got = tp_tiered(ask({"tiers": [0.5, 1.0]}, {"target_price": None}))
+    assert got.hit is None
+    assert "目标价" in got.why_not
+
+
+def test_cross_below_needs_the_previous_close_to_call_it_a_cross() -> None:
+    got = price_cross_below(ask({"price": 10.5}, {"prev_close": None}))
+    assert got.hit is None
+    assert "前收盘" in got.why_not
+
+
+def test_a_price_already_below_the_line_at_the_previous_close_is_not_a_cross() -> None:
+    """这就是那一枚防刷屏的用例：昨天就在下面，今天不算「穿」。
+
+    只用现价判的话，这条规则每个交易日收盘后都响一次，而 §10.1 的去重键里没有
+    「第几天」这一维——刷屏会在三天内把用户对该通道的信任磨光。
+    """
+    got = price_cross_below(ask({"price": 10.5}, {"prev_close": 10.4, "price": 10.1}))
+    assert got.hit is None
+
+
+def test_a_downward_cross_is_reported_with_both_sides_and_the_currency() -> None:
+    got = price_cross_below(ask({"price": 10.5}, {"prev_close": 10.6, "price": 10.1}))
+    assert got.hit is not None
+    assert got.hit.stage == HIT
+    assert got.hit.threshold_text == "10.50 CNY"
+    assert "前收盘" in got.hit.why and "现价" in got.hit.why
+
+
+def test_cross_above_is_the_mirror_image() -> None:
+    got = price_cross_above(ask({"price": 10.5}, {"prev_close": 10.4, "price": 10.8}))
+    assert got.hit is not None
+    assert got.hit.stage == HIT
+    assert got.hit.threshold == 10.5
+
+
+def test_cross_above_stays_quiet_when_we_were_already_above() -> None:
+    got = price_cross_above(ask({"price": 10.5}, {"prev_close": 10.9, "price": 11.0}))
+    assert got.hit is None
