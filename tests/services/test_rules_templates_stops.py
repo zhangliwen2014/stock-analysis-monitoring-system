@@ -170,6 +170,7 @@ def test_ma_stop_takes_the_weekly_line_by_default() -> None:
 def test_ma_stop_can_take_the_daily_sixty() -> None:
     got = stop_ma(ask({"basis": "daily_ma60"}, daily_ma60=9.0))
     assert got.hit is None  # 现价 10 > 9，也还没进 9×1.03 之内 ⇒ 两档都不报
+    assert got == Outcome()  # quiet 路径只有真正读到日线且三档全不报才会返回
 
 
 def test_a_missing_ma_names_which_line_is_missing() -> None:
@@ -195,9 +196,38 @@ def test_breakeven_stays_quiet_when_the_trigger_was_never_hit() -> None:
     assert got.why_not == ""
 
 
+def test_a_breakeven_trigger_reached_exactly_is_not_lost_to_float_rounding() -> None:
+    """成本 10、最高 11.5 恰好 +15%：浮点算出来是 0.1499999999999999，不能因此不抬线。"""
+    got = stop_breakeven(
+        ask({"trigger_pct": 0.15}, avg_cost=10.0, holding_high=11.5, price=9.9)
+    )
+    assert got.hit is not None
+    assert got.hit.threshold == pytest.approx(10.0)
+    assert got.hit.stage == HIT
+
+
 def test_breakeven_without_a_position_has_no_cost_to_breakeven_against() -> None:
     got = stop_breakeven(
         ask({"trigger_pct": 0.15}, avg_cost=None, qty=None, holding_high=None)
     )
     assert got.hit is None
     assert "成本" in got.why_not
+
+
+def test_atr_stop_without_a_position_has_no_line_to_measure_from() -> None:
+    got = stop_atr(ask({"multiple": 2.0}, avg_cost=None, qty=None, atr=0.5))
+    assert got.hit is None
+    assert "成本" in got.why_not
+
+
+def test_breakeven_without_a_holding_high_refuses_to_guess() -> None:
+    """有成本、没有持仓期最高价：判不出「曾经到过 x%」，必须有话而不是静默。"""
+    got = stop_breakeven(ask({"trigger_pct": 0.15}, holding_high=None))
+    assert got.hit is None
+    assert "最高价" in got.why_not
+
+
+def test_breakeven_is_quiet_when_the_high_never_exceeded_cost() -> None:
+    """持仓期最高价还低于成本：那 15% 从没到过，静默是正确状态，不是缺输入。"""
+    got = stop_breakeven(ask({"trigger_pct": 0.15}, holding_high=11.0))
+    assert got == Outcome()

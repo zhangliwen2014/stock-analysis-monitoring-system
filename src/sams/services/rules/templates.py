@@ -188,7 +188,7 @@ def stop_atr(ask: Ask) -> Outcome:
     if line <= 0:
         return Outcome(
             why_not=f"倍数 {multiple:g} 把线算到了 {money(line, snapshot.currency)}："
-            "一条在 0 以下的线永远不会触发，这条规则等于没写"
+            "一条在 0 或以下的线永远不会触发，这条规则等于没写"
         )
     stage = stop_stage(snapshot, line)
     if stage is None:
@@ -227,14 +227,14 @@ def stop_ma(ask: Ask) -> Outcome:
     if stage is None:
         return Outcome()
     return _hit(
-        snapshot, line, stage, f"现价跌破 {label} {money(line, snapshot.currency)}"
+        snapshot, line, stage, f"{label} 线 {money(line, snapshot.currency)}"
     )
 
 
 def stop_breakeven(ask: Ask) -> Outcome:
     """`stop.breakeven`：浮盈曾经到过 x% 之后，把线抬到成本。
 
-    触发判据是**持仓期最高价**而不是今天的现价（上面那枚测试的理由）：这一条的意义就是
+    触发判据是**持仓期最高价**而不是今天的现价：这一条的意义就是
     「已经赚过，别把利润全还回去」，而赚过的那一刻是唯一可查的事实。
     线抬到成本 ⇒ 现价只要低于成本就 `hit`，正是字面意思。
     """
@@ -249,7 +249,7 @@ def stop_breakeven(ask: Ask) -> Outcome:
         )
     trigger = float(ask.params["trigger_pct"])
     reached = snapshot.holding_high / snapshot.avg_cost - 1.0
-    if reached < trigger:
+    if reached < trigger - 1e-9:
         return Outcome()
     line = snapshot.avg_cost
     stage = stop_stage(snapshot, line)
