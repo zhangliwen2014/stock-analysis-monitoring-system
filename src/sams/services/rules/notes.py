@@ -86,10 +86,10 @@ def constraint_lines(snapshot: Snapshot) -> tuple[str, ...]:
             and snapshot.price_on is not None
             and snapshot.opened_on == snapshot.price_on
         ):
-            # 「今日买入」的证据其实是「建仓日 == 现价日」，所以那句话里带上这一天：
-            # 现价陈旧时「今日」会不准，而日期是 `Snapshot` 里查得出的事实。
+            # spec §10.2 把这句话的措辞写死了，照抄；后面再补上「建仓日 == 现价日」那个
+            # 日期：现价陈旧时单说「今日」不准，而日期是 `Snapshot` 里查得出的事实。
             lines.append(
-                f"{snapshot.price_on} 建仓、现价同为该日读数：受 T+1 限制当日无法卖出，"
+                f"今日买入（{snapshot.price_on}），受 T+1 限制无法当日卖出："
                 "这一条要等下一个交易日执行"
             )
     down, band = _limit_down(snapshot, market)

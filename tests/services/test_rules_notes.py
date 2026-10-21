@@ -34,8 +34,9 @@ def snap(**over) -> Snapshot:
 
 def test_a_position_opened_today_is_marked_t_plus_one() -> None:
     got = constraint_lines(snap(opened_on=date(2026, 10, 20)))
-    # 那句话带上了「建仓日 == 现价日」这一天：现价陈旧时「今日」会不准，日期才查得出
-    assert any("T+1" in line and "2026-10-20" in line for line in got)
+    # 「今日买入，受 T+1 限制无法当日卖出」是 spec §10.2 写死的措辞，照抄；
+    # 后面那枚日期是证据（建仓日 == 现价日），现价陈旧时单说「今日」不准。
+    assert any("今日买入" in line and "T+1" in line and "2026-10-20" in line for line in got)
 
 
 def test_an_older_position_is_not_marked_t_plus_one() -> None:
