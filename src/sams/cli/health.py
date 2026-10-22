@@ -112,12 +112,11 @@ def _print_ledger(report) -> None:
 
 
 def _print_backlog(notify) -> None:
-    """积压那两行：`None` 时什么都不打，因为「库里还没有 0015 的形状」由上面那句说过了。
+    """积压那两行，只在「库已经是 0015 的形状」时被调用：那一句由 `_print_notify` 判、
+    判完就 return，这条线只在那一处判（在这里再判一次就是第二个主人）。
 
     用户与系统各一行：两个受害者、两句修法——`sams alert list` 答不了「哪个 job 在反复失败」。
     """
-    if notify.unhandled is None:
-        return
     if notify.unhandled:
         oldest = (
             f"（最早 {stamp(notify.unhandled_oldest)}）" if notify.unhandled_oldest else ""
@@ -219,8 +218,10 @@ def _print_schedule(report) -> None:
     for job in data.jobs:
         # 周期紧跟着名字：它是「连续失败 N 个周期」的分母——
         # 日频 job 连败 2 个周期与月频 job 连败 2 个周期是两个不同的事
-        # 名字那一列按注册表里最长的名字留宽（现在是 `financials`，10 个字符）：
-        # `:<` 只补不截，列窄一格整列就右移，两行不齐时读不出「谁在反复失败」
+        # 名字那一列留宽到注册表里最长的那个名字（现在是 `financials`，10 个字符）：
+        # `:<` 只补不截，留窄一格后面的列就跟着左移，两行不齐时读不出「谁在反复失败」。
+        # 注册表里长出更长的名字时这一格要跟着改——用例钉的是当下这三列齐不齐，
+        # 不是「这一格永远够宽」
         line = f"  {job.name:<11} {(job.market or '全局'):<4} {job.period:<7}"
         latest = job.latest
         if latest is None:

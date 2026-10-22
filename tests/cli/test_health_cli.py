@@ -233,9 +233,13 @@ def test_a_run_row_without_a_period_key_shows_a_dash(invoke) -> None:
 
 
 def test_the_columns_line_up_across_the_widest_inputs(invoke) -> None:
-    """名字、市场、周期三列各自按注册表里最长的取值留宽（`financials` 10 个字符、
-    `monthly` 7 个、市场码 `A`/`HK`/`US` 到 2 个）。`:<` 只补不截，哪一列留窄了，
-    后面的状态列就跟着左移，一屏里两行不齐就读不出「谁在反复失败」。"""
+    """名字与周期两列的宽度由注册表算得出（`financials` 10 个字符 → 留 11、
+    `monthly` 7 个 → 正好 7）；市场那一列的 4 不是：市场码是 `canonical_market`
+    大写后的自由字符串，现在用到的 `A`/`HK` 都只有 1~2 个字符，「全局」占 2 个。
+
+    `:<` 只补不截，哪一列留窄了后面的状态列就跟着左移，一屏里两行不齐就读不出
+    「谁在反复失败」——对齐这一枚钉的是三列**当下**齐不齐，不是「这三格永远够宽」。
+    """
     jobs = (
         run_for("financials", period="daily"),
         run_for("calendar", period="monthly"),
@@ -268,6 +272,19 @@ def test_unwired_reading_keeps_the_section_and_exits_0(invoke) -> None:
     assert "[调度]" in text
     assert "未接入调度器读数" in text
     assert code == 0
+
+
+def test_an_unmigrated_db_says_the_version_and_no_backlog_numbers(invoke) -> None:
+    """未迁移的那一屏只说「该跑迁移」，不接着报积压：`NotifyData()` 里那八个数是 `None`，
+    而 `None` 是「没查过」不是「查出来是 0」。把两者印在同一屏上，读的人会在一个
+    还没有 `alerts` 表形状的库里去找「谁没看告警」。
+
+    这一枚钉的是 `_print_notify` 里那句 `return`：它是「这条线只判一次」的唯一主人。
+    """
+    _, text = invoke(report_with(notify=NotifyData()))
+    assert "库里还没有 0015 的形状" in text
+    assert "未处理告警" not in text, "未迁移的库不报用户积压，连 0 都不报"
+    assert "个组件未处理" not in text
 
 
 def test_system_backlog_gets_its_own_line_not_the_user_one(invoke) -> None:
