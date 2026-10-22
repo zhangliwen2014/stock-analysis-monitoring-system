@@ -1,4 +1,4 @@
-"""`sams health` —— 一屏看清库、日历、数据源是否正常。"""
+"""`sams health` —— 一屏看清库、日历、数据源与调度器心跳是否正常。"""
 
 from __future__ import annotations
 
@@ -112,19 +112,32 @@ def _print_ledger(report) -> None:
 
 
 def _print_backlog(notify) -> None:
-    """积压那一行：`None` 时什么都不打，因为「库里还没有 0015 的形状」由上面那句说过了。"""
+    """积压那两行：`None` 时什么都不打，因为「库里还没有 0015 的形状」由上面那句说过了。
+
+    用户与系统各一行：两个受害者、两句修法——`sams alert list` 答不了「哪个 job 在反复失败」。
+    """
     if notify.unhandled is None:
         return
-    if not notify.unhandled:
+    if notify.unhandled:
+        oldest = (
+            f"（最早 {stamp(notify.unhandled_oldest)}）" if notify.unhandled_oldest else ""
+        )
+        print(
+            f"  ⚠ 未处理告警 {notify.unhandled} 条{oldest}"
+            "：`sams alert list --user … --status new`"
+        )
+    else:
         print("  未处理告警 0 条")
-        return
-    oldest = (
-        f"（最早 {stamp(notify.unhandled_oldest)}）" if notify.unhandled_oldest else ""
-    )
-    print(
-        f"  ⚠ 未处理告警 {notify.unhandled} 条{oldest}"
-        "：`sams alert list --user … --status new`"
-    )
+    if notify.unhandled_system:
+        oldest = (
+            f"（最早 {stamp(notify.unhandled_system_oldest)}）"
+            if notify.unhandled_system_oldest
+            else ""
+        )
+        print(
+            f"  ⚠ 系统告警 {notify.unhandled_system} 个组件未处理{oldest}"
+            "：`sams run jobs` 看哪个 job 在反复失败"
+        )
 
 
 def _print_notify(report) -> None:
@@ -159,6 +172,59 @@ def _print_notify(report) -> None:
         print(f"  ⚠ 库里有不认识的 kind（{shown}）：路由会跳过它们，`sams channel remove` 清掉")
 
 
+def _age(seconds: int | None) -> str:
+    """把「距今多少秒」折成人能扫一眼的时长：一个四位数秒值在屏幕上没有量感。"""
+    if seconds is None:
+        return "未知"
+    if seconds < 60:
+        return f"{seconds} 秒"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟"
+    return f"{seconds // 3600} 小时 {(seconds % 3600) // 60} 分钟"
+
+
+def _print_schedule(report) -> None:
+    """`[调度]`：它还在不在跑，加上每个 job 上一轮跑成什么。
+
+    死掉的调度器发不出「我死了」（D101），所以这一节是循环存在与否唯一的出口；
+    「未接入」也要占一行而不是让这一节消失——缺席会被读成「调度器好好的」。
+    过期那一行只是说「可能停了」，退出码让 cron 也能听见这件事（`show` 的最后一行）。
+    """
+    print("[调度]")
+    if report.schedule is None:
+        print("  未接入调度器读数")
+        return
+    data = report.schedule
+    if data.never_started:
+        print("  从未启动（`sams run start` 启动常驻调度器）")
+    elif data.stale:
+        print(f"  ⚠ 心跳已经 {_age(data.beat_age_s)}没更新：常驻调度器可能已经停了")
+    else:
+        print(f"  心跳 {_age(data.beat_age_s)}前 · 管理员 {data.admins} 名")
+    if data.admins == 0:
+        # 与上一行的「管理员 0 名」不冲突：那一行报事实，这一行报后果——
+        # 「循环还在跑」与「告警没有一个收件人」恰好可以同时成立
+        print("  ⚠ 没有在用的管理员：系统告警一个收件人都没有（`sams user set-admin …`）")
+    for job in data.jobs:
+        # 周期跟着名字一起打：它是「连续失败 N 个周期」的分母——
+        # 日频 job 连败 2 个周期与季频 job 连败 2 个周期是两个不同的事
+        line = f"  {job.name:<9} {(job.market or '全局'):<4} {job.period:<7}"
+        latest = job.latest
+        if latest is None:
+            print(line + "  从未运行")
+            continue
+        line += f" {latest.status:<7} 周期 {latest.period_key or '—'}"
+        if latest.finished_at:
+            line += f" · {stamp(latest.finished_at)}"
+        if job.streak:
+            line += f" · 连续失败 {job.streak} 个周期"
+        if latest.error:
+            line += f" · {latest.error[:60]}"
+        if latest.note:
+            line += f" · {latest.note}"
+        print(line)
+
+
 def show(container: Container, args: argparse.Namespace) -> int:
     report = container.health.report()
     print(f"库: {report.db_path}")
@@ -171,6 +237,7 @@ def show(container: Container, args: argparse.Namespace) -> int:
     _print_fundamentals(container, report)
     _print_ledger(report)
     _print_notify(report)
+    _print_schedule(report)
     print("[日历覆盖]")
     for market, years in report.calendar_years.items():
         shown = ", ".join(str(y) for y in years) or "（无）"
@@ -214,4 +281,11 @@ def show(container: Container, args: argparse.Namespace) -> int:
         print(f"  ⚠ {source.name} 未恢复，检查网络或换源")
     for source in report.unverified_sources:
         print(f"  · {source.name} 尚未被调用过，健康状态未知")
-    return 0 if not report.degraded_sources and not report.pending_migrations else 1
+    # 退出码给 cron 看（D101：死掉的调度器发不出「我死了」，只有外部读者能判）。
+    # 用 `schedule_stale` 而不用「从未启动」：一次都没跑过的库不是事故，
+    # 那一格由 `[调度]` 自己的文案说
+    return (
+        1
+        if report.degraded_sources or report.pending_migrations or report.schedule_stale
+        else 0
+    )

@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from typing import TYPE_CHECKING
 
 from sams.core.calendar import CalendarStore
 from sams.core.clock import SYSTEM_CLOCK, Clock
@@ -21,6 +22,11 @@ from sams.storage.migrate import pending
 from sams.storage.repos.bars import ADJUST
 from sams.storage.repos.fx import FxPair, FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+
+if TYPE_CHECKING:
+    # 只在注解里出现：健康这一层要的是 `ScheduleData` 的**形状**，不是调度器的循环
+    # （运行时 import 会把 services.health 连到调度器的依赖图上，见 `HealthService.__init__`）
+    from sams.services.scheduler.report import ScheduleData
 
 
 def _as_date(value) -> date | None:
@@ -49,6 +55,10 @@ KEY_TABLES = (
     "channels",
     "alerts",
     "notify_log",
+    # 调度器的两张台账各答一个问题：`task_runs` 是「每个 job 上一轮跑成什么」，
+    # `scheduler_heartbeats` 是「还在跑吗」（D101：判「它还在不在跑」的读者必须在循环之外）
+    "task_runs",
+    "scheduler_heartbeats",
 )
 
 
@@ -123,7 +133,8 @@ class NotifyData:
     `channels=None` 表示「库里还不是 0015 的形状」，与 0 是两句话：0 意思是「一个通道
     都没配」（用户该去配），None 意思是「该跑迁移」。把 None 写成 0，运维会去查
     「为什么通道没了」而真正的问题是版本。六个数**一起**可空：只让前两列可空的话，
-    「0 次投递」这一句在未迁移的库上仍然是谎话。
+    「0 次投递」这一句在未迁移的库上仍然是谎话。下面积压那四个数沿用同一条线：
+    未迁移时它们也一起是 `None`，不是「系统积压为零」。
     """
 
     channels: int | None = None
@@ -133,10 +144,17 @@ class NotifyData:
     failed: int | None = None
     suppressed: int | None = None
     no_channel: int | None = None
-    #: 未处理（`status='new'`）的条数与**最早**那一条的时刻。跨全部用户数：健康页是运维视角，
-    #: 「响了多少没人看」与「谁该看」是两件事。`None` 沿用上面那几个数的同一条线（D93）
+    #: 未处理（`status='new'`）的**用户**条数与**最早**那一条的时刻。跨全部用户数：健康页是
+    #: 运维视角，「响了多少没人看」与「谁该看」是两件事。`None` 沿用上面那几个数的同一条线（D93）。
+    #: 排除 `market='SYS'`：一条系统告警在每个管理员名下各落一行（D102），混进来的话
+    #: 「2 个组件在反复告警、2 个管理员」会显示成「未处理 4 条」——而那两句修法是两个问题
     unhandled: int | None = None
     unhandled_oldest: datetime | None = None
+    #: 系统积压：**未处理的组件个数**（`code` 存的是组件名，D102）而不是行数——
+    #: 一行管理员副本不是一个新问题，数行数会把同一个故障按管理员数放大。
+    #: 最早一条的时刻与用户那两个数走同一条可空线：未迁移时保持 `None`
+    unhandled_system: int | None = None
+    unhandled_system_oldest: datetime | None = None
     #: 本机那两个通道的可用性：**None 是「没接入探测」**（这一层不认识 monitor），
     #: 空串是「这台机器发得出去」，其余就是那一句原因。三个状态必须分得开——
     #: 把「没接入」显示成「可用」，健康页就在替一个从没试过的通道打包票。
@@ -159,6 +177,10 @@ class HealthReport:
     ledger: LedgerData = field(default_factory=LedgerData)
     #: 未迁移的库里这一节全是 None（不是 0）：见 `NotifyData`
     notify: NotifyData = field(default_factory=NotifyData)
+    #: 调度器的读数。**None 是「没接入」**，与接入了但从未启动
+    #: （`ScheduleData(heartbeat=None, ...)`）是两件事，必须在类型上分得开：
+    #: 把前者显示成后者，运维会去查一个从没跑过的调度器
+    schedule: ScheduleData | None = None
 
     @property
     def degraded_sources(self) -> list[SourceRecord]:
@@ -169,6 +191,12 @@ class HealthReport:
     @property
     def unverified_sources(self) -> list[SourceRecord]:
         return [s for s in self.sources if s.ok is None]
+
+    @property
+    def schedule_stale(self) -> bool:
+        """有过心跳且已经过期：退出码里只有这一条算「它可能死了」（D101）。
+        从未启动不是事故、没接入更不是，所以这里不读 `never_started`。"""
+        return self.schedule is not None and self.schedule.stale
 
 
 #: 三张基本面表各自的「有几只票、最新到哪一天」。列名到报告字段的映射写在同一行，
@@ -228,6 +256,7 @@ class HealthService:
         sim_ledger: SimOrderRepo | None = None,
         fx: FxRepo | None = None,
         local_status: Callable[[], dict[str, str]] | None = None,
+        schedule: Callable[[], ScheduleData] | None = None,
     ) -> None:
         self.db = db
         self.registry = registry
@@ -244,6 +273,9 @@ class HealthService:
         #: monitor（守卫），所以来的是一个函数而不是一个 monitor 对象。不传就是空串，
         #: 屏幕上那一行会写「未接入」而不是「可用」
         self.local_status = local_status
+        #: 调度器读数同理，而且**函数比调度器对象更对**：健康这一层不认识循环，
+        #: 只要一份 `ScheduleData` 的形状；传对象会把 `services.health` 连到调度器的依赖图上
+        self.schedule = schedule
 
     def report(self) -> HealthReport:
         tables = {
@@ -259,6 +291,7 @@ class HealthService:
             fundamentals=self._fundamentals_coverage(),
             ledger=self._ledger_data(),
             notify=self._notify_data(),
+            schedule=self.schedule() if self.schedule is not None else None,
         )
 
     def _notify_data(self) -> NotifyData:
@@ -286,12 +319,33 @@ class HealthService:
             for row in self.db.query("SELECT DISTINCT kind FROM channels").to_dicts()
         }
         status = self.local_status() if self.local_status is not None else {}
+        # 用户积压排除 `market='SYS'`：系统告警在每个管理员名下各有一行副本，
+        # 混进来的话「2 个组件、2 个管理员」会显示成「未处理 4 条」
         unhandled = int(
-            self.db.scalar("SELECT count(*) FROM alerts WHERE status = 'new'") or 0
+            self.db.scalar(
+                "SELECT count(*) FROM alerts WHERE status = 'new' AND market <> 'SYS'"
+            ) or 0
         )
         oldest = (
-            self.db.scalar("SELECT min(triggered_at) FROM alerts WHERE status = 'new'")
+            self.db.scalar(
+                "SELECT min(triggered_at) FROM alerts"
+                " WHERE status = 'new' AND market <> 'SYS'"
+            )
             if unhandled
+            else None
+        )
+        # 数**组件**而不是数行：`code` 存的是组件名（D102），一行管理员副本不是一个新问题
+        system_unhandled = int(
+            self.db.scalar(
+                "SELECT count(DISTINCT code) FROM alerts"
+                " WHERE status = 'new' AND market = 'SYS'"
+            ) or 0
+        )
+        system_oldest = (
+            self.db.scalar(
+                "SELECT min(triggered_at) FROM alerts WHERE status = 'new' AND market = 'SYS'"
+            )
+            if system_unhandled
             else None
         )
         return NotifyData(
@@ -303,6 +357,8 @@ class HealthService:
             no_channel=counts.get(NO_CHANNEL, 0),
             unhandled=unhandled,
             unhandled_oldest=oldest,
+            unhandled_system=system_unhandled,
+            unhandled_system_oldest=system_oldest,
             desktop=status.get("desktop"),
             voice=status.get("voice"),
             unknown_kinds=tuple(sorted(kinds - set(KINDS))),
