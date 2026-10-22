@@ -488,3 +488,66 @@ def test_the_same_no_answer_is_ok_for_bars_and_not_ok_for_actions():
     mute = ActionsAdapter("sina", error=EmptyResponse("sina", "区间无数据"))
     acts = registry(mute, ActionsAdapter("akshare")).fetch_actions("A", "601088", D1, D2)
     assert acts.attempts[0].ok is False
+
+
+class AllFailAdapter:
+    """每个能力都抛同一个异常：验「全链都失败」时终端错误是哪一种。"""
+
+    markets = frozenset({"A"})
+
+    def __init__(self, name: str, exc: Exception) -> None:
+        self.name = name
+        self.exc = exc
+
+    def daily_bars(self, market, code, start, end):
+        raise self.exc
+
+    def corp_actions(self, market, code, start, end):
+        raise self.exc
+
+    def financials(self, market, code, start, end):
+        raise self.exc
+
+
+def _two_failing(*exc: Exception):
+    return registry(
+        AllFailAdapter("akshare", exc[0]),
+        AllFailAdapter("eastmoney", exc[1]),
+    )
+
+
+def test_all_daily_sources_rate_limited_is_transient():
+    """全链都是限流 ⇒ 「下轮再试」，不是「链坏了」（D104）。"""
+    reg = _two_failing(RateLimited("akshare", "429"), RateLimited("eastmoney", "429"))
+    with pytest.raises(TransientError, match="所有源均失败"):
+        reg.fetch_daily("A", "600519", D1, D2)
+
+
+def test_one_structural_failure_makes_daily_terminal():
+    """掺进一个改版 ⇒ 出声告警，不带「重试就好」的意思。"""
+    reg = _two_failing(RateLimited("akshare", "429"), FieldDrift("eastmoney", "少列"))
+    with pytest.raises(DatasourceError) as caught:
+        reg.fetch_daily("A", "600519", D1, D2)
+    assert not isinstance(caught.value, TransientError)
+
+
+def test_actions_keep_retryability_in_the_terminal_error():
+    reg = _two_failing(RateLimited("akshare", "429"), RateLimited("eastmoney", "429"))
+    with pytest.raises(TransientError, match="取不到公司行为"):
+        reg.fetch_actions("A", "600519", D1, D2)
+
+
+def test_frames_with_a_no_answer_are_terminal_even_if_the_rest_are_retryable():
+    """「答不上来」不是「下轮再试」：它意味着这个源今天的答复不可读，必须出声。"""
+    reg = _two_failing(
+        RateLimited("akshare", "429"), EmptyResponse("eastmoney", "接口回空")
+    )
+    with pytest.raises(DatasourceError) as caught:
+        reg.fetch_financials("A", "600519", D1, D2)
+    assert not isinstance(caught.value, TransientError)
+
+
+def test_frames_all_rate_limited_are_transient():
+    reg = _two_failing(RateLimited("akshare", "429"), RateLimited("eastmoney", "429"))
+    with pytest.raises(TransientError, match="取不到基本面"):
+        reg.fetch_financials("A", "600519", D1, D2)

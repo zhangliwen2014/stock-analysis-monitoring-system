@@ -48,6 +48,21 @@ def default_adapters() -> dict[str, BarAdapter]:
 #: 值得原地退避重试的错误。FieldDrift 不在其中——改版重试不会变好，只会白等 21 秒
 RETRYABLE: tuple[type[BaseException], ...] = (RateLimited, TransientError, OSError, TimeoutError)
 
+
+def _terminal_error(
+    reason: str, causes: list[Exception | None], *, no_answer: bool = False
+) -> DatasourceError:
+    """全链都失败时终端错误该是哪一种（D88/D104）。
+
+    判据只有一条：**每一个真失败过的源都只抖了一下**（限流/超时/网络），才值得
+    「下轮再试」；链上只要有一个改版（`FieldDrift`）、或者有源连「没有」都没答清
+    （`EmptyResponse`），这次失败就要人出声——重试不会让一个缺失的字段长回来。
+    """
+    if causes and not no_answer and all(isinstance(cause, RETRYABLE) for cause in causes):
+        return TransientError("registry", reason)
+    return DatasourceError("registry", reason)
+
+
 #: 所有源都回答「无数据」时返回的空帧，列集与标准列一致，调用方无需分支
 EMPTY_BARS = pl.DataFrame(
     schema={
@@ -105,6 +120,8 @@ class _Outcome:
     frame: pl.DataFrame | None = None
     error: str | None = None
     tries: int = 1
+    #: 原始异常：终端错误的归类要靠类型，字符串里活不下来（`_SourceFailed.cause` 同理）
+    cause: Exception | None = None
 
 
 @dataclass(frozen=True)
@@ -347,7 +364,9 @@ class AdapterRegistry:
             try:
                 frame = self._call(name, market, code, start, end, method=method)
             except _SourceFailed as failed:
-                yield _Outcome(name, "failed", error=failed.error, tries=failed.tries)
+                yield _Outcome(
+                    name, "failed", error=failed.error, tries=failed.tries, cause=failed.cause
+                )
                 continue
             except EmptyResponse as exc:
                 yield _Outcome(name, "no_answer", error=str(exc))
@@ -358,12 +377,14 @@ class AdapterRegistry:
         attempts: list[Attempt] = []
         skipped: list[tuple[str, str]] = []
         empties: list[str] = []
+        causes: list[Exception | None] = []
         for out in self._walk(market, code, start, end, method="daily_bars"):
             if out.kind == "skipped":
                 skipped.append((out.source, out.error))
                 continue
             if out.kind == "failed":
                 attempts.append(Attempt(out.source, False, out.tries, out.error))
+                causes.append(out.cause)
                 continue
             if out.kind == "no_answer":
                 empties.append(out.source)
@@ -386,7 +407,7 @@ class AdapterRegistry:
                 empty_everywhere=True,
             )
         detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
-        raise DatasourceError("registry", f"{market} {code} 所有源均失败 → {detail}")
+        raise _terminal_error(f"{market} {code} 所有源均失败 → {detail}", causes)
 
     def fetch_actions(self, market: str, code: str, start: date, end: date) -> ActionsResult:
         """公司行为链：按同一条路由顺序走，但**只走有这个能力的源**。
@@ -404,18 +425,22 @@ class AdapterRegistry:
         skipped: list[tuple[str, str]] = []
         empties: list[tuple[str, bool]] = []
         unanswered: list[str] = []
+        causes: list[Exception | None] = []
+        no_answer = False
         for out in self._walk(market, code, start, end, method="corp_actions"):
             if out.kind == "skipped":
                 skipped.append((out.source, out.error))
                 continue
             if out.kind == "failed":
                 attempts.append(Attempt(out.source, False, out.tries, out.error))
+                causes.append(out.cause)
                 unanswered.append(out.source)
                 continue
             if out.kind == "no_answer":
                 # 源连「没有」这句话都没说清（接口回空/解析不了）：不能替它写成查过（D36）
                 attempts.append(Attempt(out.source, False, 1, f"无数据: {out.error}"))
                 unanswered.append(out.source)
+                no_answer = True
                 logger.info(
                     "公司行为 %s 回答无数据（%s %s），换源", out.source, market, code
                 )
@@ -455,13 +480,13 @@ class AdapterRegistry:
 
         detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
         said_no = "、".join(name for name, _ in empties)
-        raise DatasourceError(
-            "registry",
+        reason = (
             f"{market} {code} 取不到公司行为。链 {list(self.sources_for(market))} 里"
             f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}"
             + (f"；说查无记录的 {said_no}（因为 {('、'.join(unanswered))} 没答上来，"
-               f"这些「没有」还不能写成确认）" if empties else ""),
+               f"这些「没有」还不能写成确认）" if empties else "")
         )
+        raise _terminal_error(reason, causes, no_answer=no_answer)
 
     def fetch_financials(self, market: str, code: str, start: date, end: date) -> FrameResult:
         """按报告期的财务指标（ROE、增速、股息率）。
@@ -501,18 +526,22 @@ class AdapterRegistry:
         skipped: list[tuple[str, str]] = []
         empties: list[str] = []
         unanswered: list[str] = []
+        causes: list[Exception | None] = []
+        no_answer = False
         for out in self._walk(market, code, start, end, method=method):
             if out.kind == "skipped":
                 skipped.append((out.source, out.error))
                 continue
             if out.kind == "failed":
                 attempts.append(Attempt(out.source, False, out.tries, out.error))
+                causes.append(out.cause)
                 unanswered.append(out.source)
                 continue
             if out.kind == "no_answer":
                 # 源连「没有」都没说清（接口回空、解析不出）：不能替它写成查过（D36）
                 attempts.append(Attempt(out.source, False, 1, f"无数据: {out.error}"))
                 unanswered.append(out.source)
+                no_answer = True
                 logger.info("%s %s 回答无数据（%s %s），换源", cap.label, out.source, market, code)
                 continue
             if out.frame.height == 0:
@@ -548,8 +577,7 @@ class AdapterRegistry:
 
         detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
         said_no = "、".join(empties)
-        raise DatasourceError(
-            "registry",
+        reason = (
             f"{market} {code} 取不到{cap.label}。链 {list(self.sources_for(market))} 里"
             f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}"
             + (
@@ -557,8 +585,9 @@ class AdapterRegistry:
                 f"这些「没有」还不能写成确认）"
                 if empties
                 else ""
-            ),
+            )
         )
+        raise _terminal_error(reason, causes, no_answer=no_answer)
 
     def fetch_fx(self, base: str, quote: str, start: date, end: date) -> FxResult:
         """汇率链：注册表里所有「提供汇率」的源，按注册顺序试，与 `market_sources` 无关。
@@ -625,12 +654,7 @@ class AdapterRegistry:
                 else ""
             )
         )
-        # 「待会儿重跑就好」还是「链真的坏了」，看的是失败本身值不值得再试一次：
-        # 全链都是限流或抖动就抛 `TransientError`，掺进一个改版（`FieldDrift`）就抛
-        # `DatasourceError`——调度器据这个分界决定是下轮再试还是出声告警。
-        if failed and all(isinstance(cause, RETRYABLE) for _, cause in failed):
-            raise TransientError("registry", reason)
-        raise DatasourceError("registry", reason)
+        raise _terminal_error(reason, [cause for _, cause in failed])
 
     def _call_fx(self, name: str, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
         """对单个源的一次汇率取数：限速、退避、归类，与 `_call` 同一套预算。
@@ -716,13 +740,13 @@ class AdapterRegistry:
             raise
         except DatasourceError as exc:
             self._mark_failure(name, exc)
-            raise _SourceFailed(name, calls, str(exc)) from exc
+            raise _SourceFailed(name, calls, str(exc), exc) from exc
         except Exception as exc:  # noqa: BLE001 — 适配器漏归类时兜底，路由不能被打断
             # 不是 BaseException：Ctrl-C 不是「这个源坏了，换下一个」，
             # 兜住它等于让中断要等整条链每个源都试完才生效，还把一次取消记成源故障
             wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
             self._mark_failure(name, wrapped)
-            raise _SourceFailed(name, calls, str(wrapped)) from exc
+            raise _SourceFailed(name, calls, str(wrapped), wrapped) from exc
         return frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
 
     def _mark_ok(self, name: str) -> None:
