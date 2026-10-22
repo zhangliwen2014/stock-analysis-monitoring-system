@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import NotAdjustable, SamsError, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
@@ -209,10 +210,14 @@ class RuleEngine:
         而本函数不知道自己被调了几次——一次还是三个市场，是调用方的事。
 
         `market` 是对象级子集：过滤在展开之后做——规则的目标可以是 `*` 那种
-        「我的全部持仓」，展开之前问不出「这里面哪些属于 HK」。
+        「我的全部持仓」，展开之前问不出「这里面哪些属于 HK」。大小写先归一（D46）：
+        配置里那个键是原样留下的，`"hk"` 不归一就会让每一张规则都「对象全在别的市场」，
+        而那一趟出门说的是「触发 0」，与一晚平安长得一模一样。
         """
         now = self.clock.now_utc()
         day = as_of if as_of is not None else self.clock.today()
+        if market is not None:
+            market = canonical_market(market)
         raised: list[Raised] = []
         suppressed: list[Suppressed] = []
         skipped: list[Skipped] = []

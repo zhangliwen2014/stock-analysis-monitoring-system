@@ -23,6 +23,7 @@ from functools import partial
 
 from sams.core.errors import DatasourceError, SamsError
 from sams.core.timeutil import HISTORY_START
+from sams.services.actors import active_users
 from sams.services.scheduler.due import DAILY, FX, MONTHLY, WEEKLY
 from sams.services.scheduler.types import (
     JobContext,
@@ -148,9 +149,10 @@ def _has(deps: JobDeps, market: str, method: str) -> bool:
 def run_fx(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """汇率没有市场维度：对象来自账户的币种对，窗口按每对各自的库内最新日。
 
-    这一头的单元是「一对」而不是「一只票」，失败那句话还得带上方向（`fx_rates` 只存
-    `(base, quote)` 那一个方向），所以这段循环不并进 `_collect`。接住的仍然只有
-    `SamsError`：按对隔离与按只隔离是同一条规矩，用例因此在汇率这一头也单独钉了一枚。
+    不并进 `_collect` 是因为那一头的单位是 `(market, code)` 那一只票：量词「只」和失败
+    那句的前缀都是按它写的，而这里的单位是「一对」。接住的仍然只有 `SamsError`——
+    按对隔离与按只隔离是同一条规矩，但那份规矩是两处各写一遍的，所以四个运维 job
+    每一个都在自己那一头单独钉一枚：放宽一处不该让其余三处跟着红。
     """
     pairs = ctx.universe.fx_pairs
     rows = 0
@@ -172,9 +174,10 @@ def run_fx(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
 
 def run_calendar(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    """当月刷新一次；12 月顺手把下一年铺好（D109：跨年那天之前要有一整年的日历）。
+    """每月一次，每次把 `as_of` 那一年整年重铺；12 月顺手把下一年也铺上
+    （D109：跨年那天之前要有一整年的日历）。
 
-    按年隔离：下一年那条链挂了不该把当月已经刷到的行一起报没了——行数照收，
+    按年隔离：下一年那条链挂了不该把当年已经刷到的行一起报没了——行数照收，
     坏的那一年单独进 `errors`。
     """
     assert ctx.market is not None  # 日历 job 只在市场 job 上登记
@@ -197,12 +200,17 @@ def run_calendar(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 def run_rules(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """只评估这个市场的对象；每用户一趟，一个用户失败不带走其余（`errors` 与行数并存）。
 
-    `suppressed`（冷却/过滤拦下）、`skipped`（判不了）、`blocked`（展开失败）各留一个数：
-    合成一个「异常数」就分不清那三件事，处置的话也不同。判过了没到的 `quiet` 不进 note：
-    一个正常的夜里它占绝大多数，写出来只是噪音。
+    这一趟的出口是投递（`engine._dispatch` → 通知通道），所以只跑启用的账号：
+    `router.dispatch` 只查「有没有这个用户」，不查状态。采集那一头不过滤，理由在
+    `universe.py` 的文件头。
+
+    `suppressed`（过滤器与冷却合起来拦下的，不是一个「冷却」数）、`skipped`（判不了）、
+    `blocked`（展开失败）各留一个数：合成一个「异常数」就分不清那三件事，处置的话也不同。
+    判过了没到的 `quiet` 不进 note：那一摞说的是「没到」，而这一屏问的是
+    「到了什么、有什么拦着」。
     """
-    users = deps.users.list_users()
-    raised = suppressed = skipped = blocked = 0
+    users = active_users(deps.users)
+    raised = suppressed = skipped = blocked = done = 0
     errors: list[str] = []
     for user in users:
         try:
@@ -214,9 +222,10 @@ def run_rules(deps: JobDeps, ctx: JobContext) -> JobOutcome:
         suppressed += len(report.suppressed)
         skipped += len(report.skipped)
         blocked += len(report.blocked)
+        done += 1
     note = (
-        f"{len(users)} 个用户：触发 {raised}、冷却 {suppressed}、"
-        f"跳过 {skipped}、阻塞 {blocked}"
+        f"{done}/{len(users)} 个用户：触发 {raised}、压住 {suppressed}、"
+        f"判不了 {skipped}、阻塞 {blocked}"
     )
     if errors:
         note += f"，{len(errors)} 个用户失败"
@@ -224,9 +233,13 @@ def run_rules(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
 
 def run_recheck(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    """周复检按用户隔离，与 `run_rules` 同一条规矩；行数就是这一趟比过的论数。"""
-    users = deps.users.list_users()
-    rows = 0
+    """周复检按用户隔离，与 `run_rules` 同一条规矩，也只跑启用的账号——它会写基线。
+
+    行数就是这一趟挑出来的论数，里头含「刚建立基线」与「读不到分」那两类：
+    它们没有可比的东西，所以这一句不说「比过」。
+    """
+    users = active_users(deps.users)
+    rows = done = 0
     errors: list[str] = []
     for user in users:
         try:
@@ -235,7 +248,8 @@ def run_recheck(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             errors.append(f"{user.username}: {exc}")
             continue
         rows += len(report.rows)
-    note = f"{len(users)} 个用户复检 {rows} 条观点"
+        done += 1
+    note = f"{done}/{len(users)} 个用户复检 {rows} 条观点"
     if errors:
         note += f"，{len(errors)} 个用户失败"
     return JobOutcome(rows, note, tuple(errors))
@@ -246,8 +260,9 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
     每个市场：数据链 → 周复检 → 规则；然后汇率；最后日历。
 
     周复检排在规则之前说的是**同一晚之内**：`thesis.drift` 读的是复检写下的
-    `baseline_items`，所以一条还没有基线的论——先复检，当晚就比得出漂移，
-    先跑规则，那一晚它只能拿到「还没有分项基线」那一句，得等下一晚。
+    `baseline_items`，没有它就只拿到「这条论还没有分项基线」那一句。先复检，那条论当晚
+    就有基线可读——但当晚比不出掉档：那份基线正是同一趟同一次读取写下的，
+    自己和自己不会掉一档。要真比出漂移，得等下一晚的快照与这一晚的基线对上。
     已经有基线的论不受这个顺序影响。
     """
     jobs: list[JobSpec] = []

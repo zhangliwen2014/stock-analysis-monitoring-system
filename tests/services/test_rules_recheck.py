@@ -357,6 +357,8 @@ def test_market_filter_skips_theses_from_other_markets(container) -> None:
     rec = build(container)
     assert rec.run(USER, as_of=AS_OF, market="HK").rows == ()
     assert len(rec.run(USER, as_of=AS_OF, market="A").rows) == 1
+    # 与引擎同一件事：库里存大写，配置里的键原样留着，`"a"` 不归一就是「0 条观点」
+    assert len(rec.run(USER, as_of=AS_OF, market="a").rows) == 1
     with pytest.raises(ValidationError, match="不是 HK"):
         rec.run(USER, as_of=AS_OF, thesis_id=thesis.id, market="HK")
 

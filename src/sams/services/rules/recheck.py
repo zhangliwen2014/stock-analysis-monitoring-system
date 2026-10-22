@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.codes import canonical_market
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.events import EventBus, ThesisDrifted
 from sams.services.rules.snapshot import RuleData, Snapshot, Target
@@ -110,8 +111,12 @@ class Rechecker:
     ) -> RecheckReport:
         """一趟复检。`market` 是调度器那一头给的：每个市场各跑一趟，别市场的论不进 `_one`
         ——那里头既读行情也可能写基线，一趟 HK 的复检不该碰 A 股的论。
+        给定的一头先归一大小写（D46）：`"hk"` 与库里大写的 `HK` 比不出相等，
+        那个市场的论就会一条都进不了 `_one`，而屏幕上说的是「复检 0 条观点」。
         """
         day = as_of if as_of is not None else self.clock.today()
+        if market is not None:
+            market = canonical_market(market)
         targets = self._select(user_id, thesis_id, market)
         rows = tuple(self._one(thesis, day, dry_run) for thesis in targets)
         return RecheckReport(user_id=user_id, as_of=day, dry_run=dry_run, rows=rows)

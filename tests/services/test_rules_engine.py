@@ -359,10 +359,13 @@ def test_as_of_moves_the_reading_day_without_moving_the_clock(h) -> None:
 def test_market_filter_leaves_other_markets_alone(h) -> None:
     """调度器每个市场单独跑一趟：不是这个市场的对象一个都不许判。
 
-    两头都钉：`market="HK"` 时那条 A 股规则既不响也不投递（响了就等于替美股那一趟把 A 股
-    的告警又推一遍，而冷却是按 `(rule, market, code)` 去的，两个市场各推一遍谁也拦不住谁）；
-    `market="A"` 时照旧响。`rules` 仍是 1——那个数问的是「这一趟看了几条规则」，
-    不是「看了几个对象」，跟着对象数缩会让屏幕读不出「规则被过滤了」还是「压根没规则」。
+    两头都钉：`market="HK"` 时那条 A 股规则既不响也不投递，`market="A"` 时照旧响。
+    没有这层过滤的代价是每一趟都把全部对象重读一遍，而第二趟响不响只剩冷却一道闸——
+    冷却的键是 `(rule, market, code)`，那个 `market` 是**对象自己的**市场，同一只票
+    在哪一趟都是同一个键：挡不挡得住取决于窗口（`cooldown_min=0` 就是重复投递），
+    不取决于这一趟跑的是哪个市场。
+    `rules` 仍是 1——那个数问的是「这一趟看了几条规则」，不是「看了几个对象」，
+    跟着对象数缩会让屏幕读不出「规则被过滤了」还是「压根没规则」。
     """
     h.add()
     report = h.engine().check(USER, market="HK")
@@ -372,6 +375,9 @@ def test_market_filter_leaves_other_markets_alone(h) -> None:
     assert (report.suppressed, report.skipped, report.blocked, report.quiet) == ((), (), (), 0)
     assert report.judged == 0 and h.calendar.day_calls == []
     assert h.engine().check(USER, market="A").raised
+    # 大小写在这里不是排版：配置里那个市场键原样留着，而库里存的是大写。
+    # 不归一的话 `"a"` 那一趟会挑出零个对象，出门说的还是「触发 0」
+    assert h.engine().check(USER, market="a").raised
 
 
 # --- 除权换算（§10.2 在引擎这一头的四个形状）----------------------------------------------

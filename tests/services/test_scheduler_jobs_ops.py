@@ -110,6 +110,15 @@ def fx_service(db, adapter):
     return FxSyncService(registry, FxRepo(db))
 
 
+def _boom(*_args, **_kwargs):
+    """三个槽位共用的一种替身：它抛的不是本项目的失败。
+
+    「只接 `SamsError`」这句在四段各写一遍的循环里，所以每一段都要在自己那一头钉一枚：
+    把其中一处放宽成 `except Exception`，其余三处不该跟着红，而那一处也不该绿着过。
+    """
+    raise TypeError("这一层收到了没有键的一行")
+
+
 # --- 汇率：窗口按每对各自问，失败按对隔离 --------------------------------------------------
 
 
@@ -150,6 +159,19 @@ def test_fx_job_skips_a_pair_already_at_as_of(db, settings):
     # 追平到今天就不该问链：每晚重问一次同一个数，症状是「一切正常」
     assert adapter.calls == []
     assert outcome.rows_affected == 0 and outcome.errors == ()
+
+
+def test_a_pair_list_that_is_empty_is_a_successful_noop(db, settings):
+    """没人持有外币的那一晚：0 对既不是失败，也不该被读成「汇率链坏了」。
+
+    数据那一头已经钉过同一条（`test_empty_universe_is_a_successful_noop`），
+    但那是另一段循环，所以这里也要一枚。
+    """
+    adapter = StubFxAdapter()
+    outcome = run_fx(deps(db, settings, fx=fx_service(db, adapter)), ctx(market=None))
+    assert adapter.calls == []
+    assert outcome.errors == () and outcome.rows_affected == 0
+    assert outcome.note == "0/0 对汇率"
 
 
 def test_one_bad_pair_does_not_drop_the_other(db, settings):
@@ -239,8 +261,13 @@ def test_calendar_job_next_year_failure_keeps_the_current_year(db, settings):
     outcome = run_calendar(deps(db, settings, calendar=calendar), december_ctx())
     assert CalendarRepo(db).year_covered("A", 2024)
     assert not CalendarRepo(db).year_covered("A", 2025)
-    assert outcome.rows_affected > 0  # 当月那一年的行还在账上
+    assert outcome.rows_affected > 0  # 当年那一整年的行还在账上
     assert len(outcome.errors) == 1 and "2025" in outcome.errors[0]
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_year(db, settings):
+    with pytest.raises(TypeError):
+        run_calendar(deps(db, settings, calendar=SimpleNamespace(refresh=_boom)), ctx())
 
 
 # --- 规则与复检：市场传下去，用户互不牵连 --------------------------------------------------
@@ -292,8 +319,9 @@ def test_rules_job_asks_for_that_market_only(db, settings):
     outcome = run_rules(deps(db, settings, rules=recorder, users=users), ctx())
     assert recorder.calls == [(alice.id, AS_OF, "A")]
     assert outcome.rows_affected == 2
-    # 四摞各是一个数：合成一个「异常数」就分不清「冷却掉了」「判不了」「展开失败」
-    assert outcome.note == "1 个用户：触发 2、冷却 3、跳过 1、阻塞 1"
+    # 四摞各是一个数：合成一个「异常数」就分不清「压住」「判不了」「展开失败」
+    # （`suppressed` 那一摞是过滤器与冷却合起来的，所以那句不写「冷却」）
+    assert outcome.note == "1/1 个用户：触发 2、压住 3、判不了 1、阻塞 1"
 
 
 def test_one_bad_user_does_not_drop_the_others_in_rules(db, settings):
@@ -304,7 +332,23 @@ def test_one_bad_user_does_not_drop_the_others_in_rules(db, settings):
     assert [call[0] for call in recorder.calls] == [alice.id, bob.id]
     assert len(outcome.errors) == 1 and "bob" in outcome.errors[0]
     assert outcome.rows_affected == 2  # alice 那两条触发还在
-    assert "1 个用户失败" in outcome.note
+    assert outcome.note == "1/2 个用户：触发 2、压住 3、判不了 1、阻塞 1，1 个用户失败"
+
+
+def test_a_disabled_user_is_not_evaluated_or_delivered_to(db, settings):
+    """`sams user disable` 说的是「停止一切动作」，而夜里跑的是这一条链。
+
+    投递那一头（`router.dispatch`）只查「有没有这个用户」，不查状态：不在这里挡，
+    禁用就只挡住了手敲命令的那一路。采集那一头相反（`universe.py` 的文件头），
+    所以这一枚钉的是「按用户做事」的那两头之一，另一头是复检。
+    """
+    users, alice = one_user(db)
+    disabled = users.create("bob", "correct horse battery")
+    users.disable(disabled.id)
+    recorder = RecordingRules()
+    outcome = run_rules(deps(db, settings, rules=recorder, users=users), ctx())
+    assert recorder.calls == [(alice.id, AS_OF, "A")]
+    assert outcome.note == "1/1 个用户：触发 2、压住 3、判不了 1、阻塞 1"
 
 
 def test_recheck_job_asks_for_that_market_only(db, settings):
@@ -313,7 +357,7 @@ def test_recheck_job_asks_for_that_market_only(db, settings):
     outcome = run_recheck(deps(db, settings, recheck=recorder, users=users), ctx())
     assert recorder.calls == [(alice.id, AS_OF, "A")]
     assert outcome.rows_affected == 3
-    assert outcome.note == "1 个用户复检 3 条观点"
+    assert outcome.note == "1/1 个用户复检 3 条观点"
 
 
 def test_one_bad_user_does_not_drop_the_others_in_recheck(db, settings):
@@ -323,6 +367,30 @@ def test_one_bad_user_does_not_drop_the_others_in_recheck(db, settings):
     assert [call[0] for call in recorder.calls] == [alice.id, bob.id]
     assert len(outcome.errors) == 1 and "bob" in outcome.errors[0]
     assert outcome.rows_affected == 3
+    assert outcome.note == "1/2 个用户复检 3 条观点，1 个用户失败"
+
+
+def test_recheck_job_writes_no_baseline_for_a_disabled_user(db, settings):
+    """复检那一头不是投递，是写库：同一条规矩要有第二枚，因为它坏的是另一种东西。"""
+    users, alice = one_user(db)
+    disabled = users.create("bob", "correct horse battery")
+    users.disable(disabled.id)
+    recorder = RecordingRecheck()
+    outcome = run_recheck(deps(db, settings, recheck=recorder, users=users), ctx())
+    assert recorder.calls == [(alice.id, AS_OF, "A")]
+    assert outcome.note == "1/1 个用户复检 3 条观点"
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_user_in_rules(db, settings):
+    users, _ = one_user(db)
+    with pytest.raises(TypeError):
+        run_rules(deps(db, settings, rules=SimpleNamespace(check=_boom), users=users), ctx())
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_user_in_recheck(db, settings):
+    users, _ = one_user(db)
+    with pytest.raises(TypeError):
+        run_recheck(deps(db, settings, recheck=SimpleNamespace(run=_boom), users=users), ctx())
 
 
 # --- 注册表：顺序就是执行顺序 --------------------------------------------------------------
