@@ -687,8 +687,10 @@ def test_report_carries_the_schedule_reading(db, settings) -> None:
 
 
 def test_an_unwired_reader_gives_no_reading_rather_than_a_blank_one(db, settings) -> None:
-    """「没接入」是 None，与「接入了但从未启动」（`ScheduleData(heartbeat=None)`）
-    是两句话，必须在类型上分得开：把前者显示成后者，运维会去查一个没跑过的调度器。"""
+    """`None` 现在有两种原因，这一枚钉的是「没接入」那一种：库里那两张表都在，
+    所以 `schedule_unmigrated` 仍然是 `False`。它必须与「接入了但从未启动」
+    （`ScheduleData(heartbeat=None)`）分得开：把前者显示成后者，
+    运维会去查一个从没跑过的调度器。"""
     report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
     assert report.schedule is None
     assert report.schedule_stale is False

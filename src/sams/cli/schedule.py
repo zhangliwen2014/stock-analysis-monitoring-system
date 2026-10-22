@@ -86,8 +86,10 @@ def _start(container: Container, args: argparse.Namespace) -> int:
     try:
         ticks = scheduler.run_forever(on_tick=_print_tick)
     except SamsError as exc:
-        # 只有「认领心跳失败（已经有一个循环在跑）」会走到这里，而顶层 `run()` 也会兜住它、
-        # 说同一句话、给同一个码（1，不是 2：命令行没错）。这里先兜一层，是为了这一层的
+        # 走到这里的是「进不了循环」那一类：`run_forever` 先认领心跳，才进那个自己兜
+        # `SamsError` 的 try，所以「已经有一个循环在跑」与「心跳那一行写不进去」
+        # （库在那一刻读不了、迁移只应用了一半）是同一个出口。顶层 `run()` 也会兜住、
+        # 说同一句话、给同一个码（1，不是 2：命令行没错）；这里先兜一层，是为了这一层的
         # 两个出口由这一层自己的用例钉住——顶层那一句目前没有用例
         print(f"错误: {exc}", file=sys.stderr)
         return exit_for(exc)
@@ -113,7 +115,9 @@ def _once(container: Container, args: argparse.Namespace) -> int:
         print(f"等待  {title}  还没到点")
     for error in report.errors:
         print(f"错误  {error}")
-    # 错误也非零：那几条是「这一轮连该不该跑都算不出来」，与「跑过了、跳过」不同
+    # 错误也非零：那几条是「这一轮连该不该跑都算不出来」，与「跑过了、跳过」不同。
+    # 能走到这一行的 `errors` 只有到期计算那一条路：账本读不了那类是从上面那个
+    # `except SamsError` 出 screen 的（一句 stderr、同一个码 1），不留到屏幕上
     return 1 if report.failed or report.errors else 0
 
 

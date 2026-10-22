@@ -181,12 +181,14 @@ class HealthReport:
     ledger: LedgerData = field(default_factory=LedgerData)
     #: 未迁移的库里这一节全是 None（不是 0）：见 `NotifyData`
     notify: NotifyData = field(default_factory=NotifyData)
-    #: 调度器的读数。**None 是「没接入」**，与接入了但从未启动
-    #: （`ScheduleData(heartbeat=None, ...)`）是两件事，必须在类型上分得开：
-    #: 把前者显示成后者，运维会去查一个从没跑过的调度器
+    #: 调度器的读数。「没有读数」在这一格上有两种，别读成同一种：`None` 是「没接入」
+    #: 或「库里还没有那两张表」（后者由下面那一格说清楚），而
+    #: `ScheduleData(heartbeat=None, ...)` 是「接入了、只是那一拍还没写下」。
+    #: 三种混成一屏，运维会去查一个从没跑过的调度器
     schedule: ScheduleData | None = None
-    #: 那两张表还不存在（`schedule` 接的是生产那台调度器，但库里还没应用 0018）。
-    #: 与「没接入」分开是因为两句的修法相反：一句查装配，一句跑 `sams db migrate`
+    #: 读数接的是生产那台调度器，但库里还没应用 0018，于是这一问压根没发出去。
+    #: 单独一格是为了把「还没迁移」从 `None` 里分出来：两句的修法相反，
+    #: 一句跑 `sams db migrate`、一句查装配
     schedule_unmigrated: bool = False
 
     @property
@@ -202,7 +204,8 @@ class HealthReport:
     @property
     def schedule_stale(self) -> bool:
         """有过心跳且已经过期：退出码里只有这一条算「它可能死了」（D101）。
-        从未启动不是事故、没接入更不是，所以这里不读 `never_started`。"""
+        从未启动不是事故、没接入与还没迁移更不是，所以这里既不读 `never_started`，
+        也不读 `schedule_unmigrated`。"""
         return self.schedule is not None and self.schedule.stale
 
 
@@ -287,9 +290,12 @@ class HealthService:
     def report(self) -> HealthReport:
         have = set(self.db.table_names())
         tables = {name: self.db.row_count(name) for name in KEY_TABLES if name in have}
-        # 调度器那一问要查 0018 那两张表，护栏放在发 SQL 之前，与 `_notify_data` 开头那一句
-        # 是同一条线：这一屏的合同是「拿到一个没迁移的容器也要出得来」
-        # （`tests/test_adversarial_services.py` 直接喂 `show` 那条路钉着它）
+        # 调度器那一问要查 0018 那两张表，护栏放在发 SQL 之前：这一屏的合同是
+        # 「拿到一个没迁移的容器也要出得来」（`tests/test_adversarial_services.py`
+        # 直接喂 `show` 钉着它）。这里只问表在不在、不问列，靠的是 0018 一次做两件事：
+        # 建 `scheduler_heartbeats`、给 0001 那张 `task_runs` 补上 `period_key`/`note`。
+        # `_notify_data` 那边没有这个巧合（`channels`/`notify_log` 是 0001 的表，
+        # `outcome` 那一列要到 0015 才有），所以它多问了一句列在不在
         schedule = None
         schedule_unmigrated = False
         if self.schedule is not None:

@@ -280,7 +280,8 @@ def test_an_unmigrated_db_says_the_schedule_shape_not_the_unwired_one(invoke) ->
 
     这一格今天从 `sams health` 走不到（`run()` 在非 db 命令之前顺手补齐迁移），钉的是
     `_print_schedule` 对一份 report 的显示合同——与 `[通知]` 那节的「库里还没有 0015 的形状」
-    同一条线，那一句也只在直接喂 `show` 的那条路上走得到。
+    同一条线的是那一句早退（未迁移就往下走只会对着不存在的表发 SQL），不是 `None` 的用法：
+    那一头的 `None` 没有第三种原因要分，这一头有。
 
     钉整行：`[通知]` 那一节同屏也写着「sams db migrate」，只查子串的话两句会互相顶包。
     """

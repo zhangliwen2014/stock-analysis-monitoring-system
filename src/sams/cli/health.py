@@ -196,7 +196,9 @@ def _print_schedule(report) -> None:
     """
     print("[调度]")
     if report.schedule_unmigrated:
-        # 排在「未接入」之前，两句的修法相反：一句跑迁移，一句查装配
+        # 排在「未接入」之前，两句的修法相反：一句跑迁移、一句查装配。
+        # 版本号写在这里是给个人去跑哪条命令，真要问「还差哪几个迁移」看这一屏最上面
+        # 那行的「待应用迁移」——那一句才是从库里读出来的
         print("  库里还没有 0018 的形状：sams db migrate")
         return
     if report.schedule is None:
