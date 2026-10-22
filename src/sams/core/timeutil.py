@@ -13,6 +13,10 @@ from zoneinfo import ZoneInfo
 
 from sams.core.errors import ValidationError
 
+#: 全历史类数据（除权、财务）的起点：沪深交易所 1990/1991 年才成立，
+#: 再早不存在可查的 A 股记录。job 与命令行都从这里取，不各写一个 1990
+HISTORY_START = date(1990, 1, 1)
+
 
 def parse_hm(value: str) -> time:
     try:

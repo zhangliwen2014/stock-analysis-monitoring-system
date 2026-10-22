@@ -13,14 +13,14 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
 
 from sams.bootstrap import Container
 from sams.cli.common import currency_arg, emit, exit_for, group, iso_date, refused
 from sams.core.errors import SamsError, ValidationError
+from sams.core.timeutil import HISTORY_START
 
-#: 除权记录的默认起点：沪深交易所 1990/1991 年才成立，再早不存在可查的 A 股除权日
-DEFAULT_ACTIONS_START = date(1990, 1, 1)
+#: 除权记录的默认起点：与调度 job 共用同一个常量，免得两处各写一个 1990
+DEFAULT_ACTIONS_START = HISTORY_START
 #: 基本面与估值的默认起点同上：这些接口的答复本来就是「这只票的全部历史」，
 #: 窗口只用来切源返回的帧，把默认值编成「近五年」会让人以为更早的期数不存在
 DEFAULT_FUNDAMENTALS_START = DEFAULT_ACTIONS_START
