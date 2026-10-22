@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -410,7 +410,7 @@ def test_get_without_a_user_still_reads_any_row(repo, seeded_user):
 # ---------- 系统告警的冷却（D102：同组件同人一个窗口）----------
 
 
-def test_since_system_matches_one_admin_one_component(repo, seeded_user, other_user):
+def test_has_system_alert_matches_one_admin_one_component(repo, seeded_user, other_user):
     system = {
         **CREATE_KW,
         "rule_id": None,
@@ -421,25 +421,52 @@ def test_since_system_matches_one_admin_one_component(repo, seeded_user, other_u
     repo.create(seeded_user, **system)
 
     since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
-    assert repo.since_system(seeded_user, "calendar", since=since) is not None
-    assert repo.since_system(other_user, "calendar", since=since) is None
-    assert repo.since_system(seeded_user, "datasource:akshare", since=since) is None
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is True
+    assert repo.has_system_alert(other_user, "calendar", since=since) is False
+    assert repo.has_system_alert(seeded_user, "datasource:akshare", since=since) is False
     assert (
-        repo.since_system(
+        repo.has_system_alert(
             seeded_user, "calendar", since=datetime(2026, 10, 20, 15, 0, tzinfo=UTC)
         )
-        is None
+        is False
     )
 
 
-def test_since_system_does_not_mistake_a_stock_alert_for_a_component(repo, seeded_user):
+def test_has_system_alert_counts_the_boundary_moment_as_inside(repo, seeded_user):
+    """窗口在仓库层也是闭的：`triggered_at == since` 的那一行算「刚告过」。
+
+    只在服务层钉这一条不够——那里隔着收件人筛选与消息构造，把 `>=` 写成 `>` 时
+    屏幕上留下的是一条没有解释的沉默，而这一层的一问一答必须自己说清边界归谁。
+    """
+    moment = datetime(2026, 10, 20, 14, 30, tzinfo=UTC)
+    repo.create(
+        seeded_user,
+        **{
+            **CREATE_KW,
+            "rule_id": None,
+            "account_id": None,
+            "market": "SYS",
+            "code": "calendar",
+            "triggered_at": moment,
+        },
+    )
+
+    assert repo.has_system_alert(seeded_user, "calendar", since=moment) is True
+    # 窗口右端挪一秒，那一行就落在外面：闭区间不是「全都算」
+    assert (
+        repo.has_system_alert(seeded_user, "calendar", since=moment + timedelta(seconds=1))
+        is False
+    )
+
+
+def test_has_system_alert_does_not_mistake_a_stock_alert_for_a_component(repo, seeded_user):
     repo.create(seeded_user, **{**CREATE_KW, "code": "calendar"})
 
     since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
-    assert repo.since_system(seeded_user, "calendar", since=since) is None
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is False
 
 
-def test_since_system_needs_both_halves_of_the_system_shape(repo, seeded_user):
+def test_has_system_alert_needs_both_halves_of_the_system_shape(repo, seeded_user):
     """`market = 'SYS'` 与 `rule_id IS NULL` 是两个条件，所以要一行只缺半边的证据。
 
     只种形状完整的那一行时，删掉任一条件用例都还是绿的；缺一边的那两种行都会被当成
@@ -448,14 +475,15 @@ def test_since_system_needs_both_halves_of_the_system_shape(repo, seeded_user):
     since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
     # SYS 市场、组件名对，但挂着 `rule_id`：那是规则告警，不是系统告警
     repo.create(seeded_user, **{**CREATE_KW, "market": "SYS", "code": "calendar"})
-    assert repo.since_system(seeded_user, "calendar", since=since) is None
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is False
 
     # 反过来：没有 `rule_id`，但市场是普通的 A（一条恰好把 `code` 写成组件名的规则告警）
     repo.create(seeded_user, **{**CREATE_KW, "rule_id": None, "code": "calendar"})
-    assert repo.since_system(seeded_user, "calendar", since=since) is None
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is False
 
     # 两半都齐才算：同一句查询的正例
     system = {"rule_id": None, "account_id": None, "market": "SYS", "code": "calendar"}
     repo.create(seeded_user, **{**CREATE_KW, **system})
-    assert repo.since_system(seeded_user, "calendar", since=since) is not None
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is True
+
 

@@ -1,8 +1,10 @@
 """`SystemAlarm` → 管理员（D102）。
 
-与用户告警共用 `alerts` 那张表与同一个投递口（`AlertSender`，生产上是 bootstrap 折给
-`NotifyService.dispatch` 的那一层），不一样的三件事都在这里：收件人（启用且 `is_admin`）、
-数据形状（`rule_id=NULL`、`market='SYS'`、`code=component`）、去重（同组件同人一个冷却窗口）。
+与用户告警共用 `alerts` 那张表，投递也只对着同一个端口 `AlertSender`（D95）：那是规则
+引擎唯一的发送出口，生产上由 `bootstrap` 把 `NotifyService.dispatch` 折成这个形状。
+本模块只说「我对着这个端口发」——它接到哪条线路上由装配那一步决定。
+不一样的三件事都在这里：收件人（启用且 `is_admin`）、数据形状（`rule_id=NULL`、
+`market='SYS'`、`code=component`）、去重（同组件同人一个冷却窗口）。
 去重读的是库里的行而不是进程内的一份集合：调度器重启之后，同一个窗口内的同一次故障
 不会再发一遍。
 
@@ -52,7 +54,7 @@ class SystemAlerter:
         for user in active_users(self.users):
             if not user.is_admin:
                 continue
-            if self.alerts.since_system(user.id, alarm.component, since=since) is not None:
+            if self.alerts.has_system_alert(user.id, alarm.component, since=since):
                 continue
             message = AlertMessage(
                 market=SYS_MARKET,
@@ -70,4 +72,7 @@ class SystemAlerter:
             try:
                 self.sender.dispatch(message, user_id=user.id, rule_id=None)
             except Exception as exc:  # noqa: BLE001 — 一个收件人失败不能挡住其余收件人
-                logger.warning("系统告警发给 %s 失败：%s", user.id, exc)
+                # 栈只能在这里留：异常被逐个人包住之后到不了 `EventBus.publish`（那里是另一处
+                # 带栈的日志），少一个栈就没人能从那一句话找到抛出的是哪一段代码
+                # （`runner.py` 答同一个问题时用的也是 `logger.exception`）
+                logger.exception("系统告警发给 %s 失败：%s", user.id, exc)

@@ -215,7 +215,7 @@ class AlertRepo:
         )
         return self._to_alert(rows.to_dicts()[0]) if rows.height else None
 
-    def since_system(self, user_id: str, component: str, *, since: datetime) -> Alert | None:
+    def has_system_alert(self, user_id: str, component: str, *, since: datetime) -> bool:
         """这个人名下从 `since` 起有没有过关于这个组件的系统告警（D102 的去重键）。
 
         问的是**库里有没有那一行**，不是那个人有没有真的收到一条通知：
@@ -224,14 +224,18 @@ class AlertRepo:
         一条恰好把 `code` 写成组件名的规则告警不能被当成冷却的起点。
         `triggered_at` 与 `since` 必须在同一条时间轴上：调用方传「现在 - 冷却」，
         这里不读 `clock`，否则窗口的宽度会变成两个时钟之差。
+        答案是一个 `bool` 而不是那一行：调用方拿到行也只为问同一个问题，
+        为它解出整份 `payload_json` 是那一次白花的解码。
         """
-        rows = self.db.query(
-            f"SELECT {_ALERT_COLUMNS} FROM alerts"
-            " WHERE user_id = ? AND market = 'SYS' AND code = ? AND rule_id IS NULL"
-            " AND triggered_at >= ? ORDER BY triggered_at DESC, id DESC LIMIT 1",
-            [user_id, component, _moment(since)],
+        return bool(
+            self.db.scalar(
+                "SELECT EXISTS ("
+                " SELECT 1 FROM alerts"
+                " WHERE user_id = ? AND market = 'SYS' AND code = ? AND rule_id IS NULL"
+                " AND triggered_at >= ?)",
+                [user_id, component, _moment(since)],
+            )
         )
-        return self._to_alert(rows.to_dicts()[0]) if rows.height else None
 
     def record(
         self,
