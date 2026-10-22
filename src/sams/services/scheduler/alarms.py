@@ -3,7 +3,7 @@
 与用户告警共用 `alerts` 那张表，投递也只对着同一个端口 `AlertSender`（D95）：那是规则
 引擎唯一的发送出口，生产上由 `bootstrap` 把 `NotifyService.dispatch` 折成这个形状。
 本模块只说「我对着这个端口发」——它接到哪条线路上由装配那一步决定。
-不一样的三件事都在这里：收件人（启用且 `is_admin`）、数据形状（`rule_id=NULL`、
+不一样的三件事都在这里：收件人（`admin_users`：启用且 `is_admin`）、数据形状（`rule_id=NULL`、
 `market='SYS'`、`code=component`）、去重（同组件同人一个冷却窗口）。
 去重读的是库里的行而不是进程内的一份集合：调度器重启之后，同一个窗口内的同一次故障
 不会再发一遍。
@@ -23,7 +23,7 @@ from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.notify import STRONG, AlertMessage, AlertSender
-from sams.services.actors import active_users
+from sams.services.actors import admin_users
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.users import UserRepo
 
@@ -51,9 +51,7 @@ class SystemAlerter:
     def handle(self, alarm: SystemAlarm) -> None:
         now = self.clock.now_utc()
         since = now - timedelta(minutes=self.settings.cooldown_min)
-        for user in active_users(self.users):
-            if not user.is_admin:
-                continue
+        for user in admin_users(self.users):
             if self.alerts.has_system_alert(user.id, alarm.component, since=since):
                 continue
             message = AlertMessage(

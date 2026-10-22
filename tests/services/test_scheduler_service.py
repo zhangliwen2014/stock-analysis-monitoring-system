@@ -3,11 +3,13 @@
 runner 用记录型替身：这一层要钉的是「谁在什么时候被交给 runner」，
 执行本身的三条时间规则已经在 `test_scheduler_runner.py` 钉过。
 心跳那一半也两头钉：手工 `tick` 一行都不留、常驻循环每一拍打一拍，
-而过期那条判据只写在一处（`report.stale_at`），页面与单实例守卫必须同时翻。
+而过期那条判据只写在一处（`heartbeat.stale_at`），读数与单实例守卫必须同时翻。
 """
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -15,11 +17,8 @@ from support import FrozenClock
 from support_scheduler import FakeCalendar
 
 from sams.core.errors import CalendarSourceError, SchedulerBusy, StorageError, ValidationError
-from sams.services.scheduler.report import (
-    HEARTBEAT_STALE_S,
-    STREAK_DISPLAY_PERIODS,
-    collect,
-)
+from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
+from sams.services.scheduler.report import STREAK_DISPLAY_PERIODS, collect
 from sams.services.scheduler.runner import RunResult
 from sams.services.scheduler.service import Scheduler
 from sams.services.scheduler.types import JobOutcome, JobSpec
@@ -104,12 +103,12 @@ def make(
     scheduler = Scheduler(
         settings,
         specs,
-        runner,
-        runs,
-        heartbeats,
-        universe or StubUniverse(),
-        UserRepo(db),
-        calendar or FakeCalendar(settings),
+        runner=runner,
+        runs=runs,
+        heartbeats=heartbeats,
+        universe=universe or StubUniverse(),
+        users=UserRepo(db),
+        calendar=calendar or FakeCalendar(settings),
         clock=clock,
         sleep=sleep or (lambda seconds: None),
     )
@@ -175,6 +174,19 @@ def test_as_of_uses_the_period_key_of_its_week(db, settings):
     assert runner.calls == [("recheck", "A", "2024-W43", FRIDAY)]
 
 
+def test_the_manual_anchor_is_not_the_clock_of_the_tick(db, settings):
+    """补跑的那一天是 `as_of`，`now` 只是这一轮的时间戳。
+    把锚点换成从时钟读出来的那一天，补跑会静默地写到另一个周期上（D98）。"""
+    runner = RecordingRunner()
+    scheduler, _, _ = make(db, settings, (job_spec("recheck", "A", "weekly"),), runner)
+    december = datetime(2024, 12, 3, 8, 30, tzinfo=UTC)
+
+    report = scheduler.tick(now=december, as_of=FRIDAY, only_job="recheck")
+
+    assert runner.calls == [("recheck", "A", "2024-W43", FRIDAY)]
+    assert report.now == december
+
+
 def test_the_market_filter_narrows_the_selection(db, settings):
     runner = RecordingRunner()
     specs = (job_spec("bars", "A"), job_spec("bars", "HK"), job_spec("calendar", "A", "monthly"))
@@ -195,10 +207,28 @@ def test_an_unmatched_filter_is_refused(db, settings):
         scheduler.tick(as_of=FRIDAY, only_market="US")
 
 
+def test_the_refusal_names_the_filter_and_the_registry(db, settings):
+    """一句话要能看出两件事：哪一个词打错了（`job=`/`market=`），以及这里有什么。"""
+    specs = (job_spec("bars", "A"), job_spec("fx", None, "fx"))
+    scheduler, _, _ = make(db, settings, specs, RecordingRunner())
+
+    with pytest.raises(ValidationError, match=r"job=nope"):
+        scheduler.tick(as_of=FRIDAY, only_job="nope")
+    with pytest.raises(ValidationError, match=r"market=US"):
+        scheduler.tick(as_of=FRIDAY, only_market="US")
+    # 两个条件都敲上时两个都要说：只说一个会让人去改那个没敲错的地方
+    with pytest.raises(ValidationError, match=r"job=bars、market=US"):
+        scheduler.tick(as_of=FRIDAY, only_job="bars", only_market="US")
+    with pytest.raises(ValidationError, match=r"现有 \['bars', 'fx'\]"):
+        scheduler.tick(as_of=FRIDAY, only_job="nope")
+
+
 def test_an_empty_registry_is_refused_too(db, settings):
+    """没登记 job 与「筛选条件敲错了」是两个原因：少了「全部」那一个字，
+    前者会被读成后者的一个特例，于是人去查命令，而该查的是这里登记了什么。"""
     scheduler, _, _ = make(db, settings, (), RecordingRunner())
 
-    with pytest.raises(ValidationError, match="没有匹配"):
+    with pytest.raises(ValidationError, match="没有匹配的 job（全部）"):
         scheduler.tick(as_of=FRIDAY)
 
 
@@ -218,6 +248,26 @@ def test_a_broken_calendar_does_not_stop_the_next_market(db, settings):
     assert len(report.errors) == 1
     assert "bars@A" in report.errors[0] and "日历源挂了" in report.errors[0]
     assert [call[1] for call in runner.calls] == ["HK"]
+
+
+def test_an_unexpected_calendar_error_is_not_collected_as_a_tick_error(db, settings):
+    """这里隔离的只有 `SamsError`：日历实现里的编程错误不能被收成一句「这一轮算不出」，
+    那样一种坏会被读成一种等。"""
+
+    class BoomingCalendar(FakeCalendar):
+        def is_trading_day(self, market, day):
+            raise RuntimeError("日历在读一个不存在的键")
+
+    scheduler, _, _ = make(
+        db,
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        calendar=BoomingCalendar(settings),
+    )
+
+    with pytest.raises(RuntimeError, match="不存在的键"):
+        scheduler.tick(now=MOMENT)
 
 
 def test_fx_waits_until_every_market_has_closed(db, settings):
@@ -254,6 +304,22 @@ def test_a_manual_tick_does_not_leave_a_heartbeat(db, settings):
     assert heartbeats.latest() is None
 
 
+def test_the_beat_goes_out_before_the_selection(db, settings):
+    """一个 job 都没选出的那一轮，那一拍也已经打出去了：选 job 失败同样是
+    「循环还在转」的一轮。挪到选取之后，读的那一侧就把它与「进程停了」混成一个。"""
+    clock = FrozenClock(MOMENT)
+    scheduler, heartbeats, _ = make(
+        db, settings, (job_spec("bars", "A"),), RecordingRunner(), clock=clock
+    )
+    scheduler.run_forever(max_ticks=1)
+    clock.advance(seconds=30)
+
+    with pytest.raises(ValidationError, match="没有匹配"):
+        scheduler.tick(as_of=FRIDAY, only_job="nope")
+
+    assert heartbeats.latest().beat_at == MOMENT + timedelta(seconds=30)
+
+
 def test_run_forever_beats_on_every_tick(db, settings):
     runner = RecordingRunner()
     clock = FrozenClock(MOMENT)
@@ -280,6 +346,40 @@ def test_run_forever_beats_on_every_tick(db, settings):
     assert sleeps == [settings.scheduler_tick_s]
 
 
+def test_zero_rounds_leave_no_tick_and_no_claim(db, settings):
+    """`max_ticks=0`（或负数）一轮都不跑，也不认领心跳：留下一行刚打的拍会把下一个常驻循环
+    挡在阈值外面，而这一次连活都还没开始。"""
+    for max_ticks in (0, -1):
+        runner = RecordingRunner()
+        scheduler, heartbeats, _ = make(db, settings, (job_spec("bars", "A"),), runner)
+        reports = []
+
+        ticks = scheduler.run_forever(max_ticks=max_ticks, on_tick=reports.append)
+
+        assert ticks == 0
+        assert reports == []
+        assert runner.calls == []
+        assert heartbeats.latest() is None
+
+
+def test_the_dependencies_are_passed_by_name(db, settings):
+    """`jobs` 之后六个依赖里有三个同为仓库对象、两个同为注入的替身：写错顺序的两份
+    都构造得出对象，症状要到第一次真跑才看得见。所以这一句 `TypeError` 是那道墙。"""
+    args = (
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        TaskRunRepo(db),
+        HeartbeatRepo(db),
+        StubUniverse(),
+        UserRepo(db),
+        FakeCalendar(settings),
+    )
+
+    with pytest.raises(TypeError, match="positional"):
+        Scheduler(*args)
+
+
 def test_the_same_scheduler_can_start_its_loop_again(db, settings):
     scheduler, heartbeats, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
 
@@ -299,6 +399,19 @@ def test_a_second_daemon_is_refused(db, settings):
 
     with pytest.raises(SchedulerBusy, match="心跳"):
         second.run_forever(max_ticks=1)
+
+
+def test_the_guard_reads_the_last_beat_not_the_row_being_created(db, settings):
+    """`started_at` 是那一行被创建的时刻，「还活着」看的是最后一次 `beat_at`。
+    读错那一列，一个刚打过拍的循环会被看成六分钟前起、于是被接管。"""
+    beat_id = HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(minutes=6))).start(
+        note="tick=60s"
+    )
+    HeartbeatRepo(db, clock=FrozenClock(MOMENT)).beat(beat_id)
+    scheduler, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+
+    with pytest.raises(SchedulerBusy, match="心跳"):
+        scheduler.run_forever(max_ticks=1)
 
 
 def test_a_dead_heartbeat_does_not_block_a_new_daemon(db, settings):
@@ -331,7 +444,27 @@ def test_one_second_under_the_threshold_is_fresh_and_refuses_takeover(db, settin
         scheduler.run_forever(max_ticks=1)
 
 
-def test_a_tick_level_failure_is_reported_and_the_loop_survives(db, settings):
+def test_a_tick_not_shorter_than_the_heartbeat_threshold_is_refused(db, settings):
+    """等待间隔不比阈值短，形状就是「一个空转的循环也会把自己读成停了」：
+    读数与守卫共用同一个比较，两边一起翻错，所以在构造时就挡住，而不是等第一轮。"""
+    for tick_s in (HEARTBEAT_STALE_S - 1, 1):
+        make(
+            db,
+            replace(settings, scheduler_tick_s=tick_s),
+            (job_spec("bars", "A"),),
+            RecordingRunner(),
+        )
+    for tick_s in (HEARTBEAT_STALE_S, HEARTBEAT_STALE_S + 1):
+        with pytest.raises(ValidationError, match="scheduler_tick_s"):
+            make(
+                db,
+                replace(settings, scheduler_tick_s=tick_s),
+                (job_spec("bars", "A"),),
+                RecordingRunner(),
+            )
+
+
+def test_a_tick_level_failure_is_reported_and_the_loop_survives(db, settings, caplog):
     reports = []
     clock = FrozenClock(MOMENT)
     sleeps = []
@@ -350,12 +483,39 @@ def test_a_tick_level_failure_is_reported_and_the_loop_survives(db, settings):
         universe=BrokenUniverse(),
     )
 
-    ticks = scheduler.run_forever(max_ticks=2, on_tick=reports.append)
+    with caplog.at_level(logging.WARNING):
+        ticks = scheduler.run_forever(max_ticks=2, on_tick=reports.append)
 
     assert ticks == 2
     assert all("db 挂了" in report.errors[0] for report in reports)
     # 那一拍在做活之前就打出去了：这一轮没做成事，不等于循环不转了
     assert heartbeats.latest().beat_at == MOMENT + timedelta(seconds=settings.scheduler_tick_s)
+    # 每一轮失败都要留下一句：只留 `TickReport` 的话，日志里读不到「循环还在转但在失败」
+    logged = [rec for rec in caplog.records if "这一轮 tick 失败" in rec.getMessage()]
+    assert len(logged) == 2
+    # 栈只能留在这里：这一句把异常吞了，往上再没有人能打印它
+    assert "in build" in caplog.text
+
+
+def test_an_interrupt_leaves_a_line_in_the_log(db, settings, caplog):
+    """退出要留下一句：`run_forever` 正常返回，返回值看不出它是被打断的还是跑满了轮数——
+    那一行是日志里唯一的区别。"""
+
+    def interrupt(seconds):
+        raise KeyboardInterrupt
+
+    scheduler, _, _ = make(
+        db,
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        sleep=interrupt,
+    )
+    with caplog.at_level(logging.WARNING):
+        ticks = scheduler.run_forever()
+
+    assert ticks == 1
+    assert "收到中断，调度器退出" in caplog.text
 
 
 def test_an_unexpected_error_is_not_swallowed_by_the_loop(db, settings):
@@ -433,8 +593,30 @@ def test_schedule_data_without_a_heartbeat_is_not_stale(db):
     assert data.beat_age_s is None
 
 
+def test_the_reading_ages_the_last_beat_not_the_row_being_created(db):
+    """与守卫读同一列：年龄从 `beat_at` 算。读成 `started_at` 时，一个一直在打的循环
+    会被显示成「六分钟前起的、之后再没动过」。"""
+    beat_id = HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(minutes=6))).start(
+        note="tick=60s"
+    )
+    HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(seconds=30))).beat(beat_id)
+    clock = FrozenClock(MOMENT)
+
+    data = collect(
+        runs=TaskRunRepo(db, clock=clock),
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        users=UserRepo(db),
+        specs=(),
+        clock=clock,
+    )
+
+    assert data.beat_age_s == 30
+    assert data.stale is False
+
+
 def test_a_beat_written_ahead_of_the_reading_clock_reads_as_zero(db):
-    """写的那一侧跑在前面（两个进程各自的时钟）时，年龄不能是负数。"""
+    """写那一侧的时钟跑在读取侧前面（两个各自的 `Clock`、或系统时钟被校正过）时，
+    年龄不能是负数——负数打印出来是一个看不出原因的数。"""
     heartbeats = HeartbeatRepo(db, clock=FrozenClock(MOMENT + timedelta(seconds=5)))
     heartbeats.start(note="tick=60s")
 
@@ -496,11 +678,11 @@ def test_the_streak_saturates_at_the_display_cap(db):
     """比 `STREAK_DISPLAY_PERIODS` 更长的连败显示那个上限本身，不显示真实周期数。"""
     clock = FrozenClock(MOMENT)
     runs = TaskRunRepo(db, clock=clock)
-    newest = None
+    last_written = None
     for index in range(STREAK_DISPLAY_PERIODS + 1):
         day = FRIDAY - timedelta(days=index)
-        newest = day.isoformat()
-        run_id = runs.start("bars", market="A", period_key=newest)
+        last_written = day.isoformat()
+        run_id = runs.start("bars", market="A", period_key=last_written)
         runs.finish(run_id, status=FAILED, error="boom")
         clock.advance(minutes=1)
 
@@ -513,7 +695,7 @@ def test_the_streak_saturates_at_the_display_cap(db):
     )
 
     assert data.jobs[0].streak == STREAK_DISPLAY_PERIODS
-    assert data.jobs[0].latest.period_key == newest
+    assert data.jobs[0].latest.period_key == last_written
 
 
 def test_the_scheduler_reports_through_its_own_clock(db, settings):
