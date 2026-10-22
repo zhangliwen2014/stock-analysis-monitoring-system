@@ -3137,13 +3137,21 @@ git commit -m "feat(scheduler): 汇率/日历/规则/复检四个 job 与市场�
 
 **Files:**
 - Create: `src/sams/services/scheduler/runner.py`
+- Modify: `src/sams/storage/repos/task_runs.py`（新增 `latest_per_period`）
 - Test: `tests/services/test_scheduler_runner.py`
+- Test: `tests/storage/test_task_runs.py`（追加四枚）
 
 三件事只能有一个地方决定（D105）：本周期跑过没有、上一轮留下的行还算不算数、
-失败之后多久准重来。写成 runner 而不是写进九个 job，是因为这九个 job 的失败形状
-本该一样；写进 job 的话，某一个 job 忘了看 `period_key`，它就会每 tick 跑一遍。
+失败之后多久准重来。写成 runner 而不是写进那九类 job（`_DATA_JOBS` 五类 + 复检/规则/汇率/日历），
+是因为它们的失败形状本该一样；写进 job 的话，某一个 job 忘了看 `period_key`，
+它就会每 tick 跑一遍。
 
-- [ ] **Step 1: 写失败用例**
+**这一层的账要数「周期」而不是数「行」**：一个一直失败的周期每 `RETRY_GAP_MIN` 分钟就多写一行，
+而 `daily_due` 会把同一个 `period_key` 一路到期到下一个交易日收盘之后。所以按行开的窗口
+无论多宽都会被这一晚自己的重试占满，D103 的「连续三个周期」永远凑不满；
+分组这件事归仓库（`latest_per_period`），runner 只数它拿到的那几个周期。
+
+- [ ] **Step 1: 写失败用例（runner 那一半）**
 
 `tests/services/test_scheduler_runner.py`：
 
@@ -3151,11 +3159,15 @@ git commit -m "feat(scheduler): 汇率/日历/规则/复检四个 job 与市场�
 """`JobRunner`：记账、重试间隔、连续失败的告警（D103/D105）。
 
 时钟全部由 `FrozenClock` 推进：这些规则说的是「多久之后」，不是「过一会儿」。
+每一枚都钉两头——该等的那一轮没跑、等到了的那一轮真跑了，
+所以「把间隔写死成零」与「把间隔写成无穷」都能在这里红掉。
 """
 
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+
+from support import FrozenClock
 
 from sams.core.errors import TransientError
 from sams.core.events import EventBus, SystemAlarm
@@ -3169,7 +3181,6 @@ from sams.services.scheduler.runner import (
 from sams.services.scheduler.types import JobOutcome, JobSpec
 from sams.services.scheduler.universe import Universe
 from sams.storage.repos.task_runs import FAILED, OK, RUNNING, TaskRunRepo
-from support import FrozenClock
 
 MOMENT = datetime(2024, 10, 25, 8, 30, tzinfo=UTC)
 UNIVERSE = Universe(by_market={}, fx_pairs=())
@@ -3201,6 +3212,8 @@ def test_success_writes_ok_with_rows_and_note(db):
     assert result.rows_affected == 3
     row = runs.latest_for_period("bars", "A", "2024-10-25")
     assert (row.status, row.rows_affected, row.note) == (OK, 3, "3 只")
+    # 行上的市场就是 spec 的市场：漏写 market 的话这一行会落进「全局」那本账
+    assert row.market == "A"
     assert seen[0].period_key == "2024-10-25"
     assert seen[0].as_of == date(2024, 10, 25)
     assert seen[0].market == "A"
@@ -3222,7 +3235,25 @@ def test_a_successful_period_is_not_rerun(db):
     assert "已经成功" in second.skip_reason
     assert second.run_id == first.run_id
     assert calls == ["2024-10-25"]
-    assert runs.count() == 1
+    assert runs.count() == 1  # 被拦下的那一轮不留行
+
+
+def test_a_blank_note_is_stored_as_null(db):
+    """job 没说话与 job 说了一个空串在库里必须是两种答案。
+
+    `TaskRun.note` 是 `str | None`：写 `""` 进去，读的一侧就分不出「没写」与「写了个空」。
+    """
+
+    def job(ctx):
+        return JobOutcome(rows_affected=2)
+
+    runner, runs, _, _, spec = harness(db, job)
+    result = runner.execute(spec, DUE, UNIVERSE)
+
+    assert result.note == ""
+    row = runs.latest_for_period("bars", "A", "2024-10-25")
+    assert row.note is None
+    assert row.rows_affected == 2
 
 
 def test_a_failure_is_retried_only_after_the_gap(db):
@@ -3247,6 +3278,7 @@ def test_a_failure_is_retried_only_after_the_gap(db):
     again = runner.execute(spec, DUE, UNIVERSE)
     assert again.status == FAILED
     assert len(calls) == 2
+    assert runs.count() == 2  # 中间那轮等待同样不留行
 
 
 def test_a_crashed_running_row_is_replaced_only_after_the_limit(db):
@@ -3265,6 +3297,8 @@ def test_a_crashed_running_row_is_replaced_only_after_the_limit(db):
     fresh = runner.execute(spec, DUE, UNIVERSE)
     assert fresh.status == OK
     assert runs.count() == 2
+    # 崩溃那一行原样留着：改写它等于抹掉「那一晚死过一次」的证据
+    assert [row.status for row in runs.recent("bars", "A", limit=5)] == [OK, RUNNING]
 
 
 def test_the_third_failed_period_alarms_once(db):
@@ -3304,6 +3338,99 @@ def test_retries_inside_one_period_do_not_count_as_periods(db):
     assert len(alarms) == 1  # 三个周期
 
 
+def test_the_alarm_survives_a_retry_storm_inside_the_middle_period(db):
+    """窗口按行数时，一个周期的重试能把窗口全部占满。
+
+    第 2 个周期失败 29 次（每次隔 `RETRY_GAP_MIN`），最近 30 行就只剩
+    第 3 个周期的一行加第 2 个周期的 29 行：连续三个失败周期永远凑不满，
+    一个每晚都失败的 job 一条告警都不发。读取按周期分组后应当恰好告一条，
+    且是第 3 个周期出结论时告（D103）。
+    """
+
+    def job(ctx):
+        raise TransientError("akshare", "boom")
+
+    runner, _, clock, alarms, spec = harness(db, job)
+    runner.execute(spec, Due(period_key="2024-10-24", as_of=date(2024, 10, 24)), UNIVERSE)
+    for attempt in range(29):
+        if attempt:
+            clock.advance(minutes=RETRY_GAP_MIN)
+        runner.execute(spec, DUE, UNIVERSE)
+    clock.advance(minutes=RETRY_GAP_MIN)
+    runner.execute(spec, Due(period_key="2024-10-26", as_of=date(2024, 10, 26)), UNIVERSE)
+
+    assert len(alarms) == 1
+    assert "2024-10-26" in alarms[0].message
+
+
+def test_the_alarming_period_alarms_once_across_its_retries(db):
+    """告警的周期自己继续重试，不能每重试一次就再告一条。
+
+    第 3 个周期失败 5 次：每一次的连续失败周期数都恰好是 3，
+    若不看「这一行是不是这个周期的第一个结论」，这里会收到 5 条而不是 1 条（D103）。
+    """
+
+    def job(ctx):
+        raise TransientError("akshare", "boom")
+
+    runner, _, clock, alarms, spec = harness(db, job)
+    runner.execute(spec, Due(period_key="2024-10-24", as_of=date(2024, 10, 24)), UNIVERSE)
+    runner.execute(spec, Due(period_key="2024-10-25", as_of=date(2024, 10, 25)), UNIVERSE)
+    for attempt in range(5):
+        if attempt:
+            clock.advance(minutes=RETRY_GAP_MIN)
+        runner.execute(spec, Due(period_key="2024-10-26", as_of=date(2024, 10, 26)), UNIVERSE)
+
+    assert len(alarms) == 1
+
+
+def test_a_successful_period_resets_the_streak(db):
+    """连续失败必须是**连续**：中间成功过一个周期，计数就要从头来。
+
+    把 `failure_streak` 里的 `break` 换成 `continue`，第 4 个失败周期会数到
+    第 1、2 个（跳过第 3 个成功的），抖动一场也会发出告警。
+    """
+
+    def job(ctx):
+        if ctx.period_key == "2024-10-26":
+            return JobOutcome()
+        raise TransientError("akshare", "boom")
+
+    runner, _, _, alarms, spec = harness(db, job)
+    for period in ("2024-10-24", "2024-10-25", "2024-10-26", "2024-10-27"):
+        result = runner.execute(
+            spec, Due(period_key=period, as_of=date.fromisoformat(period)), UNIVERSE
+        )
+        assert result.status == (OK if period == "2024-10-26" else FAILED)
+
+    assert alarms == []
+
+
+def test_the_gap_is_measured_from_the_end_of_the_last_attempt(db):
+    """重试间隔从上一次**结束**起算，不是从它开始起算。
+
+    一个跑了 25 分钟才失败的 job，失败后立刻重来并没有「等满 10 分钟」：
+    从 `started_at` 起算的话，慢 job 的每次失败都像是早就过完了间隔，
+    打源的就不是重试，是循环。
+    """
+
+    def job(ctx):
+        clock.advance(minutes=25)
+        raise TransientError("akshare", "boom")
+
+    runner, _, clock, _, spec = harness(db, job)
+    first = runner.execute(spec, DUE, UNIVERSE)
+    assert first.status == FAILED
+
+    waiting = runner.execute(spec, DUE, UNIVERSE)
+    assert waiting.status == SKIPPED
+    assert "不足" in waiting.skip_reason
+
+    clock.advance(minutes=RETRY_GAP_MIN)
+    again = runner.execute(spec, DUE, UNIVERSE)
+    assert again.status == FAILED
+
+
 def test_outcome_errors_mark_failed_and_keep_the_note(db):
     def job(ctx):
         return JobOutcome(rows_affected=1, note="1/2 只日线", errors=("600519: boom",))
@@ -3338,6 +3465,41 @@ def test_global_jobs_and_market_jobs_keep_separate_ledgers(db):
     # `job_name` 相同、market 不同：八小时后的 A 股那一行不是「全局那条」的替身
     assert runs.latest_for_period("bars", None, DUE.period_key) is not None
     assert runs.latest_for_period("bars", "A", DUE.period_key) is None
+
+
+def test_a_global_row_does_not_stand_in_for_the_market_row(db):
+    """上面那一枚只钉了「全局看不见 A 股那一行」，这一枚钉反方向。
+
+    查账时漏掉 `market` 的话，A 股那一晚会被全局那条的成功行说成「已经成功」，
+    而一个市场的数据都不会拉——症状与「今天不是交易日」一模一样。
+    """
+    calls = []
+
+    def job(ctx):
+        calls.append(ctx.market)
+        return JobOutcome()
+
+    runner, _, _, _, global_spec = harness(db, job, market=None)
+    runner.execute(global_spec, DUE, UNIVERSE)
+    market_spec = JobSpec(name="bars", period="daily", market="A", run=job)
+
+    assert runner.execute(market_spec, DUE, UNIVERSE).status == OK
+    assert calls == [None, "A"]
+
+
+def test_the_running_row_written_by_this_round_is_not_its_own_block(db):
+    """查账读的是这一轮之前的行：自己刚写的那一行不能把自己拦下。
+
+    把 `latest_for_period` 挪到 `start` 之后，每一轮都会得到「上一轮还在跑（已 0 分钟）」，
+    而 job 一次也不会被执行——注册表、心跳、退出码全都正常。
+    """
+
+    def job(ctx):
+        return JobOutcome()
+
+    runner, runs, _, _, spec = harness(db, job)
+    assert runner.execute(spec, DUE, UNIVERSE).status == OK
+    assert runs.latest_for_period("bars", "A", DUE.period_key).status == OK
 ```
 
 - [ ] **Step 2: 跑红**
@@ -3348,24 +3510,140 @@ uv run pytest tests/services/test_scheduler_runner.py -q
 
 Expected: FAIL（`sams.services.scheduler.runner` 不存在）。
 
-- [ ] **Step 3: 写实现**
+- [ ] **Step 3: 实现 `TaskRunRepo.latest_per_period`**
+
+`src/sams/storage/repos/task_runs.py` 在 `recent` 下方加：
+
+```python
+    def latest_per_period(
+        self, job_name: str, market: str | None, *, limit: int
+    ) -> list[TaskRun]:
+        """每个周期只报它最近的那一行，新到旧，最多 `limit` 个**周期**。
+
+        `recent` 数的是行，而一个一直失败的周期每 `RETRY_GAP_MIN` 分钟就多写一行：
+        按行数窗口，多大的数都会被同一个周期自己的重试占满。
+        一个周期的结论就是它的最后一行：成功之后这个周期不再被重跑，
+        所以最后一行不会被更早的行盖住。
+        """
+        rows = self.db.query(
+            f"SELECT {_COLUMNS} FROM ("
+            " SELECT *, rowid,"
+            " row_number() OVER ("
+            "   PARTITION BY period_key ORDER BY started_at DESC, rowid DESC"
+            " ) AS rnk"
+            " FROM task_runs WHERE job_name = ? AND market IS NOT DISTINCT FROM ?)"
+            " WHERE rnk = 1 ORDER BY started_at DESC, rowid DESC LIMIT ?",
+            [job_name, market, int(limit)],
+        )
+        return [_to_run(row) for row in rows.to_dicts()]
+```
+
+`tests/storage/test_task_runs.py` 追加（沿用该文件自己的 `Clock` 桩；推进时钟的那些枚
+故意让两行的 `started_at` 不同，好把「按周期取最新」与「同一瞬间靠 `rowid` 决胜」分开钉）：
+
+```python
+def test_latest_per_period_reports_only_the_last_row_of_a_period(db):
+    """一个周期的结论就是它的最后一行：更早的重试行不能替这个周期说话。
+
+    两行之间推进了时钟，所以这一枚钉的是「按周期取最新一行」本身，
+    不依赖同一时刻多行之间的 `rowid` 决胜。
+    """
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    failed = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(failed, status=FAILED, error="boom")
+    clock.advance(minutes=1)
+    ok = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(ok, status=OK)
+    latest = repo.latest_per_period("bars", "A", limit=5)
+    assert [row.id for row in latest] == [ok]
+    assert latest[0].status == OK
+
+
+def test_two_rows_at_the_same_instant_report_the_last_written(db):
+    """同一瞬间写下的两行，报后写的那一行：决胜靠 `rowid`，不靠运气。
+
+    去掉分组排序里的 `rowid DESC`，DuckDB 会把**先**写的那一行当成这个周期的结论：
+    一个先失败、后跑成的周期就被数成一个失败周期，连续三个周期的告警因此能凑满，
+    而这一晚其实一次都没打挂。「最近的一行」如果由存储引擎的心情决定，就不是最近的一行。
+    """
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    first = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(first, status=FAILED, error="第一次")
+    second = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(second, status=OK)
+    latest = repo.latest_per_period("bars", "A", limit=5)
+    assert [row.id for row in latest] == [second]
+
+
+def test_latest_per_period_limit_counts_periods_not_rows(db):
+    """`limit` 数的是**周期**：一个周期无论写了多少行，都只占一格。"""
+    clock = Clock(datetime(2024, 10, 24, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    last_ids = []
+    for period in ("2024-10-24", "2024-10-25", "2024-10-26"):
+        for _ in range(3):
+            run_id = repo.start("bars", market="A", period_key=period)
+            repo.finish(run_id, status=FAILED, error="boom")
+            clock.advance(minutes=1)
+        last_ids.append(run_id)
+    latest = repo.latest_per_period("bars", "A", limit=2)
+    assert [row.id for row in latest] == list(reversed(last_ids))[:2]
+    assert [row.period_key for row in latest] == ["2024-10-26", "2024-10-25"]
+
+
+def test_latest_per_period_does_not_leak_across_markets(db):
+    """两个方向都要钉住：全局账本看不见 A 股的行，A 股的账本也看不见全局的行。
+
+    漏了 `market` 的话，一个账本的失败周期会去数进另一个账本的连续失败里。
+    """
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    for period in ("2024-10-25", "2024-10-26"):
+        global_run = repo.start("fx", period_key=period)
+        repo.finish(global_run, status=OK)
+        market_run = repo.start("fx", market="A", period_key=period)
+        repo.finish(market_run, status=OK)
+        clock.advance(minutes=1)
+    global_rows = repo.latest_per_period("fx", None, limit=5)
+    assert [row.market for row in global_rows] == [None, None]
+    market_rows = repo.latest_per_period("fx", "A", limit=5)
+    assert [row.market for row in market_rows] == ["A", "A"]
+```
+
+- [ ] **Step 4: 实现 runner**
 
 `src/sams/services/scheduler/runner.py`：
 
 ```python
-"""`task_runs` 的唯一写入方：一次 job 执行怎么开始、怎么收尾、什么时候准重来。
+"""`task_runs` 的唯一写入方：一个 job 的一次执行怎么开始、怎么收尾、什么时候准重来。
 
-三条规则（D105）写在这里而不是 job 里：九个 job 的失败形状本该一样，
-写进 job 的话，某一个忘了看 `period_key` 就会每 tick 跑一遍。
+三条规则只写在这一处（D105），不写进 job 里：每个 job 的失败形状本该一样，
+写进 job 的话，某一个忘了看 `period_key`，它就会每 tick 跑一遍。
 - 本周期成功过 → 不再跑（`period_key` 是「跑过没有」的唯一依据，D98）；
-- 上一轮还在跑且还算新鲜 → 等它（过期的 `running` 是崩溃留下的行，可以重跑）；
+- 上一轮还在跑且还算新鲜 → 等它（超过 `STALE_RUNNING_H` 的 `running` 是崩溃留下的行，
+  读取侧不能把它当活进程，但也不能每个 `running` 都当成死进程）；
 - 上一次失败且还在重试间隔内 → 等一等（每 tick 都重拉不是重试，是打源）。
-连续失败满三个**周期**才发一条 `SystemAlarm`（D103）：同一个周期里的重试
-不是三个周期，否则一次网络抖动很快就能凑满。
+连续失败满 `FAILURES_FOR_ALARM` 个**周期**才发一条 `SystemAlarm`，且一个周期至多告一次——
+只在写出它**第一个结论**的那一次（D103）：账本读取按周期分组，因为一个一直失败的周期
+每轮重试都多写一行；同一个周期里的重试不是三个周期，否则一次网络抖动很快就能凑满。
+
+`SKIPPED` 不是 `task_runs` 的第四种状态：被这三条拦下的那一轮**不留行**——
+「该不该跑」由到期计算与这三条回答，不是一次执行（`task_runs.py` 的文件头）。
+
+异常在这里接住的是 `Exception`，而 `jobs.py` 的每一段循环只接 `SamsError`：这不是矛盾，
+是两层各管各的隔离范围。job 那一层的单位是一只票/一对币种/一个用户，接错了就把编程错误
+说成「这一只取不到」，而该修的那行代码永远没人去修；这一层的单位是「一个 job 的一晚」，
+它冒出来的任何东西都不该带走同一个 tick 里排在后面的那些 job，所以 job 本体的异常
+全部在这里接住并记成一行 `failed`（`TypeError: ...`），让健康页与告警去读那一行。
+账本写入（`start`/`finish`）不在这个 `try` 里：那一行连自己都写不进去时，这里没有
+别的载体能替它说话。
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -3377,14 +3655,20 @@ from sams.services.scheduler.types import JobContext, JobSpec
 from sams.services.scheduler.universe import Universe
 from sams.storage.repos.task_runs import FAILED, OK, RUNNING, TaskRun, TaskRunRepo
 
+logger = logging.getLogger("sams.services.scheduler.runner")
+
+#: 失败后多久准重来（D105）。
 RETRY_GAP_MIN = 10
+#: `running` 超过这个小时数就当它是崩溃留下的行，可以重跑（D105）。
 STALE_RUNNING_H = 6
+#: 连续多少个**周期**失败才发一条 `SystemAlarm`（D103）。
 FAILURES_FOR_ALARM = 3
 #: `RunResult` 的第三种结论：这一轮没跑，而且**没有**写 `task_runs`
 #: （「该不该跑」由到期计算与上面三条规则回答，不是一次执行）
 SKIPPED = "skipped"
 
-STREAK_WINDOW = 30
+#: 数连续失败周期时读几个**周期**：多读一格，第 4 个失败周期才不会被数成第 3 个（D103）。
+STREAK_PERIODS = FAILURES_FOR_ALARM + 1
 
 
 @dataclass(frozen=True)
@@ -3401,19 +3685,14 @@ class RunResult:
 
 
 def failure_streak(runs: Sequence[TaskRun]) -> int:
-    """从最近一行往回数：连续多少个**周期**失败。
+    """从最近的周期往回数：连续多少个**周期**失败。
 
-    `runs` 必须是新到旧。同一个周期里的多次重试只算一次（D105 允许隔一段时间
-    再试），否则一次网络抖动就能凑满三次告警。0018 之前写的老行没有周期键，
-    一行就是一个周期——它们的时刻本来也没有别的用途。
+    `runs` 必须是每个周期一行（那一行的最近状态）、新到旧——`latest_per_period`
+    给的就是这个形状：一个周期的结论就是它的最后一行，成功之后不再被重跑，
+    所以这里不需要再按 `period_key` 去重。
     """
-    seen: set[str] = set()
     streak = 0
     for run in runs:
-        key = run.period_key or run.id
-        if key in seen:
-            continue
-        seen.add(key)
         if run.status != FAILED:
             break
         streak += 1
@@ -3425,23 +3704,24 @@ class JobRunner:
     runs: TaskRunRepo
     bus: EventBus
     clock: Clock = SYSTEM_CLOCK
-    retry_gap: timedelta = timedelta(minutes=RETRY_GAP_MIN)
-    stale_after: timedelta = timedelta(hours=STALE_RUNNING_H)
-    failures_for_alarm: int = FAILURES_FOR_ALARM
 
     def execute(self, spec: JobSpec, due: Due, universe: Universe) -> RunResult:
         now = self.clock.now_utc()
+        # 查账在 `start` 之前：这一轮自己写的那一行不能成为拦下自己的那一行
         previous = self.runs.latest_for_period(spec.name, spec.market, due.period_key)
-        reason = self._skip_reason(previous, due, now) if previous is not None else ""
-        if reason:
-            return RunResult(
-                job=spec.name,
-                market=spec.market,
-                period_key=due.period_key,
-                status=SKIPPED,
-                skip_reason=reason,
-                run_id=previous.id if previous is not None else "",
-            )
+        if previous is not None:
+            reason = self._skip_reason(previous, due, now)
+            if reason:
+                return RunResult(
+                    job=spec.name,
+                    market=spec.market,
+                    period_key=due.period_key,
+                    status=SKIPPED,
+                    skip_reason=reason,
+                    run_id=previous.id,
+                )
+        # 崩溃会留下那行 `running`：它没有结论，所以替它重跑的这一轮就是这个周期的第一个结论
+        first_verdict = previous is None or previous.status == RUNNING
         run_id = self.runs.start(spec.name, market=spec.market, period_key=due.period_key)
         context = JobContext(
             period_key=due.period_key,
@@ -3451,8 +3731,14 @@ class JobRunner:
         )
         try:
             outcome = spec.run(context)
-        except Exception as exc:  # noqa: BLE001 — 隔离是这一层的职责：一次跑挂不能带走循环
-            return self._failed(spec, due, run_id, f"{type(exc).__name__}: {exc}")
+        except Exception as exc:
+            # 隔离是这一层的职责：一次跑挂不能带走同一个 tick 里排在后面的那些 job
+            # （`jobs.py` 那一层只接 `SamsError`，理由写在它的文件头）
+            # 行里只留得下 `类型名: 消息`，栈只能进日志，否则编程错误没法读
+            logger.exception("job %s 周期 %s 执行异常", spec.name, due.period_key)
+            return self._failed(
+                spec, due, run_id, f"{type(exc).__name__}: {exc}", first_verdict=first_verdict
+            )
         if outcome.ok:
             self.runs.finish(
                 run_id,
@@ -3474,6 +3760,7 @@ class JobRunner:
             due,
             run_id,
             "；".join(outcome.errors),
+            first_verdict=first_verdict,
             rows_affected=outcome.rows_affected,
             note=outcome.note,
         )
@@ -3483,15 +3770,15 @@ class JobRunner:
             return f"周期 {due.period_key} 已经成功"
         if previous.status == RUNNING:
             age = now - previous.started_at
-            if age < self.stale_after:
+            if age < timedelta(hours=STALE_RUNNING_H):
                 return f"上一轮还在跑（已 {int(age.total_seconds() // 60)} 分钟）"
             return ""
-        moment = previous.finished_at or previous.started_at
-        waited = now - moment
-        if waited < self.retry_gap:
+        # `failed` 只能由 `finish()` 写出，而它同一句就写了 `finished_at`
+        waited = now - previous.finished_at
+        if waited < timedelta(minutes=RETRY_GAP_MIN):
             return (
                 f"距上次失败 {int(waited.total_seconds() // 60)} 分钟，"
-                f"不足 {int(self.retry_gap.total_seconds() // 60)} 分钟"
+                f"不足 {RETRY_GAP_MIN} 分钟"
             )
         return ""
 
@@ -3502,6 +3789,7 @@ class JobRunner:
         run_id: str,
         error: str,
         *,
+        first_verdict: bool,
         rows_affected: int = 0,
         note: str = "",
     ) -> RunResult:
@@ -3513,9 +3801,11 @@ class JobRunner:
             note=note or None,
         )
         streak = failure_streak(
-            self.runs.recent(spec.name, spec.market, limit=STREAK_WINDOW)
+            self.runs.latest_per_period(spec.name, spec.market, limit=STREAK_PERIODS)
         )
-        if streak == self.failures_for_alarm:
+        # 只在第一个结论上告（D103）：第三个周期重试到第 144 次时连续数还是 3，
+        # 没有 `first_verdict` 这一格，告警会从「永不发」翻成「每天发 144 条」
+        if first_verdict and streak == FAILURES_FOR_ALARM:
             self.bus.publish(
                 SystemAlarm(
                     component=spec.component,
@@ -3537,22 +3827,74 @@ class JobRunner:
         )
 ```
 
-- [ ] **Step 4: 跑绿**
+- [ ] **Step 5: 跑绿**
 
 ```bash
-uv run pytest tests/services/test_scheduler_runner.py -q
+uv run pytest tests/storage/test_task_runs.py tests/services/test_scheduler_runner.py -q
 ```
 
-Expected: PASS。
+Expected: PASS（11 + 16 = 27 枚）。
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
-git add src/sams/services/scheduler/runner.py tests/services/test_scheduler_runner.py
+git add src/sams/services/scheduler/runner.py src/sams/storage/repos/task_runs.py tests/services/test_scheduler_runner.py tests/storage/test_task_runs.py
 git commit -m "feat(scheduler): JobRunner 的周期记账、重试间隔与连续失败告警"
 ```
 
 ---
+
+
+**评审收尾（2026-10-22）**：实现落在 `d99efae`，两路评审之后修在 `2e30aa4`，
+`rowid` 决胜那一枚补在 `6d4b09e`。评审发现的问题与处理：
+
+- **D103 的告警在生产形状下永远不响**（BLOCKING，`2e30aa4`）。计划的窗口是
+  `recent(..., limit=STREAK_WINDOW=30)`，数的是**行**；一个一直失败的周期每 10 分钟多写一行，
+  而 `daily_due`（`due.py:63`）把同一个 `period_key` 一路到期到下一个交易日收盘之后，
+  约 144 行/天。最近 30 行于是全是这一个周期的重试，`failure_streak` 只见到一个周期键，
+  永远数到 1，健康页写着「连续失败」而管理员一条都收不到。落地把分组下推到仓库
+  （`latest_per_period`，窗口函数按 `period_key` 分组、`limit` 数周期），
+  runner 只留 `STREAK_PERIODS = FAILURES_FOR_ALARM + 1`。
+- **只把窗口改对会反过来告上百条**（同一次修完）。计数一变成按周期的，第三个周期的
+  每一次重试看到的连续数都恰好是 3——从每天 0 条变成每天上百条。补的第二格是
+  `first_verdict`：只有写出本周期**第一个结论**的那一轮才配告警；上一行是崩溃留下的
+  `running` 时它没有结论，替它重跑的那一轮就算第一个结论。用例
+  `test_the_alarming_period_alarms_once_across_its_retries` 单独钉这一格（它对
+  「只改窗口」的那版实现是红的）。
+- **计划片段自身有两处死代码**：`if previous is not None else ""` 那个三元（`previous`
+  在 `if reason` 那支里必然不是 None）、`finished_at or started_at` 的回退
+  （`failed` 只能由 `finish()` 写出，而它同一句就写了 `finished_at`，
+  DDL 只在收尾前允许 NULL）。落地都删了；`RETRY_GAP_MIN` 取 `started_at` 的写法
+  由 `test_the_gap_is_measured_from_the_end_of_the_last_attempt` 钉住——
+  那枚用例改的是 job 内部推进 25 分钟，旧实现下是绿的，因为没有任何用例在
+  `start` 与 `finish` 之间推过时钟。
+- **「0018 之前写的老行没有周期键」是假的**：`0018_scheduler.sql` 的文件头写着这张表
+  从来没有写入方，所以计划那句为老行准备的 `run.period_key or run.id` 没有对象，
+  落地按「不写没发生的兼容分支」删掉。
+- **D96 两处过头话**：① 文件头说这一层「兜住全部」，而 `try` 只包住 `spec.run`——
+  `runs.start`/`runs.finish` 在外面，账本自己都写不进去时这里没有别的载体。
+  现在照实写范围。② 那个窗口的注释说「窗口必须宽于那个数」，没有任何行数够宽
+  （每周期重试次数没有上界），换成按周期分组之后这条才成立。
+- **补齐的单向钉**（四枚新用例）：`failure_streak` 的 `break`（`break`→`continue`
+  在旧用例下全绿，症状是一场抖动也能告警）、重试间隔从 `finished_at` 起算（换成
+  `started_at` 全绿，症状是慢 job 每 tick 打一次源）、连续失败读的那一趟也要按市场分账
+  （漏掉 `market` 全绿，症状是全局那条链的三次失败替 A 股告警）、
+  同一瞬间两行的决胜（去掉 `rowid DESC`，DuckDB 会把**先**写的那一行当成本周期的结论，
+  于是「先失败后跑成」的周期被数成失败周期）。
+- **裸 `Exception` 加了一条 `logger.exception`**：行里只放得下「类型名: 消息」，
+  没有栈的 `TypeError` 读不出是哪一行。`outcome.errors` 那一支不加——失败文本本来就是数据。
+- **没采纳的建议与理由**：把 `RunResult.run_id` 在 `SKIPPED` 时清空或改名
+  `previous_run_id`——那个字段在这里回答的是「拦下这一轮的是哪一行」，
+  计划与用例都要它，改名属于无关重构；把 `skip_reason` 与 `error` 并成一个 `detail`——
+  Task 11 那一屏要分开读两种颜色；把「一个周期只告一次」的去重推给 Task 9 的 `SystemAlerter`
+  （D102 的 cooldown 是按 component 的投递去重，默认 30 分钟，而重试是 10 分钟一次，
+  推过去等于每小时告两条）。
+- **往后的任务要注意**：Task 11 的 `report.py` 计划片段还在 `from ...runner import
+  STREAK_WINDOW, failure_streak` 并用 `runs.recent(..., limit=STREAK_WINDOW)` 数连续失败——
+  `STREAK_WINDOW` 已经不存在了。那一屏要的是「连续几个周期」，同样必须走
+  `latest_per_period`，并且自己带一个显示用的周期上限（要说清那个数会饱和），
+  `failure_streak` 可以接着用——它现在吃的形状是「每周期一行」。
+
 
 ### Task 9: `SystemAlerter`——系统告警只到管理员，冷却跨重启
 
