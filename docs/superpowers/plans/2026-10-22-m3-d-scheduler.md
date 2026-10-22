@@ -5859,19 +5859,26 @@ git commit -m "fix(scheduler): 评审收尾——守卫不再谎称跨进程，�
 ### Task 11: 健康页的 `[调度]` 与退出码
 
 **Files:**
-- Modify: `src/sams/services/health.py`（`KEY_TABLES` 两行、`HealthReport.schedule`、构造参数）
-- Modify: `src/sams/cli/health.py`（`_print_schedule` + 退出码）
-- Test: `tests/services/test_health.py`（追加三枚）
-- Test: `tests/cli/test_health_cli.py`（新建）
+- Modify: `src/sams/services/health.py`（`KEY_TABLES` 两张台账、`NotifyData` 的两个系统数、
+  `HealthReport.schedule` 与 `schedule_stale`、构造参数 `schedule`）
+- Modify: `src/sams/cli/health.py`（`_age`、`_print_schedule`、`_print_backlog` 的系统那一行、退出码）
+- Test: `tests/services/test_health.py`（追加 5 枚 + `service` 辅助函数接 `schedule`）
+- Test: `tests/cli/test_health_cli.py`（新建，19 枚）
 
-D101 说「心跳丢失的告警由外部承担」：死掉的调度器发不出「我死了」，所以
-`sams health` 的退出码是这条决定唯一的执行点。屏幕上那一句给人看，退出码给 cron 看。
-`schedule` 是一个**函数**而不是 `Scheduler` 对象：`services/health.py` 不需要认识
-调度器的循环，只需要一份 `ScheduleData`；不传时这一节写「未接入」而不是消失。
+D101 说「心跳丢失的发现归外部」：死掉的调度器发不出「我死了」，所以这一屏的那一句与
+`sams health` 的退出码是那条决定唯一的执行点。屏幕上那句给人读，那个码给不盯屏幕的人读。
+`schedule` 是一个**函数**而不是 `Scheduler` 对象：`services/health.py` 只要那份
+`ScheduleData` 的形状，不需要在 import 图上连到调度器的循环；不传时这一节写「未接入」
+而不是从屏幕上消失。
+
+**这一节读的是库，不是那个进程**（实测过两次）：DuckDB 1.5.6 对库文件持独占锁，
+常驻调度器活着的时候，另一个 `sams` 命令连 `read_only=True` 都开不了这个文件。所以
+Task 12 接线之后 `[调度]` 说的也是「上一次它留下的记录」，而「它此刻还活着吗」要由那一任务
+决定载体：要么调度器把那一拍写到一个不锁文件的旁路上，要么承认这个旁观者读不到活的进程。
 
 - [ ] **Step 1: 写失败用例**
 
-`tests/services/test_health.py`：把 `service` 辅助函数改成能接 `schedule`，并追加三枚。
+`tests/services/test_health.py`：辅助函数接住 `schedule`，末尾追加五枚。
 
 ```python
 def service(db, settings, *adapters, local_status=None, schedule=None) -> HealthService:
@@ -5890,39 +5897,150 @@ def service(db, settings, *adapters, local_status=None, schedule=None) -> Health
     )
 ```
 
+顶部这一段 import（这一枚新增的是 `ScheduleData` 与 `Alert`/`AlertRepo`）：
+
 ```python
-def test_key_tables_include_the_scheduler_ledgers(db, settings):
-    report = service(db, settings).report()
-    assert {"task_runs", "scheduler_heartbeats"} <= set(report.tables)
+from sams.services.health import KEY_TABLES, HealthService
+from sams.services.scheduler.report import ScheduleData
+from sams.storage.db import Database
+from sams.storage.migrate import apply_migrations, discover
+from sams.storage.repos.alerts import Alert, AlertRepo
+from sams.storage.repos.bars import BarRepo
+from sams.storage.repos.calendar import CalendarRepo
+from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.fx import FxRepo
+from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+from sams.storage.repos.users import UserRepo
+from sams.storage.repos.watchlists import WatchlistRepo
+```
+
+```python
+# ---------- 调度器读数：随报告带上，系统积压单独数 ----------
+
+
+def test_key_tables_include_the_scheduler_ledgers(db, settings) -> None:
+    """两张表各答一个问题，所以都要在这一屏上：`task_runs` 是「每个 job 跑成什么」，
+    `scheduler_heartbeats` 是「还在跑吗」（D101：判「它还在不在跑」的读者必须在循环之外）。"""
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
     assert report.tables["task_runs"] == 0
+    assert report.tables["scheduler_heartbeats"] == 0
 
 
-def test_report_carries_the_schedule_reading(db, settings):
-    data = ScheduleData(heartbeat=None, beat_age_s=None, admins=0, jobs=())
-    report = service(db, settings, schedule=lambda: data).report()
+def test_report_carries_the_schedule_reading(db, settings) -> None:
+    """`schedule` 是函数不是调度器对象：这一层调用它、存下结果，不认识循环。
+
+    这里给的是 `collect` 真正会产出的形状（没行就没有年龄）；「从未启动不是过期」
+    这一条在 `tests/services/test_scheduler_service.py` 里从 `collect` 那一层钉住。
+    """
+    data = ScheduleData(heartbeat=None, beat_age_s=None, admins=1, jobs=())
+    report = service(
+        db, settings, StubAdapter("akshare", ["A"], sample_bars()), schedule=lambda: data
+    ).report()
     assert report.schedule is data
     assert report.schedule_stale is False
 
 
-def test_without_a_schedule_reader_the_section_is_absent(db, settings):
-    report = service(db, settings).report()
+def test_an_unwired_reader_gives_no_reading_rather_than_a_blank_one(db, settings) -> None:
+    """「没接入」是 None，与「接入了但从未启动」（`ScheduleData(heartbeat=None)`）
+    是两句话，必须在类型上分得开：把前者显示成后者，运维会去查一个没跑过的调度器。"""
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
     assert report.schedule is None
     assert report.schedule_stale is False
+
+
+def make_sys_alert(alerts: AlertRepo, user_id: str, component: str, moment: datetime) -> Alert:
+    """一条系统告警的管理员副本：形状照 `has_system_alert` 的 WHERE（`market='SYS'`、
+    `rule_id` 为 NULL、`code` 是组件名）。写回来的那一行给用例比时刻用。"""
+    return alerts.create(
+        user_id,
+        rule_id=None,
+        rule_name="系统",
+        account_id=None,
+        account_name="",
+        market="SYS",
+        code=component,
+        symbol_name="",
+        severity="mid",
+        stage="调度",
+        value_text="",
+        threshold_text="",
+        action_note="",
+        triggered_at=moment,
+    )
+
+
+def test_system_alerts_are_not_counted_as_user_backlog(db, settings) -> None:
+    """一条系统告警在每个管理员名下各落一行（D102）：把它们数进用户积压，
+    「2 个组件在反复告警、2 个管理员」会显示成「未处理 4 条」，而那两句修法是两件事。
+
+    组件数用 `count(DISTINCT code)` 而不是数行：一行管理员副本不是一个新问题。
+    四个数都钉（两批的条数与两批各自最早那条）：只钉条数的话，把用户的最早时刻
+    填进系统那一格是绿的，而屏幕上那一句会把「一小时前开始的故障」说成「刚发生的」。
+    """
+    alerts = AlertRepo(db)
+    trader = UserRepo(db).create("trader", PASSWORD).id
+    keeper = UserRepo(db).create("keeper", PASSWORD).id
+    moment = datetime.now(UTC)
+    # 系统那一批更早：两批的最早时刻必须是两个不同的数，才有东西可换错
+    hour_earlier = moment - timedelta(hours=1)
+    user_rows = [
+        alerts.create(
+            trader,
+            rule_id="rule-1",
+            rule_name="PR 低",
+            account_id=None,
+            account_name="主账户",
+            market="A",
+            code=code,
+            symbol_name="某票",
+            severity="mid",
+            stage="入池",
+            value_text="PR=0.31",
+            threshold_text="PR≤0.4",
+            action_note="",
+            triggered_at=moment,
+        )
+        for code in ("600519", "000001")
+    ]
+    sys_rows = [
+        make_sys_alert(alerts, trader, "sync", hour_earlier),
+        make_sys_alert(alerts, keeper, "sync", hour_earlier),
+    ]
+
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+    assert report.notify.unhandled == 2, "用户积压不混系统副本"
+    assert report.notify.unhandled_system == 1, "2 行同组件 = 1 个问题"
+    assert report.notify.unhandled_oldest == min(r.triggered_at for r in user_rows)
+    assert report.notify.unhandled_system_oldest == min(r.triggered_at for r in sys_rows)
+
+
+def test_the_system_backlog_uses_the_same_maybe_line_as_the_rest(tmp_path, settings) -> None:
+    """未迁移的库里那两个新数也是 None：沿用 `NotifyData` 那一节其余那几个数的同一条线（D93），
+    而不是给系统积压另立第二条「该跑迁移」的判据。库的形状照旧用例的办法造：只到 0014。"""
+    partial = tmp_path / "migrations"
+    partial.mkdir()
+    for path in discover():
+        if not path.name.startswith("0015"):
+            (partial / path.name).symlink_to(path)
+    fresh = Database.open(tmp_path / "pre-0015.duckdb")
+    try:
+        apply_migrations(fresh, partial)
+        report = service(fresh, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+        assert report.notify.unhandled_system is None
+        assert report.notify.unhandled_system_oldest is None
+    finally:
+        fresh.close()
 ```
 
-需要追加的 import：
+`tests/cli/test_health_cli.py`（新建，整份就是这些）：
 
 ```python
-from sams.services.scheduler.report import ScheduleData
-```
+"""`sams health` 的 `[调度]` 一节与退出码：钉屏幕和退出码，不钉装配。
 
-`tests/cli/test_health_cli.py`（新建）：
-
-```python
-"""`sams health` 的 `[调度]` 一节（D101）。
-
-心跳丢失只能被**外部**发现：这一屏的那一句与退出码是调度器死后唯一会响的东西。
-用一个只带四样东西的假容器：这一枚钉的是屏幕与退出码，不是装配。
+容器是手搭的 `SimpleNamespace`：装配归后面的任务，这些用例只回答
+「给定一份读数，这一屏该说什么、该以什么码退出」。过期与新鲜那两枚用
+`HEARTBEAT_STALE_S` 取数而不是写死秒数——阈值改了这两枚要跟着翻，
+不许出现「阈值改了而测试还绿」。
 """
 
 from __future__ import annotations
@@ -5930,99 +6048,303 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from sams.cli.health import show
-from sams.services.health import HealthReport
+from sams.services.health import HealthReport, NotifyData
+from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
 from sams.services.scheduler.report import JobHealth, ScheduleData
 from sams.storage.repos.task_runs import Heartbeat, TaskRun
 
-MOMENT = datetime(2024, 10, 25, 8, 30, tzinfo=UTC)
+MOMENT = datetime(2024, 10, 25, 15, 30, tzinfo=UTC)
 
 
-def beat(age_s: int) -> Heartbeat:
+def beat(age_seconds: int) -> Heartbeat:
+    """一行心跳，`age_seconds` 前打过最后一拍。
+
+    这一层的判据读的是 `ScheduleData.beat_age_s`（`collect` 由那一拍算出来），
+    时间戳只负责让形状像「有过那一拍」——与 `heartbeat=None` 的那一格分开。
+    """
     return Heartbeat(
-        id="beat-1",
-        started_at=MOMENT - timedelta(days=1),
-        beat_at=MOMENT - timedelta(seconds=age_s),
+        id="hb-1",
+        started_at=MOMENT - timedelta(seconds=age_seconds),
+        beat_at=MOMENT - timedelta(seconds=age_seconds),
         note="tick=60s",
     )
 
 
-class FakeContainer:
-    def __init__(self, report, settings) -> None:
-        self.health = SimpleNamespace(report=lambda: report)
-        self.settings = settings
-        self.source_admin = SimpleNamespace(list=lambda: ())
-        self.registry = SimpleNamespace(
-            market_sources={}, chain_for=lambda market, method: ()
-        )
+def run_for(
+    name: str,
+    *,
+    market: str | None = "A",
+    period: str = "daily",
+    period_key: str | None = "2024-10-25",
+    status: str = "ok",
+    finished_at: datetime | None = MOMENT,
+    error: str | None = None,
+    note: str | None = None,
+    streak: int = 0,
+) -> JobHealth:
+    """一行台账加上它的连败计数：`[调度]` 里 job 那一行的全部输入。
 
-
-def report_with(data, *, pending=()) -> HealthReport:
-    return HealthReport(db_path=":memory:", schedule=data, pending_migrations=list(pending))
-
-
-def test_a_stale_heartbeat_is_printed_and_fails_the_exit_code(settings, capsys):
-    data = ScheduleData(heartbeat=beat(601), beat_age_s=601, admins=1, jobs=())
-
-    assert show(FakeContainer(report_with(data), settings), None) == 1
-
-    out = capsys.readouterr().out
-    assert "[调度]" in out
-    assert "心跳" in out and "可能已经停了" in out
-
-
-def test_a_fresh_heartbeat_passes(settings, capsys):
-    data = ScheduleData(heartbeat=beat(30), beat_age_s=30, admins=2, jobs=())
-
-    assert show(FakeContainer(report_with(data), settings), None) == 0
-
-    out = capsys.readouterr().out
-    assert "管理员 2 名" in out
-
-
-def test_never_started_is_honest_but_does_not_fail(settings, capsys):
-    data = ScheduleData(heartbeat=None, beat_age_s=None, admins=0, jobs=())
-
-    assert show(FakeContainer(report_with(data), settings), None) == 0
-
-    out = capsys.readouterr().out
-    assert "从未启动" in out
-    assert "没有在用的管理员" in out
-
-
-def test_job_lines_show_the_last_outcome_and_streak(settings, capsys):
+    默认是「一次干净的成功」——无错误、无说明、无连败，用例只写自己要改的那一格。
+    """
     run = TaskRun(
-        id="r1",
-        job_name="bars",
-        market="A",
-        period_key="2024-10-25",
-        started_at=MOMENT,
-        finished_at=MOMENT,
-        status="failed",
-        rows_affected=0,
-        error="[akshare] boom",
-        note=None,
+        id=f"r-{name}",
+        job_name=name,
+        market=market,
+        period_key=period_key,
+        started_at=MOMENT - timedelta(minutes=5),
+        finished_at=finished_at,
+        status=status,
+        rows_affected=1,
+        error=error,
+        note=note,
     )
-    data = ScheduleData(
-        heartbeat=beat(30),
-        beat_age_s=30,
-        admins=1,
-        jobs=(JobHealth(name="bars", market="A", period="daily", latest=run, streak=2),),
+    return JobHealth(name=name, market=market, period=period, latest=run, streak=streak)
+
+
+def reading(*, age: int | None, admins: int = 2, jobs: tuple[JobHealth, ...] = ()):
+    """一份读数。`age=None` 就是「还没有那一拍」那一格（`never_started`）。"""
+    return ScheduleData(
+        heartbeat=None if age is None else beat(age),
+        beat_age_s=age,
+        admins=admins,
+        jobs=jobs,
     )
 
-    show(FakeContainer(report_with(data), settings), None)
 
-    out = capsys.readouterr().out
-    assert "bars" in out and "failed" in out
-    assert "周期 2024-10-25" in out and "连续失败 2 个周期" in out and "boom" in out
+def report_with(schedule: ScheduleData | None = None, notify: NotifyData | None = None):
+    return HealthReport(db_path=":memory:", schedule=schedule, notify=notify or NotifyData())
 
 
-def test_without_a_schedule_reader_the_section_says_so(settings, capsys):
-    report = HealthReport(db_path=":memory:")
+@pytest.fixture
+def invoke(settings, capsys):
+    """跑一遍 `sams health` 的 `show`，拿 (退出码, 屏幕)。只带这一屏真正读的四样。"""
 
-    assert show(FakeContainer(report, settings), None) == 0
+    def call(report: HealthReport) -> tuple[int, str]:
+        container = SimpleNamespace(
+            health=SimpleNamespace(report=lambda: report),
+            settings=settings,
+            source_admin=SimpleNamespace(list=lambda: []),
+            registry=SimpleNamespace(market_sources={}, chain_for=lambda market, cap: ()),
+        )
+        capsys.readouterr()
+        code = show(container, SimpleNamespace())
+        return code, capsys.readouterr().out
 
-    assert "未接入调度器读数" in capsys.readouterr().out
+    return call
+
+
+def test_beat_exactly_at_the_threshold_is_stale_and_exit_1(invoke) -> None:
+    """恰好等于阈值算过期：`stale_at` 取 `>=`，这一枚钉的就是那个等号。
+
+    退出码这一头是 D101 唯一的执行点：屏幕那句给人读，这个码给不盯屏幕的读者读。
+    """
+    code, text = invoke(report_with(schedule=reading(age=HEARTBEAT_STALE_S)))
+    assert code == 1, "「它可能已经停了」必须让读退出码的人拿到非零"
+    assert "常驻调度器可能已经停了" in text
+
+
+def test_one_second_under_the_threshold_is_fresh_and_exit_0(invoke) -> None:
+    """同一阈值的另一头：少一秒就不算「可能停了」，码回到 0。
+
+    与上一枚差一秒、差一个码，才是那个 `>=` 的两边而不是一个写死的秒数。
+    """
+    code, text = invoke(report_with(schedule=reading(age=HEARTBEAT_STALE_S - 1)))
+    assert code == 0
+    assert f"心跳 {(HEARTBEAT_STALE_S - 1) // 60} 分钟前 · 管理员 2 名" in text
+
+
+def test_never_started_prints_a_line_but_exits_0(invoke) -> None:
+    """一次都没跑过的库不是事故：`never_started` 不进退出码，那一格自己会说。"""
+    code, text = invoke(report_with(schedule=reading(age=None)))
+    assert code == 0
+    assert "从未启动" in text and "sams run start" in text
+
+
+def test_zero_admins_is_said_loudly_without_touching_the_exit_code(invoke) -> None:
+    """「有 0 个管理员但循环还在跑」是合法的一格：两句话都要打，码还是 0。"""
+    code, text = invoke(report_with(schedule=reading(age=60, admins=0)))
+    assert "没有在用的管理员" in text
+    assert "管理员 0 名" in text, "新鲜那一行的「管理员 N 名」照打，两句不冲突"
+    assert code == 0
+
+
+def test_a_stale_beat_over_an_hour_shows_hours_and_minutes(invoke) -> None:
+    """时长串走「小时 + 分钟」那一支：7500 秒在屏上该是「2 小时 5 分钟」。"""
+    _, text = invoke(report_with(schedule=reading(age=2 * 3600 + 5 * 60)))
+    assert "已经 2 小时 5 分钟没更新" in text
+
+
+def test_an_exact_hour_does_not_get_a_zero_minute_tail(invoke) -> None:
+    """整小时不补「0 分钟」：7200 秒那一格的信息量是「两个小时没拍了」，
+    「2 小时 0 分钟」读起来像秒表，会让那一行显得还差一分钟就到下一个数。"""
+    _, text = invoke(report_with(schedule=reading(age=2 * 3600)))
+    assert "已经 2 小时没更新" in text
+    assert "0 分钟" not in text
+
+
+def test_a_stale_beat_of_whole_minutes_shows_minutes(invoke) -> None:
+    """整分钟的读数不该被写成秒：600 秒那一格打「10 分钟」。"""
+    _, text = invoke(report_with(schedule=reading(age=10 * 60)))
+    assert "已经 10 分钟没更新" in text
+
+
+def test_minutes_drop_the_leftover_seconds(invoke) -> None:
+    """不足一分钟的零头被折掉：1840 秒打「30 分钟」而不是「30 分 40 秒」。"""
+    _, text = invoke(report_with(schedule=reading(age=30 * 60 + 40)))
+    assert "已经 30 分钟没更新" in text
+    assert "40 秒" not in text
+
+
+def test_a_fresh_beat_under_a_minute_shows_seconds(invoke) -> None:
+    """不足一分钟时给秒：那一支被折成「0 分钟前」，屏上就分不出刚打的与半分钟前的。"""
+    _, text = invoke(report_with(schedule=reading(age=30, admins=1)))
+    assert "心跳 30 秒前" in text
+
+
+def test_a_failed_run_shows_period_status_streak_and_error(invoke) -> None:
+    """job 那一行：周期是「连续失败 N 个周期」的分母，没有这一列就说不清连败多久。
+
+    错误串折到 60 个字符：一条带栈的源错误能有几百字，而这一屏是给人扫的，
+    「哪个 job 坏了」由前面那三列说，不由栈说。
+    """
+    long_error = "connection reset by peer after 3 retries: " + "X" * 80
+    job = run_for("bars", status="failed", error=long_error, streak=2)
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(job,))))
+    assert "bars" in text
+    assert "failed" in text
+    # 「daily」是 `job.period` 的读者：没有这一断言，健康页上的周期字段没有主人
+    assert "daily" in text
+    assert "周期 2024-10-25" in text
+    assert "连续失败 2 个周期" in text
+    assert long_error[:60] in text
+    assert long_error[:61] not in text, "折痕在 60 个字符：多一个字符就是这一枚的另一边"
+    assert "X" * 60 not in text, "整条栈不该把这一行撑开"
+    # 收尾时刻也在这一行：`周期 2024-10-25` 说的是哪个周期，时刻说的是它什么时候结束的
+    assert "2024-10-25 15:30:00 UTC" in text
+
+
+def test_a_still_running_row_shows_no_completion_time(invoke) -> None:
+    """崩溃留下的那一行是 `running`、没有收尾时刻（D105）：没有时刻就什么都不打，
+    而不是落一个「–」——那个破折号会被读成「跑完了，只是库里没记时间」。"""
+    job = run_for("bars", status="running", finished_at=None)
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(job,))))
+    line = next(ln for ln in text.splitlines() if "bars" in ln)
+    assert "running" in line
+    assert "UTC" not in line and "–" not in line
+
+
+def test_the_note_on_a_run_is_printed(invoke) -> None:
+    """`note` 说的是「成了，但要补一句」：`error` 是没成，`note` 是成了却只更新了 3 只
+    （0018 的头注），runner 写的「周期 … 已经成功」也落在这一列。
+
+    两行一起给：只钉带说明的那一行，会放过「干净的那行也被打上一段」——那时运维看到的
+    两个 `ok` 长得一样，而其中一个其实只更新了 3 只。
+    """
+    jobs = (run_for("fx", market=None, note="等 A 股收盘后才换汇"), run_for("bars"))
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=jobs)))
+    noted = next(ln for ln in text.splitlines() if "等 A 股" in ln)
+    clean = next(ln for ln in text.splitlines() if ln.lstrip().startswith("bars"))
+    assert "ok" in noted and "全局" in noted, "没有市场的 job 报「全局」而不是空白"
+    assert clean.endswith("2024-10-25 15:30:00 UTC"), text
+    assert "None" not in clean and "连续失败" not in clean
+
+
+def test_a_zero_streak_is_not_printed_as_zero_failures(invoke) -> None:
+    """`streak=0` 那一格什么都不说：「连续失败 0 个周期」会把一次正常的运行读成
+    「刚停下来」，而这一屏上「没坏」的正确表达是少一段字。"""
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(run_for("bars", streak=0),))))
+    assert "连续失败" not in text
+
+
+def test_a_run_row_without_a_period_key_shows_a_dash(invoke) -> None:
+    """`period_key` 是 0018 用 `ALTER TABLE … ADD COLUMN` 加上的，DuckDB 那一句带不了
+    NOT NULL，所以库里这一列可以是 NULL：这里落一个「–」而不是把 `None` 打上屏幕。"""
+    _, text = invoke(
+        report_with(schedule=reading(age=60, jobs=(run_for("bars", period_key=None),)))
+    )
+    line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("bars"))
+    assert "周期 –" in line and "None" not in line
+
+
+def test_the_columns_line_up_across_the_widest_inputs(invoke) -> None:
+    """名字与周期两列的宽度由注册表算得出（`financials` 10 个字符 → 留 11、
+    `monthly` 7 个 → 正好 7）；市场那一列的 4 不是：市场码是 `canonical_market`
+    大写后的自由字符串，现在用到的 `A`/`HK` 都只有 1~2 个字符，「全局」占 2 个。
+
+    `:<` 只补不截，哪一列留窄了后面的状态列就跟着左移，一屏里两行不齐就读不出
+    「谁在反复失败」——对齐这一枚钉的是三列**当下**齐不齐，不是「这三格永远够宽」。
+    """
+    jobs = (
+        run_for("financials", period="daily"),
+        run_for("calendar", period="monthly"),
+        run_for("bars", market="HK", period="daily"),
+    )
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=jobs)))
+    lines = [
+        ln
+        for name in ("financials", "calendar", "bars")
+        for ln in text.splitlines()
+        if ln.lstrip().startswith(name)
+    ]
+    assert len(lines) == 3, text
+    offsets = {ln.index("ok") for ln in lines}
+    assert len(offsets) == 1, f"三行的状态列没对齐：{lines}"
+
+
+def test_a_job_that_never_ran_says_so(invoke) -> None:
+    """登记了但一行台账都没有：与「跑过且失败」是两件事，前者是还没轮到。"""
+    job = JobHealth(name="bars", market="A", period="daily", latest=None, streak=0)
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(job,))))
+    assert "从未运行" in text
+    assert "daily" in text, "从未运行的那一行也报周期：它是「该不该轮到」的分母"
+
+
+def test_unwired_reading_keeps_the_section_and_exits_0(invoke) -> None:
+    """这一节不因「没接入」而消失：缺席会被读成「调度器好好的」，
+    而那一句说的才是事实——还没有读数接进来。"""
+    code, text = invoke(HealthReport(db_path=":memory:"))
+    assert "[调度]" in text
+    assert "未接入调度器读数" in text
+    assert code == 0
+
+
+def test_an_unmigrated_db_says_the_version_and_no_backlog_numbers(invoke) -> None:
+    """未迁移的那一屏只说「该跑迁移」，不接着报积压：`NotifyData()` 里那八个数是 `None`，
+    而 `None` 是「没查过」不是「查出来是 0」。把两者印在同一屏上，读的人会在一个
+    还没有 `alerts` 表形状的库里去找「谁没看告警」。
+
+    这一枚钉的是 `_print_notify` 里那句 `return`：它是「这条线只判一次」的唯一主人。
+    """
+    _, text = invoke(report_with(notify=NotifyData()))
+    assert "库里还没有 0015 的形状" in text
+    assert "未处理告警" not in text, "未迁移的库不报用户积压，连 0 都不报"
+    assert "个组件未处理" not in text
+
+
+def test_system_backlog_gets_its_own_line_not_the_user_one(invoke) -> None:
+    """系统与用户是两个受害者，分两行：给用户的那句修法（`sams alert list`）
+    答不了「哪个 job 在反复失败」，而这一屏下面的 `[调度]` 那一节能答。"""
+    notify = NotifyData(
+        channels=1,
+        enabled=1,
+        sent=0,
+        failed=0,
+        suppressed=0,
+        no_channel=0,
+        unhandled=0,
+        unhandled_system=2,
+        unhandled_system_oldest=MOMENT,
+    )
+    code, text = invoke(report_with(notify=notify))
+    assert "系统告警 2 个组件未处理" in text
+    assert "`[调度]` 那一节按 job 列了最近一次的结论" in text
+    assert "未处理告警 2 条" not in text, "用户那句说的还是用户的 0 条"
+    assert "未处理告警 0 条" in text
+    assert code == 0
+
 ```
 
 - [ ] **Step 2: 跑红**
@@ -6031,100 +6353,210 @@ def test_without_a_schedule_reader_the_section_says_so(settings, capsys):
 uv run pytest tests/services/test_health.py tests/cli/test_health_cli.py -q
 ```
 
-Expected: FAIL（`HealthService` 没有 `schedule` 参数；`HealthReport` 没有 `schedule` 字段；`sams.cli.health.show` 还没有 `[调度]`）。
+Expected: FAIL（`HealthService` 没有 `schedule` 参数；`HealthReport` 没有 `schedule` 字段；
+`NotifyData` 没有那两个系统数；`sams.cli.health.show` 还没有 `[调度]`）。
 
 - [ ] **Step 3: 改 `services/health.py`**
 
-顶部 import 加一行（`TYPE_CHECKING` 与 `ScheduleData`）：
+注解只 import 类型，运行时不连调度器：
 
 ```python
-from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
+    # 只在注解里出现：健康这一层要的是 `ScheduleData` 的**形状**，不是调度器的循环
+    # （运行时 import 会把 services.health 连到调度器的依赖图上，见 `HealthService.__init__`）
     from sams.services.scheduler.report import ScheduleData
 ```
 
 `KEY_TABLES` 末尾（`"notify_log"` 之后）：
 
 ```python
-    # 调度器的两本账：task_runs 是每个 job 的执行记录，scheduler_heartbeats 是「还在跑吗」
+    # 调度器的两张台账各答一个问题：`task_runs` 是「每个 job 上一轮跑成什么」，
+    # `scheduler_heartbeats` 是「还在跑吗」（D101：判「它还在不在跑」的读者必须在循环之外）
     "task_runs",
     "scheduler_heartbeats",
 ```
 
-`HealthReport` 末尾加：
+`NotifyData` 末尾加两个数（`None` 沿用 D93 那条「库里还没有 0015 的形状」的线）：
 
 ```python
-    #: 调度器的读数；`None` 是「这个进程没接调度器」（不是「从没启动」，那是心跳为空）。
-    #: 用 `TYPE_CHECKING` 的字符串注解而不是 import：这一层只需要那份数据的形状，
-    #: 不需要在 import 图上连到调度器的循环
-    schedule: ScheduleData | None = None
+    #: 系统积压：**未处理的组件个数**（`code` 存的是组件名，D102）而不是行数——
+    #: 一行管理员副本不是一个新问题，数行数会把同一个故障按管理员数放大。
+    #: 最早一条的时刻与用户那两个数走同一条可空线：未迁移时保持 `None`
+    unhandled_system: int | None = None
+    unhandled_system_oldest: datetime | None = None
+```
 
+`HealthReport` 末尾加读数：
+
+```python
+    #: 调度器的读数。**None 是「没接入」**，与接入了但从未启动
+    #: （`ScheduleData(heartbeat=None, ...)`）是两件事，必须在类型上分得开：
+    #: 把前者显示成后者，运维会去查一个从没跑过的调度器
+    schedule: ScheduleData | None = None
+```
+
+以及退出码唯一读的那条判据（它排在 `degraded_sources` 之后）：
+
+```python
     @property
     def schedule_stale(self) -> bool:
+        """有过心跳且已经过期：退出码里只有这一条算「它可能死了」（D101）。
+        从未启动不是事故、没接入更不是，所以这里不读 `never_started`。"""
         return self.schedule is not None and self.schedule.stale
 ```
 
-构造参数末尾加：
+构造参数与赋值：
 
 ```python
-        schedule: Callable[[], ScheduleData] | None = None,
+        schedule: Callable[[], ScheduleData] | None = None
 ```
 
-赋值与 `report()`：
-
 ```python
+        #: 调度器读数同理，而且**函数比调度器对象更对**：健康这一层不认识循环，
+        #: 只要一份 `ScheduleData` 的形状；传对象会把 `services.health` 连到调度器的依赖图上
         self.schedule = schedule
 ```
 
 ```python
-            notify=self._notify_data(),
             schedule=self.schedule() if self.schedule is not None else None,
+```
+
+`_notify_data` 里用户那两问排除 `market='SYS'`，系统那两问只认 `SYS` 且**数组件**：
+
+```python
+        # 用户积压排除 `market='SYS'`：系统告警在每个管理员名下各有一行副本，
+        # 混进来的话「2 个组件、2 个管理员」会显示成「未处理 4 条」
+        unhandled = int(
+            self.db.scalar(
+                "SELECT count(*) FROM alerts WHERE status = 'new' AND market <> 'SYS'"
+            ) or 0
+        )
+        oldest = (
+            self.db.scalar(
+                "SELECT min(triggered_at) FROM alerts"
+                " WHERE status = 'new' AND market <> 'SYS'"
+            )
+            if unhandled
+            else None
+        )
+        # 数**组件**而不是数行：`code` 存的是组件名（D102），一行管理员副本不是一个新问题
+        system_unhandled = int(
+            self.db.scalar(
+                "SELECT count(DISTINCT code) FROM alerts"
+                " WHERE status = 'new' AND market = 'SYS'"
+            ) or 0
+        )
+        system_oldest = (
+            self.db.scalar(
+                "SELECT min(triggered_at) FROM alerts WHERE status = 'new' AND market = 'SYS'"
+            )
+            if system_unhandled
+            else None
+        )
+```
+
+```python
+            unhandled=unhandled,
+            unhandled_oldest=oldest,
+            unhandled_system=system_unhandled,
+            unhandled_system_oldest=system_oldest,
 ```
 
 - [ ] **Step 4: 改 `cli/health.py`**
 
-在 `_print_notify` 之后加：
+积压那一节分成两行（两个受害者、两句修法）：
 
 ```python
-def _age(seconds: int | None) -> str:
-    if seconds is None:
-        return "未知"
+def _print_backlog(notify) -> None:
+    """积压那两行，只在「库已经是 0015 的形状」时被调用：那一句由 `_print_notify` 判、
+    判完就 return，这条线只在那一处判（在这里再判一次就是第二个主人）。
+
+    用户与系统各一行：两个受害者、两句修法——`sams alert list` 答不了「哪个 job 在反复失败」。
+    """
+    if notify.unhandled:
+        oldest = (
+            f"（最早 {stamp(notify.unhandled_oldest)}）" if notify.unhandled_oldest else ""
+        )
+        print(
+            f"  ⚠ 未处理告警 {notify.unhandled} 条{oldest}"
+            "：`sams alert list --user … --status new`"
+        )
+    else:
+        print("  未处理告警 0 条")
+    if notify.unhandled_system:
+        oldest = (
+            f"（最早 {stamp(notify.unhandled_system_oldest)}）"
+            if notify.unhandled_system_oldest
+            else ""
+        )
+        print(
+            f"  ⚠ 系统告警 {notify.unhandled_system} 个组件未处理{oldest}"
+            "：下面 `[调度]` 那一节按 job 列了最近一次的结论"
+        )
+```
+
+`_print_notify` 之后是这一节的两函数：`_age` 把秒折成能扫一眼的时长，`_print_schedule`
+把读数打成屏幕。
+
+```python
+def _age(seconds: int) -> str:
+    """把「距今多少秒」折成人能扫一眼的时长：一个四位数秒值在屏幕上没有量感。
+
+    整小时不补一个「0 分钟」：「1 小时 0 分钟没更新」读起来像秒表，而那一格的
+    信息量就是「一个多小时没拍了」。
+    """
     if seconds < 60:
         return f"{seconds} 秒"
     if seconds < 3600:
         return f"{seconds // 60} 分钟"
     hours, rest = divmod(seconds, 3600)
-    return f"{hours} 小时 {rest // 60} 分钟"
+    minutes = rest // 60
+    return f"{hours} 小时 {minutes} 分钟" if minutes else f"{hours} 小时"
 
 
 def _print_schedule(report) -> None:
-    """`[调度]`：它还在不在跑、每个 job 上一轮跑成什么（D101）。
+    """`[调度]`：它还在不在跑，加上每个 job 上一轮跑成什么。
 
-    心跳丢失的告警只能由**外部**发出；这一节的退出码是那条决定唯一的执行点——
-    屏幕可以没人看，cron 看的是 `sams health` 的退出码。
+    死掉的调度器发不出「我死了」（D101），所以「还在不在跑」这句话只能由外面的人说。
+    「未接入」也要占一行而不是让这一节消失——缺席会被读成「调度器好好的」。
+    过期那一句之外，同一件事还进 `show` 的最后一行：屏幕上那句给人读，那个码给
+    不盯屏幕的人读。
     """
     print("[调度]")
-    data = report.schedule
-    if data is None:
+    if report.schedule is None:
         print("  未接入调度器读数")
         return
+    data = report.schedule
+    # 到下面两支时年龄已经折得出来：`collect` 把那一拍与年龄绑在同一条腿上（有行才算得出数）。
+    # 那个「有行没有数」的形状不在这里兜住：炸出去的那一句正指着写错的调用方，
+    # 而屏上一个不动声色的「未知」只会让读的人以为一切都好
     if data.never_started:
         print("  从未启动（`sams run start` 启动常驻调度器）")
     elif data.stale:
-        print(f"  ⚠ 心跳已经 {_age(data.beat_age_s)} 没更新：常驻调度器可能已经停了")
+        print(f"  ⚠ 心跳已经 {_age(data.beat_age_s)}没更新：常驻调度器可能已经停了")
     else:
         print(f"  心跳 {_age(data.beat_age_s)}前 · 管理员 {data.admins} 名")
     if data.admins == 0:
-        print("  ⚠ 没有在用的管理员：系统告警一个收件人都没有（`sams user set-admin …`）")
+        # 与上一行的「管理员 0 名」不冲突：那一行报事实，这一行报后果——
+        # 「循环还在跑」与「告警没有一个收件人」恰好可以同时成立
+        print(
+            "  ⚠ 没有在用的管理员：系统告警一个收件人都没有"
+            "（`sams user promote --username …`）"
+        )
     for job in data.jobs:
+        # 周期紧跟着名字：它是「连续失败 N 个周期」的分母——
+        # 日频 job 连败 2 个周期与月频 job 连败 2 个周期是两个不同的事
+        # 名字那一列留宽到注册表里最长的那个名字（现在是 `financials`，10 个字符）：
+        # `:<` 只补不截，留窄一格后面的列就跟着左移，两行不齐时读不出「谁在反复失败」。
+        # 注册表里长出更长的名字时这一格要跟着改——用例钉的是当下这三列齐不齐，
+        # 不是「这一格永远够宽」
+        line = f"  {job.name:<11} {(job.market or '全局'):<4} {job.period:<7}"
         latest = job.latest
-        line = f"  {job.name:<9} {(job.market or '全局'):<4}"
         if latest is None:
             print(line + " 从未运行")
             continue
-        line += f" {latest.status:<7} 周期 {latest.period_key or '—'}"
-        if latest.finished_at is not None:
+        line += f" {latest.status:<7} 周期 {latest.period_key or '–'}"
+        if latest.finished_at:
             line += f" · {stamp(latest.finished_at)}"
         if job.streak:
             line += f" · 连续失败 {job.streak} 个周期"
@@ -6135,13 +6567,17 @@ def _print_schedule(report) -> None:
         print(line)
 ```
 
-`show` 里 `_print_notify(report)` 之后加 `_print_schedule(report)`，并把最后一行改成：
+`show` 里 `_print_notify(report)` 之后加 `_print_schedule(report)`，最后一行按这条退出：
 
 ```python
-    degraded = (
-        report.degraded_sources or report.pending_migrations or report.schedule_stale
+    # 退出码说的是同一件事（D101：死掉的调度器发不出「我死了」，判它的读者在循环之外）。
+    # 用 `schedule_stale` 而不用「从未启动」：一次都没跑过的库不是事故，
+    # 那一格由 `[调度]` 自己的文案说
+    return (
+        1
+        if report.degraded_sources or report.pending_migrations or report.schedule_stale
+        else 0
     )
-    return 1 if degraded else 0
 ```
 
 - [ ] **Step 5: 跑绿**
@@ -6150,14 +6586,93 @@ def _print_schedule(report) -> None:
 uv run pytest tests/services/test_health.py tests/cli/test_health_cli.py -q
 ```
 
-Expected: PASS。
+Expected: PASS（34 + 19 = 53 枚）。
 
 - [ ] **Step 6: 提交**
 
+实现与评审收尾各一个提交：不改历史（`--amend` 与 `git reset --soft` 都不用），
+所以评审发现的那几处口径由后面那两个提交说明。
+
 ```bash
-git add src/sams/services/health.py src/sams/cli/health.py tests/services/test_health.py tests/cli/test_health_cli.py
+# fc812df —— 实现
+git add src/sams/services/health.py src/sams/cli/health.py \
+    tests/services/test_health.py tests/cli/test_health_cli.py
 git commit -m "feat(health): [调度] 一节与心跳丢失的退出码"
+
+# 695ab55 —— 评审收尾（第一轮）
+git add src/sams/cli/health.py tests/services/test_health.py tests/cli/test_health_cli.py
+git commit -m "fix(health): 评审收尾——不存在的命令与走不到的形状都从这一屏去掉"
+
+# 1b853de —— 评审收尾（第二轮）
+git add src/sams/cli/health.py tests/cli/test_health_cli.py
+git commit -m "fix(health): 评审第二轮——未迁移那条线只留一个主人"
 ```
+
+**评审收尾（2026-10-23）**：实现落在 `fc812df`，修在 `695ab55`（第一轮）与 `1b853de`（第二轮）。
+
+- **「有过心跳但算不出年龄」是一个代码走不到的形状**：`collect` 只有在那一行心跳存在时
+  才写 `beat_age_s`，所以用例原来手工造的 `ScheduleData(heartbeat=有, beat_age_s=None)`
+  不存在，而 `_age` 里那条 `None` 分支（返回「未知」）也就是死代码。两处一起删：
+  `_age(seconds: int)` 不再接 `None`，用例改回 `collect` 真正会产出的那份
+  （`heartbeat=None, beat_age_s=None`）。「没有年龄不等于过期」那一半仍然有主人，
+  在 `tests/services/test_scheduler_service.py` 里从 `collect` 那一层钉着。
+- **`_age` 整小时不再补「0 分钟」**：「1 小时 0 分钟没更新」读起来像秒表。钉它的用例两头
+  都给（`2 小时 5 分钟` 与 `2 小时` 且屏上没有「0 分钟」）。
+- **修法提示改指真实存在的命令**：原来那句 `sams user set-admin …` 在 CLI 里没有
+  （`cli/user.py` 的动作是 add/list/passwd/enable/disable/**promote**），会引导运维去敲一条
+  不存在的命令。现在是 `sams user promote --username …`。
+- **对没接线的生产作现在时陈述的注释去掉**：「退出码让 cron 也能听见」——`bootstrap.py`
+  还没把 `schedule` 接进来（那是 Task 12），改成「同一件事还进 `show` 的最后一线：
+  屏幕上那句给人读，那个码给不盯屏幕的人读」。
+- **列宽按注册表里的真实取值定，并补上对齐这一枚**：名字列原来留 9 个字符，而
+  `financials` 有 10 个（`_DATA_JOBS` 与 `build_jobs` 里最长就是它），真数据里那一行会把
+  后面每一列左移一格，「谁在反复失败」在两行之间对不齐。现在是 11；周期列 7 正好是
+  `monthly` 的长度。用例把三列一起钉（`financials`/`calendar`/`bars`，市场码取 `A` 与 `HK`
+  两种长度），变异 `{job.name:<11}`→`<9`、`{job.period:<7}`→`<6`、去掉市场列宽度都打红。
+- **两枚单向钉补齐**（评审用变异找出来）：`if job.streak:` 改成恒真是绿的（没有用例说
+  「连败 0 就不该提连败」），`latest.error[:60]` 改成 `[:61]` 也是绿的。现在各有一边：
+  `test_a_zero_streak_is_not_printed_as_zero_failures` 与
+  `long_error[:61] not in text`。同一条思路补上 `period_key` 为空时落「–」而不是 `None`
+  （这一列是 0018 用 `ALTER TABLE … ADD COLUMN` 加的，DuckDB 那句带不了 NOT NULL）。
+- **修法提示不指还没存在的命令**：系统积压那一行原来写「`sams run jobs` 看哪个 job 在
+  反复失败」，而 `run` 这个命令是 Task 12 才有的——今天敲它会得到「未知子命令」。改成指向
+  本屏下面那一节（`[调度]` 按 job 列最近一次的结论），Task 12 之后那句话仍然是真的。
+- **代码不固定的计数从文档里去掉**：用例原来写「沿用『六个数一起可空』的同一条线」，
+  而 `NotifyData` 里可空的数有八个、这个数字没有任何代码在守。改成指向那条线本身
+  （「`NotifyData` 那一节其余那几个数的同一条线（D93）」）。
+- **注释里的周期举例换成真存在的周期**：原来那句「日频 job 连败 2 个周期与季频 job 连败
+  2 个周期是两个不同的事」举了「季频」，而 `due.py` 的 `PERIODS` 只有
+  `daily`/`weekly`/`monthly`/`fx` 四个取值——注释举了一个代码里不存在的类别。改成月频。
+- **第一轮驳回的一条，第二轮按仓库事实接受**：「`_print_backlog` 里 `unhandled is None`
+  那一支走不到」。第一次的回答是「调用方今天没有那个检查」——这句话是错的：
+  `_print_notify` 在 `notify.channels is None` 时打完「库里还没有 0015 的形状」就 `return`，
+  那条线本来就只判一次。于是那一支既走不到、又没有用例钉着，两处一起删，
+  `_print_backlog` 的文档串改成点名那个唯一主人。缺的那枚屏幕用例补上了：
+  `test_an_unmigrated_db_says_the_version_and_no_backlog_numbers`——未迁移的那一屏有
+  「库里还没有 0015 的形状」而没有「未处理告警」（`None` 是「没查过」，印成 0 是谎话）。
+  删掉那句 `return` 现在会打红（变异「未迁移的库跟着报积压数字」）。
+- **列宽的注释不替市场那一列打包票，方向也不说反**：原来那句「三列各自按注册表里最长的
+  取值留宽」对名字（`financials` 10 个字符 → 留 11）与周期（`monthly` 7 个 → 正好 7）成立，
+  对市场不成立——市场码不是封闭集合（`core/codes.py` 的 `canonical_market` 只做大小写与
+  空格归一，没有取值表），4 那一格是留的余量而不是算出来的。注释与用例文档串一起改成
+  「钉的是这三列**当下**齐不齐」。另外原来写「整列就右移」，方向说反了：留窄一格，
+  后面的列往**左**走。
+- **三条评审意见按仓库事实驳回**：①「系统积压 `count(DISTINCT code)` 会把一个组件的两个
+  问题合成一个」——屏幕上那一格明说单位是「个组件」，与 D102 写行的单位一致，不是「问题数」；
+  ②「健康页那两个数该带上 D102 的三件标记（再加 `rule_id IS NULL`）」——`market = 'SYS'`
+  与 `market <> 'SYS'` 是 `alerts` 的一对**补集**，加第三个条件会让一个假想的
+  「SYS 而带 rule_id」的行两个数都不进；写侧那条三条件查询认的是「自己写下的那批行」，
+  读侧这两问切的是全表，语义不同。今天只有 `scheduler/alarms.py` 写 `market='SYS'`；
+  ③「`[调度]` 里 `sams run start` 与积压那行指向 `[调度]` 都是还没存在的命令」——两支今天
+  都走不到：`bootstrap.py` 没传 `schedule=`，那一节只会说「未接入调度器读数」，而系统积压
+  那一行要 `unhandled_system > 0`，那只能由还没接线的调度器写出来。Task 12 接上这两支的
+  同一晚 `run start` 就存在了。与第一轮删掉的 `sams run jobs` 不同：那一次本屏有一句真替换，
+  这一次没有同屏的可指。
+- **变异电池 37 枚**（`/tmp/mut11.py`，两份文件跑完逐字节还原）：服务层 10 枚（两条 SQL 的
+  排除与只认、`DISTINCT`、两批时刻互换、`schedule_stale` 的两半、读数不被取、`KEY_TABLES`
+  两张表）、屏幕 27 枚（退出码的两头、三列宽度与「周期那一列没了」、连败与 note 两支的
+  正反、收尾时刻/零管理员/过期那一支/「从未启动」并入的单向、错误折痕的两边、`_age` 四支
+  与整小时的尾巴、量词、「未接入」那一行、积压那两行不打、未迁移的库跟着报积压数字）。全红。
 
 ### Task 12: `sams run start|once|jobs` 与组装根接线
 
