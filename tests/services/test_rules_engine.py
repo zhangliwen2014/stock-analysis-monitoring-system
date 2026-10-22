@@ -356,6 +356,24 @@ def test_as_of_moves_the_reading_day_without_moving_the_clock(h) -> None:
     assert len(report.raised) == 1
 
 
+def test_market_filter_leaves_other_markets_alone(h) -> None:
+    """调度器每个市场单独跑一趟：不是这个市场的对象一个都不许判。
+
+    两头都钉：`market="HK"` 时那条 A 股规则既不响也不投递（响了就等于替美股那一趟把 A 股
+    的告警又推一遍，而冷却是按 `(rule, market, code)` 去的，两个市场各推一遍谁也拦不住谁）；
+    `market="A"` 时照旧响。`rules` 仍是 1——那个数问的是「这一趟看了几条规则」，
+    不是「看了几个对象」，跟着对象数缩会让屏幕读不出「规则被过滤了」还是「压根没规则」。
+    """
+    h.add()
+    report = h.engine().check(USER, market="HK")
+    assert report.rules == 1
+    assert report.raised == () and h.sender.sent == []
+    # 五摞出口全空，而且「一个都没读」是断得出来的：判定要问日历，连一次都没问就是真没读
+    assert (report.suppressed, report.skipped, report.blocked, report.quiet) == ((), (), (), 0)
+    assert report.judged == 0 and h.calendar.day_calls == []
+    assert h.engine().check(USER, market="A").raised
+
+
 # --- 除权换算（§10.2 在引擎这一头的四个形状）----------------------------------------------
 
 #: 10 派 1、前收 10.00 ⇒ 因子 10/9，写在它之前的「10 元」今天站在 9.00。

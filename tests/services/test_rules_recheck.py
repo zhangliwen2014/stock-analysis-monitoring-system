@@ -347,6 +347,20 @@ def test_a_named_thesis_outside_the_two_statuses_is_refused_with_a_reason(contai
         build(container).run(USER, thesis_id=idle.id)
 
 
+def test_market_filter_skips_theses_from_other_markets(container) -> None:
+    """调度器每个市场单独跑一趟复检：不属于这个市场的论一条都不许读。
+
+    点名一条 A 股的论又限定 HK，两句拼不成一句——这里必须出声（静默返回零行会被读成
+    「HK 那一趟复检过了」），而 `market=None` 那一头其余用例照旧全比，CLI 不必改。
+    """
+    thesis = open_thesis(container)
+    rec = build(container)
+    assert rec.run(USER, as_of=AS_OF, market="HK").rows == ()
+    assert len(rec.run(USER, as_of=AS_OF, market="A").rows) == 1
+    with pytest.raises(ValidationError, match="不是 HK"):
+        rec.run(USER, as_of=AS_OF, thesis_id=thesis.id, market="HK")
+
+
 def test_an_unknown_thesis_says_unknown(container) -> None:
     with pytest.raises(StorageError, match="thesis"):
         build(container).run(USER, thesis_id="does-not-exist")

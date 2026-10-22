@@ -201,10 +201,16 @@ class RuleEngine:
         user_id: str,
         *,
         as_of: date | None = None,
+        market: str | None = None,
         dry_run: bool = False,
         rule_id: str | None = None,
     ) -> RunReport:
-        """一趟同步求值。M3-D 的调度器以后按市场时段调这里，本函数不知道自己被调了几次。"""
+        """一趟同步求值。调度器的 `rules` job 按市场跑（传 `market`），CLI 那一趟不传，
+        而本函数不知道自己被调了几次——一次还是三个市场，是调用方的事。
+
+        `market` 是对象级子集：过滤在展开之后做——规则的目标可以是 `*` 那种
+        「我的全部持仓」，展开之前问不出「这里面哪些属于 HK」。
+        """
         now = self.clock.now_utc()
         day = as_of if as_of is not None else self.clock.today()
         raised: list[Raised] = []
@@ -220,6 +226,13 @@ class RuleEngine:
             except ValidationError as exc:
                 blocked.append(Blocked(rule_id=rule.id, rule_name=rule.name, reason=str(exc)))
                 continue
+            if market is not None:
+                targets = [target for target in targets if target.market == market]
+                if not targets:
+                    # 这条规则的对象全在别的市场：这一趟一个都没读，所以五摞出口
+                    # （触发/压制/跳过/阻塞/没到）都不因此动一行——只有 `rules` 那个数
+                    # 照旧算它一眼，它问的是「这一趟看了几条规则」而不是「看了几个对象」
+                    continue
             held = self._holdings(rule, cache)
             for target in targets:
                 fate = self._one(

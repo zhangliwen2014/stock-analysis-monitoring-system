@@ -106,25 +106,38 @@ class Rechecker:
         as_of: date | None = None,
         dry_run: bool = False,
         thesis_id: str | None = None,
+        market: str | None = None,
     ) -> RecheckReport:
+        """一趟复检。`market` 是调度器那一头给的：每个市场各跑一趟，别市场的论不进 `_one`
+        ——那里头既读行情也可能写基线，一趟 HK 的复检不该碰 A 股的论。
+        """
         day = as_of if as_of is not None else self.clock.today()
-        targets = self._select(user_id, thesis_id)
+        targets = self._select(user_id, thesis_id, market)
         rows = tuple(self._one(thesis, day, dry_run) for thesis in targets)
         return RecheckReport(user_id=user_id, as_of=day, dry_run=dry_run, rows=rows)
 
-    def _select(self, user_id: str, thesis_id: str | None) -> list[Thesis]:
-        if thesis_id is None:
-            found = list(self.theses.list(user_id, status=OPENED))
-            found += list(self.theses.list(user_id, status=TRACKING))
-            return found
-        thesis = self.theses.require(user_id, thesis_id)
-        if thesis.status not in RECHECK_STATUSES:
-            allowed = "/".join(RECHECK_STATUSES)
-            raise ValidationError(
-                f"{thesis.id} 现在是 {thesis.status}，不在复检范围内（只比 {allowed}）："
-                "没建过仓的论没有「建仓时那一眼」可比，静默返回零行会被读成复检过了"
-            )
-        return [thesis]
+    def _select(
+        self, user_id: str, thesis_id: str | None, market: str | None
+    ) -> list[Thesis]:
+        if thesis_id is not None:
+            thesis = self.theses.require(user_id, thesis_id)
+            if market is not None and thesis.market != market:
+                raise ValidationError(
+                    f"{thesis.id} 属于 {thesis.market}，不是 {market}："
+                    "点名一条观点又限定另一个市场，是把两次请求拼成了一次"
+                )
+            if thesis.status not in RECHECK_STATUSES:
+                allowed = "/".join(RECHECK_STATUSES)
+                raise ValidationError(
+                    f"{thesis.id} 现在是 {thesis.status}，不在复检范围内（只比 {allowed}）："
+                    "没建过仓的论没有「建仓时那一眼」可比，静默返回零行会被读成复检过了"
+                )
+            return [thesis]
+        found = list(self.theses.list(user_id, status=OPENED))
+        found += list(self.theses.list(user_id, status=TRACKING))
+        if market is not None:
+            found = [thesis for thesis in found if thesis.market == market]
+        return found
 
     def _one(self, thesis: Thesis, as_of: date, dry_run: bool) -> RecheckRow:
         target = Target(thesis.user_id, thesis.market, thesis.code, None, thesis.id)

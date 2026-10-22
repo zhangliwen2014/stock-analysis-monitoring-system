@@ -110,3 +110,16 @@ def test_a_stored_flag_survives_being_read_on_its_own_day(fx: FxRepo) -> None:
     row = fx.get(DAY, "USD", "CNY")
     assert row.is_stale is True
     assert isinstance(row, FxRate)
+
+
+def test_latest_date_answers_even_when_that_rate_is_stale(fx: FxRepo) -> None:
+    """增量窗口问的是「这一对还缺哪段」，不是「那个数还能不能用」——后者是 `latest` 的问题。
+
+    拿 `latest` 的定窗口，一行三周没动的汇率会被答成「库里什么都没有」，于是每一趟都
+    从回补起点把那段重拉一遍；窗口那条线存在的理由正是别再重拉，所以这里不看陈旧度。
+    """
+    old = DAY - timedelta(days=30)
+    assert fx.latest_date("USD", "CNY") is None
+    fx.put(old, "USD", "CNY", 7.1, source="manual")
+    assert fx.latest_date("USD", "CNY") == old
+    assert fx.latest(DAY, "USD", "CNY") is None  # 同一个数在 `latest` 那一头是不可用

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from math import isfinite
 
 from sams.core.errors import ValidationError
@@ -119,6 +119,19 @@ class FxRepo:
         if age > limit:
             return None
         return _row(row, age)
+
+    def latest_date(self, base: str, quote: str) -> date | None:
+        """这一对已经存到哪一天，**不看陈旧度**：job 的增量窗口问的是「还缺哪段」，
+        不是「这个数还能不能用」——后者是 `latest(..., max_age_days=)` 的问题。
+        拿 `latest` 定窗口，一行三周没动的汇率会被当成「库里什么都没有」。
+        """
+        value = self.db.scalar(
+            "SELECT max(date) FROM fx_rates WHERE base_ccy = ? AND quote_ccy = ?",
+            [base, quote],
+        )
+        if value is None:
+            return None
+        return value.date() if isinstance(value, datetime) else value
 
 
 def _row(row: dict, age_days: int) -> FxRate:
