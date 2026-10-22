@@ -7530,26 +7530,49 @@ git commit -m "docs(scheduler): 评审收尾——注释不再替走不到的路
 ### Task 13: 一个模拟交易日的端到端验收
 
 **Files:**
-- Modify: `tests/support_valuation.py`（`make_container` 接受 `moment`/`adapters`/`providers`）
-- Create: `tests/test_scheduler_acceptance.py`
+- Modify: `tests/support_valuation.py`（`make_container` 接受 `moment`/`adapters`/`providers`/`notifier_factory`）
+- Create: `tests/test_scheduler_acceptance.py`（2 枚用例）
 - Test: `tests/test_scheduler_acceptance.py`
 
-这一枚验的不是「每个零件都对」（那由前十二枚各自的用例回答），而是**它们排成一晚之后
-仍然对**：数据 job 写进去的行被规则读到、失败的 job 不挡住后面的市场、常驻循环认领了
-心跳、第二轮不重复写账也不重复打扰。把这条链拆成单个用例全绿、拼起来却对不上的
-事故，只会在这个粒度上露头。
+这一枚验的不是「每个零件都对」（那由前面十二枚各自的用例回答），而是**它们排成一晚
+之后仍然对**：数据 job 写进去的行被规则读到、失败的 job 不挡住后面的市场、常驻循环
+认领了心跳、同一晚再一拍不重复写账也不重复打扰。把这条链拆成单个用例全绿、拼起来却
+对不上的事故，只会在这个粒度上露头。
 
-时钟冻在 **2024-10-25 23:00 UTC**：A/HK 本地 15:00 收盘 + 30 分钟、美股 EDT 15:00
-收盘 + 60 分钟都已过去，三个市场的 `as_of` 都是 10-25，且 10-25 是那一 ISO 周的
-最后一个交易日（下一个交易日 10-28 已是第 44 周）。库里只铺到 **10-24**：这一晚每条
-job 都有真正要做的事，不是「全都已跑过」的空转。
+**计划草稿与仓库对不上的四处**（都改了，改完的事实记在这儿，免得下次照草稿再踩）：
 
-数据源替身必须**五个方法都在**。`chain_for` 按方法存在与否路由（D38）：只有日线的桩
-会让 `financials`/`valuation`/`flow` 三个 job 根本不登记，验收就悄悄退化成「只验了日线」。
+1. **草稿没有档位断言，注释却宣称「告警出现了 = 规则读的是今晚那根」**。这句话是假的：
+   `stop.fixed` 的 `pre` 档带宽 `PRE_BAND = 0.03`（`src/sams/services/rules/templates.py:24`），
+   止损线 17.03 的 `pre` 上沿是 17.54，而昨晚那根的收盘 17.06 也在带宽里——也就是说
+   「库里没写今晚那根、规则读了昨晚那根」照样发得出**一条**告警、照样投递成功。真正
+   能分开两根的是档位（`hit` 要求 `price < line`，昨晚那根在线上方只给得出 `pre`）与
+   数值（`17.00`）。补这两条之后新增一枚只有它们能打红的变异：把 `templates.py` 的
+   `if price < line: return HIT` 改成 `if False:`——告警还在、还在 `sent`、值还是
+   `17.00`，这一整晚里只有新加的那条 `stage == "hit"` 能打红它。废掉 `stop_stage`
+   的 `HIT` 分支前面十二枚自然各有用例看得见，那是它们的分工；这里要的证据是
+   **「拼成一晚之后仍然看得见」**。
+2. **草稿把美股的盘后触发点写成「17:00 EDT（= 21:00 UTC）刚过」**。真实数由
+   `WeekdayProvider.typical_windows`（对所有市场都是 09:30–15:00）加上各市场配置的
+   `post_close_min` 偏移决定（`src/sams/core/timeutil.py:138-143`）：A 与 HK 是 15:30
+   本地（= 07:30 UTC），美股是 16:00 EDT（= 20:00 UTC）。顺带一个已经存在的分裂：
+   `tests/support_scheduler.py` 里 `FakeCalendar.CLOSE` 给 HK/US 的是 16:00，
+   `WeekdayProvider` 给的是 15:00——两个替身本来就不一致，验收读的是 provider 那一
+   份，所以文档里的数字按 provider 写。要不要把 `WeekdayProvider` 的时段做成按市场
+   配（像 `FakeCalendar` 那样），留作后续：它不影响今晚的任何断言，三个市场在
+   23:00 UTC 都已过了两小时以上。
+3. **草稿说「这一晚每条 job 都有真正要做的事」**。17 条里只有 A 的那 7 条真动了数据：
+   HK/US 与 `fx` 跑的是空 universe（第一个用例只给 A 挂了自选股），它们的 `ok` 说的
+   只是「到点了、无事可做」。登记它们与自选股无关——D106 看的是市场配了什么源，
+   `Scheduler.jobs` 在构造时就定下（`src/sams/services/scheduler/service.py:82`）。
+   `fx@全局` 在这枚里要的证据不是 `ok`，是 `report.waiting == ()`：那才是 D108
+   「等所有当天开市的市场都收盘」被满足的证据。
+4. **`WeekdayProvider` 早就在 `tests/support_scheduler.py`**（Task 4/11 就在用），
+   草稿暗示要新造一个非网络日历替身——不用，直接 import。
 
-- [ ] **Step 1: 让 `make_container` 能接住这三个口子**
+- [x] **Step 1: 让 `make_container` 能接住这三个口子**
 
-`tests/support_valuation.py` 的 `make_container` 整体替换为：
+`tests/support_valuation.py` 的 `make_container` 最终形态（三个后门都是关键字参数，
+默认值原样复现旧世界，所以另外 16 个使用它的测试模块一行没改）：
 
 ```python
 def make_container(
@@ -7565,23 +7588,32 @@ def make_container(
 ):
     """一个铺好样本库、时钟冻在 `today`（或指定时刻）的容器。
 
-    `adapters`/`providers` 是调度器验收的后门：那一晚要五个能力的源与非网络的日历；
-    默认的 `StubFundamentalsAdapter` 只有基本面三件、没有日线，日历也要走真 provider。
-    `moment` 与 `today` 并存：前者到分钟（收盘后延迟要它），后者是「铺到哪一天」。
+    放这里而不是各测试文件里抄一份，是因为两边要验的是同一条链的两端（服务给的数 /
+    屏幕上那句怎么说）；两份装配一旦分叉，一边改的数就再也对不上另一边说的话。
+
+    `adapters`/`providers` 是给调度器那一路的后门：验收要跑的那一晚需要五个能力都在的
+    源（只有日线的桩会让基本面三件根本不登记）与一张不看网络的日历（默认真 provider
+    会打外网）。不传就是原来那份世界。
+
+    `moment` 与 `today` 并存：前者到分钟（盘后延迟过没过只有时刻能答），后者是
+    「样本库铺到哪一天」，缺了前者就按后者的 15:00 UTC 冻。
+
+    `notifier_factory` 是给通知那一路的后门：真通道会打网络，而这条链上每一个用例
+    要断言的都是「路由把这条告警交给了哪个 kind」。
     """
-    adapter = StubFundamentalsAdapter(["A"])
-    container = build_container(
-        settings,
-        db=db,
-        adapters=adapters
-        if adapters is not None
-        else {
+    if adapters is None:
+        adapter = StubFundamentalsAdapter(["A"])
+        adapters = {
             "akshare": adapter,
             "eastmoney": adapter,
             "yfinance": support.StubAdapter(
                 "yfinance", ["HK", "US"], support.sample_bars(source="yfinance")
             ),
-        },
+        }
+    container = build_container(
+        settings,
+        db=db,
+        adapters=adapters,
         providers=providers,
         clock=support.FrozenClock(
             moment
@@ -7595,16 +7627,32 @@ def make_container(
     return container
 ```
 
-- [ ] **Step 2: 写验收用例**
+- [x] **Step 2: 写验收用例**
 
-`tests/test_scheduler_acceptance.py`：
+`tests/test_scheduler_acceptance.py` 全文：
 
 ```python
 """M3-D 的验收：一个模拟交易日，从日线到告警、从心跳到健康页走一遍。
 
-时钟冻在 2024-10-25 23:00 UTC：三个市场的收盘与盘后延迟都已过去；库里铺到 10-24，
-所以每条 job 都有真正要做的事。数据源是五能力替身——只有日线的桩会让三个基本面 job
-根本不登记，验收就退化成「只验了日线」。
+这一枚验的不是「每个零件都对」（那由前面各自的用例回答），而是**它们排成一晚之后
+仍然对**：数据 job 写进去的行被规则读到、失败的 job 不挡住后面的市场、常驻循环认领了
+心跳、同一晚再一拍不重复写账也不重复打扰。这类事故只在「拼起来」的粒度上露头。
+
+时钟冻在 2024-10-25 23:00 UTC。那一瞬间三个市场各自拿到的到期日都是 10-25，但**不
+是同一条路**：A 与 HK 的本地已经是 10-26（周六），靠 `daily_due` 的回看落到周五；
+美股本地还是 10-25。触发时点由 `WeekdayProvider` 的常规时段（对所有市场都是
+09:30–15:00）加上各市场配置的盘后偏移算出：A 与 HK 是 15:30 本地（= 07:30 UTC），
+美股是 16:00 EDT（= 20:00 UTC）——23:00 UTC 三个都已过了，`fx` 要的「当天开市的市
+场都收盘」也满足（D108）。10-25 又是那一 ISO 周的最后一个交易日（下一个 10-28 已进
+第 44 周），所以周频的复检也到期。
+
+库里只铺到 **10-24**，且第一个用例里只有 A 股挂了标的：A 的那五条数据 job 与 `rules@A`
+都有真正要做的事，不是「全都已跑过」的空转。HK/US 的 job 照样登记（D106 看的是市场
+配了什么源，不是谁的自选股里有什么），它们在第一枚里是「跑到点、没标的可收」也记为
+ok，在第二枚里才真的带着标的去撞一个被限流的源。
+
+数据源替身必须**五个方法都在**。`chain_for` 按方法存在与否路由（D38）：只有日线的桩
+会让 `financials`/`valuation`/`flow` 三个 job 根本不登记，验收就悄悄退化成「只验了日线」。
 """
 
 from __future__ import annotations
@@ -7617,6 +7665,7 @@ from support_scheduler import WeekdayProvider
 
 from sams.core.errors import RateLimited
 from sams.core.notify import NotifyResult
+from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
 from sams.services.scheduler.runner import SKIPPED
 from sams.storage.repos.bars import BarRepo
 
@@ -7624,8 +7673,16 @@ MOMENT = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
 AS_OF = date(2024, 10, 25)
 USER = "trader"
 PWD = "correct-horse-battery"
+#: 样本库只铺到 10-24：今晚那一条得由 job 自己去取，否则「规则读到刚写进去的那根」
+#: 这句话就没有反例可挡
 HISTORY = [day for day in sample.DAYS if day <= date(2024, 10, 24)]
 HISTORY_CLOSES = sample.CLOSES[: len(HISTORY)]
+#: 昨晚那根的收盘（样本序列走到这里正在下滑）与今晚 `WorldAdapter` 给的那根（恒定
+#: `PRICE`）之间的中线。光看「有没有告警」分不开这两根：`stop.fixed` 的 `pre` 档带宽
+#: 是 3%（`PRE_BAND`），17.06 与 17.00 都够得到，所以线卡在中间还不够——真正钉死「读的
+#: 是今晚那根」的是下面那条 `stage == "hit"`：昨晚那根在线上方，只给得出 `pre`
+SEED_LAST_CLOSE = HISTORY_CLOSES[-1]
+STOP_LINE = (SEED_LAST_CLOSE + sample.PRICE) / 2
 
 
 def weekdays(start: date, end: date) -> list[date]:
@@ -7641,10 +7698,8 @@ class WorldAdapter:
     """A 股的五能力源：每个方法都要在，`chain_for` 才登记对应的 job。"""
 
     name = "world"
+    markets = frozenset({"A"})
     corp_actions_full_history = True
-
-    def __init__(self, markets=("A",)) -> None:
-        self.markets = frozenset(markets)
 
     def daily_bars(self, market, code, start, end):
         days = weekdays(start, end)
@@ -7660,10 +7715,13 @@ class WorldAdapter:
         return sample.valuation(weekdays(start, end), market=market, code=code)
 
     def funding_flow(self, market, code, start, end):
-        return sample.flow_rows(weekdays(start, end), net=1.0e8, market=market, code=code)
+        return sample.flow_rows(
+            weekdays(start, end), net=1.0e8, market=market, code=code
+        )
 
 
 def providers_for(settings) -> dict:
+    """每个市场一张不看网络的日历：工作日开市，收盘时点由 `WeekdayProvider` 给。"""
     return {
         market: WeekdayProvider(market, cfg.tz)
         for market, cfg in settings.markets.items()
@@ -7671,6 +7729,8 @@ def providers_for(settings) -> dict:
 
 
 def recording_factory(kind, config):
+    """通知出口的后门：真通道会打网络，而这一枚要断言的是「发出去了」这个结论。"""
+
     class Node:
         name = kind
 
@@ -7681,7 +7741,7 @@ def recording_factory(kind, config):
             return ""
 
         def send(self, message):
-            return NotifyResult(ok=True)
+            return NotifyResult(ok=True, attempts=1)
 
     return Node()
 
@@ -7696,7 +7756,9 @@ def build_world(db, settings, *, yfinance=None, notifier_factory=None):
             "akshare": world,
             "eastmoney": world,
             "yfinance": yfinance
-            or StubAdapter("yfinance", ["HK", "US"], sample_bars("HK", "00700", source="yfinance")),
+            or StubAdapter(
+                "yfinance", ["HK", "US"], sample_bars("HK", "00700", source="yfinance")
+            ),
         },
         providers=providers_for(settings),
         notifier_factory=notifier_factory,
@@ -7713,10 +7775,10 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
     container.rule_service.add(
         user.id,
         kind="stop.fixed",
-        name="跌破十万",
+        name="跌破止损",
         target_type="symbol",
         target_ref=f"A/{sample.CODE}",
-        params={"price": 100000},
+        params={"price": STOP_LINE},
         channel_ids=[node.id],
     )
 
@@ -7724,18 +7786,47 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
     assert container.scheduler.run_forever(on_tick=reports.append, max_ticks=1) == 1
     report = reports[0]
 
-    assert report.waiting == () and report.errors == ()
-    assert [result.status for result in report.results] == ["ok"] * len(report.results)
-    assert [f"{r.job}@{r.market or '全局'}" for r in report.results] == [
-        job.title for job in container.scheduler.jobs
+    # 五个能力都在的源才登记得出 A 的那五条数据 job：`WorldAdapter` 少一个方法，
+    # 这一晚会安静地退化成「只验了日线」（D38 的按方法路由 + D106 的按能力登记）
+    assert [job.title for job in container.scheduler.jobs] == [
+        "bars@A",
+        "actions@A",
+        "financials@A",
+        "valuation@A",
+        "flow@A",
+        "recheck@A",
+        "rules@A",
+        "bars@HK",
+        "recheck@HK",
+        "rules@HK",
+        "bars@US",
+        "recheck@US",
+        "rules@US",
+        "fx@全局",
+        "calendar@A",
+        "calendar@HK",
+        "calendar@US",
     ]
 
-    # 规则读的是今晚刚写进去的那一根：bars job 必须排在 rules job 之前
+    # 没有「还没到点」，也没有「算不出到期日」：这一晚每一个登记的 job 都真的到期了
+    assert report.waiting == () and report.errors == ()
+    assert [result.status for result in report.results] == ["ok"] * len(report.results)
+    assert [(r.job, r.market) for r in report.results] == [
+        (spec.name, spec.market) for spec in container.scheduler.jobs
+    ]
+
+    # 库里铺到 10-24，所以今晚这根是新的——「全都已跑过」的空转跑不出这个数
+    by_key = {(r.job, r.market): r for r in report.results}
+    assert by_key[("bars", "A")].rows_affected == 1
     assert BarRepo(db).latest_date("A", sample.CODE) == AS_OF
 
+    # 告警的档位与数值都只能来自今晚刚写进去的那一根：昨晚那根（17.06）在止损线上方，
+    # 只给得出 `pre`；线本身又在线下方，`hit` 加 `17.00` 才是「规则读到今晚」的形状
     alerts = container.alerts_store.list_for(user.id)
     assert len(alerts) == 1
     assert alerts[0].code == sample.CODE
+    assert alerts[0].stage == "hit"
+    assert alerts[0].payload["value_text"].startswith(f"{sample.PRICE:.2f}")
     assert container.alerts_store.deliveries(alerts[0].id)[0].outcome == "sent"
 
     health = container.health.report()
@@ -7748,15 +7839,26 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
         for job in health.schedule.jobs
     )
 
-    # 同一晚再一拍：成功的周期不重跑，不写新账，也不重复打扰
+    # 同一晚再一拍（把钟推过「失联」阈值再多一分钟，让「这一拍留没留痕迹」可分辨）：
+    # 成功的周期不重跑，不写新账，也不重复打扰
     run_count = container.scheduler.runs.count()
+    container.clock.advance(seconds=HEARTBEAT_STALE_S + 60)
     again = container.scheduler.tick()
+    assert len(again.results) == len(container.scheduler.jobs)
     assert [result.status for result in again.results] == [SKIPPED] * len(again.results)
     assert container.scheduler.runs.count() == run_count
     assert len(container.alerts_store.list_for(user.id)) == 1
+    # 心跳是每一拍写的，不是只有认领那一次：推过阈值再多一分钟，读到的仍是「刚打过」
+    beat = container.health.report().schedule
+    assert beat is not None and beat.beat_age_s == 0 and not beat.stale
 
 
 def test_one_market_failure_does_not_stop_the_rest(db, settings):
+    """港股的源被限流，带走的是港股自己那几条：A 的日线、A 的规则与全局的汇率照跑。
+
+    这一条是「隔离」这件事的端到端版本——`runner.py` 那一层接住异常不往外抛，
+    只有拼上一晚才看得见它挡住了后面的市场。
+    """
     broken = StubAdapter(
         "yfinance", ["HK", "US"], RateLimited("yfinance", "429 too many requests")
     )
@@ -7775,32 +7877,94 @@ def test_one_market_failure_does_not_stop_the_rest(db, settings):
     assert by_key[("rules", "A")].status == "ok"
     assert by_key[("fx", None)].status == "ok"
     assert BarRepo(db).latest_date("A", sample.CODE) == AS_OF
+    # 账本那一行也得是失败：健康页的 `[调度]` 与 `sams run jobs` 读的是它，不是屏幕上这一条
+    ledger = container.scheduler.runs.latest_per_period("bars", "HK", limit=1)
+    assert ledger[0].status == "failed"
+    assert "429" in ledger[0].error
 ```
 
-- [ ] **Step 3: 跑它**
+- [x] **Step 3: 跑它**
 
-```bash
-uv run pytest tests/test_scheduler_acceptance.py -q
+```
+$ .venv/bin/python -m pytest tests/test_scheduler_acceptance.py -q --no-header -p no:cacheprovider
+2 passed in 4.13s
+$ .venv/bin/ruff check src tests --no-cache
+All checks passed!
 ```
 
-Expected: PASS。红了先别改用例：这一枚红的地方就是前十二枚之间的集成缺口
-（最常见的是 job 注册顺序、日历 provider 没接到 `make_container`、或规则读到的
-K 线仍是 10-24）。按失败信息回到对应的那一枚修，修完再跑这一枚。
+**变异电池（11 枚，全红）**。这一枚电池问的不是「代码写得对不对」，而是「这一晚拼
+起来还成不成立」——注册表少一个能力、`bars` 排在 `rules` 之后、心跳不写、查账被绕过，
+症状都不是报错，是屏幕上那句「跑了 17 个 job 全 ok」：
 
-- [ ] **Step 4: 回归这一层最容易被碰到的邻居**
-
-```bash
-uv run pytest tests/services/test_scheduler_service.py tests/services/test_scheduler_runner.py tests/cli/test_rule_cli.py tests/test_bootstrap.py -q
+```
+RED  能力门被绕过：没那个方法也登记（HK/US 冒出数据 job）
+RED  规则排在数据链之前：读到的是昨晚那根
+RED  增量窗口不算：每次都从 1990 年起
+RED  回看窗口归零：周六就不算有到期日          ← 两枚用例都红
+RED  查账被绕过：成功的周期每晚重跑
+RED  失败也算成功（账本写 ok）
+RED  tick 不打心跳
+RED  自选清单不进 universe：这一晚没有对象要取
+RED  替身少一个方法（验收退化成只验日线）
+RED  样本库铺到今晚：这一晚没有新东西，但屏幕上还是「17 个全 ok」
+RED  已破线不再算 hit（只报 pre）：告警照发，档位却读了昨晚那一档
 ```
 
-Expected: PASS。`make_container` 多了三个可选参数，所有老调用点都必须原样可用。
+跑完九份文件（`jobs.py`/`due.py`/`runner.py`/`service.py`/`universe.py`/
+`bootstrap.py`/`templates.py`/验收用例/`support_valuation.py`）逐字节 sha256 还原
+校验通过。
 
-- [ ] **Step 5: 提交**
+**打过又撤掉的三枚**，连同「为什么这一晚看不出差别」一起记在这里，免得下次再打一遍：
+
+1. `_local_today` 改成 `now.date()`：冻住的那一瞬间，A/HK 的回看与美股的直接命中都
+   落在 10-25，周期键一模一样——这一晚**没有**可观察的差别，市场本地那一半由
+   `tests/services/test_scheduler_due.py` 钉。
+2. `channel_ids=channel_ids` 改成 `channel_ids=()`：这个世界只有一条通道，路由在
+   「规则没指定通道」时按严重级别走默认路由，投递照写——两通道以上才分得开，那一头
+   在 `tests/monitor/test_router.py`。
+3. `providers=providers` 改成 `providers=None`：它没有红，因为它真的联网取回了 2024
+   年的真日历，而那一晚真日历与替身给的答案一致（耗时从 3.5s 变 7.8s 就是证据）。
+   这一枚要说的不是「注入可以省」，而是**仓库里没有 socket 护栏**：离线策略完全靠
+   构造参数注入，一旦某处漏注入，测试会安静地打外网并且大概率还是绿的。
+
+- [x] **Step 4: 回归这一层最容易被碰到的邻居**
+
+除验收用例自己以外，`make_container` 的另外 16 个使用方（`tests/monitor/test_router.py`
+一枚、`tests/cli/` 八枚、`tests/test_adversarial_rules.py` 一枚、`tests/services/`
+六枚）：
+
+```
+388 passed in 243.29s (0:04:03)
+```
+
+- [x] **Step 5: 提交**
 
 ```bash
 git add tests/support_valuation.py tests/test_scheduler_acceptance.py
 git commit -m "test(scheduler): 一个模拟交易日的端到端验收（告警、心跳、幂等）"
 ```
+
+**评审轮（只读，验收用例的「测试诚实性」）**。发现的五条都改了，一条拒了：
+
+* `stage == "hit"` 与 `payload["value_text"]` 前缀——见上面第 1 条，注释替断言打包票
+  的那一处；
+* 文档段里「每条 job 都有真正要做的事」与美股触发点那两个数字——见第 2、3 条；
+* 心跳那一拍原来推的是 `minutes=5`，正好等于 `HEARTBEAT_STALE_S = 300`，而
+  `stale_at` 用的是 `>=`：判定此刻仍然成立，但把阈值改成 301、或把 `>=` 改成 `>`，
+  这一条就静默失去分辨力。改成 `HEARTBEAT_STALE_S + 60` 秒，关系写进代码而不是注释；
+* 结果与 job 的对应关系原来比的是 `f"{r.job}@{r.market or '全局'}"` 对 `spec.title`，
+  等于把断言绑在展示格式上；改成 `(r.job, r.market)` 对 `(spec.name, spec.market)`，
+  展示格式只由那 17 个字面量钉一次；
+* `WorldAdapter` 的 `markets=("A",)` 参数从来没人传值（YAGNI，改成类属性），
+  `make_container` 在传入 `adapters` 时仍然先构造一份 `StubFundamentalsAdapter`（挪进
+  `if adapters is None` 分支）。
+* 拒的一条：把测试里的 `weekdays(start, end)` 换成复用 `WeekdayProvider`。两者要的
+  形状不同——provider 按年铺给日历服务，替身要的是「这次请求区间里的工作日」，为了
+  复用得给 provider 加一个区间方法，那才是多出来的接口。
+
+**三道闸的读数**（提交 `b9cd316` 之后重跑）：`ruff check src tests --no-cache` 全绿、
+分层守卫 `417 passed`、离线 `2953 passed / 14 deselected in 607.01s`（收集 2967；
+M3-C 收尾时离线 2738、分层 381，M3-D 一层把离线加到 +215）。
 
 ### Task 14: spec 收尾——状态行、§14 两段、U7
 
