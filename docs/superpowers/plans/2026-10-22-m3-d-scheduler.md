@@ -150,7 +150,7 @@ tests/
 - Test: `tests/storage/test_migration_0018.py`
 - Test: `tests/storage/test_task_runs.py`
 
-- [ ] **Step 1: 写迁移与仓库的失败用例**
+- [x] **Step 1: 写迁移与仓库的失败用例**
 
 `tests/storage/test_migration_0018.py`：
 
@@ -300,7 +300,7 @@ def test_unfinished_run_is_still_latest(db):
     assert latest.id == run_id and latest.status == RUNNING
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/storage/test_migration_0018.py tests/storage/test_task_runs.py -q
@@ -308,7 +308,7 @@ uv run pytest tests/storage/test_migration_0018.py tests/storage/test_task_runs.
 
 Expected: FAIL（`sams.storage.repos.task_runs` 不存在；`db` 里 `period_key` 也不存在）。
 
-- [ ] **Step 3: 写迁移**
+- [x] **Step 3: 写迁移**
 
 `src/sams/storage/migrations/0018_scheduler.sql`：
 
@@ -339,7 +339,7 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS period_key VARCHAR;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS note VARCHAR;
 ```
 
-- [ ] **Step 4: 写仓库**
+- [x] **Step 4: 写仓库**
 
 `src/sams/storage/repos/task_runs.py`：
 
@@ -529,7 +529,7 @@ class SchedulerBusy(SamsError):
     """
 ```
 
-- [ ] **Step 5: 跑绿**
+- [x] **Step 5: 跑绿**
 
 ```bash
 uv run pytest tests/storage/test_migration_0018.py tests/storage/test_task_runs.py -q
@@ -537,7 +537,7 @@ uv run pytest tests/storage/test_migration_0018.py tests/storage/test_task_runs.
 
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src/sams/storage/migrations/0018_scheduler.sql src/sams/storage/repos/task_runs.py src/sams/core/errors.py tests/storage/test_migration_0018.py tests/storage/test_task_runs.py
@@ -575,7 +575,7 @@ status 校验、空 job_name）。四条闸：目标用例 **24 passed**、`ruff
 - Modify: `config/settings.example.toml`
 - Test: `tests/core/test_config.py`
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 在 `tests/core/test_config.py` 里追加（复用文件已有的 `BASE` 与 `write(tmp_path, text=BASE)`；`BASE` 已含 `[general]` 与 `[markets.A]`）：
 
@@ -592,7 +592,7 @@ def test_scheduler_tick_is_read_and_validated(tmp_path):
         Settings.load(write(tmp_path, BASE.replace("[general]", "[general]\nscheduler_tick_s = 0")))
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/core/test_config.py -q
@@ -600,7 +600,7 @@ uv run pytest tests/core/test_config.py -q
 
 Expected: FAIL（`Settings` 没有 `scheduler_tick_s`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/sams/core/config.py`：
 
@@ -639,7 +639,7 @@ class Settings:
 scheduler_tick_s = 60        # 调度器检查到期任务的间隔（秒）；不是盘中轮询
 ```
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 ```bash
 uv run pytest tests/core/test_config.py -q
@@ -647,7 +647,7 @@ uv run pytest tests/core/test_config.py -q
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/core/config.py config/settings.example.toml tests/core/test_config.py
@@ -672,7 +672,7 @@ git commit -m "feat(config): 调度器 tick 与盘中轮询分开（D97）"
 - Modify: `src/sams/datasource/registry.py`
 - Test: `tests/datasource/test_registry.py`
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 在 `tests/datasource/test_registry.py` 末尾追加：
 
@@ -740,7 +740,7 @@ def test_frames_all_rate_limited_are_transient():
         reg.fetch_financials("A", "600519", D1, D2)
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/datasource/test_registry.py -q -k "transient or terminal or no_answer"
@@ -748,7 +748,7 @@ uv run pytest tests/datasource/test_registry.py -q -k "transient or terminal or 
 
 Expected: FAIL（`fetch_daily/fetch_actions/fetch_financials` 的终端错误恒为 `DatasourceError`，不是 `TransientError`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/sams/datasource/registry.py` 在 `RETRYABLE` 下方加一个函数：
 
@@ -820,7 +820,7 @@ def _terminal_error(
         raise _terminal_error(reason, [cause for _, cause in failed])
 ```
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 ```bash
 uv run pytest tests/datasource/test_registry.py -q
@@ -828,7 +828,7 @@ uv run pytest tests/datasource/test_registry.py -q
 
 Expected: PASS（原有 30 余条一起跑，确认没有把「全空」与「全失败」的分支改坏）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/datasource/registry.py tests/datasource/test_registry.py
@@ -863,7 +863,7 @@ git commit -m "feat(datasource): 全链失败的重试分界延伸到日线/公�
 - Create: `tests/support_scheduler.py`
 - Test: `tests/services/test_scheduler_due.py`
 
-- [ ] **Step 1: 写 `FakeCalendar` 与失败用例**
+- [x] **Step 1: 写 `FakeCalendar` 与失败用例**
 
 `tests/support_scheduler.py`（第一段；后面的任务往同一个文件追加）：
 
@@ -1040,7 +1040,7 @@ def test_period_key_follows_the_job_period():
     assert period_key("fx", FRIDAY) == "2024-10-25"
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_scheduler_due.py -q
@@ -1048,7 +1048,7 @@ uv run pytest tests/services/test_scheduler_due.py -q
 
 Expected: FAIL（`sams.services.scheduler.due` 不存在）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/sams/services/scheduler/__init__.py` 先只写包说明与空的 `__all__`：
 
@@ -1225,7 +1225,7 @@ def due_for(
     raise ValueError(f"未知周期 {period!r}：只认 {list(PERIODS)}")
 ```
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 ```bash
 uv run pytest tests/services/test_scheduler_due.py -q
@@ -1233,7 +1233,7 @@ uv run pytest tests/services/test_scheduler_due.py -q
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/services/scheduler/__init__.py src/sams/services/scheduler/due.py tests/support_scheduler.py tests/services/test_scheduler_due.py
@@ -1271,7 +1271,7 @@ git commit -m "feat(scheduler): 到期计算按市场本地收盘与周期键（
 - Create: `src/sams/services/scheduler/universe.py`
 - Test: `tests/services/test_scheduler_universe.py`
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 `tests/services/test_scheduler_universe.py`：
 
@@ -1487,7 +1487,7 @@ def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, capl
     assert f"规则 {broken.id} 展开失败" in caplog.text
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_scheduler_universe.py -q
@@ -1495,7 +1495,7 @@ uv run pytest tests/services/test_scheduler_universe.py -q
 
 Expected: FAIL（`sams.services.scheduler.universe` 不存在）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/sams/services/scheduler/universe.py`：
 
@@ -1612,7 +1612,7 @@ def _key(market: str, code: str) -> tuple[str, str]:
     return normalized, canonical_code(normalized, code)
 ```
 
-- [ ] **Step 4: 跑绿**
+- [x] **Step 4: 跑绿**
 
 ```bash
 uv run pytest tests/services/test_scheduler_universe.py -q
@@ -1620,7 +1620,7 @@ uv run pytest tests/services/test_scheduler_universe.py -q
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/services/scheduler/universe.py tests/services/test_scheduler_universe.py
@@ -1673,7 +1673,7 @@ git commit -m "feat(scheduler): 盘后链的对象并集与币种对（四种来
 - Modify: `src/sams/cli/sync.py`（两个默认值改为别名）
 - Test: `tests/services/test_scheduler_jobs_data.py`
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 `tests/services/test_scheduler_jobs_data.py`：
 
@@ -1932,7 +1932,7 @@ def test_build_jobs_skips_a_market_without_any_source(db, settings):
     assert ("bars", "A") in {(job.name, job.market) for job in jobs}
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_scheduler_jobs_data.py -q
@@ -1940,7 +1940,7 @@ uv run pytest tests/services/test_scheduler_jobs_data.py -q
 
 Expected: FAIL（`sams.services.scheduler.types` / `jobs` 不存在）。
 
-- [ ] **Step 3: 移动 `HISTORY_START`**
+- [x] **Step 3: 移动 `HISTORY_START`**
 
 `src/sams/core/timeutil.py` 的 import 之后加：
 
@@ -1962,7 +1962,7 @@ DEFAULT_ACTIONS_START = HISTORY_START
 
 下面已有的 `DEFAULT_FUNDAMENTALS_START = DEFAULT_ACTIONS_START` 原样保留（不要再写一遍）。
 
-- [ ] **Step 4: 写 `types.py`**
+- [x] **Step 4: 写 `types.py`**
 
 `src/sams/services/scheduler/types.py`：
 
@@ -2057,7 +2057,7 @@ class JobDeps:
     users: UserRepo
 ```
 
-- [ ] **Step 5: 写 `jobs.py` 的五个数据 job 与注册**
+- [x] **Step 5: 写 `jobs.py` 的五个数据 job 与注册**
 
 `src/sams/services/scheduler/jobs.py`：
 
@@ -2214,7 +2214,7 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
     return tuple(jobs)
 ```
 
-- [ ] **Step 6: 跑绿**
+- [x] **Step 6: 跑绿**
 
 ```bash
 uv run pytest tests/services/test_scheduler_jobs_data.py tests/cli/test_sync_fx_cli.py -q
@@ -2222,7 +2222,7 @@ uv run pytest tests/services/test_scheduler_jobs_data.py tests/cli/test_sync_fx_
 
 Expected: PASS（后者确认 `DEFAULT_*_START` 别名没有改掉命令行的默认区间）。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add src/sams/services/scheduler/types.py src/sams/services/scheduler/jobs.py src/sams/core/timeutil.py src/sams/cli/sync.py tests/services/test_scheduler_jobs_data.py
@@ -2283,7 +2283,7 @@ git commit -m "feat(scheduler): job 形状与五个数据 job（增量窗口 + �
 - Test: `tests/services/test_rules_recheck.py`
 - Test: `tests/storage/test_fx_repo.py`
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 `tests/services/test_scheduler_jobs_ops.py`（整份，落地形状）：
 
@@ -2784,7 +2784,7 @@ def test_latest_date_answers_even_when_that_rate_is_stale(fx: FxRepo) -> None:
     assert fx.latest(DAY, "USD", "CNY") is None  # 同一个数在 `latest` 那一头是不可用
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_scheduler_jobs_ops.py tests/services/test_rules_engine.py tests/services/test_rules_recheck.py tests/storage/test_fx_repo.py -q
@@ -2792,7 +2792,7 @@ uv run pytest tests/services/test_scheduler_jobs_ops.py tests/services/test_rule
 
 Expected: FAIL（四个 job 不存在；`market=` 不被接受；`FxRepo.latest_date` 不存在）。
 
-- [ ] **Step 3: 实现 `FxRepo.latest_date`**
+- [x] **Step 3: 实现 `FxRepo.latest_date`**
 
 `src/sams/storage/repos/fx.py` 在 `latest` 下方加：
 
@@ -2811,7 +2811,7 @@ Expected: FAIL（四个 job 不存在；`market=` 不被接受；`FxRepo.latest_
         return value.date() if isinstance(value, datetime) else value
 ```
 
-- [ ] **Step 4: 实现四个运维 job 与最终注册表**
+- [x] **Step 4: 实现四个运维 job 与最终注册表**
 
 `src/sams/services/actors.py` 加这一头（按名单跑的循环只认启用的账号；`sams user disable`
 挡住的是手敲命令那一路，夜里跑的是这一条链）：
@@ -2966,7 +2966,7 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
 
 （上面这段以 `def run_fx` 起、到文件末尾为止，含 `build_jobs` 的整份替换。）
 
-- [ ] **Step 5: 市场过滤（引擎与复检）**
+- [x] **Step 5: 市场过滤（引擎与复检）**
 
 `src/sams/services/rules/engine.py` 的 `check` 签名加 `market: str | None = None`。
 `rules=len(selected)` 保持不变：这个数回答的是「这一趟看了几条规则」，不是「看了几个对象」。
@@ -3065,7 +3065,7 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         return found
 ```
 
-- [ ] **Step 6: 跑绿**
+- [x] **Step 6: 跑绿**
 
 ```bash
 uv run pytest tests/services/test_scheduler_jobs_ops.py tests/services/test_rules_engine.py tests/services/test_rules_recheck.py tests/storage/test_fx_repo.py -q
@@ -3073,7 +3073,7 @@ uv run pytest tests/services/test_scheduler_jobs_ops.py tests/services/test_rule
 
 Expected: PASS。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add src/sams/services/scheduler/jobs.py src/sams/services/actors.py src/sams/services/rules/engine.py src/sams/services/rules/recheck.py src/sams/storage/repos/fx.py tests/services/test_scheduler_jobs_ops.py tests/services/test_rules_engine.py tests/services/test_rules_recheck.py tests/storage/test_fx_repo.py
@@ -3151,7 +3151,7 @@ git commit -m "feat(scheduler): 汇率/日历/规则/复检四个 job 与市场�
 无论多宽都会被这一晚自己的重试占满，D103 的「连续三个周期」永远凑不满；
 分组这件事归仓库（`latest_per_period`），runner 只数它拿到的那几个周期。
 
-- [ ] **Step 1: 写失败用例（runner 那一半）**
+- [x] **Step 1: 写失败用例（runner 那一半）**
 
 `tests/services/test_scheduler_runner.py`：
 
@@ -3502,7 +3502,7 @@ def test_the_running_row_written_by_this_round_is_not_its_own_block(db):
     assert runs.latest_for_period("bars", "A", DUE.period_key).status == OK
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_scheduler_runner.py -q
@@ -3510,7 +3510,7 @@ uv run pytest tests/services/test_scheduler_runner.py -q
 
 Expected: FAIL（`sams.services.scheduler.runner` 不存在）。
 
-- [ ] **Step 3: 实现 `TaskRunRepo.latest_per_period`**
+- [x] **Step 3: 实现 `TaskRunRepo.latest_per_period`**
 
 `src/sams/storage/repos/task_runs.py` 在 `recent` 下方加：
 
@@ -3612,7 +3612,7 @@ def test_latest_per_period_does_not_leak_across_markets(db):
     assert [row.market for row in market_rows] == ["A", "A"]
 ```
 
-- [ ] **Step 4: 实现 runner**
+- [x] **Step 4: 实现 runner**
 
 `src/sams/services/scheduler/runner.py`：
 
@@ -3827,7 +3827,7 @@ class JobRunner:
         )
 ```
 
-- [ ] **Step 5: 跑绿**
+- [x] **Step 5: 跑绿**
 
 ```bash
 uv run pytest tests/storage/test_task_runs.py tests/services/test_scheduler_runner.py -q
@@ -3835,7 +3835,7 @@ uv run pytest tests/storage/test_task_runs.py tests/services/test_scheduler_runn
 
 Expected: PASS（11 + 16 = 27 枚）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src/sams/services/scheduler/runner.py src/sams/storage/repos/task_runs.py tests/services/test_scheduler_runner.py tests/storage/test_task_runs.py
@@ -3912,7 +3912,7 @@ Task 8 的 runner），订阅方只有 `attach_log_sink` 的日志。D102 要回
 收件人那一关复用 `services/actors.active_users`（「替一批用户做事只认启用账号」那条
 不变量归它），`is_admin` 才是本模块自己加的那一关。
 
-- [ ] **Step 1: 写失败用例（服务层）**
+- [x] **Step 1: 写失败用例（服务层）**
 
 `tests/services/test_scheduler_alarms.py`：
 
@@ -4205,7 +4205,7 @@ def test_the_runner_alarm_is_delivered_by_the_attached_alerter(db, settings):
     assert len(sender.calls) == 1
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_scheduler_alarms.py -q
@@ -4213,7 +4213,7 @@ uv run pytest tests/services/test_scheduler_alarms.py -q
 
 Expected: FAIL（`sams.services.scheduler.alarms` 不存在，`AlertRepo` 没有 `has_system_alert`）。
 
-- [ ] **Step 3: 写 `has_system_alert`**
+- [x] **Step 3: 写 `has_system_alert`**
 
 `src/sams/storage/repos/alerts.py` 在 `latest_open` 之后加：
 
@@ -4398,7 +4398,7 @@ def test_has_system_alert_needs_both_halves_of_the_system_shape(repo, seeded_use
     assert repo.has_system_alert(seeded_user, "calendar", since=since) is True
 ```
 
-- [ ] **Step 4: 写 `alarms.py`**
+- [x] **Step 4: 写 `alarms.py`**
 
 `src/sams/services/scheduler/alarms.py`：
 
@@ -4483,7 +4483,7 @@ class SystemAlerter:
                 logger.exception("系统告警发给 %s 失败：%s", user.id, exc)
 ```
 
-- [ ] **Step 5: 跑绿**
+- [x] **Step 5: 跑绿**
 
 ```bash
 uv run pytest tests/services/test_scheduler_alarms.py tests/storage/test_alerts_repo.py -q
@@ -4491,7 +4491,7 @@ uv run pytest tests/services/test_scheduler_alarms.py tests/storage/test_alerts_
 
 Expected: PASS（11 + 36 = 47 枚）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src/sams/storage/repos/alerts.py src/sams/services/scheduler/alarms.py tests/services/test_scheduler_alarms.py tests/storage/test_alerts_repo.py
@@ -4604,7 +4604,7 @@ git commit -m "feat(scheduler): 系统告警投递给在线管理员（冷却跨
 `StorageError`），那一类重复启动在走到这句守卫之前就炸在连接上了。这条事实同时决定
 Task 11/12 的形状，见下面的「往后的任务要注意」。
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 `tests/services/test_scheduler_service.py`：
 
@@ -5322,7 +5322,7 @@ def test_the_scheduler_reports_through_its_own_clock(db, settings):
     assert data.beat_age_s == 0
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_scheduler_service.py -q
@@ -5332,7 +5332,7 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'sams.services.scheduler.
 ——收集阶段就在第一个 import 上炸，`report`/`service` 那两行要等这一行有了才会被读到，
 所以这里只可能报这一个名字。
 
-- [ ] **Step 3: 写 `heartbeat.py` 与 `report.py`**
+- [x] **Step 3: 写 `heartbeat.py` 与 `report.py`**
 
 `src/sams/services/scheduler/heartbeat.py`：
 
@@ -5499,7 +5499,7 @@ def admin_users(users: UserRepo) -> list[User]:
                 logger.exception("系统告警发给 %s 失败：%s", user.id, exc)
 ```
 
-- [ ] **Step 4: 写 `service.py`**
+- [x] **Step 4: 写 `service.py`**
 
 `src/sams/services/scheduler/service.py`：
 
@@ -5736,7 +5736,7 @@ class Scheduler:
         )
 ```
 
-- [ ] **Step 5: 跑绿**
+- [x] **Step 5: 跑绿**
 
 ```bash
 uv run pytest tests/services/test_scheduler_service.py tests/services/test_scheduler_alarms.py -q
@@ -5744,7 +5744,7 @@ uv run pytest tests/services/test_scheduler_service.py tests/services/test_sched
 
 Expected: PASS（37 + 11 = 48 枚）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 实现与评审收尾各一个提交：不改历史（`--amend` 与 `git reset --soft` 都不用），
 所以评审发现的那几处口径由第二个提交说明。
@@ -5876,7 +5876,7 @@ D101 说「心跳丢失的发现归外部」：死掉的调度器发不出「我
 Task 12 接线之后 `[调度]` 说的也是「上一次它留下的记录」，而「它此刻还活着吗」要由那一任务
 决定载体：要么调度器把那一拍写到一个不锁文件的旁路上，要么承认这个旁观者读不到活的进程。
 
-- [ ] **Step 1: 写失败用例**
+- [x] **Step 1: 写失败用例**
 
 `tests/services/test_health.py`：辅助函数接住 `schedule`，末尾追加五枚。
 
@@ -6347,7 +6347,7 @@ def test_system_backlog_gets_its_own_line_not_the_user_one(invoke) -> None:
 
 ```
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 uv run pytest tests/services/test_health.py tests/cli/test_health_cli.py -q
@@ -6356,7 +6356,7 @@ uv run pytest tests/services/test_health.py tests/cli/test_health_cli.py -q
 Expected: FAIL（`HealthService` 没有 `schedule` 参数；`HealthReport` 没有 `schedule` 字段；
 `NotifyData` 没有那两个系统数；`sams.cli.health.show` 还没有 `[调度]`）。
 
-- [ ] **Step 3: 改 `services/health.py`**
+- [x] **Step 3: 改 `services/health.py`**
 
 注解只 import 类型，运行时不连调度器：
 
@@ -6462,7 +6462,7 @@ if TYPE_CHECKING:
             unhandled_system_oldest=system_oldest,
 ```
 
-- [ ] **Step 4: 改 `cli/health.py`**
+- [x] **Step 4: 改 `cli/health.py`**
 
 积压那一节分成两行（两个受害者、两句修法）：
 
@@ -6580,7 +6580,7 @@ def _print_schedule(report) -> None:
     )
 ```
 
-- [ ] **Step 5: 跑绿**
+- [x] **Step 5: 跑绿**
 
 ```bash
 uv run pytest tests/services/test_health.py tests/cli/test_health_cli.py -q
@@ -6588,7 +6588,7 @@ uv run pytest tests/services/test_health.py tests/cli/test_health_cli.py -q
 
 Expected: PASS（34 + 19 = 53 枚）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 实现与评审收尾各一个提交：不改历史（`--amend` 与 `git reset --soft` 都不用），
 所以评审发现的那几处口径由后面那两个提交说明。
@@ -6708,7 +6708,7 @@ git commit -m "fix(health): 评审第二轮——未迁移那条线只留一个�
 还有第三个，是接线之后才显形的：**读数接进生产，就把「库里还没有那两张表」这一形状
 带进了每一次 `sams health`**（Step 11）。
 
-- [ ] **Step 1: 写失败的 CLI 用例**
+- [x] **Step 1: 写失败的 CLI 用例**
 
 `tests/cli/test_run_cli.py`（整份就是这些）：
 
@@ -6984,7 +6984,7 @@ def test_jobs_lists_the_registration_order(capsys):
   同时钉住状态列宽、`@` 后面的市场、分隔符那一个 `·` 与缩进；子串断言只钉得住文字，
   把两格合成一格、或把缩进吞掉都是绿的。
 
-- [ ] **Step 2: 跑红**
+- [x] **Step 2: 跑红**
 
 ```bash
 .venv/bin/python -m pytest tests/cli/test_run_cli.py -q
@@ -6993,7 +6993,7 @@ def test_jobs_lists_the_registration_order(capsys):
 Expected: FAIL（`run` 不是已注册的子命令，`build_parser().parse_args(["run", …])` 在
 argparse 处就 `SystemExit(2)`）。
 
-- [ ] **Step 3: 写 `cli/schedule.py`**
+- [x] **Step 3: 写 `cli/schedule.py`**
 
 ```python
 """`sams run`：常驻调度、手工补一轮、按执行顺序列出注册的 job。
@@ -7130,7 +7130,7 @@ def _jobs(container: Container, args: argparse.Namespace) -> int:
 
 ```
 
-- [ ] **Step 4: 注册进包入口**
+- [x] **Step 4: 注册进包入口**
 
 `src/sams/cli/__init__.py` 两处（import 块按字母序，`COMMAND_MODULES` 按命令分组顺序，
 `schedule` 落在 `rule` 之后）：
@@ -7173,7 +7173,7 @@ COMMAND_MODULES = (
 )
 ```
 
-- [ ] **Step 5: 跑绿**
+- [x] **Step 5: 跑绿**
 
 ```bash
 .venv/bin/python -m pytest tests/cli/test_run_cli.py tests/cli/test_cli.py -q
@@ -7182,7 +7182,7 @@ COMMAND_MODULES = (
 Expected: PASS。`tests/cli/test_cli.py` 里的 `test_every_subcommand_help_page_formats`
 会自动走到新命令的三个 help 页。
 
-- [ ] **Step 6: 写失败的组装根用例**
+- [x] **Step 6: 写失败的组装根用例**
 
 在 `tests/test_bootstrap.py` 末尾追加（`SystemAlarm` 已在文件顶部 import）：
 
@@ -7232,7 +7232,7 @@ def test_health_carries_the_schedule_reading(container):
     assert report.schedule.admins == 0
 ```
 
-- [ ] **Step 7: 跑红**
+- [x] **Step 7: 跑红**
 
 ```bash
 .venv/bin/python -m pytest tests/test_bootstrap.py -q
@@ -7241,7 +7241,7 @@ def test_health_carries_the_schedule_reading(container):
 Expected: FAIL（`Container` 没有 `scheduler`；`HealthReport.schedule` 仍为 `None`；
 发布告警后 `alerts` 为空）。
 
-- [ ] **Step 8: 接线 `bootstrap.py`**
+- [x] **Step 8: 接线 `bootstrap.py`**
 
 六行服务 import（排在 `rules.snapshot` 之后、`screen` 之前，字母序）与一行仓库 import：
 
@@ -7370,7 +7370,7 @@ Task 11 的实测结论在接线之后仍然成立）：
             schedule=scheduler.schedule_data,
 ```
 
-- [ ] **Step 9: 跑绿与静态检查**
+- [x] **Step 9: 跑绿与静态检查**
 
 ```bash
 .venv/bin/python -m pytest tests/cli/test_run_cli.py tests/test_bootstrap.py \
@@ -7380,7 +7380,7 @@ Task 11 的实测结论在接线之后仍然成立）：
 
 Expected: PASS；ruff `All checks passed!`。
 
-- [ ] **Step 10: 真进程冒烟（不是用例，是打开眼睛看）**
+- [x] **Step 10: 真进程冒烟（不是用例，是打开眼睛看）**
 
 ```bash
 SAMS_CONFIG=tmp/task12-smoke.toml SAMS_SECRET_KEY=… .venv/bin/sams run jobs
@@ -7401,7 +7401,7 @@ SAMS_CONFIG=tmp/task12-smoke.toml SAMS_DB_PATH=/tmp/t12c.duckdb SAMS_SECRET_KEY=
   显示宽度计算（`east_asian_width`）会把两屏的断言全换成宽度表；如果 Task 13 之后这一屏
   真的多了全局 job，再回来算这笔。
 
-- [ ] **Step 11: 未迁移的容器不能炸掉整屏（接线带出来的回归）**
+- [x] **Step 11: 未迁移的容器不能炸掉整屏（接线带出来的回归）**
 
 接线前跑全量，`tests/test_adversarial_services.py::test_health_show_exit_codes` 直接红了：
 那枚用例造的是**没跑过迁移**的容器，而 `HealthService.report()` 现在无条件调
@@ -7464,7 +7464,7 @@ SCHEDULE_TABLES = ("task_runs", "scheduler_heartbeats")
 `tests/cli/test_health_cli.py::test_an_unmigrated_db_says_the_schedule_shape_not_the_unwired_one`
 钉整行——子串断言在这一屏会被 `[通知]` 那节的「库里还没有 0015 的形状」顶掉。
 
-- [ ] **Step 12: 提交**
+- [x] **Step 12: 提交**
 
 不改历史（不 `--amend`、不 `reset --soft`），所以评审那两处由后面的提交说明。
 
@@ -7973,73 +7973,105 @@ M3-C 收尾时离线 2738、分层 381，M3-D 一层把离线加到 +215）。
 
 这一枚不改代码：把「M3 做完了」写成可复核的几句话。先记两件容易糊过去的事：
 
-1. **§14 缺 M3-C 那一段**。M3-C 的计划收了尾（它自己的 §4/§5），spec 的状态行却还写着
-   「M3-C 待实施计划」。不改这一句，下一份计划读到的现状就是假的。
-2. **数字只能来自实测**。M3-C 的 2738/381 是它收尾时的读数，本轮收尾必须重新跑；
-   拿旧数当承诺与不写数一样糟。
+1. **§14 缺 M3-C 那一段**。M3-C 的计划收了尾（`de564cf`），spec 的状态行却还写着
+   「M3-C 规则引擎、M3-D 调度器待实施计划」、D1–D93、2195 用例。不改这一句，下一份
+   计划读到的现状就是假的。
+2. **数字只能来自实测**。M3-C 的 2738/381 是它收尾时的读数（从它的计划 15084 行核对），
+   本轮收尾必须重新跑自己那三个数。
 
-- [ ] **Step 1: 先把全量跑一遍，把数字记下来**
+- [x] **Step 1: 先把全量跑一遍，把数字记下来**
 
-```bash
-uv run ruff check src tests --no-cache
-uv run pytest tests/test_layering.py -q
-uv run pytest -m "not live" -q
-uv run pytest -m "not live" -q --collect-only | tail -2
+计划草稿写的是 `uv run …`，这个仓库的实际调用是 `.venv/bin/python -m pytest` 与控制台
+脚本 `sams`（没有 `uv` 那一层），所以按仓库的口径跑：
+
+```
+$ .venv/bin/ruff check src tests --no-cache
+All checks passed!
+$ .venv/bin/python -m pytest tests/test_layering.py -q --no-header -p no:cacheprovider
+417 passed in 2.72s
+$ .venv/bin/python -m pytest -q --no-header -p no:cacheprovider
+2953 passed, 14 deselected, 2 warnings in 607.01s (0:10:07)
+$ .venv/bin/python -m pytest -m "not live" -q --collect-only
+2953/2967 tests collected (14 deselected)
 ```
 
-Expected: 前三行全绿；最后一行给出收集数，与 `-q` 最后那句 `NNNN passed` 加上
-`14 deselected` 对得上。把三个数记下来：**离线 passed**、**收集数**、**分层 passed**。
-对不上就别往下写——下面的段落要引用它们。
+三个数：**离线 2953**、**收集 2967**（= 2953 + 14，对得上）、**分层 417**。
+M3-D 一层把离线从 2738 加到 2953，净 **+215**。
 
-- [ ] **Step 2: 改状态行**
-
-文件第 4 行整体替换为（`<离线 passed>` 换成 Step 1 的读数，其余原样）：
+- [x] **Step 2: 改状态行**（第 4 行整体替换）
 
 ```markdown
-状态：**M1 + M2（A–E）+ M3-A 账本 + M3-B 通知层 + M3-C 规则引擎 + M3-D 调度器已实现并离线自测通过**（<离线 passed> 用例绿 + 真实屏），本文档已同步这些里程碑落地的口径决定（D1–D110，§14 按里程碑分段记录）；M4–M5 只有范围
+状态：**M1 + M2（A–E）+ M3-A 账本 + M3-B 通知层 + M3-C 规则引擎 + M3-D 调度器已实现并离线自测通过**（2953 用例绿 + 真实屏），本文档已同步这些里程碑落地的口径决定（D1–D110，§14 按里程碑分段记录）；M4–M5 只有范围
 ```
 
-- [ ] **Step 3: 在 §14 补 M3-C 那一段**
+- [x] **Step 3 + 4: §14 补 M3-C 那一段，并用 M3-D 与「M3 到此收口」替换「M3 还剩」**
 
-M3-B 段之后、`**M3 还剩**` 之前插入：
+草稿里那句「M3 还剩」整段删除，落进去的是这三段：
 
 ```markdown
-**M3-C 规则引擎已完成（2026-10-22，新增 D94–D96）**：§9.2/§9.3/§10 落成——迁移 0016 给复检基线一块住的地方、0017 给 `rules.params_on` 一个价空间锚；`core/rules.py` 把十四种模板的参数契约收成名单的唯一出处；`services/rules/snapshot.py` 的 `expand`/`read` 是取数的唯一入口，`templates/` 的止损止盈与观点类模板共用同一份 `stop_stage`/`target_stage`；`engine.py` 一趟求值的次序是判定 → 过滤 → 冷却 → 投递 → 事件（D94/D95），命中后走 `AlertSender` 端口（`bootstrap` 把它接到 `NotifyService.dispatch`）；`derive.py` 六条建仓派生幂等、改参数回写论上那一列；`recheck.py` 周复检建基线、比基线；`maintenance.py` 补上四个仓库层看不见的检查；`sams rule {kinds,add,list,show,edit,enable,disable,remove,derive,check,recheck}` 与 `sams alert {list,show,handle,dismiss}` 两条命令面；`sams health` 能读出告警积压。除权日误报由 0017 的锚 + `move_prices` 把参数与论上的线搬进今天的价空间关掉（对应的强制验收在真容器上红过再绿）。三道闸：离线 **2738 passed / 14 deselected**（收集 2752），分层守卫 **381 passed**，`ruff check` 全绿。那一轮记下的债（`Relocation.moves` 没有 src 读者、`params_on` 不在 `sams rule list`、`QuoteUpdated` 无发布方）原样留给后续。
+**M3-C 规则引擎已完成（2026-10-22，新增 D94–D96）**：§9.2/§9.3/§10 落成——迁移 0016 给复检基线一块住的地方、0017 给 `rules.params_on` 一个价空间锚；`core/rules.py` 把十四种模板的参数契约收成名单的唯一出处；`services/rules/snapshot.py` 的 `expand`/`read` 是取数的唯一入口，`templates.py` 的六条价格止损模板共用同一份 `stop_stage`（止盈与观点类各自判档，`tp.tiered` 用的是「第几档到了」而不是这条线）；`engine.py` 一趟求值的次序是判定 → 过滤 → 冷却 → 投递 → 事件（D94/D95），命中后走 `AlertSender` 端口（`bootstrap` 把它接到 `NotifyService.dispatch`）；`derive.py` 六条建仓派生幂等、改参数回写论上那一列；`recheck.py` 周复检建基线、比基线；`maintenance.py` 补上四个仓库层看不见的检查；`sams rule {kinds,add,list,show,edit,enable,disable,remove,derive,check,recheck}` 与 `sams alert {list,show,handle,dismiss}` 两条命令面；`sams health` 能读出告警积压。除权日误报由 0017 的锚 + `move_prices` 把参数与论上的线搬进今天的价空间关掉（对应的强制验收在真容器上红过再绿）。三道闸：离线 **2738 passed / 14 deselected**（收集 2752），分层守卫 **381 passed**，`ruff check` 全绿。那一轮记下的债里有两条原样留给后续（`anchor.Relocation.moves` 在 src 里没有消费者、`QuoteUpdated` 无发布方），第三条关了一半：`params_on` 现在上 `sams rule show` 那一屏（「锚」那一行，只在模板要搬价时印出来）与 `list`/`show` 的 `--json` payload，而 `rule list` 那一屏仍不印它——一行一条的规则表里挤不进第二行。
+
+**M3-D 调度器已完成（2026-10-23，新增 D97–D110）**：§12 收盘后那一半落成——迁移 0018 给 `task_runs` 加 `period_key` 与 `scheduler_heartbeats` 表；`services/scheduler/` 按「到期计算无 IO（`due.py`）→ 对象并集（`universe.py`）→ job 只拼已有服务（`jobs.py`）→ runner 只记这一跑（`runner.py`）→ service 只排顺序与心跳（`service.py`）→ report 只读（`report.py`）」切开；`sams run {start,once,jobs}` 是它的三个入口；`sams health` 多一节 `[调度]`，心跳丢失用退出码说。job 的注册顺序即执行顺序：每个市场数据链 → 周复检 → 规则，然后汇率，最后日历；没有能力的市场不登记该 job（D106）。这一层防的三件事：**同一晚不重复跑**（`period_key` + 成功不重跑 + 10 分钟重试，D98/D105）、**不重复打扰**（`SystemAlarm` 只在连续 3 个周期失败时补一条，D103；admin 去重跨重启，D102）、**一个失败不挡住别人**（runner 按 job 隔离、tick 按到期计算隔离；模拟交易日里港股 429 时 A 的整条链与后面的 job 照常）。§14 那条「挂机运行一个真实 A 股交易日」按 D97 的口径（盘中那一半不在这轮）拆成几处钉：`tests/test_scheduler_acceptance.py` 的模拟交易日钉住「那一晚登记的 job 整链 ok、规则读的是当晚那根 K 线（`stage=hit` + 当晚的价）且只发一条告警、健康页心跳为 0 秒、同一晚第二拍全部 skipped 且不新增账与告警、港股被限流时 A 与全局照跑」；「非交易时段静默」由 `due.py` 的到期判断（休市与没到点就返回 `None`）加上 `service.py` 把它收进 `TickReport.waiting` 那一列钉，「除权股不误报」在 M3-C 的除权真链验收里，「重启后不重复推送」由账本的成功不重跑（D98/D105）与系统告警「读库不读内存」的去重（D102）两枚各自钉死——**没有跑过一次真进程重启，也没有跑过一个真交易日的挂机**。盘中那一半（每 10 秒快照 → `QuoteUpdated` → 盘中规则）仍归 M4/U7，`quotes_snapshot` 仍没有写入方。三道闸：`ruff check` 全绿、分层 **417 passed**、离线 **2953 passed / 14 deselected**（收集 2967；M3-C 收尾时 2738，本层新增 215 枚）。
+
+**M3 到此收口**：规则引擎、通知、账本、调度器四层都已接上，M3 不再有「待实施计划」的条目。M3 留给下一层的接口是两块：看板与盘中实时行情（`quotes_snapshot`/`QuoteUpdated` 的发布方与每 10 秒轮询）——M4 的完整范围还有批注系统、推送带上下文与复盘闭环，见下面「M4 范围」；此外，上面那个模拟交易日验的是**离线**的整链，本节原验收里「真实 A 股交易日挂机、自选股无漏报」仍需要一次真实网络、真实交易日的运行来复核——它是一次人工动作，不是自动化闸能替代的。
 ```
 
-- [ ] **Step 4: 用 M3-D 那一段替换「M3 还剩」**
-
-`**M3 还剩**：…` 那整段删除，替换为（三层数字来自 Step 1；「本层新增」= 离线 passed − 2738）：
+- [x] **Step 5: 改 §18 的 U7**
 
 ```markdown
-**M3-D 调度器已完成（2026-10-22，新增 D97–D110）**：§12 收盘后那一半落成——迁移 0018 给 `task_runs` 加 `period_key` 与 `scheduler_heartbeats` 表；`services/scheduler/` 按「到期计算无 IO（`due.py`）→ 对象并集（`universe.py`）→ job 只拼已有服务（`jobs.py`）→ runner 只记这一跑（`runner.py`）→ service 只排顺序与心跳（`service.py`）→ report 只读（`report.py`）」切开；`sams run {start,once,jobs}` 是它的三个入口；`sams health` 多一节 `[调度]`，心跳丢失用退出码说。job 的注册顺序即执行顺序：每个市场数据链 → 周复检 → 规则，然后汇率，最后日历；没有能力的市场不登记该 job（D106）。这一层防的三件事：**同一晚不重复跑**（`period_key` + 成功不重跑 + 10 分钟重试，D98/D105）、**不重复打扰**（`SystemAlarm` 只在连续 3 个周期失败时补一条，D103；admin 去重跨重启，D102）、**一个失败不挡住别人**（runner 按 job 隔离、tick 按到期计算隔离；模拟交易日里港股 429 时 A 的整条链与后面的 job 照常）。M3 总验收的「挂机运行一个真实 A 股交易日」按 D97 的口径落在 `tests/test_scheduler_acceptance.py` 的模拟交易日上：收盘后整链 ok、规则读到当晚 K 线并只发一条告警、健康页心跳为 0 秒、同一晚第二拍全部 skipped 且不新增账与告警。盘中那一半（每 10 秒快照 → `QuoteUpdated` → 盘中规则）仍归 M4/U7，`quotes_snapshot` 仍没有写入方。三道闸：`ruff check` 全绿、分层 **<分层 passed> passed**、离线 **<离线 passed> passed / 14 deselected**（M3-C 收尾时 2738，本层新增 <离线 passed − 2738> 枚）。
-
-**M3 到此收口**：规则引擎、通知、账本、调度器四层都已接上，M3 不再有「待实施计划」的条目。留给 M4 的两件是看板与盘中实时行情（`quotes_snapshot`/`QuoteUpdated` 的发布方与每 10 秒轮询）；此外，上面那个模拟交易日验的是**离线**的整链，§14 原验收里「真实 A 股交易日挂机、自选股无漏报」仍需要一次真实网络、真实交易日的运行来复核——它是一次人工动作，不是自动化闸能替代的。
+| U7 | `quotes_snapshot.is_stale` 有表无写入方（`task_runs` 已在 M3-D 接上写入方） | §5.3 的陈旧标记服务盘中轮询，M1 只有盘后日线；就 §5.3 那两张表而言，M3-D 只接了 `task_runs` 与 `scheduler_heartbeats` 的写入方，快照采集器仍不存在 | M4 的快照采集器落地时（届时一并接 `QuoteUpdated`） |
 ```
 
-- [ ] **Step 5: 改 §18 的 U7**
+- [x] **Step 6: 自检，别让文档说假话**
 
-U7 那一行整体替换为：
-
-```markdown
-| U7 | `quotes_snapshot.is_stale` 有表无写入方（`task_runs` 已在 M3-D 接上写入方） | §5.3 的陈旧标记服务盘中轮询，M1 只有盘后日线；M3-D 的调度器只写 `task_runs` 与 `heartbeats`，快照采集器仍不存在 | M4 的快照采集器落地时（届时一并接 `QuoteUpdated`） |
+```
+$ grep -n "M3-C 规则引擎、M3-D 调度器" …spec…      # 无输出（旧状态已消失）
+$ grep -n "M3 还剩\|M3 到此收口\|M3-D 调度器已完成\|M3-C 规则引擎已完成" …spec…
+1024:**M3-C 规则引擎已完成（2026-10-22，新增 D94–D96）**…
+1026:**M3-D 调度器已完成（2026-10-23，新增 D97–D110）**…
+1028:**M3 到此收口**：…
+$ grep -n "^| U7 |" …spec…                          # 新 U7 那一行
 ```
 
-- [ ] **Step 6: 自检，别让文档说假话**
+恰好三行、`M3 还剩` 一个都没有 ✓。文档里每一个数都能在上面 Step 1 的输出里找到 ✓。
 
-```bash
-grep -n "M3-C 规则引擎、M3-D 调度器" docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md
-grep -n "M3 还剩\|M3 到此收口\|M3-D 调度器已完成\|M3-C 规则引擎已完成" docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md
-grep -n "^| U7 |" docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md
-```
+**草稿与事实对不上的七处**（前四处是自己核对时改的，后三处是一轮只读评审揪出来的，
+其中两处改的是「我第一版改错」的地方）：
 
-Expected: 第一条**没有输出**（旧状态已消失）；第二条恰好三行（`M3-C`、`M3-D`、`M3 到此收口`，
-且 `M3 还剩` 一个都没有）；第三条是新的 U7。再把 Step 2/4 里的数字与 Step 1 的读数对一遍——
-文档里的每一个数都必须能在刚才那次输出里找到，找不到就改回实测值。
+1. **M3-D 的完成日期**。草稿两段都写 2026-10-22：那是 M3-C 收尾与 M3-D 开工的那一天，
+   M3-D 实际收口是 2026-10-23（`b9cd316`/`548f195`）。M3-C 那一段写 2026-10-22 是对的。
+2. **草稿把整句 M3 总验收压在 `test_scheduler_acceptance.py` 一个文件上**。那句
+   「挂机运行一个真实 A 股交易日」的六个半句不是一个用例的形状：模拟交易日钉的是
+   「整链 ok / 读的是当晚那根 K 线且只发一条告警 / 心跳 0 秒 / 第二拍全 skipped 不新增
+   账与告警 / 港股 429 时 A 与全局照跑」；「非交易时段静默」在 `due.py` 的到期判断与
+   `service.py` 的 `waiting`；「除权股不误报」在 M3-C 的除权真链验收；「重启后不重复
+   推送」由账本的成功不重跑（D98/D105）与系统告警读库不读内存的去重（D102）各自钉。
+   段落里明写了**没有跑过一次真进程重启、也没有跑过一个真交易日的挂机**——这是这一句
+   最容易被读成「已经验收过了」的地方。
+3. **「收盘后 17 条 job」不写进 spec**。17 是那个测试世界（A 五能力 + HK/US 只有日线）
+   的注册数，不是系统的数；写进 spec 会让下一份计划把它当承诺。
+4. **草稿说 M3-C 的三条债原样留给后续**。其中 `params_on` 不上屏那一条在 M3-C 自己的
+   `f4aefd1` 里就动了 `cli/rule.py`，不能再说「留给后续」。
+5. **草稿写的是 `templates/` 目录，真实是单文件 `templates.py`**——改这一处时我顺手把
+   「止损止盈与观点类模板共用同一份 `stop_stage`/`target_stage`」抄了下来，而
+   **`target_stage` 在 src 里根本不存在**（`grep -rn "target_stage" src/sams` 无命中）：
+   `stop_stage` 的调用点是六条价格止损（`templates.py:120,140,164,195,228,257`），
+   `tp.tiered` 走的是「第几档到了」（同文件 444 行 `HIT if final else PRE`），观点类
+   各自判档。评审那句话是对的：修路径不等于修断言。
+6. **`params_on` 那条债只关了一半**（第一版我写成「当场关掉了」，也是假的）：那一屏的
+   「锚」行只由 `_print_view` 印（`cli/rule.py:302`，且只在模板带金额参数时），
+   `run_list` 走的是一行一条的表（同文件 360-371），不印它；`--json` 的 payload 两处都有。
+7. **`waiting` 不住在 `due.py`**：`due_for()` 返回 `None`，那一列是 `Scheduler.tick` 收进
+   `TickReport.waiting` 的（`service.py:126-130`）。顺带把 U7 那句「调度器只写
+   `task_runs` 与 `heartbeats`」限定成「就 §5.3 那两张表而言」——job 经服务层往
+   `bars_daily`/`financials`/`alerts` 那些表写的都是真写入方，那句话不加限定就是把 U7
+   说成了一句更大的谎。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md
 git commit -m "docs(spec): M3-C / M3-D 收尾——D94–D110 与模拟交易日验收"
+git commit -m "docs(spec): 评审收尾——五句说不准的话改成说得准的"
 ```
+
