@@ -136,7 +136,7 @@ def _print_backlog(notify) -> None:
         )
         print(
             f"  ⚠ 系统告警 {notify.unhandled_system} 个组件未处理{oldest}"
-            "：`sams run jobs` 看哪个 job 在反复失败"
+            "：下面 `[调度]` 那一节按 job 列了最近一次的结论"
         )
 
 
@@ -172,29 +172,37 @@ def _print_notify(report) -> None:
         print(f"  ⚠ 库里有不认识的 kind（{shown}）：路由会跳过它们，`sams channel remove` 清掉")
 
 
-def _age(seconds: int | None) -> str:
-    """把「距今多少秒」折成人能扫一眼的时长：一个四位数秒值在屏幕上没有量感。"""
-    if seconds is None:
-        return "未知"
+def _age(seconds: int) -> str:
+    """把「距今多少秒」折成人能扫一眼的时长：一个四位数秒值在屏幕上没有量感。
+
+    整小时不补一个「0 分钟」：「1 小时 0 分钟没更新」读起来像秒表，而那一格的
+    信息量就是「一个多小时没拍了」。
+    """
     if seconds < 60:
         return f"{seconds} 秒"
     if seconds < 3600:
         return f"{seconds // 60} 分钟"
-    return f"{seconds // 3600} 小时 {(seconds % 3600) // 60} 分钟"
+    hours, rest = divmod(seconds, 3600)
+    minutes = rest // 60
+    return f"{hours} 小时 {minutes} 分钟" if minutes else f"{hours} 小时"
 
 
 def _print_schedule(report) -> None:
     """`[调度]`：它还在不在跑，加上每个 job 上一轮跑成什么。
 
-    死掉的调度器发不出「我死了」（D101），所以这一节是循环存在与否唯一的出口；
+    死掉的调度器发不出「我死了」（D101），所以「还在不在跑」这句话只能由外面的人说。
     「未接入」也要占一行而不是让这一节消失——缺席会被读成「调度器好好的」。
-    过期那一行只是说「可能停了」，退出码让 cron 也能听见这件事（`show` 的最后一行）。
+    过期那一句之外，同一件事还进 `show` 的最后一行：屏幕上那句给人读，那个码给
+    不盯屏幕的人读。
     """
     print("[调度]")
     if report.schedule is None:
         print("  未接入调度器读数")
         return
     data = report.schedule
+    # 到下面两支时年龄已经折得出来：`collect` 把那一拍与年龄绑在同一条腿上（有行才算得出数）。
+    # 那个「有行没有数」的形状不在这里兜住：炸出去的那一句正指着写错的调用方，
+    # 而屏上一个不动声色的「未知」只会让读的人以为一切都好
     if data.never_started:
         print("  从未启动（`sams run start` 启动常驻调度器）")
     elif data.stale:
@@ -204,16 +212,21 @@ def _print_schedule(report) -> None:
     if data.admins == 0:
         # 与上一行的「管理员 0 名」不冲突：那一行报事实，这一行报后果——
         # 「循环还在跑」与「告警没有一个收件人」恰好可以同时成立
-        print("  ⚠ 没有在用的管理员：系统告警一个收件人都没有（`sams user set-admin …`）")
+        print(
+            "  ⚠ 没有在用的管理员：系统告警一个收件人都没有"
+            "（`sams user promote --username …`）"
+        )
     for job in data.jobs:
-        # 周期跟着名字一起打：它是「连续失败 N 个周期」的分母——
-        # 日频 job 连败 2 个周期与季频 job 连败 2 个周期是两个不同的事
-        line = f"  {job.name:<9} {(job.market or '全局'):<4} {job.period:<7}"
+        # 周期紧跟着名字：它是「连续失败 N 个周期」的分母——
+        # 日频 job 连败 2 个周期与月频 job 连败 2 个周期是两个不同的事
+        # 名字那一列按注册表里最长的名字留宽（现在是 `financials`，10 个字符）：
+        # `:<` 只补不截，列窄一格整列就右移，两行不齐时读不出「谁在反复失败」
+        line = f"  {job.name:<11} {(job.market or '全局'):<4} {job.period:<7}"
         latest = job.latest
         if latest is None:
-            print(line + "  从未运行")
+            print(line + " 从未运行")
             continue
-        line += f" {latest.status:<7} 周期 {latest.period_key or '—'}"
+        line += f" {latest.status:<7} 周期 {latest.period_key or '–'}"
         if latest.finished_at:
             line += f" · {stamp(latest.finished_at)}"
         if job.streak:
@@ -281,7 +294,7 @@ def show(container: Container, args: argparse.Namespace) -> int:
         print(f"  ⚠ {source.name} 未恢复，检查网络或换源")
     for source in report.unverified_sources:
         print(f"  · {source.name} 尚未被调用过，健康状态未知")
-    # 退出码给 cron 看（D101：死掉的调度器发不出「我死了」，只有外部读者能判）。
+    # 退出码说的是同一件事（D101：死掉的调度器发不出「我死了」，判它的读者在循环之外）。
     # 用 `schedule_stale` 而不用「从未启动」：一次都没跑过的库不是事故，
     # 那一格由 `[调度]` 自己的文案说
     return (

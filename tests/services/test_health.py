@@ -15,13 +15,12 @@ from sams.services.health import KEY_TABLES, HealthService
 from sams.services.scheduler.report import ScheduleData
 from sams.storage.db import Database
 from sams.storage.migrate import apply_migrations, discover
-from sams.storage.repos.alerts import AlertRepo
+from sams.storage.repos.alerts import Alert, AlertRepo
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
-from sams.storage.repos.task_runs import Heartbeat
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
 
@@ -649,18 +648,6 @@ def test_a_dismissed_alert_needs_no_channel_to_leave_the_backlog(db, settings):
 # ---------- 调度器读数：随报告带上，系统积压单独数 ----------
 
 
-def _beat(age_seconds: int) -> Heartbeat:
-    """一行心跳：`ScheduleData` 的过期判断读的是 `beat_age_s`，这里的时间戳只是让它
-    看起来是「有过那一拍」的形状（与 `never_started` 的 `heartbeat=None` 分开）。"""
-    moment = datetime(2024, 10, 25, 15, 30, tzinfo=UTC)
-    return Heartbeat(
-        id="hb-1",
-        started_at=moment - timedelta(seconds=age_seconds),
-        beat_at=moment - timedelta(seconds=age_seconds),
-        note="tick=60s",
-    )
-
-
 def test_key_tables_include_the_scheduler_ledgers(db, settings) -> None:
     """两张表各答一个问题，所以都要在这一屏上：`task_runs` 是「每个 job 跑成什么」，
     `scheduler_heartbeats` 是「还在跑吗」（D101：判「它还在不在跑」的读者必须在循环之外）。"""
@@ -672,9 +659,10 @@ def test_key_tables_include_the_scheduler_ledgers(db, settings) -> None:
 def test_report_carries_the_schedule_reading(db, settings) -> None:
     """`schedule` 是函数不是调度器对象：这一层调用它、存下结果，不认识循环。
 
-    `beat_age_s=None` 那份钉的是「没有年龄」与「过期」是两个数——前者不能被判成死。
+    这里给的是 `collect` 真正会产出的形状（没行就没有年龄）；「从未启动不是过期」
+    这一条在 `tests/services/test_scheduler_service.py` 里从 `collect` 那一层钉住。
     """
-    data = ScheduleData(heartbeat=_beat(30), beat_age_s=None, admins=1, jobs=())
+    data = ScheduleData(heartbeat=None, beat_age_s=None, admins=1, jobs=())
     report = service(
         db, settings, StubAdapter("akshare", ["A"], sample_bars()), schedule=lambda: data
     ).report()
@@ -682,7 +670,7 @@ def test_report_carries_the_schedule_reading(db, settings) -> None:
     assert report.schedule_stale is False
 
 
-def test_without_a_schedule_reader_the_section_is_absent(db, settings) -> None:
+def test_an_unwired_reader_gives_no_reading_rather_than_a_blank_one(db, settings) -> None:
     """「没接入」是 None，与「接入了但从未启动」（`ScheduleData(heartbeat=None)`）
     是两句话，必须在类型上分得开：把前者显示成后者，运维会去查一个没跑过的调度器。"""
     report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
@@ -690,10 +678,10 @@ def test_without_a_schedule_reader_the_section_is_absent(db, settings) -> None:
     assert report.schedule_stale is False
 
 
-def make_sys_alert(alerts: AlertRepo, user_id: str, component: str, moment: datetime) -> None:
+def make_sys_alert(alerts: AlertRepo, user_id: str, component: str, moment: datetime) -> Alert:
     """一条系统告警的管理员副本：形状照 `has_system_alert` 的 WHERE（`market='SYS'`、
-    `rule_id` 为 NULL、`code` 是组件名）。"""
-    alerts.create(
+    `rule_id` 为 NULL、`code` 是组件名）。写回来的那一行给用例比时刻用。"""
+    return alerts.create(
         user_id,
         rule_id=None,
         rule_name="系统",
@@ -716,14 +704,16 @@ def test_system_alerts_are_not_counted_as_user_backlog(db, settings) -> None:
     「2 个组件在反复告警、2 个管理员」会显示成「未处理 4 条」，而那两句修法是两件事。
 
     组件数用 `count(DISTINCT code)` 而不是数行：一行管理员副本不是一个新问题。
-    这一枚必须两头都能红——去掉 `<> 'SYS'` 打红前一个断言，
-    把 `unhandled_system` 数成行数打红后一个。
+    四个数都钉（两批的条数与两批各自最早那条）：只钉条数的话，把用户的最早时刻
+    填进系统那一格是绿的，而屏幕上那一句会把「一小时前开始的故障」说成「刚发生的」。
     """
     alerts = AlertRepo(db)
     trader = UserRepo(db).create("trader", PASSWORD).id
     keeper = UserRepo(db).create("keeper", PASSWORD).id
     moment = datetime.now(UTC)
-    for code in ("600519", "000001"):
+    # 系统那一批更早：两批的最早时刻必须是两个不同的数，才有东西可换错
+    hour_earlier = moment - timedelta(hours=1)
+    user_rows = [
         alerts.create(
             trader,
             rule_id="rule-1",
@@ -740,16 +730,22 @@ def test_system_alerts_are_not_counted_as_user_backlog(db, settings) -> None:
             action_note="",
             triggered_at=moment,
         )
-    make_sys_alert(alerts, trader, "sync", moment)
-    make_sys_alert(alerts, keeper, "sync", moment)
+        for code in ("600519", "000001")
+    ]
+    sys_rows = [
+        make_sys_alert(alerts, trader, "sync", hour_earlier),
+        make_sys_alert(alerts, keeper, "sync", hour_earlier),
+    ]
 
     report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
     assert report.notify.unhandled == 2, "用户积压不混系统副本"
     assert report.notify.unhandled_system == 1, "2 行同组件 = 1 个问题"
+    assert report.notify.unhandled_oldest == min(r.triggered_at for r in user_rows)
+    assert report.notify.unhandled_system_oldest == min(r.triggered_at for r in sys_rows)
 
 
 def test_the_system_backlog_uses_the_same_maybe_line_as_the_rest(tmp_path, settings) -> None:
-    """未迁移的库里那两个新数也是 None：沿用「六个数一起可空」的同一条线（D93），
+    """未迁移的库里那两个新数也是 None：沿用 `NotifyData` 那一节其余那几个数的同一条线（D93），
     而不是给系统积压另立第二条「该跑迁移」的判据。库的形状照旧用例的办法造：只到 0014。"""
     partial = tmp_path / "migrations"
     partial.mkdir()

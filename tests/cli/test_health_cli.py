@@ -36,6 +36,47 @@ def beat(age_seconds: int) -> Heartbeat:
     )
 
 
+def run_for(
+    name: str,
+    *,
+    market: str | None = "A",
+    period: str = "daily",
+    period_key: str | None = "2024-10-25",
+    status: str = "ok",
+    finished_at: datetime | None = MOMENT,
+    error: str | None = None,
+    note: str | None = None,
+    streak: int = 0,
+) -> JobHealth:
+    """一行台账加上它的连败计数：`[调度]` 里 job 那一行的全部输入。
+
+    默认是「一次干净的成功」——无错误、无说明、无连败，用例只写自己要改的那一格。
+    """
+    run = TaskRun(
+        id=f"r-{name}",
+        job_name=name,
+        market=market,
+        period_key=period_key,
+        started_at=MOMENT - timedelta(minutes=5),
+        finished_at=finished_at,
+        status=status,
+        rows_affected=1,
+        error=error,
+        note=note,
+    )
+    return JobHealth(name=name, market=market, period=period, latest=run, streak=streak)
+
+
+def reading(*, age: int | None, admins: int = 2, jobs: tuple[JobHealth, ...] = ()):
+    """一份读数。`age=None` 就是「还没有那一拍」那一格（`never_started`）。"""
+    return ScheduleData(
+        heartbeat=None if age is None else beat(age),
+        beat_age_s=age,
+        admins=admins,
+        jobs=jobs,
+    )
+
+
 def report_with(schedule: ScheduleData | None = None, notify: NotifyData | None = None):
     return HealthReport(db_path=":memory:", schedule=schedule, notify=notify or NotifyData())
 
@@ -58,138 +99,194 @@ def invoke(settings, capsys):
     return call
 
 
-class TestHeartbeatStates:
-    """心跳三态：过期（退出码 1）、新鲜（0）、从未启动（0——没跑过不是事故）。"""
+def test_beat_exactly_at_the_threshold_is_stale_and_exit_1(invoke) -> None:
+    """恰好等于阈值算过期：`stale_at` 取 `>=`，这一枚钉的就是那个等号。
 
-    def test_beat_exactly_at_the_threshold_is_stale_and_exit_1(self, invoke) -> None:
-        """恰好等于阈值算过期：`stale_at` 取 `>=`，这一枚钉的就是那个等号。"""
-        data = ScheduleData(
-            heartbeat=beat(HEARTBEAT_STALE_S), beat_age_s=HEARTBEAT_STALE_S, admins=2, jobs=()
-        )
-        code, text = invoke(report_with(schedule=data))
-        assert code == 1, "「它可能已经停了」必须让 cron 拿到非零"
-        assert "常驻调度器可能已经停了" in text
-
-    def test_fresh_beat_exits_0_and_shows_the_age(self, invoke) -> None:
-        data = ScheduleData(
-            heartbeat=beat(HEARTBEAT_STALE_S - 1),
-            beat_age_s=HEARTBEAT_STALE_S - 1,
-            admins=2,
-            jobs=(),
-        )
-        code, text = invoke(report_with(schedule=data))
-        assert code == 0
-        assert f"心跳 {(HEARTBEAT_STALE_S - 1) // 60} 分钟前 · 管理员 2 名" in text
-
-    def test_never_started_prints_a_line_but_exits_0(self, invoke) -> None:
-        """一次都没跑过的库不是事故：`never_started` 不进退出码，那一格自己会说。"""
-        data = ScheduleData(heartbeat=None, beat_age_s=None, admins=2, jobs=())
-        code, text = invoke(report_with(schedule=data))
-        assert code == 0
-        assert "从未启动" in text and "sams run start" in text
-
-    def test_zero_admins_is_said_loudly_without_touching_the_exit_code(self, invoke) -> None:
-        """「有 0 个管理员但循环还在跑」是合法的一格：两句话都要打，码还是 0。"""
-        data = ScheduleData(
-            heartbeat=beat(60), beat_age_s=60, admins=0, jobs=()
-        )
-        code, text = invoke(report_with(schedule=data))
-        assert "没有在用的管理员" in text
-        assert "管理员 0 名" in text, "新鲜那一行的「管理员 N 名」照打，两句不冲突"
-        assert code == 0
+    退出码这一头是 D101 唯一的执行点：屏幕那句给人读，这个码给不盯屏幕的读者读。
+    """
+    code, text = invoke(report_with(schedule=reading(age=HEARTBEAT_STALE_S)))
+    assert code == 1, "「它可能已经停了」必须让读退出码的人拿到非零"
+    assert "常驻调度器可能已经停了" in text
 
 
-class TestAgeRendering:
-    """`_age` 的三个数字分支各钉一次——通过屏幕上印出来的那个时长串。"""
+def test_one_second_under_the_threshold_is_fresh_and_exit_0(invoke) -> None:
+    """同一阈值的另一头：少一秒就不算「可能停了」，码回到 0。
 
-    def _stale_text(self, invoke, seconds: int) -> str:
-        data = ScheduleData(
-            heartbeat=beat(seconds), beat_age_s=seconds, admins=1, jobs=()
-        )
-        _, text = invoke(report_with(schedule=data))
-        return text
-
-    def test_minutes_branch_shows_whole_minutes(self, invoke) -> None:
-        # 取 600 秒（阈值之上）走过期那一句：钉的时长串是 600 秒本身，不是阈值
-        text = self._stale_text(invoke, 10 * 60)
-        assert "已经 10 分钟没更新" in text
-
-    def test_under_an_hour_shows_minutes(self, invoke) -> None:
-        text = self._stale_text(invoke, 30 * 60 + 40)
-        assert "已经 30 分钟没更新" in text
-
-    def test_over_an_hour_shows_hours_and_minutes(self, invoke) -> None:
-        text = self._stale_text(invoke, 2 * 3600 + 5 * 60)
-        assert "已经 2 小时 5 分钟没更新" in text
-
-    def test_under_60_seconds_shows_seconds_on_the_fresh_line(self, invoke) -> None:
-        data = ScheduleData(heartbeat=beat(30), beat_age_s=30, admins=1, jobs=())
-        _, text = invoke(report_with(schedule=data))
-        assert "心跳 30 秒前" in text
+    与上一枚差一秒、差一个码，才是那个 `>=` 的两边而不是一个写死的秒数。
+    """
+    code, text = invoke(report_with(schedule=reading(age=HEARTBEAT_STALE_S - 1)))
+    assert code == 0
+    assert f"心跳 {(HEARTBEAT_STALE_S - 1) // 60} 分钟前 · 管理员 2 名" in text
 
 
-class TestJobRows:
-    """每个 job 一行：周期是「连续失败 N 个周期」的分母，必须露头。"""
-
-    def test_failed_run_shows_period_status_streak_and_error(self, invoke) -> None:
-        run = TaskRun(
-            id="r1",
-            job_name="bars",
-            market="A",
-            period_key="2024-10-25",
-            started_at=MOMENT - timedelta(minutes=5),
-            finished_at=MOMENT,
-            status="failed",
-            rows_affected=0,
-            error="connection reset by peer after 3 retries",
-            note=None,
-        )
-        job = JobHealth(name="bars", market="A", period="daily", latest=run, streak=2)
-        data = ScheduleData(heartbeat=beat(60), beat_age_s=60, admins=2, jobs=(job,))
-        _, text = invoke(report_with(schedule=data))
-        assert "bars" in text
-        assert "failed" in text
-        # 「daily」是 `job.period` 的读者：没有这一断言，健康页上的周期字段没有主人
-        assert "daily" in text
-        assert "周期 2024-10-25" in text
-        assert "连续失败 2 个周期" in text
-        assert "connection reset by peer" in text
-
-    def test_job_never_run_says_so(self, invoke) -> None:
-        job = JobHealth(name="bars", market="A", period="daily", latest=None, streak=0)
-        data = ScheduleData(heartbeat=beat(60), beat_age_s=60, admins=2, jobs=(job,))
-        _, text = invoke(report_with(schedule=data))
-        assert "从未运行" in text
+def test_never_started_prints_a_line_but_exits_0(invoke) -> None:
+    """一次都没跑过的库不是事故：`never_started` 不进退出码，那一格自己会说。"""
+    code, text = invoke(report_with(schedule=reading(age=None)))
+    assert code == 0
+    assert "从未启动" in text and "sams run start" in text
 
 
-class TestScheduleAbsent:
-    def test_unwired_reading_keeps_the_section_and_exits_0(self, invoke) -> None:
-        """这一节不因「没接入」而消失：缺席会被读成「调度器好好的」，
-        而那一句说的才是事实——还没有读数接进来。"""
-        code, text = invoke(HealthReport(db_path=":memory:"))
-        assert "[调度]" in text
-        assert "未接入调度器读数" in text
-        assert code == 0
+def test_zero_admins_is_said_loudly_without_touching_the_exit_code(invoke) -> None:
+    """「有 0 个管理员但循环还在跑」是合法的一格：两句话都要打，码还是 0。"""
+    code, text = invoke(report_with(schedule=reading(age=60, admins=0)))
+    assert "没有在用的管理员" in text
+    assert "管理员 0 名" in text, "新鲜那一行的「管理员 N 名」照打，两句不冲突"
+    assert code == 0
 
 
-class TestSystemBacklogLine:
-    def test_system_backlog_gets_its_own_line_not_the_user_one(self, invoke) -> None:
-        """系统与用户是两个受害者，分两行：给用户的那句修法（`sams alert list`）
-        对「哪个 job 在反复失败」这个问题没有意义。"""
-        notify = NotifyData(
-            channels=1,
-            enabled=1,
-            sent=0,
-            failed=0,
-            suppressed=0,
-            no_channel=0,
-            unhandled=0,
-            unhandled_system=2,
-            unhandled_system_oldest=MOMENT,
-        )
-        code, text = invoke(report_with(notify=notify))
-        assert "系统告警 2 个组件未处理" in text
-        assert "sams run jobs" in text
-        assert "未处理告警 2 条" not in text, "用户那句说的还是用户的 0 条"
-        assert "未处理告警 0 条" in text
-        assert code == 0
+def test_a_stale_beat_over_an_hour_shows_hours_and_minutes(invoke) -> None:
+    """时长串走「小时 + 分钟」那一支：7500 秒在屏上该是「2 小时 5 分钟」。"""
+    _, text = invoke(report_with(schedule=reading(age=2 * 3600 + 5 * 60)))
+    assert "已经 2 小时 5 分钟没更新" in text
+
+
+def test_an_exact_hour_does_not_get_a_zero_minute_tail(invoke) -> None:
+    """整小时不补「0 分钟」：7200 秒那一格的信息量是「两个小时没拍了」，
+    「2 小时 0 分钟」读起来像秒表，会让那一行显得还差一分钟就到下一个数。"""
+    _, text = invoke(report_with(schedule=reading(age=2 * 3600)))
+    assert "已经 2 小时没更新" in text
+    assert "0 分钟" not in text
+
+
+def test_a_stale_beat_of_whole_minutes_shows_minutes(invoke) -> None:
+    """整分钟的读数不该被写成秒：600 秒那一格打「10 分钟」。"""
+    _, text = invoke(report_with(schedule=reading(age=10 * 60)))
+    assert "已经 10 分钟没更新" in text
+
+
+def test_minutes_drop_the_leftover_seconds(invoke) -> None:
+    """不足一分钟的零头被折掉：1840 秒打「30 分钟」而不是「30 分 40 秒」。"""
+    _, text = invoke(report_with(schedule=reading(age=30 * 60 + 40)))
+    assert "已经 30 分钟没更新" in text
+    assert "40 秒" not in text
+
+
+def test_a_fresh_beat_under_a_minute_shows_seconds(invoke) -> None:
+    """不足一分钟时给秒：那一支被折成「0 分钟前」，屏上就分不出刚打的与半分钟前的。"""
+    _, text = invoke(report_with(schedule=reading(age=30, admins=1)))
+    assert "心跳 30 秒前" in text
+
+
+def test_a_failed_run_shows_period_status_streak_and_error(invoke) -> None:
+    """job 那一行：周期是「连续失败 N 个周期」的分母，没有这一列就说不清连败多久。
+
+    错误串折到 60 个字符：一条带栈的源错误能有几百字，而这一屏是给人扫的，
+    「哪个 job 坏了」由前面那三列说，不由栈说。
+    """
+    long_error = "connection reset by peer after 3 retries: " + "X" * 80
+    job = run_for("bars", status="failed", error=long_error, streak=2)
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(job,))))
+    assert "bars" in text
+    assert "failed" in text
+    # 「daily」是 `job.period` 的读者：没有这一断言，健康页上的周期字段没有主人
+    assert "daily" in text
+    assert "周期 2024-10-25" in text
+    assert "连续失败 2 个周期" in text
+    assert long_error[:60] in text
+    assert long_error[:61] not in text, "折痕在 60 个字符：多一个字符就是这一枚的另一边"
+    assert "X" * 60 not in text, "整条栈不该把这一行撑开"
+    # 收尾时刻也在这一行：`周期 2024-10-25` 说的是哪个周期，时刻说的是它什么时候结束的
+    assert "2024-10-25 15:30:00 UTC" in text
+
+
+def test_a_still_running_row_shows_no_completion_time(invoke) -> None:
+    """崩溃留下的那一行是 `running`、没有收尾时刻（D105）：没有时刻就什么都不打，
+    而不是落一个「–」——那个破折号会被读成「跑完了，只是库里没记时间」。"""
+    job = run_for("bars", status="running", finished_at=None)
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(job,))))
+    line = next(ln for ln in text.splitlines() if "bars" in ln)
+    assert "running" in line
+    assert "UTC" not in line and "–" not in line
+
+
+def test_the_note_on_a_run_is_printed(invoke) -> None:
+    """`note` 说的是「成了，但要补一句」：`error` 是没成，`note` 是成了却只更新了 3 只
+    （0018 的头注），runner 写的「周期 … 已经成功」也落在这一列。
+
+    两行一起给：只钉带说明的那一行，会放过「干净的那行也被打上一段」——那时运维看到的
+    两个 `ok` 长得一样，而其中一个其实只更新了 3 只。
+    """
+    jobs = (run_for("fx", market=None, note="等 A 股收盘后才换汇"), run_for("bars"))
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=jobs)))
+    noted = next(ln for ln in text.splitlines() if "等 A 股" in ln)
+    clean = next(ln for ln in text.splitlines() if ln.lstrip().startswith("bars"))
+    assert "ok" in noted and "全局" in noted, "没有市场的 job 报「全局」而不是空白"
+    assert clean.endswith("2024-10-25 15:30:00 UTC"), text
+    assert "None" not in clean and "连续失败" not in clean
+
+
+def test_a_zero_streak_is_not_printed_as_zero_failures(invoke) -> None:
+    """`streak=0` 那一格什么都不说：「连续失败 0 个周期」会把一次正常的运行读成
+    「刚停下来」，而这一屏上「没坏」的正确表达是少一段字。"""
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(run_for("bars", streak=0),))))
+    assert "连续失败" not in text
+
+
+def test_a_run_row_without_a_period_key_shows_a_dash(invoke) -> None:
+    """`period_key` 是 0018 用 `ALTER TABLE … ADD COLUMN` 加上的，DuckDB 那一句带不了
+    NOT NULL，所以库里这一列可以是 NULL：这里落一个「–」而不是把 `None` 打上屏幕。"""
+    _, text = invoke(
+        report_with(schedule=reading(age=60, jobs=(run_for("bars", period_key=None),)))
+    )
+    line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("bars"))
+    assert "周期 –" in line and "None" not in line
+
+
+def test_the_columns_line_up_across_the_widest_inputs(invoke) -> None:
+    """名字、市场、周期三列各自按注册表里最长的取值留宽（`financials` 10 个字符、
+    `monthly` 7 个、市场码 `A`/`HK`/`US` 到 2 个）。`:<` 只补不截，哪一列留窄了，
+    后面的状态列就跟着左移，一屏里两行不齐就读不出「谁在反复失败」。"""
+    jobs = (
+        run_for("financials", period="daily"),
+        run_for("calendar", period="monthly"),
+        run_for("bars", market="HK", period="daily"),
+    )
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=jobs)))
+    lines = [
+        ln
+        for name in ("financials", "calendar", "bars")
+        for ln in text.splitlines()
+        if ln.lstrip().startswith(name)
+    ]
+    assert len(lines) == 3, text
+    offsets = {ln.index("ok") for ln in lines}
+    assert len(offsets) == 1, f"三行的状态列没对齐：{lines}"
+
+
+def test_a_job_that_never_ran_says_so(invoke) -> None:
+    """登记了但一行台账都没有：与「跑过且失败」是两件事，前者是还没轮到。"""
+    job = JobHealth(name="bars", market="A", period="daily", latest=None, streak=0)
+    _, text = invoke(report_with(schedule=reading(age=60, jobs=(job,))))
+    assert "从未运行" in text
+    assert "daily" in text, "从未运行的那一行也报周期：它是「该不该轮到」的分母"
+
+
+def test_unwired_reading_keeps_the_section_and_exits_0(invoke) -> None:
+    """这一节不因「没接入」而消失：缺席会被读成「调度器好好的」，
+    而那一句说的才是事实——还没有读数接进来。"""
+    code, text = invoke(HealthReport(db_path=":memory:"))
+    assert "[调度]" in text
+    assert "未接入调度器读数" in text
+    assert code == 0
+
+
+def test_system_backlog_gets_its_own_line_not_the_user_one(invoke) -> None:
+    """系统与用户是两个受害者，分两行：给用户的那句修法（`sams alert list`）
+    答不了「哪个 job 在反复失败」，而这一屏下面的 `[调度]` 那一节能答。"""
+    notify = NotifyData(
+        channels=1,
+        enabled=1,
+        sent=0,
+        failed=0,
+        suppressed=0,
+        no_channel=0,
+        unhandled=0,
+        unhandled_system=2,
+        unhandled_system_oldest=MOMENT,
+    )
+    code, text = invoke(report_with(notify=notify))
+    assert "系统告警 2 个组件未处理" in text
+    assert "`[调度]` 那一节按 job 列了最近一次的结论" in text
+    assert "未处理告警 2 条" not in text, "用户那句说的还是用户的 0 条"
+    assert "未处理告警 0 条" in text
+    assert code == 0
