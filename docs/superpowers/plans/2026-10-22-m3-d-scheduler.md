@@ -3895,14 +3895,13 @@ git commit -m "feat(scheduler): JobRunner 的周期记账、重试间隔与连�
   `latest_per_period`，并且自己带一个显示用的周期上限（要说清那个数会饱和），
   `failure_streak` 可以接着用——它现在吃的形状是「每周期一行」。
 
-
 ### Task 9: `SystemAlerter`——系统告警只到管理员，冷却跨重启
 
 **Files:**
-- Modify: `src/sams/storage/repos/alerts.py`（`latest_open` 之后加 `since_system`）
+- Modify: `src/sams/storage/repos/alerts.py`（`latest_open` 之后加 `has_system_alert`）
 - Create: `src/sams/services/scheduler/alarms.py`
-- Test: `tests/services/test_scheduler_alarms.py`
-- Test: `tests/storage/test_alerts_repo.py`（追加两条）
+- Test: `tests/services/test_scheduler_alarms.py`（自带 `PersistingSender` 替身）
+- Test: `tests/storage/test_alerts_repo.py`（追加四枚）
 
 `SystemAlarm` 现在有三个发布方（`datasource/registry.py`、`services/calendar.py`、
 Task 8 的 runner），订阅方只有 `attach_log_sink` 的日志。D102 要回答的是：
@@ -3910,7 +3909,10 @@ Task 8 的 runner），订阅方只有 `attach_log_sink` 的日志。D102 要回
 `code=component`）、**多久之内算同一次故障**（同组件同人一个 `cooldown_min`）。
 去重读 `alerts` 的行，所以调度器重启之后计数不会从零开始。
 
-- [ ] **Step 1: 写失败用例**
+收件人那一关复用 `services/actors.active_users`（「替一批用户做事只认启用账号」那条
+不变量归它），`is_admin` 才是本模块自己加的那一关。
+
+- [ ] **Step 1: 写失败用例（服务层）**
 
 `tests/services/test_scheduler_alarms.py`：
 
@@ -3919,33 +3921,50 @@ Task 8 的 runner），订阅方只有 `attach_log_sink` 的日志。D102 要回
 
 四条规则：只有 `is_admin && active` 收；形状是 `market='SYS'`、`code=component`、
 `rule_id=NULL`；同组件同人一个冷却窗口只发一次；去重读库，重启之后仍是同一次故障。
+这四条各钉两头——该沉默的那一次没出声、该出声的那一次确实出声，否则「把冷却写成零」
+与「写成无穷」都能全绿；两头不一定落在同一个用例里（形状那一枚只管库里那一行长什么样，
+「只缺半边的行不能当冷却起点」那一头住在 `tests/storage/test_alerts_repo.py`）。
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import logging
+from collections.abc import Iterable
+from datetime import UTC, date, datetime
 
+from support import FrozenClock
+
+from sams.core.errors import TransientError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.notify import STRONG, AlertMessage
 from sams.services.scheduler.alarms import SYS_LABEL, SYS_MARKET, SystemAlerter
+from sams.services.scheduler.due import Due
+from sams.services.scheduler.runner import JobRunner
+from sams.services.scheduler.types import JobSpec
+from sams.services.scheduler.universe import Universe
 from sams.storage.repos.alerts import AlertRepo
+from sams.storage.repos.task_runs import TaskRunRepo
 from sams.storage.repos.users import UserRepo
-from support import FrozenClock
 
 MOMENT = datetime(2024, 10, 25, 8, 30, tzinfo=UTC)
 PASSWORD = "correct-horse-battery"
+UNIVERSE = Universe(by_market={}, fx_pairs=())
 
 
 class PersistingSender:
-    """`AlertSender` 的替身：像 `NotifyService.dispatch` 一样先落一行，再返回 id。
+    """`AlertSender` 的替身：像 `NotifyService.dispatch` 一样先在 `alerts` 落一行，再尝试投递。
 
-    去重读的是 `alerts` 的行；只记调用的假发送器会让冷却永远不成立，
-    测试就退化成「两次调用只记一次」的同义反复。
+    去重读的是库里那一行，所以替身必须真写库：只记调用的替身攒不出冷却，
+    「两次告警只发一次」就会退化成「两次调用只断言一次调用」。
+    写的形状照 `support_rules.StoringSender`（同一套列，同一份 payload）。
+    `fail_for` 那一个人是**写完行之后**才抛的：生产上那一行先落库、投递在后面
+    （`monitor/router.py` 先 `alerts.create` 再发），所以「发不出去」改不了去重的答案。
     """
 
-    def __init__(self, alerts: AlertRepo, *, fail_for: set[str] | None = None) -> None:
+    def __init__(self, alerts: AlertRepo, *, fail_for: Iterable[str] | None = None) -> None:
         self.alerts = alerts
-        self.fail_for = fail_for or set()
+        #: 这些用户的 `dispatch` 抛异常：一个收件人失败不该带走其余收件人
+        self.fail_for = set(fail_for or ())
         self.calls: list[tuple[str, AlertMessage, str | None]] = []
 
     def dispatch(
@@ -3957,8 +3976,6 @@ class PersistingSender:
         rule_id: str | None = None,
         account_id: str | None = None,
     ) -> str:
-        if user_id in self.fail_for:
-            raise RuntimeError("通道挂了")
         alert = self.alerts.create(
             user_id,
             rule_id=rule_id,
@@ -3977,6 +3994,8 @@ class PersistingSender:
             channel_ids=list(channel_ids),
             extra={"body": message.body},
         )
+        if user_id in self.fail_for:
+            raise RuntimeError(f"通道挂了：{user_id}")
         self.calls.append((user_id, message, rule_id))
         return alert.id
 
@@ -4003,6 +4022,8 @@ def test_the_alarm_goes_to_active_admins_only(db, settings):
 
     bus.publish(SystemAlarm(component="job.bars.A", message="boom"))
 
+    # 三个人都在库里：只有一个收件人不是因为另外两个没建成功
+    assert len(users.list_users()) == 3
     assert [call[0] for call in sender.calls] == [admin.id]
     _, message, rule_id = sender.calls[0]
     assert message.market == SYS_MARKET
@@ -4040,6 +4061,25 @@ def test_the_same_component_is_silent_inside_the_cooldown(db, settings):
     assert [call[1].body for call in sender.calls] == ["第一次", "第三次"]
 
 
+def test_the_boundary_moment_still_counts_as_inside_the_cooldown(db, settings):
+    """窗口是闭的：`triggered_at == since` 的那一行仍然算「刚告过」。
+
+    写成 `>` 的话，恰好隔 `cooldown_min` 分钟的那一次会再发一遍——而库里躺着的那一行
+    说的正是「这一次已经发过了」，屏幕上的管理员会看到同一场故障的两条告警。
+    """
+    bus, sender, users, _, clock = harness(db, settings)
+    users.create("admin", PASSWORD, is_admin=True)
+
+    bus.publish(SystemAlarm(component="calendar", message="第一次"))
+    clock.advance(minutes=settings.cooldown_min)
+    bus.publish(SystemAlarm(component="calendar", message="恰好到点，仍然沉默"))
+    assert [call[1].body for call in sender.calls] == ["第一次"]
+
+    clock.advance(minutes=1)
+    bus.publish(SystemAlarm(component="calendar", message="过了一点就该出声"))
+    assert [call[1].body for call in sender.calls] == ["第一次", "过了一点就该出声"]
+
+
 def test_different_components_do_not_share_a_cooldown(db, settings):
     bus, sender, users, _, _ = harness(db, settings)
     users.create("admin", PASSWORD, is_admin=True)
@@ -4048,6 +4088,25 @@ def test_different_components_do_not_share_a_cooldown(db, settings):
     bus.publish(SystemAlarm(component="datasource:akshare", message="b"))
 
     assert len(sender.calls) == 2
+
+
+def test_the_cooldown_is_per_recipient(db, settings):
+    """去重键里有收件人：两个人共用一个窗口时，后建的那一个永远收不到第一条。
+
+    按组件独占去重的话，第一个管理员那一行就把第二个挡住了——而「发给在线管理员」
+    说的是每一个在线管理员。
+    """
+    bus, sender, users, _, _ = harness(db, settings)
+    first = users.create("admin-a", PASSWORD, is_admin=True)
+    second = users.create("admin-b", PASSWORD, is_admin=True)
+
+    bus.publish(SystemAlarm(component="calendar", message="日历源全挂"))
+
+    assert [call[0] for call in sender.calls] == [first.id, second.id]
+
+    # 第二趟：两个人各自还在窗口内，一个都不该再加
+    bus.publish(SystemAlarm(component="calendar", message="还是那场故障"))
+    assert [call[0] for call in sender.calls] == [first.id, second.id]
 
 
 def test_dedupe_reads_the_database_not_memory(db, settings):
@@ -4075,12 +4134,194 @@ def test_a_failing_recipient_does_not_block_the_next(db, settings):
     bus.publish(SystemAlarm(component="calendar", message="boom"))
 
     assert [call[0] for call in sender.calls] == [other.id]
+
+
+def test_a_failing_recipient_leaves_a_traceback_in_the_log(db, settings, caplog):
+    """按收件人包起来的 `try` 不许把栈吃掉。
+
+    `dispatch` 在收件人循环里被逐个人包住，异常因此到不了 `EventBus.publish`（那里是
+    另一处会带栈的日志）：写成 `logger.warning` 的话，一次投递失败在屏幕上只剩一行
+    没有模块、没有帧的消息——没人能从那一句话找到抛出来的那一段代码。
+    """
+    users = UserRepo(db)
+    broken = users.create("admin-a", PASSWORD, is_admin=True)
+    bus, _, _, _, _ = harness(db, settings, fail_for={broken.id})
+
+    with caplog.at_level(logging.WARNING):
+        bus.publish(SystemAlarm(component="calendar", message="boom"))
+
+    logged = [rec for rec in caplog.records if "系统告警发给" in rec.getMessage()]
+    assert len(logged) == 1
+    assert logged[0].exc_info is not None
+    assert logged[0].exc_info[0] is RuntimeError
+    # 栈里要有抛出那一站：只有消息文本的话，`warning` 与 `exception` 断言不出差别
+    assert "in dispatch" in caplog.text
+
+
+def test_a_recipient_whose_delivery_raised_is_not_retried_inside_the_window(db, settings):
+    """一次发不出去 = 这一窗口内不再替他重试；读的一侧看到的那一行沉默没有解释，
+    只有库里那一行解释了它。
+
+    生产上 `dispatch` 先写 `alerts` 那一行、再尝试投递（`monitor/router.py`），所以失败的
+    那一个人也在库里留下一行，而去重读的就是这一行：同一场故障的下一次发布对他仍然沉默。
+    """
+    users = UserRepo(db)
+    broken = users.create("admin-a", PASSWORD, is_admin=True)
+    bus, sender, _, alerts, _ = harness(db, settings, fail_for={broken.id})
+
+    bus.publish(SystemAlarm(component="calendar", message="第一次"))
+    bus.publish(SystemAlarm(component="calendar", message="第二次"))
+
+    # 那一行确实落了，而它压住了第二次的投递
+    assert len(alerts.list_for(broken.id)) == 1
+    assert sender.calls == []
+
+
+def test_the_runner_alarm_is_delivered_by_the_attached_alerter(db, settings):
+    """D103 → D102 的那一棒：runner 发的那一条由这里送到管理员眼前。
+
+    去重键用的是 `JobSpec.component` 那一侧的 `job.<name>.<market>`：两边各写各的串时，
+    同一个 job 的每一晚都会重新数一遍冷却，而屏幕上是每天一条重复告警。
+    """
+    bus, sender, users, alerts, clock = harness(db, settings)
+    admin = users.create("admin", PASSWORD, is_admin=True)
+    runner = JobRunner(runs=TaskRunRepo(db, clock=clock), bus=bus, clock=clock)
+
+    def failing(ctx):
+        raise TransientError("akshare", "boom")
+
+    spec = JobSpec(name="bars", period="daily", market="A", run=failing)
+    for period in ("2024-10-24", "2024-10-25", "2024-10-26"):
+        runner.execute(
+            spec, Due(period_key=period, as_of=date.fromisoformat(period)), UNIVERSE
+        )
+
+    assert len(sender.calls) == 1
+    row = alerts.list_for(admin.id)[0]
+    assert (row.market, row.code, row.rule_id) == (SYS_MARKET, "job.bars.A", None)
+
+    # 同一个组件再告一次（换市场才算换组件）：窗口内沉默
+    bus.publish(SystemAlarm(component="job.bars.A", message="再来一次"))
+    assert len(sender.calls) == 1
 ```
 
-`tests/storage/test_alerts_repo.py` 末尾追加：
+- [ ] **Step 2: 跑红**
+
+```bash
+uv run pytest tests/services/test_scheduler_alarms.py -q
+```
+
+Expected: FAIL（`sams.services.scheduler.alarms` 不存在，`AlertRepo` 没有 `has_system_alert`）。
+
+- [ ] **Step 3: 写 `has_system_alert`**
+
+`src/sams/storage/repos/alerts.py` 在 `latest_open` 之后加：
 
 ```python
-def test_since_system_matches_one_admin_one_component(repo, seeded_user, other_user):
+    def has_system_alert(self, user_id: str, component: str, *, since: datetime) -> bool:
+        """这个人名下从 `since` 起有没有过关于这个组件的系统告警（D102 的去重键）。
+
+        问的是**库里有没有那一行**，不是那个人有没有真的收到一条通知：
+        压制与 `no_channel` 照样留下这一行，而这一行正是压住后续告警的那个东西。
+        `code` 与股票代码共用一列，靠 `market = 'SYS'` 与 `rule_id IS NULL` 分开：
+        一条恰好把 `code` 写成组件名的规则告警不能被当成冷却的起点。
+        `triggered_at` 与 `since` 必须在同一条时间轴上：调用方传「现在 - 冷却」，
+        这里不读 `clock`，否则窗口的宽度会变成两个时钟之差。
+        答案是一个 `bool` 而不是那一行：调用方拿到行也只为问同一个问题，
+        为它解出整份 `payload_json` 是那一次白花的解码。
+        """
+        return bool(
+            self.db.scalar(
+                "SELECT EXISTS ("
+                " SELECT 1 FROM alerts"
+                " WHERE user_id = ? AND market = 'SYS' AND code = ? AND rule_id IS NULL"
+                " AND triggered_at >= ?)",
+                [user_id, component, _moment(since)],
+            )
+        )
+
+    def record(
+        self,
+        alert_id: str,
+        channel_id: str | None,
+        outcome: str,
+        *,
+        error: str = "",
+        attempts: int = 1,
+    ) -> None:
+        """一次投递尝试的结果。
+
+        `channel_id=None` 只允许配 `suppressed`/`no_channel`。这条约束写在 Python 而不是
+        DDL：DuckDB 的 CHECK 报错到屏幕上只剩一个约束名，而这一句要能说清
+        「为什么压制没有通道」——压制的意思是「还没有选到通道就停了」。
+        """
+        if outcome not in OUTCOMES:
+            raise ValidationError(f"未知投递结果 outcome={outcome!r}：只有 {list(OUTCOMES)}")
+        if self.get(alert_id) is None:
+            raise StorageError(f"告警 {alert_id} 不存在（投递记录必须挂在一条告警上）")
+        if outcome == NO_CHANNEL and channel_id is not None:
+            raise ValidationError(
+                "no_channel 不能带 channel_id：那一句话的意思是「一个通道都没选到」，"
+                "配一个 id 就自相矛盾了"
+            )
+        if outcome in (SENT, FAILED) and not channel_id:
+            raise ValidationError(f"{outcome} 必须带 channel_id：一次真发过的事件总得发到哪")
+        # `suppressed` 两种形状都合法：免打扰压制发生在选路之前（channel_id 为空），
+        # 而「这台机器没有桌面」是关于某一条具体通道的事实（id 要留着才认得出是哪条）
+        if attempts < 0:
+            raise ValidationError(f"attempts 不能为负（收到 {attempts}）")
+        self.db.execute(
+            "INSERT INTO notify_log (id, alert_id, channel_id, ts, attempt, outcome, error)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                new_id(),
+                alert_id,
+                channel_id,
+                self.clock.now_utc(),
+                int(attempts),
+                outcome,
+                (error or "").strip()[:_ERROR_MAX_CHARS],
+            ],
+        )
+
+    def deliveries(self, alert_id: str) -> list[Delivery]:
+        rows = self.db.query(
+            "SELECT id, channel_id, coalesce(outcome, 'failed') AS outcome,"
+            " coalesce(error, '') AS error, attempt, ts FROM notify_log"
+            " WHERE alert_id = ? ORDER BY ts, id",
+            [alert_id],
+        )
+        return [
+            Delivery(
+                id=str(row["id"]),
+                channel_id=row["channel_id"],
+                outcome=str(row["outcome"]),
+                error=str(row["error"] or ""),
+                attempts=int(row["attempt"] or 1),
+```
+
+`src/sams/services/actors.py` 里已有、这里直接复用的那一个筛选：
+
+```python
+def active_users(users: UserRepo) -> list[User]:
+    """替一批用户做事的那一趟，只认启用的账号。
+
+    `resolve_actor` 挡的是屏幕上传进来的那一个名字，而常驻的盘后链按名单跑，
+    那一条路上没有任何入口经过 `resolve_actor`：不在这里挡，`sams user disable`
+    就只挡住了手敲命令的那一头。
+    采集那一头相反（见 `services/scheduler/universe.py` 的文件头）：停用的用户照拉对象，
+    数据是公共资源，明天启用时库里该已经有数。
+    """
+    return [user for user in users.list_users() if user.status == ACTIVE]
+```
+
+仓库层的四枚用例（`tests/storage/test_alerts_repo.py` 追加）：
+
+```python
+# ---------- 系统告警的冷却（D102：同组件同人一个窗口）----------
+
+
+def test_has_system_alert_matches_one_admin_one_component(repo, seeded_user, other_user):
     system = {
         **CREATE_KW,
         "rule_id": None,
@@ -4091,54 +4332,70 @@ def test_since_system_matches_one_admin_one_component(repo, seeded_user, other_u
     repo.create(seeded_user, **system)
 
     since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
-    assert repo.since_system(seeded_user, "calendar", since=since) is not None
-    assert repo.since_system(other_user, "calendar", since=since) is None
-    assert repo.since_system(seeded_user, "datasource:akshare", since=since) is None
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is True
+    assert repo.has_system_alert(other_user, "calendar", since=since) is False
+    assert repo.has_system_alert(seeded_user, "datasource:akshare", since=since) is False
     assert (
-        repo.since_system(
+        repo.has_system_alert(
             seeded_user, "calendar", since=datetime(2026, 10, 20, 15, 0, tzinfo=UTC)
         )
-        is None
+        is False
     )
 
 
-def test_since_system_does_not_mistake_a_stock_alert_for_a_component(repo, seeded_user):
+def test_has_system_alert_counts_the_boundary_moment_as_inside(repo, seeded_user):
+    """窗口在仓库层也是闭的：`triggered_at == since` 的那一行算「刚告过」。
+
+    只在服务层钉这一条不够——那里隔着收件人筛选与消息构造，把 `>=` 写成 `>` 时
+    屏幕上留下的是一条没有解释的沉默，而这一层的一问一答必须自己说清边界归谁。
+    """
+    moment = datetime(2026, 10, 20, 14, 30, tzinfo=UTC)
+    repo.create(
+        seeded_user,
+        **{
+            **CREATE_KW,
+            "rule_id": None,
+            "account_id": None,
+            "market": "SYS",
+            "code": "calendar",
+            "triggered_at": moment,
+        },
+    )
+
+    assert repo.has_system_alert(seeded_user, "calendar", since=moment) is True
+    # 窗口右端挪一秒，那一行就落在外面：闭区间不是「全都算」
+    assert (
+        repo.has_system_alert(seeded_user, "calendar", since=moment + timedelta(seconds=1))
+        is False
+    )
+
+
+def test_has_system_alert_does_not_mistake_a_stock_alert_for_a_component(repo, seeded_user):
     repo.create(seeded_user, **{**CREATE_KW, "code": "calendar"})
 
     since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
-    assert repo.since_system(seeded_user, "calendar", since=since) is None
-```
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is False
 
-- [ ] **Step 2: 跑红**
 
-```bash
-uv run pytest tests/services/test_scheduler_alarms.py tests/storage/test_alerts_repo.py -q
-```
+def test_has_system_alert_needs_both_halves_of_the_system_shape(repo, seeded_user):
+    """`market = 'SYS'` 与 `rule_id IS NULL` 是两个条件，所以要一行只缺半边的证据。
 
-Expected: FAIL（`sams.services.scheduler.alarms` 不存在；`AlertRepo` 没有 `since_system`）。
+    只种形状完整的那一行时，删掉任一条件用例都还是绿的；缺一边的那两种行都会被当成
+    冷却的起点，于是本该出声的那一次被按下——而屏幕上留下的是一行看不出来的沉默。
+    """
+    since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
+    # SYS 市场、组件名对，但挂着 `rule_id`：那是规则告警，不是系统告警
+    repo.create(seeded_user, **{**CREATE_KW, "market": "SYS", "code": "calendar"})
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is False
 
-- [ ] **Step 3: 写 `since_system`**
+    # 反过来：没有 `rule_id`，但市场是普通的 A（一条恰好把 `code` 写成组件名的规则告警）
+    repo.create(seeded_user, **{**CREATE_KW, "rule_id": None, "code": "calendar"})
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is False
 
-`src/sams/storage/repos/alerts.py` 的 `latest_open` 之后：
-
-```python
-    def since_system(
-        self, user_id: str, component: str, *, since: datetime
-    ) -> Alert | None:
-        """这个人从 `since` 起有没有收到过关于这个组件的系统告警（D102 的去重键）。
-
-        `code` 与股票代码共用一列，靠 `market = 'SYS'` 与 `rule_id IS NULL` 分开：
-        一条恰好把 `code` 写成组件名的规则告警不能被当成冷却的起点。
-        `triggered_at` 与 `since` 必须在同一条时间轴上：调用方传「现在 - 冷却」，
-        这里不读 `clock`，否则窗口的宽度会变成两个时钟之差。
-        """
-        rows = self.db.query(
-            f"SELECT {_ALERT_COLUMNS} FROM alerts"
-            " WHERE user_id = ? AND market = 'SYS' AND code = ? AND rule_id IS NULL"
-            " AND triggered_at >= ? ORDER BY triggered_at DESC, id DESC LIMIT 1",
-            [user_id, component, _moment(since)],
-        )
-        return self._to_alert(rows.to_dicts()[0]) if rows.height else None
+    # 两半都齐才算：同一句查询的正例
+    system = {"rule_id": None, "account_id": None, "market": "SYS", "code": "calendar"}
+    repo.create(seeded_user, **{**CREATE_KW, **system})
+    assert repo.has_system_alert(seeded_user, "calendar", since=since) is True
 ```
 
 - [ ] **Step 4: 写 `alarms.py`**
@@ -4148,10 +4405,17 @@ Expected: FAIL（`sams.services.scheduler.alarms` 不存在；`AlertRepo` 没有
 ```python
 """`SystemAlarm` → 管理员（D102）。
 
-与用户告警共用 `alerts`/`notify_log` 两张表和同一条投递路径，
-不一样的三件事都在这里：接收人（`is_admin && active`）、数据形状
-（`rule_id=NULL`、`market='SYS'`、`code=component`）、去重（同组件同人一个冷却窗口）。
-去重读的是库里的行而不是进程内的一份集合：调度器重启之后，同一次故障不应该再发一遍。
+与用户告警共用 `alerts` 那张表，投递也只对着同一个端口 `AlertSender`（D95）：那是规则
+引擎唯一的发送出口，生产上由 `bootstrap` 把 `NotifyService.dispatch` 折成这个形状。
+本模块只说「我对着这个端口发」——它接到哪条线路上由装配那一步决定。
+不一样的三件事都在这里：收件人（启用且 `is_admin`）、数据形状（`rule_id=NULL`、
+`market='SYS'`、`code=component`）、去重（同组件同人一个冷却窗口）。
+去重读的是库里的行而不是进程内的一份集合：调度器重启之后，同一个窗口内的同一次故障
+不会再发一遍。
+
+这里说的「发给管理员」是这条告警写给谁、以及库里那一行会压住哪些后续告警：
+投递那一步由 `NotifyService.dispatch` 决定，它可能以 `NO_CHANNEL` 或免打扰压制收场，
+那两种结果里都没有人真的收到一条通知——所以本模块不声称任何人收到了什么。
 """
 
 from __future__ import annotations
@@ -4164,12 +4428,16 @@ from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.notify import STRONG, AlertMessage, AlertSender
+from sams.services.actors import active_users
 from sams.storage.repos.alerts import AlertRepo
-from sams.storage.repos.users import ACTIVE, UserRepo
+from sams.storage.repos.users import UserRepo
 
-logger = logging.getLogger("sams.scheduler.alarms")
+logger = logging.getLogger("sams.services.scheduler.alarms")
 
+#: `alerts.market` 里代表「这不是一只票」的那一个值：去重查询靠它与规则告警分开
 SYS_MARKET = "SYS"
+#: 读的一侧看到的「系统」：占的是标的位、账户位与阶段位
+#: （用户告警在这三段上写的是股票名、账户名与阶段，而这里没有一只票）
 SYS_LABEL = "系统"
 SYS_RULE_NAME = "系统告警"
 
@@ -4188,10 +4456,10 @@ class SystemAlerter:
     def handle(self, alarm: SystemAlarm) -> None:
         now = self.clock.now_utc()
         since = now - timedelta(minutes=self.settings.cooldown_min)
-        for user in self.users.list_users():
-            if not user.is_admin or user.status != ACTIVE:
+        for user in active_users(self.users):
+            if not user.is_admin:
                 continue
-            if self.alerts.since_system(user.id, alarm.component, since=since) is not None:
+            if self.alerts.has_system_alert(user.id, alarm.component, since=since):
                 continue
             message = AlertMessage(
                 market=SYS_MARKET,
@@ -4209,7 +4477,10 @@ class SystemAlerter:
             try:
                 self.sender.dispatch(message, user_id=user.id, rule_id=None)
             except Exception as exc:  # noqa: BLE001 — 一个收件人失败不能挡住其余收件人
-                logger.warning("系统告警发给 %s 失败：%s", user.id, exc)
+                # 栈只能在这里留：异常被逐个人包住之后到不了 `EventBus.publish`（那里是另一处
+                # 带栈的日志），少一个栈就没人能从那一句话找到抛出的是哪一段代码
+                # （`runner.py` 答同一个问题时用的也是 `logger.exception`）
+                logger.exception("系统告警发给 %s 失败：%s", user.id, exc)
 ```
 
 - [ ] **Step 5: 跑绿**
@@ -4218,7 +4489,7 @@ class SystemAlerter:
 uv run pytest tests/services/test_scheduler_alarms.py tests/storage/test_alerts_repo.py -q
 ```
 
-Expected: PASS。
+Expected: PASS（11 + 36 = 47 枚）。
 
 - [ ] **Step 6: 提交**
 
@@ -4227,7 +4498,82 @@ git add src/sams/storage/repos/alerts.py src/sams/services/scheduler/alarms.py t
 git commit -m "feat(scheduler): 系统告警投递给在线管理员（冷却跨重启）"
 ```
 
----
+
+**评审收尾（2026-10-22）**：实现落在 `bff0e38`，两路评审之后修在 `e5d63df`。
+评审发现的问题与处理：
+
+- **仓库层那一问一答原本返回 `Alert | None`，而调用方只问「有没有」**（`e5d63df`）。
+  解一份 `payload_json` 只为说一个「是」，而且 `ORDER BY triggered_at DESC, id DESC`
+  里的 `id` 是 `uuid4().hex`、不按时间排，那段排序是死的（D96：不许留没有主人的排序）。
+  改成 `has_system_alert(...) -> bool`（`SELECT EXISTS` + `db.scalar`），WHERE 条件与
+  `>=` 闭区间原样保留。**没**把 `>=` 翻成 `>`：那条建议要的是「和
+  `services/rules/engine.py:461` 统一」，而那句写的是 `gap >= window` 就**放行**，
+  两层的取向本来就相反（那边「恰好到点」算出窗、这边算在窗内）。这一秒之差留在两个层
+  各答一次，是因为 `triggered_at` 精确到微秒、生产上落不到那个瞬时，而把它对齐要给
+  一条已经在跑的规则链引入一次同步改动——收益是一个测不到的时刻，成本是两条链同时动。
+  闭区间归「有」的一侧由两枚用例分别钉住（服务层
+  `test_the_boundary_moment_still_counts_as_inside_the_cooldown`、仓库层
+  `_counts_the_boundary_moment_as_inside`）。
+- **测试替身与生产顺序相反，恰好表达不出一次真发生过的后果**（`e5d63df`）。
+  `dispatch` 在生产上是先写 `alerts` 那一行、再尝试投递（`monitor/router.py` 的
+  `alerts.create` 在发送之前），所以「发不出去」的那个人也在库里留下一行，而去重读的
+  就是这一行——替他重试也没有用。原替身在写行之前就 `raise`，那条后果在测试里不存在。
+  现在按生产顺序抛，并补 `test_a_recipient_whose_delivery_raised_is_not_retried_inside_the_window`。
+- **按收件人包起来的 `try` 把栈吃掉了**（`e5d63df`）。`dispatch` 在收件人循环里被逐个
+  包住，异常因此到不了 `EventBus.publish`（那里才是另一处带栈的日志）；写成
+  `logger.warning` 时屏幕上只剩一行没有模块、没有帧的消息，没人能从那句话找到抛出的
+  是哪一段。改成 `logger.exception`（Task 8 的 runner 答同一个问题用的也是它），并补
+  `test_a_failing_recipient_leaves_a_traceback_in_the_log`——它断言 `exc_info` 与栈里的
+  `in dispatch`，只断言消息文本时 `warning` 与 `exception` 分不出红绿。
+- **收件人筛选复用了 `services/actors.active_users`**（原计划把 `list_users()` 与
+  `status == ACTIVE` 就地写在 `handle` 里）。「替一批用户做事只认启用账号」这条不变量
+  已经归那一层管（`sams user disable` 挡住的那一头），在这里再抄一遍就是第二处
+  会漂移的地方。
+- **`PersistingSender` 建在 `tests/support_scheduler.py`，随后搬进
+  `tests/services/test_scheduler_alarms.py`，那个共用文件恢复原样**。要说清理由的边界：
+  成立的根据是「只有一个用户的替身不该占共用文件这一格」，不是「共用文件只放多用户的东西」
+  这条约定——同一个文件里的 `FakeCalendar` 与 `WeekdayProvider` 也各只有一个 importer，
+  所以拿后者当先例是站不住的。搬运的同时删掉了 `support_scheduler.py` 文件头那句
+  为它写的介绍。
+- **D96 两处口径**：① `alarms.py` 文件头原先写「生产上是 bootstrap 折给 `NotifyService.dispatch`
+  的那一份」，而接线发生在还没写的装配那一步（Task 12），现在只说它对着 `AlertSender`
+  这个端口发、接到哪条线路上由装配决定。② 它原先还说「管理员收到了」，而
+  `dispatch` 可能以 `NO_CHANNEL` 或免打扰压制收场，那两种结果里没有人真的收到——
+  现在明写本模块不声称任何人收到了什么，并把「库里那一行才是压住后续告警的东西」留在
+  `has_system_alert` 的文档里。
+- **D96 一处过头话被用例反过来纠正**：测试文件头原写「每一枚都钉两头」，而形状那一枚
+  （`test_the_alert_row_is_a_system_alert`）只管库里那一行长什么样，它的另一头
+  （「只缺半边的行不能当冷却起点」）住在仓库层。现在写成「这四条各钉两头，两头不一定
+  落在同一个用例里」。
+- **仓库层从计划的两枚变成四枚**：计划里那枚正例把「同一时间窗、不同人、不同组件」
+  三种负例挤在一行断言里，边界（`>=`）与形状（`market='SYS'` / `rule_id IS NULL`
+  两个条件各缺一边）都没有对手。补的两枚：`_counts_the_boundary_moment_as_inside`
+  （恰好等于 `since` 在内、晚一秒在外）、`_needs_both_halves_of_the_system_shape`
+  （只删任一条件都还是绿的，所以必须种一行只缺半边的证据）。
+- **logger 名**：计划写 `sams.scheduler.alarms`，兄弟模块用的是完整点路径
+  （`sams.services.scheduler.runner`），落地按点路径。日志级别、`SYS_LABEL` 占三段位、
+  `value_text` 写组件名（`threshold_text` 已经写了冷却多久，两处都在屏上渲染）都按计划。
+- **实现阶段的子代理做了一次 `git reset --soft HEAD~1`** 来改提交标题（`ce743d3` →
+  `bff0e38`）。核对过 reflog 与两个提交的 tree 都是 `cf28959`（没丢工作），但「永不
+  `--amend`、永远新提交」这条同样管住 soft reset，已在下一份 brief 里明写禁止。
+- **没采纳的建议与理由**：把 `severity == STRONG` 的两处断言并成一处（消息与库里那一行
+  是两个受害者，`AlertMessage` 传错与 `alerts.create` 写错不是同一个 bug）；把
+  `StoringSender` / `PersistingSender` 那两段 17 参数的 `alerts.create` 抽成一个共用
+  helper（写错参数名会在调用时就 `TypeError`，不是静默漂移，抽走反而把两处形状藏在
+  一个签名里）；把 `RunResult.skip_reason` 与 `error` 并成一个字段（Task 11 要分开读两种颜色，
+  这条在 Task 8 已记）；`canonical_market` 认 `"SYS"`（没有调用方会走到那儿的形状）。
+- **往后的任务要注意**：
+  ① **Task 12 必须真的 `alerter.attach(event_bus)`**——`SystemAlerter` 的构造与 attach
+  是分开的两步，只 new 不 attach 时这条链在屏上完全看不出来（库里没有行，健康页也不会
+  报「没人订阅」）。Task 12 的验收里要有一枚「发布一条 `SystemAlarm` → `alerts` 里出现
+  一行 `market='SYS'`」的端到端用例。
+  ② **Task 11 的 `services/health.py:290` 数的是全部 `status='new'` 的 alert**
+  （`count(*)` 与 `min(triggered_at)` 两问都只按 `status` 筛），
+  `market='SYS'` 的行会被算进「未处理 N 条」；系统告警不该和用户看到的待处理混在一个
+  数里，考虑按 `FILTER (WHERE market = 'SYS')` 拆成两个数。
+  ③ 去重靠 `alerts` 那一行，而那一行只在 `dispatch` 走到 `alerts.create` 时才存在：
+  如果 Task 12 的装配把 `AlertSender` 换成一个不落库的替身（例如纯日志的 sender），
+  冷却会退化成「每 tick 一条」。本任务的替身之所以必须真写库，就是因为这一条。
 
 ### Task 10: `Scheduler`——tick 的顺序、心跳与常驻循环
 
