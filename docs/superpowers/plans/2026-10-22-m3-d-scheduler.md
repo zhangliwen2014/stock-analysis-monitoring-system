@@ -2274,8 +2274,9 @@ git commit -m "feat(scheduler): job 形状与五个数据 job（增量窗口 + �
 
 **Files:**
 - Modify: `src/sams/services/scheduler/jobs.py`（追加 fx/calendar/rules/recheck 与最终 `build_jobs`）
-- Modify: `src/sams/services/rules/engine.py`（`check(..., market=None)`）
-- Modify: `src/sams/services/rules/recheck.py`（`run(..., market=None)`）
+- Modify: `src/sams/services/rules/engine.py`（`check(..., market=None)`，过滤之前先归一市场键）
+- Modify: `src/sams/services/rules/recheck.py`（`run(..., market=None)`，同上）
+- Modify: `src/sams/services/actors.py`（`active_users`：按名单跑的那两头只认启用的账号）
 - Modify: `src/sams/storage/repos/fx.py`（`latest_date`）
 - Test: `tests/services/test_scheduler_jobs_ops.py`
 - Test: `tests/services/test_rules_engine.py`
@@ -2284,23 +2285,33 @@ git commit -m "feat(scheduler): job 形状与五个数据 job（增量窗口 + �
 
 - [ ] **Step 1: 写失败用例**
 
-`tests/services/test_scheduler_jobs_ops.py`：
+`tests/services/test_scheduler_jobs_ops.py`（整份，落地形状）：
 
 ```python
+"""四个运维 job 各自的那句话：汇率按对、日历按年、规则与复检按用户。
+
+这里的断言看的是**问出去的对象与窗口**，不是写回来的行数：一个不问库里已有哪一天的
+汇率 job 也能把今天的报价放进库，只是每晚把所有币种对重拉一遍；一个不传市场的规则 job
+也能触发告警，只是 A 股那一趟顺手把美股也判了——两个市场各自的条件本该互不牵连。
+「互不牵连」在四个 job 上是同一件事：坏一个（一对/一个用户）时，其余那一个照常做完，
+而坏的那一个进 `errors` 而不是把整趟带走，所以每一类都钉正反两头。
+"""
+
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import polars as pl
 import pytest
 from support import FrozenClock
-from support_rules import FixedClock
 from support_scheduler import WeekdayProvider
 
+from sams.core.errors import CalendarSourceError, DatasourceError, ValidationError
 from sams.datasource.registry import AdapterRegistry
 from sams.services.calendar import CalendarService
 from sams.services.fx import FxSyncService
+from sams.services.scheduler.due import DAILY, FX, MONTHLY, WEEKLY
 from sams.services.scheduler.jobs import (
     build_jobs,
     run_calendar,
@@ -2318,38 +2329,50 @@ AS_OF = date(2024, 10, 25)
 
 
 class StubFxAdapter:
-    name = "stubfx"
+    """按币种对回答的汇率源：给自己那几天报价，`fail_on` 那一对挂掉。
 
-    def __init__(self, frame: pl.DataFrame) -> None:
-        self.frame = frame
+    它对「问哪一对」都答得上来（`fail_on` 之外），所以按对隔离那一枚要的效果是真的：
+    坏掉的那一对之外，其余那一对仍然被问过、仍然写了行。
+    `markets` 给空元组不是「这个源哪个市场都不吃」：`fetch_fx` 不走市场路由，
+    它按能力遍历注册表里的每一个源——汇率这一条链没有市场维度（`services/fx.py` 的文件头）。
+    """
+
+    name = "stubfx"
+    markets: tuple[str, ...] = ()
+
+    def __init__(
+        self, *, days: tuple[date, ...] = (AS_OF,), fail_on: tuple[str, str] | None = None
+    ) -> None:
+        self.days = days
+        self.fail_on = fail_on
         self.calls: list[tuple[str, str, date, date]] = []
 
     def fx_rate(self, base, quote, start, end):
         self.calls.append((base, quote, start, end))
-        return self.frame.filter(
-            (pl.col("base") == base) & (pl.col("quote") == quote)
+        if (base, quote) == self.fail_on:
+            raise DatasourceError(self.name, "503 服务不可用")
+        # 只回被问到的那一段：源给宽区间是常态，`_call_fx` 那一头会裁掉问之外的日子
+        days = [day for day in self.days if start <= day <= end]
+        return pl.DataFrame(
+            {
+                "date": days,
+                "base": [base] * len(days),
+                "quote": [quote] * len(days),
+                "rate": [7.1] * len(days),
+                "source": [self.name] * len(days),
+            }
         )
 
 
-def fx_frame(day: date = AS_OF) -> pl.DataFrame:
-    return pl.DataFrame(
-        {
-            "date": [day],
-            "base": ["USD"],
-            "quote": ["CNY"],
-            "rate": [7.1],
-            "source": ["stubfx"],
-        }
-    )
-
-
 def deps(db, settings, *, fx=None, calendar=None, rules=None, recheck=None, users=None):
+    """三个数据服务的槽位这里是 None——本文件不跑数据 job。
+
+    注册表给空的那一套：`build_jobs` 因此一个数据 job 都不登记，注册表那一枚用例
+    断的就只有这四个运维 job。
+    """
     return JobDeps(
         settings=settings,
-        registry=AdapterRegistry(
-            adapters={}, market_sources={}, sleep=lambda _: None
-        ),
-        universe=None,  # type: ignore[arg-type]
+        registry=AdapterRegistry(adapters={}, market_sources={}, sleep=lambda _: None),
         sync=None,  # type: ignore[arg-type]
         corp_actions=None,  # type: ignore[arg-type]
         fundamentals=None,  # type: ignore[arg-type]
@@ -2358,7 +2381,6 @@ def deps(db, settings, *, fx=None, calendar=None, rules=None, recheck=None, user
         rules=rules,
         recheck=recheck,
         users=users or UserRepo(db),
-        clock=FrozenClock(datetime(2024, 10, 25, 15, tzinfo=UTC)),
     )
 
 
@@ -2367,7 +2389,7 @@ def ctx(*, market="A", pairs=()):
         period_key="2024-10-25",
         as_of=AS_OF,
         market=market,
-        universe=Universe(by_market={market: ()}, fx_pairs=pairs),
+        universe=Universe(by_market={market: ()} if market else {}, fx_pairs=pairs),
     )
 
 
@@ -2378,9 +2400,21 @@ def fx_service(db, adapter):
     return FxSyncService(registry, FxRepo(db))
 
 
+def _boom(*_args, **_kwargs):
+    """三个槽位共用的一种替身：它抛的不是本项目的失败。
+
+    「只接 `SamsError`」这句在四段各写一遍的循环里，所以每一段都要在自己那一头钉一枚：
+    把其中一处放宽成 `except Exception`，其余三处不该跟着红，而那一处也不该绿着过。
+    """
+    raise TypeError("这一层收到了没有键的一行")
+
+
+# --- 汇率：窗口按每对各自问，失败按对隔离 --------------------------------------------------
+
+
 def test_fx_job_starts_after_the_last_stored_day(db, settings):
     FxRepo(db).put(date(2024, 10, 24), "USD", "CNY", 7.0, source="manual")
-    adapter = StubFxAdapter(fx_frame())
+    adapter = StubFxAdapter()
     outcome = run_fx(
         deps(db, settings, fx=fx_service(db, adapter)),
         ctx(market=None, pairs=(("USD", "CNY"),)),
@@ -2390,75 +2424,270 @@ def test_fx_job_starts_after_the_last_stored_day(db, settings):
     assert FxRepo(db).latest_date("USD", "CNY") == AS_OF
 
 
+def test_fx_job_backfills_the_same_window_as_the_daily_jobs_for_a_new_pair(db, settings):
+    """没存过的一对走的是与日线同一条回补规则（`_window`），不是「从今天开始同步」。
+
+    断的是问出去的区间：只写今天那一行的 job 也能把今天的报价放进库，
+    而这一对从此永远缺着前面那两年。
+    """
+    adapter = StubFxAdapter(days=(AS_OF - timedelta(days=730), AS_OF))
+    run_fx(
+        deps(db, settings, fx=fx_service(db, adapter)),
+        ctx(market=None, pairs=(("USD", "CNY"),)),
+    )
+    _, _, start, end = adapter.calls[0]
+    assert (start, end) == (AS_OF - timedelta(days=730), AS_OF)
+
+
 def test_fx_job_skips_a_pair_already_at_as_of(db, settings):
     FxRepo(db).put(AS_OF, "USD", "CNY", 7.1, source="manual")
-    adapter = StubFxAdapter(fx_frame())
+    adapter = StubFxAdapter()
     outcome = run_fx(
         deps(db, settings, fx=fx_service(db, adapter)),
         ctx(market=None, pairs=(("USD", "CNY"),)),
     )
+    # 追平到今天就不该问链：每晚重问一次同一个数，症状是「一切正常」
     assert adapter.calls == []
     assert outcome.rows_affected == 0 and outcome.errors == ()
 
 
-def test_calendar_job_refreshes_december_next_year_too(db, settings):
-    provider = WeekdayProvider("A", "Asia/Shanghai")
-    calendar = CalendarService(
-        CalendarRepo(db),
-        {"A": provider},
-        clock=FrozenClock(datetime(2024, 12, 20, 15, tzinfo=UTC)),
+def test_a_pair_list_that_is_empty_is_a_successful_noop(db, settings):
+    """没人持有外币的那一晚：0 对既不是失败，也不该被读成「汇率链坏了」。
+
+    数据那一头已经钉过同一条（`test_empty_universe_is_a_successful_noop`），
+    但那是另一段循环，所以这里也要一枚。
+    """
+    adapter = StubFxAdapter()
+    outcome = run_fx(deps(db, settings, fx=fx_service(db, adapter)), ctx(market=None))
+    assert adapter.calls == []
+    assert outcome.errors == () and outcome.rows_affected == 0
+    assert outcome.note == "0/0 对汇率"
+
+
+def test_one_bad_pair_does_not_drop_the_other(db, settings):
+    FxRepo(db).put(date(2024, 10, 24), "HKD", "CNY", 0.91, source="manual")
+    adapter = StubFxAdapter(fail_on=("USD", "CNY"))
+    outcome = run_fx(
+        deps(db, settings, fx=fx_service(db, adapter)),
+        ctx(market=None, pairs=(("USD", "CNY"), ("HKD", "CNY"))),
     )
-    ctx_december = JobContext(
+    assert [call[:2] for call in adapter.calls] == [("USD", "CNY"), ("HKD", "CNY")]
+    assert len(outcome.errors) == 1 and "USD→CNY" in outcome.errors[0]
+    assert outcome.rows_affected == 1  # 坏那对之外的 HKD 照常被问到并落了库
+    assert FxRepo(db).latest_date("HKD", "CNY") == AS_OF
+    assert outcome.note == "1/2 对汇率，1 对失败"
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_pair(db, settings, monkeypatch):
+    """和五个数据 job 同一条规矩：只接本项目的失败。
+
+    被接住的编程错误出门时说的是「这一对取不到」，而该修的那行代码永远没人去修。
+    汇率这一头是自己的那套循环，所以这条也得在这里单独钉一次：分叉是两次改动的事。
+    """
+
+    def boom(self, base, quote):
+        raise TypeError("latest_date 收到了没有键的一行")
+
+    monkeypatch.setattr(FxRepo, "latest_date", boom)
+    with pytest.raises(TypeError):
+        run_fx(
+            deps(db, settings, fx=fx_service(db, StubFxAdapter())),
+            ctx(market=None, pairs=(("USD", "CNY"), ("HKD", "CNY"))),
+        )
+
+
+# --- 日历：12 月顺手把下一年铺好 -----------------------------------------------------------
+
+
+def calendar_service(db, *, day: datetime) -> CalendarService:
+    return CalendarService(
+        CalendarRepo(db),
+        {"A": WeekdayProvider("A", "Asia/Shanghai")},
+        clock=FrozenClock(day),
+    )
+
+
+def december_ctx(market="A") -> JobContext:
+    return JobContext(
         period_key="2024-12",
         as_of=date(2024, 12, 20),
-        market="A",
-        universe=Universe(by_market={"A": ()}, fx_pairs=()),
+        market=market,
+        universe=Universe(by_market={market: ()}, fx_pairs=()),
     )
-    outcome = run_calendar(deps(db, settings, calendar=calendar), ctx_december)
+
+
+def test_calendar_job_refreshes_december_next_year_too(db, settings):
+    calendar = calendar_service(db, day=datetime(2024, 12, 20, 15, tzinfo=UTC))
+    outcome = run_calendar(deps(db, settings, calendar=calendar), december_ctx())
     assert outcome.errors == ()
     assert CalendarRepo(db).year_covered("A", 2024)
     assert CalendarRepo(db).year_covered("A", 2025)
 
 
+def test_calendar_job_outside_december_leaves_next_year_alone(db, settings):
+    """只有 12 月那一趟才顺手铺下一年：十月铺它，一年十二次里十一次都是白问来源。"""
+    calendar = calendar_service(db, day=datetime(2024, 10, 25, 15, tzinfo=UTC))
+    outcome = run_calendar(deps(db, settings, calendar=calendar), ctx())
+    assert outcome.errors == ()
+    assert CalendarRepo(db).year_covered("A", 2024)
+    assert not CalendarRepo(db).year_covered("A", 2025)
+
+
+class NextYearBlind(WeekdayProvider):
+    """下一年那一问挂掉的日历源：当月这一次刷新不该被它带走。"""
+
+    def days_for_year(self, year: int):
+        if year > 2024:
+            raise CalendarSourceError(f"{self.market} {year} 年没有日历来源")
+        return super().days_for_year(year)
+
+
+def test_calendar_job_next_year_failure_keeps_the_current_year(db, settings):
+    calendar = CalendarService(
+        CalendarRepo(db),
+        {"A": NextYearBlind("A", "Asia/Shanghai")},
+        clock=FrozenClock(datetime(2024, 12, 20, 15, tzinfo=UTC)),
+    )
+    outcome = run_calendar(deps(db, settings, calendar=calendar), december_ctx())
+    assert CalendarRepo(db).year_covered("A", 2024)
+    assert not CalendarRepo(db).year_covered("A", 2025)
+    assert outcome.rows_affected > 0  # 当年那一整年的行还在账上
+    assert len(outcome.errors) == 1 and "2025" in outcome.errors[0]
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_year(db, settings):
+    with pytest.raises(TypeError):
+        run_calendar(deps(db, settings, calendar=SimpleNamespace(refresh=_boom)), ctx())
+
+
+# --- 规则与复检：市场传下去，用户互不牵连 --------------------------------------------------
+
+
 class RecordingRules:
-    def __init__(self) -> None:
+    """`RuleEngine.check` 的替身：记下问出去的 `(user_id, as_of, market)`。
+
+    报告用 `SimpleNamespace` 而不是真 `RunReport`：这一层只读报告里那几摞的长度，
+    真报告的形状由引擎自己的用例钉，装在这里只会让引擎加一摞时两边一起改。
+    """
+
+    def __init__(self, *, fail_for: str | None = None) -> None:
         self.calls: list[tuple[str, date | None, str | None]] = []
+        self.fail_for = fail_for
 
     def check(self, user_id, *, as_of=None, market=None, dry_run=False, rule_id=None):
         self.calls.append((user_id, as_of, market))
-        return SimpleNamespace(raised=(1, 2), suppressed=(3,), skipped=())
+        if user_id == self.fail_for:
+            raise ValidationError(f"{user_id} 这一趟取不到")
+        return SimpleNamespace(raised=(1, 2), suppressed=(3, 4, 5), skipped=(6,), blocked=(7,))
 
 
 class RecordingRecheck:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_for: str | None = None) -> None:
         self.calls: list[tuple[str, date | None, str | None]] = []
+        self.fail_for = fail_for
 
     def run(self, user_id, *, as_of=None, dry_run=False, thesis_id=None, market=None):
         self.calls.append((user_id, as_of, market))
+        if user_id == self.fail_for:
+            raise ValidationError(f"{user_id} 这一趟读不到")
         return SimpleNamespace(rows=(1, 2, 3))
 
 
-def test_rules_job_asks_for_that_market_only(db, settings):
+def one_user(db):
     users = UserRepo(db)
-    users.create("alice", "correct horse battery")
+    return users, users.create("alice", "correct horse battery")
+
+
+def two_users(db):
+    users, alice = one_user(db)
+    return users, alice, users.create("bob", "correct horse battery")
+
+
+def test_rules_job_asks_for_that_market_only(db, settings):
+    users, alice = one_user(db)
     recorder = RecordingRules()
     outcome = run_rules(deps(db, settings, rules=recorder, users=users), ctx())
-    assert recorder.calls == [(users.list_users()[0].id, AS_OF, "A")]
+    assert recorder.calls == [(alice.id, AS_OF, "A")]
     assert outcome.rows_affected == 2
-    assert "触发 2" in outcome.note
+    # 四摞各是一个数：合成一个「异常数」就分不清「压住」「判不了」「展开失败」
+    # （`suppressed` 那一摞是过滤器与冷却合起来的，所以那句不写「冷却」）
+    assert outcome.note == "1/1 个用户：触发 2、压住 3、判不了 1、阻塞 1"
+
+
+def test_one_bad_user_does_not_drop_the_others_in_rules(db, settings):
+    users, alice, bob = two_users(db)
+    recorder = RecordingRules(fail_for=bob.id)
+    outcome = run_rules(deps(db, settings, rules=recorder, users=users), ctx())
+    # 挂掉那一个也真被问过（失败来自这一趟的取数，不是没排上队）
+    assert [call[0] for call in recorder.calls] == [alice.id, bob.id]
+    assert len(outcome.errors) == 1 and "bob" in outcome.errors[0]
+    assert outcome.rows_affected == 2  # alice 那两条触发还在
+    assert outcome.note == "1/2 个用户：触发 2、压住 3、判不了 1、阻塞 1，1 个用户失败"
+
+
+def test_a_disabled_user_is_not_evaluated_or_delivered_to(db, settings):
+    """`sams user disable` 说的是「停止一切动作」，而夜里跑的是这一条链。
+
+    投递那一头（`router.dispatch`）只查「有没有这个用户」，不查状态：不在这里挡，
+    禁用就只挡住了手敲命令的那一路。采集那一头相反（`universe.py` 的文件头），
+    所以这一枚钉的是「按用户做事」的那两头之一，另一头是复检。
+    """
+    users, alice = one_user(db)
+    disabled = users.create("bob", "correct horse battery")
+    users.disable(disabled.id)
+    recorder = RecordingRules()
+    outcome = run_rules(deps(db, settings, rules=recorder, users=users), ctx())
+    assert recorder.calls == [(alice.id, AS_OF, "A")]
+    assert outcome.note == "1/1 个用户：触发 2、压住 3、判不了 1、阻塞 1"
 
 
 def test_recheck_job_asks_for_that_market_only(db, settings):
-    users = UserRepo(db)
-    users.create("alice", "correct horse battery")
+    users, alice = one_user(db)
     recorder = RecordingRecheck()
     outcome = run_recheck(deps(db, settings, recheck=recorder, users=users), ctx())
-    assert recorder.calls == [(users.list_users()[0].id, AS_OF, "A")]
+    assert recorder.calls == [(alice.id, AS_OF, "A")]
     assert outcome.rows_affected == 3
+    assert outcome.note == "1/1 个用户复检 3 条观点"
 
 
-def test_build_jobs_puts_recheck_before_rules_and_fx_after_every_market(db, settings):
-    jobs = build_jobs(
+def test_one_bad_user_does_not_drop_the_others_in_recheck(db, settings):
+    users, alice, bob = two_users(db)
+    recorder = RecordingRecheck(fail_for=bob.id)
+    outcome = run_recheck(deps(db, settings, recheck=recorder, users=users), ctx())
+    assert [call[0] for call in recorder.calls] == [alice.id, bob.id]
+    assert len(outcome.errors) == 1 and "bob" in outcome.errors[0]
+    assert outcome.rows_affected == 3
+    assert outcome.note == "1/2 个用户复检 3 条观点，1 个用户失败"
+
+
+def test_recheck_job_writes_no_baseline_for_a_disabled_user(db, settings):
+    """复检那一头不是投递，是写库：同一条规矩要有第二枚，因为它坏的是另一种东西。"""
+    users, alice = one_user(db)
+    disabled = users.create("bob", "correct horse battery")
+    users.disable(disabled.id)
+    recorder = RecordingRecheck()
+    outcome = run_recheck(deps(db, settings, recheck=recorder, users=users), ctx())
+    assert recorder.calls == [(alice.id, AS_OF, "A")]
+    assert outcome.note == "1/1 个用户复检 3 条观点"
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_user_in_rules(db, settings):
+    users, _ = one_user(db)
+    with pytest.raises(TypeError):
+        run_rules(deps(db, settings, rules=SimpleNamespace(check=_boom), users=users), ctx())
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_user_in_recheck(db, settings):
+    users, _ = one_user(db)
+    with pytest.raises(TypeError):
+        run_recheck(deps(db, settings, recheck=SimpleNamespace(run=_boom), users=users), ctx())
+
+
+# --- 注册表：顺序就是执行顺序 --------------------------------------------------------------
+
+
+def built(db, settings):
+    return build_jobs(
         deps(
             db,
             settings,
@@ -2468,31 +2697,73 @@ def test_build_jobs_puts_recheck_before_rules_and_fx_after_every_market(db, sett
             recheck=SimpleNamespace(),
         )
     )
-    titles = [job.title for job in jobs]
+
+
+def test_build_jobs_puts_recheck_before_rules_and_fx_after_every_market(db, settings):
+    titles = [job.title for job in built(db, settings)]
     assert titles.index("recheck@A") < titles.index("rules@A")
     assert titles.index("rules@US") < titles.index("fx@全局")
     assert titles.index("fx@全局") < titles.index("calendar@A")
+
+
+def test_build_jobs_registers_the_ops_jobs_on_every_market_with_their_period(db, settings):
+    """四个运维 job 每一个都要有人登记，而且按各自的周期：少一行、或周期写错一格，这一枚就该红。
+
+    写错一格不是笔误那么轻：`fx` 挂到 DAILY 上，`due_for` 对「全局 job（market=None）」直接答
+    None，于是它一个晚上都不会跑——而注册表看起来是完整的。
+    """
+    by_title = {job.title: job for job in built(db, settings)}
+    for market in sorted(settings.markets):
+        assert by_title[f"recheck@{market}"].period == WEEKLY
+        assert by_title[f"recheck@{market}"].market == market
+        assert by_title[f"rules@{market}"].period == DAILY
+        assert by_title[f"calendar@{market}"].period == MONTHLY
+    assert by_title["fx@全局"].period == FX
+    assert by_title["fx@全局"].market is None
 ```
 
 `tests/services/test_rules_engine.py` 追加：
 
 ```python
 def test_market_filter_leaves_other_markets_alone(h) -> None:
+    """调度器每个市场单独跑一趟：不是这个市场的对象一个都不许判。
+
+    两头都钉：`market="HK"` 时那条 A 股规则既不响也不投递，`market="A"` 时照旧响。
+    没有这层过滤的代价是每一趟都把全部对象重读一遍，而第二趟响不响只剩冷却一道闸——
+    冷却的键是 `(rule, market, code)`，那个 `market` 是**对象自己的**市场，同一只票
+    在哪一趟都是同一个键：挡不挡得住取决于窗口（`cooldown_min=0` 就是重复投递），
+    不取决于这一趟跑的是哪个市场。
+    `rules` 仍是 1——那个数问的是「这一趟看了几条规则」，不是「看了几个对象」，
+    跟着对象数缩会让屏幕读不出「规则被过滤了」还是「压根没规则」。
+    """
     h.add()
     report = h.engine().check(USER, market="HK")
     assert report.rules == 1
     assert report.raised == () and h.sender.sent == []
+    # 五摞出口全空，而且「一个都没读」是断得出来的：判定要问日历，连一次都没问就是真没读
+    assert (report.suppressed, report.skipped, report.blocked, report.quiet) == ((), (), (), 0)
+    assert report.judged == 0 and h.calendar.day_calls == []
     assert h.engine().check(USER, market="A").raised
+    # 大小写在这里不是排版：配置里那个市场键原样留着，而库里存的是大写。
+    # 不归一的话 `"a"` 那一趟会挑出零个对象，出门说的还是「触发 0」
+    assert h.engine().check(USER, market="a").raised
 ```
 
 `tests/services/test_rules_recheck.py` 追加：
 
 ```python
 def test_market_filter_skips_theses_from_other_markets(container) -> None:
+    """调度器每个市场单独跑一趟复检：不属于这个市场的论一条都不许读。
+
+    点名一条 A 股的论又限定 HK，两句拼不成一句——这里必须出声（静默返回零行会被读成
+    「HK 那一趟复检过了」），而 `market=None` 那一头其余用例照旧全比，CLI 不必改。
+    """
     thesis = open_thesis(container)
     rec = build(container)
     assert rec.run(USER, as_of=AS_OF, market="HK").rows == ()
     assert len(rec.run(USER, as_of=AS_OF, market="A").rows) == 1
+    # 与引擎同一件事：库里存大写，配置里的键原样留着，`"a"` 不归一就是「0 条观点」
+    assert len(rec.run(USER, as_of=AS_OF, market="a").rows) == 1
     with pytest.raises(ValidationError, match="不是 HK"):
         rec.run(USER, as_of=AS_OF, thesis_id=thesis.id, market="HK")
 ```
@@ -2500,11 +2771,17 @@ def test_market_filter_skips_theses_from_other_markets(container) -> None:
 `tests/storage/test_fx_repo.py` 追加：
 
 ```python
-def test_latest_date_ignores_staleness(db):
-    repo = FxRepo(db)
-    assert repo.latest_date("USD", "CNY") is None
-    repo.put(date(2024, 1, 2), "USD", "CNY", 7.1, source="manual")
-    assert repo.latest_date("USD", "CNY") == date(2024, 1, 2)
+def test_latest_date_answers_even_when_that_rate_is_stale(fx: FxRepo) -> None:
+    """增量窗口问的是「这一对还缺哪段」，不是「那个数还能不能用」——后者是 `latest` 的问题。
+
+    拿 `latest` 的定窗口，一行三周没动的汇率会被答成「库里什么都没有」，于是每一趟都
+    从回补起点把那段重拉一遍；窗口那条线存在的理由正是别再重拉，所以这里不看陈旧度。
+    """
+    old = DAY - timedelta(days=30)
+    assert fx.latest_date("USD", "CNY") is None
+    fx.put(old, "USD", "CNY", 7.1, source="manual")
+    assert fx.latest_date("USD", "CNY") == old
+    assert fx.latest(DAY, "USD", "CNY") is None  # 同一个数在 `latest` 那一头是不可用
 ```
 
 - [ ] **Step 2: 跑红**
@@ -2513,7 +2790,7 @@ def test_latest_date_ignores_staleness(db):
 uv run pytest tests/services/test_scheduler_jobs_ops.py tests/services/test_rules_engine.py tests/services/test_rules_recheck.py tests/storage/test_fx_repo.py -q
 ```
 
-Expected: FAIL（四个 job 不存在；`market=` 不被接受）。
+Expected: FAIL（四个 job 不存在；`market=` 不被接受；`FxRepo.latest_date` 不存在）。
 
 - [ ] **Step 3: 实现 `FxRepo.latest_date`**
 
@@ -2522,7 +2799,9 @@ Expected: FAIL（四个 job 不存在；`market=` 不被接受）。
 ```python
     def latest_date(self, base: str, quote: str) -> date | None:
         """这一对已经存到哪一天，**不看陈旧度**：job 的增量窗口问的是「还缺哪段」，
-        不是「这个数还能不能用」——后者是 `latest(..., max_age_days=)` 的问题。"""
+        不是「这个数还能不能用」——后者是 `latest(..., max_age_days=)` 的问题。
+        拿 `latest` 定窗口，一行三周没动的汇率会被当成「库里什么都没有」。
+        """
         value = self.db.scalar(
             "SELECT max(date) FROM fx_rates WHERE base_ccy = ? AND quote_ccy = ?",
             [base, quote],
@@ -2534,11 +2813,33 @@ Expected: FAIL（四个 job 不存在；`market=` 不被接受）。
 
 - [ ] **Step 4: 实现四个运维 job 与最终注册表**
 
+`src/sams/services/actors.py` 加这一头（按名单跑的循环只认启用的账号；`sams user disable`
+挡住的是手敲命令那一路，夜里跑的是这一条链）：
+
+```python
+def active_users(users: UserRepo) -> list[User]:
+    """替一批用户做事的那一趟，只认启用的账号。
+
+    `resolve_actor` 挡的是屏幕上传进来的那一个名字，而常驻的盘后链按名单跑，
+    那一条路上没有任何入口经过 `resolve_actor`：不在这里挡，`sams user disable`
+    就只挡住了手敲命令的那一头。
+    采集那一头相反（见 `services/scheduler/universe.py` 的文件头）：停用的用户照拉对象，
+    数据是公共资源，明天启用时库里该已经有数。
+    """
+    return [user for user in users.list_users() if user.status == ACTIVE]
+```
+
 `src/sams/services/scheduler/jobs.py` 在 `run_flow` 之后追加：
 
 ```python
 def run_fx(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    """汇率没有市场维度：对象来自账户的币种对，窗口按每对各自的库内最新日。"""
+    """汇率没有市场维度：对象来自账户的币种对，窗口按每对各自的库内最新日。
+
+    不并进 `_collect` 是因为那一头的单位是 `(market, code)` 那一只票：量词「只」和失败
+    那句的前缀都是按它写的，而这里的单位是「一对」。接住的仍然只有 `SamsError`——
+    按对隔离与按只隔离是同一条规矩，但那份规矩是两处各写一遍的，所以四个运维 job
+    每一个都在自己那一头单独钉一枚：放宽一处不该让其余三处跟着红。
+    """
     pairs = ctx.universe.fx_pairs
     rows = 0
     done = 0
@@ -2559,24 +2860,43 @@ def run_fx(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
 
 def run_calendar(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    """当月刷新一次；12 月顺手把下一年铺好（D109）。"""
-    assert ctx.market is not None
+    """每月一次，每次把 `as_of` 那一年整年重铺；12 月顺手把下一年也铺上
+    （D109：跨年那天之前要有一整年的日历）。
+
+    按年隔离：下一年那条链挂了不该把当年已经刷到的行一起报没了——行数照收，
+    坏的那一年单独进 `errors`。
+    """
+    assert ctx.market is not None  # 日历 job 只在市场 job 上登记
     years = [ctx.as_of.year]
     if ctx.as_of.month == 12:
         years.append(ctx.as_of.year + 1)
     rows = 0
-    try:
-        for year in years:
+    errors: list[str] = []
+    for year in years:
+        try:
             rows += deps.calendar.refresh(ctx.market, year)
-    except SamsError as exc:
-        return JobOutcome(rows, f"刷新 {'/'.join(map(str, years))} 年失败", (str(exc),))
-    return JobOutcome(rows, f"刷新 {'/'.join(map(str, years))} 年日历")
+        except SamsError as exc:
+            errors.append(f"{ctx.market} {year} 年日历: {exc}")
+    note = f"刷新 {'/'.join(map(str, years))} 年日历"
+    if errors:
+        note += f"，{len(errors)} 年失败"
+    return JobOutcome(rows, note, tuple(errors))
 
 
 def run_rules(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    """只评估这个市场的对象；每用户一趟，每用户失败互不影响。"""
-    users = deps.users.list_users()
-    raised = suppressed = skipped = 0
+    """只评估这个市场的对象；每用户一趟，一个用户失败不带走其余（`errors` 与行数并存）。
+
+    这一趟的出口是投递（`engine._dispatch` → 通知通道），所以只跑启用的账号：
+    `router.dispatch` 只查「有没有这个用户」，不查状态。采集那一头不过滤，理由在
+    `universe.py` 的文件头。
+
+    `suppressed`（过滤器与冷却合起来拦下的，不是一个「冷却」数）、`skipped`（判不了）、
+    `blocked`（展开失败）各留一个数：合成一个「异常数」就分不清那三件事，处置的话也不同。
+    判过了没到的 `quiet` 不进 note：那一摞说的是「没到」，而这一屏问的是
+    「到了什么、有什么拦着」。
+    """
+    users = active_users(deps.users)
+    raised = suppressed = skipped = blocked = done = 0
     errors: list[str] = []
     for user in users:
         try:
@@ -2587,15 +2907,25 @@ def run_rules(deps: JobDeps, ctx: JobContext) -> JobOutcome:
         raised += len(report.raised)
         suppressed += len(report.suppressed)
         skipped += len(report.skipped)
-    note = f"{len(users)} 个用户：触发 {raised}、冷却 {suppressed}、跳过 {skipped}"
+        blocked += len(report.blocked)
+        done += 1
+    note = (
+        f"{done}/{len(users)} 个用户：触发 {raised}、压住 {suppressed}、"
+        f"判不了 {skipped}、阻塞 {blocked}"
+    )
     if errors:
         note += f"，{len(errors)} 个用户失败"
     return JobOutcome(raised, note, tuple(errors))
 
 
 def run_recheck(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    users = deps.users.list_users()
-    rows = 0
+    """周复检按用户隔离，与 `run_rules` 同一条规矩，也只跑启用的账号——它会写基线。
+
+    行数就是这一趟挑出来的论数，里头含「刚建立基线」与「读不到分」那两类：
+    它们没有可比的东西，所以这一句不说「比过」。
+    """
+    users = active_users(deps.users)
+    rows = done = 0
     errors: list[str] = []
     for user in users:
         try:
@@ -2604,26 +2934,27 @@ def run_recheck(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             errors.append(f"{user.username}: {exc}")
             continue
         rows += len(report.rows)
-    note = f"{len(users)} 个用户复检 {rows} 条观点"
+        done += 1
+    note = f"{done}/{len(users)} 个用户复检 {rows} 条观点"
     if errors:
         note += f"，{len(errors)} 个用户失败"
     return JobOutcome(rows, note, tuple(errors))
-```
 
-`build_jobs` 整体替换为：
 
-```python
 def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
-    """注册顺序就是 tick 的执行顺序：
+    """注册顺序就是同一个 tick 里的执行顺序：
     每个市场：数据链 → 周复检 → 规则；然后汇率；最后日历。
 
-    周复检排在规则之前：同一晚观点漂移了，当晚的规则评估就该读到新的基线；
-    反过来则要等到下一周，而「周复检之后价格又跌破止损」这一晚没有任何人被告知。
+    周复检排在规则之前说的是**同一晚之内**：`thesis.drift` 读的是复检写下的
+    `baseline_items`，没有它就只拿到「这条论还没有分项基线」那一句。先复检，那条论当晚
+    就有基线可读——但当晚比不出掉档：那份基线正是同一趟同一次读取写下的，
+    自己和自己不会掉一档。要真比出漂移，得等下一晚的快照与这一晚的基线对上。
+    已经有基线的论不受这个顺序影响。
     """
     jobs: list[JobSpec] = []
     for market in sorted(deps.settings.markets):
         for method, name, run in _DATA_JOBS:
-            if deps.registry.chain_for(market, method):
+            if _has(deps, market, method):
                 jobs.append(JobSpec(name, DAILY, market, partial(run, deps)))
         jobs.append(JobSpec("recheck", WEEKLY, market, partial(run_recheck, deps)))
         jobs.append(JobSpec("rules", DAILY, market, partial(run_rules, deps)))
@@ -2633,32 +2964,86 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
     return tuple(jobs)
 ```
 
-`types.py` 的 import 行相应改为：
-
-```python
-from sams.services.scheduler.due import DAILY, FX, MONTHLY, WEEKLY
-```
+（上面这段以 `def run_fx` 起、到文件末尾为止，含 `build_jobs` 的整份替换。）
 
 - [ ] **Step 5: 市场过滤（引擎与复检）**
 
-`src/sams/services/rules/engine.py` 的 `check` 签名加 `market: str | None = None`，docstring 补一句
-「按市场过滤的对象级子集：调度器每个市场单独跑一趟，过滤在展开之后做」；
-在 `targets = self.data.expand(rule)` 的 `except` 块之后插：
+`src/sams/services/rules/engine.py` 的 `check` 签名加 `market: str | None = None`。
+`rules=len(selected)` 保持不变：这个数回答的是「这一趟看了几条规则」，不是「看了几个对象」。
+下面这段截到过滤那块为止，`_one` 那一半没动。
 
 ```python
+    def check(
+        self,
+        user_id: str,
+        *,
+        as_of: date | None = None,
+        market: str | None = None,
+        dry_run: bool = False,
+        rule_id: str | None = None,
+    ) -> RunReport:
+        """一趟同步求值。调度器的 `rules` job 按市场跑（传 `market`），CLI 那一趟不传，
+        而本函数不知道自己被调了几次——一次还是三个市场，是调用方的事。
+
+        `market` 是对象级子集：过滤在展开之后做——规则的目标可以是 `*` 那种
+        「我的全部持仓」，展开之前问不出「这里面哪些属于 HK」。大小写先归一（D46）：
+        配置里那个键是原样留下的，`"hk"` 不归一就会让每一张规则都「对象全在别的市场」，
+        而那一趟出门说的是「触发 0」，与一晚平安长得一模一样。
+        """
+        now = self.clock.now_utc()
+        day = as_of if as_of is not None else self.clock.today()
+        if market is not None:
+            market = canonical_market(market)
+        raised: list[Raised] = []
+        suppressed: list[Suppressed] = []
+        skipped: list[Skipped] = []
+        blocked: list[Blocked] = []
+        quiet = 0
+        cache = _Cache()
+        selected = self._select(user_id, rule_id)
+        for rule in selected:
+            try:
+                targets = self.data.expand(rule)
+            except ValidationError as exc:
+                blocked.append(Blocked(rule_id=rule.id, rule_name=rule.name, reason=str(exc)))
+                continue
             if market is not None:
                 targets = [target for target in targets if target.market == market]
                 if not targets:
+                    # 这条规则的对象全在别的市场：这一趟一个都没读，所以五摞出口
+                    # （触发/压制/跳过/阻塞/没到）都不因此动一行——只有 `rules` 那个数
+                    # 照旧算它一眼，它问的是「这一趟看了几条规则」而不是「看了几个对象」
                     continue
 ```
-
-`rules=len(selected)` 保持不变：这个数回答的是「这一趟看了几条规则」，不是「看了几个对象」。
 
 `src/sams/services/rules/recheck.py` 的 `run` 签名加 `market: str | None = None`，
 `_select(user_id, thesis_id, market)`：
 
 ```python
-    def _select(self, user_id: str, thesis_id: str | None, market: str | None) -> list[Thesis]:
+    def run(
+        self,
+        user_id: str,
+        *,
+        as_of: date | None = None,
+        dry_run: bool = False,
+        thesis_id: str | None = None,
+        market: str | None = None,
+    ) -> RecheckReport:
+        """一趟复检。`market` 是调度器那一头给的：每个市场各跑一趟，别市场的论不进 `_one`
+        ——那里头既读行情也可能写基线，一趟 HK 的复检不该碰 A 股的论。
+        给定的一头先归一大小写（D46）：`"hk"` 与库里大写的 `HK` 比不出相等，
+        那个市场的论就会一条都进不了 `_one`，而屏幕上说的是「复检 0 条观点」。
+        """
+        day = as_of if as_of is not None else self.clock.today()
+        if market is not None:
+            market = canonical_market(market)
+        targets = self._select(user_id, thesis_id, market)
+        rows = tuple(self._one(thesis, day, dry_run) for thesis in targets)
+        return RecheckReport(user_id=user_id, as_of=day, dry_run=dry_run, rows=rows)
+
+    def _select(
+        self, user_id: str, thesis_id: str | None, market: str | None
+    ) -> list[Thesis]:
         if thesis_id is not None:
             thesis = self.theses.require(user_id, thesis_id)
             if market is not None and thesis.market != market:
@@ -2691,9 +3076,60 @@ Expected: PASS。
 - [ ] **Step 7: 提交**
 
 ```bash
-git add src/sams/services/scheduler/jobs.py src/sams/services/rules/engine.py src/sams/services/rules/recheck.py src/sams/storage/repos/fx.py tests/services/test_scheduler_jobs_ops.py tests/services/test_rules_engine.py tests/services/test_rules_recheck.py tests/storage/test_fx_repo.py
+git add src/sams/services/scheduler/jobs.py src/sams/services/actors.py src/sams/services/rules/engine.py src/sams/services/rules/recheck.py src/sams/storage/repos/fx.py tests/services/test_scheduler_jobs_ops.py tests/services/test_rules_engine.py tests/services/test_rules_recheck.py tests/storage/test_fx_repo.py
 git commit -m "feat(scheduler): 汇率/日历/规则/复检四个 job 与市场过滤"
 ```
+
+**评审收尾（2026-10-22）**：实现落在 `6d342c5`，两路评审之后修在 `20bca30`。评审发现的问题与处理：
+
+- **按计划写完会漏掉「禁用」那一半**（BLOCKING，`20bca30`）。计划的 `run_rules`/`run_recheck`
+  直接吃 `deps.users.list_users()`，而那个仓库不带状态过滤（`storage/repos/users.py:180`）。
+  规则这一头的出口是投递：`engine._dispatch` → `monitor/router.py:118` 只查「有没有这个用户」，
+  不查状态。于是 `sams user disable` 只挡住了手敲命令那一路，而夜里跑的正是这条链——
+  `actors.py` 的文件头把症状写得很直白（「被停用的账号还在往库里写」）。落地的解法是把这条
+  规矩收进 `services/actors.py::active_users`（那里已经有「一个用户」的形状 `resolve_actor`），
+  两个 job 都调它；采集那一头仍然不过滤，理由在 `universe.py` 的文件头。
+  **往后的任务要注意**：Task 9 的系统告警、Task 11/12 里任何「按名单跑」的都欠这一枚，
+  别再去 `list_users()`。
+- **市场键不归一会静默判零个对象**（IMPORTANT，`20bca30`）。`Settings.load` 把 `[markets.*]`
+  的键原样留下（`core/config.py:74-88`，`validate()` 不查大小写），而 `target.market` 与
+  `thesis.market` 是库里的大写键。计划的过滤是 `target.market == market` 直比：`"hk"` 会让
+  每一条规则都走进「对象全在别的市场」那一支，出门说的还是「触发 0」。两头都改成先
+  `canonical_market(market)`（`services/calendar.py:99` 的 `refresh` 早就自己归一，
+  所以日历那一头没这问题）。引擎与复检的用例各加一句 `market="a"`。
+- **`suppressed` 被 note 叫成「冷却」是错的**：那一摞是过滤器与冷却合起来拦下的
+  （`engine.py:333-336` 那两段 `return self._suppressed(...)`），job 自己的 docstring 也写着
+  两件事。按 CLI 那一屏的词改成「压住」，`skipped` 改成「判不了」；分母也统一到 `done/total`
+  ——`run_fx` 一直是，规则与复检原本把失败的那一个也算进「N 个用户」。
+- **D96 五处过头话**（`20bca30`）：① 引擎用例里那句「响了就等于替美股那一趟把 A 股的告警
+  又推一遍，而冷却是按 `(rule, market, code)` 去的，两个市场各推一遍谁也拦不住谁」把因果说反了
+  ——`_cooldown` 取的是 `snapshot.market`（`engine.py:444-446`），那是**对象自己的**市场，
+  同一只票在哪个市场的趟里都是同一个键：窗口内挡得住，`cooldown_min=0` 才挡不住
+  （`core/config.py:109` 只拒负数）。现在改成说真实代价：每一趟都把全部对象重读一遍，
+  响不响只剩冷却一道闸。② `build_jobs` 那句「先复检，当晚就比得出漂移」不成立：
+  `_lay_baseline` 写的 `baseline_items` 正是同一趟同一次读取的快照，而 `thesis_drift` 要的是
+  今天严格低于基线（`templates.py:569`），自己和自己不会掉档。先复检买到的是「那条论当晚
+  有基线可读，规则那一头不再只拿到『还没有分项基线』那句」——计划原本的措辞
+  「就该读到新的基线」是对的。③ `run_recheck` 的「行数就是这一趟比过的论数」：
+  `RecheckReport.rows` 含 `BASELINE`（没比）与 `NO_SCORE`（读不到分）。④ `run_rules` 的
+  「一个正常的夜里 `quiet` 占绝大多数」是一句没有任何东西支撑的频率断言，删了。
+  ⑤ `run_calendar` 的「当月刷新一次」：`refresh(market, year)` 铺的是整年
+  （`services/calendar.py:101-105`），改成「每月一次，每次把那一年整年重铺」。
+- **「只接 `SamsError`」原来只在汇率那一头钉过**：规则、复检、日历那三段各是各写的循环，
+  把任何一处的 `except SamsError` 放宽成 `except Exception` 都能全绿。现在四段各一枚。
+  变异清单（`20bca30`，九次全红）：引擎去归一 / 复检去归一 / `run_rules` 不挡禁用 /
+  `run_recheck` 不挡禁用 / 四处 `except SamsError` 各放宽一次 / `run_fx` 空表那句 note 改掉。
+- **计划与落地的两处形状差**：计划的 `deps(...)` 还带 `universe=None` 与 `clock=FrozenClock(...)`，
+  而 `JobDeps` 那两个字段的槽位在 `817352c` 已经删了；计划的 `build_jobs` 直接写
+  `deps.registry.chain_for(market, method)`，Task 6 修的 `_has()`（整个市场没配源时
+  `DatasourceError` 不许把注册表炸掉）留着，计划片段已按落地形状替换。`_collect` 没并进这四个
+  job：单位不是 `(market, code)`，那份规矩改由四段各自钉。
+- **没采纳的建议与理由**：把 `run_fx` 那段循环塞回 `_collect`——要给 `_collect` 加「量词」与
+  「错误前缀形状」两个旋钮，而第二个调用方仍然只有它自己；`deps.fx.fx.latest_date` 读起来像
+  笔误——那是 `FxSyncService` 本来就公开的属性，与 `deps.sync.bars` 同一个形状，改它属于无关重构。
+- **留下的两处不干净**：`run_fx` 里「已经追平到今天」的那一对算进 `done`（那句 note 说的是
+  「问过了几对」），没单独钉；四个运维 job 的用例仍给 `sync/corp_actions/fundamentals` 传
+  `None` + `# type: ignore[arg-type]`。
 
 ---
 
