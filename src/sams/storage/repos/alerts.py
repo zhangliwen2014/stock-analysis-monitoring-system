@@ -215,6 +215,24 @@ class AlertRepo:
         )
         return self._to_alert(rows.to_dicts()[0]) if rows.height else None
 
+    def since_system(self, user_id: str, component: str, *, since: datetime) -> Alert | None:
+        """这个人名下从 `since` 起有没有过关于这个组件的系统告警（D102 的去重键）。
+
+        问的是**库里有没有那一行**，不是那个人有没有真的收到一条通知：
+        压制与 `no_channel` 照样留下这一行，而这一行正是压住后续告警的那个东西。
+        `code` 与股票代码共用一列，靠 `market = 'SYS'` 与 `rule_id IS NULL` 分开：
+        一条恰好把 `code` 写成组件名的规则告警不能被当成冷却的起点。
+        `triggered_at` 与 `since` 必须在同一条时间轴上：调用方传「现在 - 冷却」，
+        这里不读 `clock`，否则窗口的宽度会变成两个时钟之差。
+        """
+        rows = self.db.query(
+            f"SELECT {_ALERT_COLUMNS} FROM alerts"
+            " WHERE user_id = ? AND market = 'SYS' AND code = ? AND rule_id IS NULL"
+            " AND triggered_at >= ? ORDER BY triggered_at DESC, id DESC LIMIT 1",
+            [user_id, component, _moment(since)],
+        )
+        return self._to_alert(rows.to_dicts()[0]) if rows.height else None
+
     def record(
         self,
         alert_id: str,

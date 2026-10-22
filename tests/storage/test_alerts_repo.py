@@ -405,3 +405,57 @@ def test_get_without_a_user_still_reads_any_row(repo, seeded_user):
     """
     alert = repo.create(seeded_user, **CREATE_KW)
     assert repo.get(alert.id) is not None
+
+
+# ---------- 系统告警的冷却（D102：同组件同人一个窗口）----------
+
+
+def test_since_system_matches_one_admin_one_component(repo, seeded_user, other_user):
+    system = {
+        **CREATE_KW,
+        "rule_id": None,
+        "account_id": None,
+        "market": "SYS",
+        "code": "calendar",
+    }
+    repo.create(seeded_user, **system)
+
+    since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
+    assert repo.since_system(seeded_user, "calendar", since=since) is not None
+    assert repo.since_system(other_user, "calendar", since=since) is None
+    assert repo.since_system(seeded_user, "datasource:akshare", since=since) is None
+    assert (
+        repo.since_system(
+            seeded_user, "calendar", since=datetime(2026, 10, 20, 15, 0, tzinfo=UTC)
+        )
+        is None
+    )
+
+
+def test_since_system_does_not_mistake_a_stock_alert_for_a_component(repo, seeded_user):
+    repo.create(seeded_user, **{**CREATE_KW, "code": "calendar"})
+
+    since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
+    assert repo.since_system(seeded_user, "calendar", since=since) is None
+
+
+def test_since_system_needs_both_halves_of_the_system_shape(repo, seeded_user):
+    """`market = 'SYS'` 与 `rule_id IS NULL` 是两个条件，所以要一行只缺半边的证据。
+
+    只种形状完整的那一行时，删掉任一条件用例都还是绿的；缺一边的那两种行都会被当成
+    冷却的起点，于是本该出声的那一次被按下——而屏幕上留下的是一行看不出来的沉默。
+    """
+    since = datetime(2026, 10, 20, 14, 0, tzinfo=UTC)
+    # SYS 市场、组件名对，但挂着 `rule_id`：那是规则告警，不是系统告警
+    repo.create(seeded_user, **{**CREATE_KW, "market": "SYS", "code": "calendar"})
+    assert repo.since_system(seeded_user, "calendar", since=since) is None
+
+    # 反过来：没有 `rule_id`，但市场是普通的 A（一条恰好把 `code` 写成组件名的规则告警）
+    repo.create(seeded_user, **{**CREATE_KW, "rule_id": None, "code": "calendar"})
+    assert repo.since_system(seeded_user, "calendar", since=since) is None
+
+    # 两半都齐才算：同一句查询的正例
+    system = {"rule_id": None, "account_id": None, "market": "SYS", "code": "calendar"}
+    repo.create(seeded_user, **{**CREATE_KW, **system})
+    assert repo.since_system(seeded_user, "calendar", since=since) is not None
+
