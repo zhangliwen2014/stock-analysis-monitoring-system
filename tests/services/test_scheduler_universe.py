@@ -150,10 +150,17 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
     assert universe.codes("HK") == ("00700",)
     assert universe.codes("US") == ("AAPL",)
     assert universe.fx_pairs == (("HKD", "CNY"), ("USD", "CNY"))
+    # 大小写与空格不算语义：查询侧也归一，否则 "hk" 查出来是空
+    assert universe.codes("hk") == ("00700",)
 
 
 def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, caplog):
-    """规则指向已删除的对象时只跳过这一条，其余对象照常进入采集。"""
+    """展开失败的规则只跳过自己，其余对象照常进入采集。
+
+    替身按 `RuleData.expand` 的失败契约抛 `ValidationError`（真展开器只在规则自身
+    形状不成时抛，见 `snapshot.py` 的展开分支），并不断言这个形状能从 `RuleRepo`
+    建出来——仓库的校验正好把它挡在外面。
+    """
 
     users = UserRepo(db)
     alice = users.create("alice", "correct horse battery")
@@ -161,7 +168,7 @@ def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, capl
     broken = rules.create(
         alice.id,
         kind="stop.fixed",
-        name="指向已删对象",
+        name="形状不成",
         target_type="symbol",
         target_ref="A/600001",
         params={"price": 10.0},
@@ -178,7 +185,7 @@ def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, capl
     class _Expanding:
         def expand(self, rule):
             if rule.id == broken.id:
-                raise ValidationError("rules", f"{rule.target_ref} 已不存在")
+                raise ValidationError("market 不能为空：A / HK / US")
             market, _, code = rule.target_ref.partition("/")
             return [Target(rule.user_id, market, code, rule.account_id, rule.thesis_id)]
 
@@ -197,4 +204,6 @@ def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, capl
 
     assert universe.codes("A") == ()
     assert universe.codes("US") == ("AAPL",)
+    # 这一只票之外，配置里的其余市场一个对象都没有，仍各占一格（空元组而不是缺格）
+    assert set(universe.by_market) == set(settings.markets)
     assert f"规则 {broken.id} 展开失败" in caplog.text

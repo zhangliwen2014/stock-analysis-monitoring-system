@@ -1,9 +1,8 @@
 """一条盘后链该覆盖哪些对象、该换哪些币种对。
 
 并集而不是「按用户分开跑」：采集是公共资源，同一只票被两个人自选，没有理由拉两次。
-对象来源只有四种（spec §10 的输入侧）：自选股、持仓、启用的规则目标、在跟的
-（opened/tracking）观点。停用的规则与观察中的观点不拉数据——它们今晚不会产生任何
-读写，拉回来只会让健康页的「同步了几只」比「规则看了几只」大。
+对象来源有四种：自选股、持仓、启用的规则目标、在跟的（opened/tracking）观点。
+停用的规则与观察中的观点不拉数据：它们不会产生任何读写，拉回来的数没人用。
 
 **用户状态不过滤**：这是数据采集，不是投递。今天停用的用户明天启用，库里该已经有数。
 """
@@ -87,8 +86,9 @@ class UniverseBuilder:
                 try:
                     targets = self.data.expand(rule)
                 except ValidationError as exc:
-                    # 一条引用已删对象的规则不该让整晚的采集停摆：这里只保证其余
-                    # 对象照常同步，坏的是哪条规则靠下面这条 warning 定位
+                    # 跳过这一条，继续收其余对象：`RuleData.expand` 只在规则自身的形状
+                    # 不成时抛 ValidationError（持仓类没绑账户、target_type 不认、
+                    # target_ref 的市场段或代码段为空），坏一条不该让整晚的采集停摆
                     logger.warning("规则 %s 展开失败，跳过：%s", rule.id, exc)
                     continue
                 found.update(_key(target.market, target.code) for target in targets)

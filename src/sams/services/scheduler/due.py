@@ -28,8 +28,8 @@ logger = logging.getLogger("sams.services.scheduler.due")
 DAILY, WEEKLY, MONTHLY, FX = "daily", "weekly", "monthly", "fx"
 PERIODS = (DAILY, WEEKLY, MONTHLY, FX)
 
-#: 最近到期日的回看窗口：停机十天之内重启，仍能找到一个到期日、照常触发；
-#: 再长的停机不自动认领——一个月的链在一个 tick 里跑完会打满所有源，要不要补由人决定
+#: 最近到期日的回看窗口：停机十天之内重启，仍能算出一个到期日；再长的停机，
+#: 这里一律答 None——一个月的链一次性跑完会打满所有源，要不要补由人决定
 CATCHUP_DAYS = 10
 #: 周任务往前找「本周最后一个交易日」的跨度：三个整周足够覆盖长假
 WEEK_SCAN_DAYS = 21
@@ -88,7 +88,7 @@ def weekly_due(
             following = view.next_trading_day(market, day)
         except CalendarSourceError as exc:
             # 找不到下一个交易日就不敢替这一周下「已经结束」的结论：跳过这一天，
-            # 继续往前找；真的一直找不到，这一轮 weekly 就不跑，而不是提前跑
+            # 继续往前找；一直找不到就答不出到期日，而不是替未结束的一周给出结论
             logger.warning("%s %s 的下一交易日不可知：%s", market, day, exc)
             continue
         if following.isocalendar()[:2] == day.isocalendar()[:2]:
@@ -101,7 +101,7 @@ def weekly_due(
 def monthly_due(
     view: CalendarView, settings: Settings, market: str, now: datetime
 ) -> Due | None:
-    """日历按月刷新：第一次有到期日的交易日触发，之后同一个月由周期键去重。"""
+    """日历按月刷新：本月最近一个已过盘后时点的交易日，键收成 `YYYY-MM`。"""
     day = daily_due(view, settings, market, now)
     if day is None:
         return None
@@ -109,7 +109,7 @@ def monthly_due(
 
 
 def fx_due(view: CalendarView, settings: Settings, now: datetime) -> Due | None:
-    """当天开市的市场都已收盘的最近一天；一个市场都不开市时不跑（D108）。"""
+    """当天开市的市场都已收盘的最近一天；还没有任何市场拿到到期日时不跑（D108）。"""
     latest: dict[str, date] = {}
     for market in settings.markets:
         due = daily_due(view, settings, market, now)
