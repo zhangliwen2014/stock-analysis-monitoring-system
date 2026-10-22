@@ -56,7 +56,7 @@
 | D105 | 失败任务按 `RETRY_GAP_MIN = 10` 重试；成功不重跑；`running` 超过 6 小时算崩溃留下的 | 每 tick 重拉全量不是重试，是打源 |
 | D106 | 没有能力的市场不注册该 job（用 `registry.chain_for` 判） | HK/US 没有按报告期的财务源（D65/U24），每天一条失败会把真故障淹掉 |
 | D107 | 不注册「指标重算」「观点估值重算」两个 job | 两者在本系统都没有落库产物；凭空造一个 job 只会造一个假执行记录 |
-| D108 | fx 的到期日 = 「当天开市的市场都已收盘」的最近一天；至少一个市场开市才跑 | 汇率没有市场维度，但它服务于所有市场的收盘后账本 |
+| D108 | fx 的到期日 = 「当天开市的市场都已收盘」的最近一天；还没有任何市场拿到到期日就不跑 | 汇率没有市场维度，但它服务于所有市场的收盘后账本 |
 | D109 | 周复检在该市场 ISO 周的最后一个交易日收盘后跑；日历每月刷新当月，12 月加刷新下一年 | 周五复检、周一前到位；下一年日历在跨年前准备好 |
 | D110 | 全市场扫描与 `QuoteUpdated` 生产者不进本轮 | 前者是 M5，后者依赖 M4 的报价源 |
 
@@ -1278,8 +1278,10 @@ git commit -m "feat(scheduler): 到期计算按市场本地收盘与周期键（
 ```python
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
+from sams.core.errors import ValidationError
 from sams.services.rules.snapshot import Target
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
@@ -1309,13 +1311,19 @@ class StubData:
 def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, settings):
     users = UserRepo(db)
     alice = users.create("alice", "correct horse battery")
+    # bob 只有自选、没有账户/规则/论点：删掉「自选」这一路时只有他会从并集里消失
+    bob = users.create("bob", "correct horse battery")
     watchlists = WatchlistRepo(db)
     watchlists.add(alice.id, "A", "600519")
+    watchlists.add(bob.id, "A", "601318")
 
     accounts = SimAccountRepo(db)
     account = accounts.open(alice.id, "主账户", report_currency="CNY")
     for currency, amount in (("CNY", 100_000.0), ("HKD", 100_000.0), ("USD", 1_000.0)):
         accounts.adjust_cash(account.id, currency, amount, reason="入金", actor_id=alice.id)
+    # 存过又清零的币种不该产生换汇对：`if amount` 判据钉在这里
+    accounts.adjust_cash(account.id, "EUR", 100.0, reason="入金", actor_id=alice.id)
+    accounts.adjust_cash(account.id, "EUR", -100.0, reason="出金", actor_id=alice.id)
     orders = SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db))
     orders.record_fill(
         account_id=account.id,
@@ -1327,13 +1335,44 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
         price=300.0,
         currency="HKD",
     )
+    # 买断再卖光：库里留下 qty=0 的历史行，它不该继续把这只票拉进采集对象
+    orders.record_fill(
+        account_id=account.id,
+        user_id=alice.id,
+        market="HK",
+        code="00998",
+        side="buy",
+        qty=100,
+        price=20.0,
+        currency="HKD",
+    )
+    orders.record_fill(
+        account_id=account.id,
+        user_id=alice.id,
+        market="HK",
+        code="00998",
+        side="sell",
+        qty=100,
+        price=21.0,
+        currency="HKD",
+    )
 
     rules = RuleRepo(db)
     rules.create(
-        alice.id, kind="stop.fixed", name="自选止损", target_type="watchlist", target_ref=""
+        alice.id,
+        kind="stop.fixed",
+        name="自选止损",
+        target_type="watchlist",
+        target_ref="*",
+        params={"price": 10.0},
     )
     rules.create(
-        alice.id, kind="stop.fixed", name="美股", target_type="symbol", target_ref="US/AAPL"
+        alice.id,
+        kind="stop.fixed",
+        name="美股",
+        target_type="symbol",
+        target_ref="US/AAPL",
+        params={"price": 10.0},
     )
     rules.create(
         alice.id,
@@ -1341,6 +1380,7 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
         name="停用的",
         target_type="symbol",
         target_ref="A/600036",
+        params={"price": 10.0},
         enabled=False,
     )
 
@@ -1353,6 +1393,14 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
         actor_id=alice.id,
         now=datetime(2024, 10, 1, tzinfo=UTC),
     )
+    opened = theses.create(
+        user_id=alice.id,
+        market="A",
+        code="000003",
+        style="value",
+        actor_id=alice.id,
+        now=datetime(2024, 10, 1, tzinfo=UTC),
+    )
     theses.create(
         user_id=alice.id,
         market="A",
@@ -1361,7 +1409,9 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
         actor_id=alice.id,
         now=datetime(2024, 10, 1, tzinfo=UTC),
     )
+    # 新建只能从 observing/proposed 开始，在跟的两态靠 UPDATE 直接落库
     db.execute("UPDATE theses SET status = 'tracking' WHERE id = ?", [live.id])
+    db.execute("UPDATE theses SET status = 'opened' WHERE id = ?", [opened.id])
 
     universe = UniverseBuilder(
         users=users,
@@ -1374,11 +1424,67 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
         settings=settings,
     ).build()
 
-    assert universe.codes("A") == ("000001", "600519")
+    assert universe.codes("A") == ("000001", "000003", "600519", "601318")
     assert universe.codes("HK") == ("00700",)
     assert universe.codes("US") == ("AAPL",)
     assert universe.fx_pairs == (("HKD", "CNY"), ("USD", "CNY"))
-    assert not universe.empty
+    # 大小写与空格不算语义：查询侧也归一，否则 "hk" 查出来是空
+    assert universe.codes("hk") == ("00700",)
+
+
+def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, caplog):
+    """展开失败的规则只跳过自己，其余对象照常进入采集。
+
+    替身按 `RuleData.expand` 的失败契约抛 `ValidationError`（真展开器只在规则自身
+    形状不成时抛，见 `snapshot.py` 的展开分支），并不断言这个形状能从 `RuleRepo`
+    建出来——仓库的校验正好把它挡在外面。
+    """
+
+    users = UserRepo(db)
+    alice = users.create("alice", "correct horse battery")
+    rules = RuleRepo(db)
+    broken = rules.create(
+        alice.id,
+        kind="stop.fixed",
+        name="形状不成",
+        target_type="symbol",
+        target_ref="A/600001",
+        params={"price": 10.0},
+    )
+    rules.create(
+        alice.id,
+        kind="stop.fixed",
+        name="美股",
+        target_type="symbol",
+        target_ref="US/AAPL",
+        params={"price": 10.0},
+    )
+
+    class _Expanding:
+        def expand(self, rule):
+            if rule.id == broken.id:
+                raise ValidationError("market 不能为空：A / HK / US")
+            market, _, code = rule.target_ref.partition("/")
+            return [Target(rule.user_id, market, code, rule.account_id, rule.thesis_id)]
+
+    accounts = SimAccountRepo(db)
+    with caplog.at_level(logging.WARNING, logger="sams.services.scheduler.universe"):
+        universe = UniverseBuilder(
+            users=users,
+            watchlists=WatchlistRepo(db),
+            accounts=accounts,
+            orders=SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db)),
+            rules=rules,
+            theses=ThesisRepo(db),
+            data=_Expanding(),
+            settings=settings,
+        ).build()
+
+    assert universe.codes("A") == ()
+    assert universe.codes("US") == ("AAPL",)
+    # 这一只票之外，配置里的其余市场一个对象都没有，仍各占一格（空元组而不是缺格）
+    assert set(universe.by_market) == set(settings.markets)
+    assert f"规则 {broken.id} 展开失败" in caplog.text
 ```
 
 - [ ] **Step 2: 跑红**
@@ -1397,9 +1503,8 @@ Expected: FAIL（`sams.services.scheduler.universe` 不存在）。
 """一条盘后链该覆盖哪些对象、该换哪些币种对。
 
 并集而不是「按用户分开跑」：采集是公共资源，同一只票被两个人自选，没有理由拉两次。
-对象来源只有四种（spec §10 的输入侧）：自选股、持仓、启用的规则目标、在跟的
-（opened/tracking）观点。停用的规则与观察中的观点不拉数据——它们今晚不会产生任何
-读写，拉回来只会让健康页的「同步了几只」比「规则看了几只」大。
+对象来源有四种：自选股、持仓、启用的规则目标、在跟的（opened/tracking）观点。
+停用的规则与观察中的观点不拉数据：它们不会产生任何读写，拉回来的数没人用。
 
 **用户状态不过滤**：这是数据采集，不是投递。今天停用的用户明天启用，库里该已经有数。
 """
@@ -1435,14 +1540,6 @@ class Universe:
 
     def codes(self, market: str) -> tuple[str, ...]:
         return self.by_market.get(canonical_market(market), ())
-
-    @property
-    def size(self) -> int:
-        return sum(len(codes) for codes in self.by_market.values())
-
-    @property
-    def empty(self) -> bool:
-        return self.size == 0
 
 
 class UniverseBuilder:
@@ -1491,8 +1588,9 @@ class UniverseBuilder:
                 try:
                     targets = self.data.expand(rule)
                 except ValidationError as exc:
-                    # 一条引用已删对象的规则不该让整晚的采集停摆；它自己会在
-                    # `rules` job 的 `blocked` 里出声，这里只保证其余对象照常同步
+                    # 跳过这一条，继续收其余对象：`RuleData.expand` 只在规则自身的形状
+                    # 不成时抛 ValidationError（持仓类没绑账户、target_type 不认、
+                    # target_ref 的市场段或代码段为空），坏一条不该让整晚的采集停摆
                     logger.warning("规则 %s 展开失败，跳过：%s", rule.id, exc)
                     continue
                 found.update(_key(target.market, target.code) for target in targets)
@@ -1528,6 +1626,43 @@ Expected: PASS。
 git add src/sams/services/scheduler/universe.py tests/services/test_scheduler_universe.py
 git commit -m "feat(scheduler): 盘后链的对象并集与币种对（四种来源）"
 ```
+
+**评审收尾（2026-10-22）**：实现落在 `5d6b2f4`，两路评审之后修在 `e124ba9`（可证性）
+与 `6ce4b97`（D96 措辞）。评审发现的问题与处理：
+
+- **四条来源逐个可证**（`e124ba9`）。原来只有一条并集断言，删掉任何一路都不会红：
+  现在 bob 只有自选（钉住「自选」这一路）、`000003` 是 opened 态论点（钉住 `OPENED`
+  与 `TRACKING` 是两个状态而不是一个）、`00998` 买断再卖光留下 `qty=0` 的历史行
+  （钉住 `qty > 0`）、EUR 入金 100 又出金 100 留下零余额行（钉住 `if amount`）。
+  变异清单：删自选循环 / 只认 TRACKING / 去掉 `qty > 0` / 去掉 `if amount` /
+  `enabled_only=True` 改成 False / 去掉 try-except / 把 warning 降成 debug——七次全红。
+- **展开失败那一支补用例**。它原来只有注释，没有任何东西能证伪；现在断言「坏规则
+  只跳过自己、其余对象照常进入」与那条 warning 的文本。删掉 try-except 或把 warning
+  改掉都会红。
+- **`size` / `empty` 删掉**（同 commit）：全仓没有读者，`Universe` 现在只有 `codes()`
+  与 `fx_pairs` 两个出口。
+- **D96 四处过头话**（本轮）：
+  1. 模块 docstring 原来写「对象来源只有四种（spec §10 的输入侧）」——spec §10 是
+     规则结构/节流/模板，没有列过对象来源；唯一的并集表述在 §7.3，而它说的是盘中
+     快照的三种来源（自选 ∪ 启用规则标的 ∪ 被引用的指数），和这里的四种不是一回事。
+     引用删掉，「只有」也删掉：四种是本文件可数的，不需要外部背书。
+  2. 「停用的规则与观察中的观点不拉数据」原来接了一句「拉回来只会让健康页的
+     「同步了几只」比「规则看了几只」大」——那两个标签此刻还不存在（健康页是 Task 11），
+     改成直接陈述后果。
+  3. try-except 的注释原来写「一条引用**已删对象**的规则不该让整晚的采集停摆」，
+     而 `RuleData.expand`（`snapshot.py:156-195`）根本不查对象是否存在：thesis 读不到
+     返回 `[]`，symbol 只是把 `target_ref` 切开。它真正抛 `ValidationError` 的三处是
+     持仓类没绑账户、`target_type` 不认、市场段或代码段为空。注释与用例的 docstring
+     都按这三处重写，用例里明说「不声称这个形状能从 `RuleRepo` 建出来」。
+  4. `due.py` 里三处描述派发而非计算的措辞：`fx_due` 的「一个市场都不开市时不跑」
+     （`if not latest` 的实际含义是「还没有任何市场拿到到期日」，周末两者并不等价）、
+     `monthly_due` 的「第一次有到期日的交易日触发…去重」、`CATCHUP_DAYS` 与
+     `weekly_due` 里的「照常触发」「这一轮 weekly 就不跑」。本包里还没有派发路径，
+     一律改成「答不答得出到期日」。决策表 D108 行同步（「至少一个市场开市才跑」→
+     「还没有任何市场拿到到期日就不跑」）。
+- **补两个能红的断言**：`codes("hk")` 走归一（把 `codes()` 里的 `canonical_market` 删掉
+  会红）、`set(by_market) == set(settings.markets)`（把配置市场并入 `markets` 的那半行
+  删掉会红——只有第二条用例里存在「一个对象都没有的市场」，所以放在它那里）。
 
 ### Task 6: job 的形状与五个数据 job（`types.py` + `jobs.py`）
 
