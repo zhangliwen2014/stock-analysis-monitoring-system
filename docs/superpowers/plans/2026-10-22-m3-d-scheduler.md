@@ -4578,17 +4578,31 @@ git commit -m "feat(scheduler): 系统告警投递给在线管理员（冷却跨
 ### Task 10: `Scheduler`——tick 的顺序、心跳与常驻循环
 
 **Files:**
+- Create: `src/sams/services/scheduler/heartbeat.py`
 - Create: `src/sams/services/scheduler/report.py`
 - Create: `src/sams/services/scheduler/service.py`
+- Modify: `src/sams/services/actors.py`（补 `admin_users`）
+- Modify: `src/sams/services/scheduler/alarms.py`（收件人改读 `admin_users`）
+- Modify: `src/sams/core/errors.py`（`SchedulerBusy` 的文档头改口径）
 - Test: `tests/services/test_scheduler_service.py`
 
-一轮 tick 做四件事，顺序就是失败时的止损顺序：构建对象全集（一次）→ 给心跳打一拍
-（只有 `run_forever` 认领过才打）→ 按注册顺序判断到期并交给 runner → 把结果原样交回。
-单个 job 的异常在 runner 里已经落账；这里只隔离**到期计算**的异常——日历源坏了不能让
-排在后面的市场也不跑。
+一轮 tick 做四件事，顺序就是代码里的顺序：打过心跳就再拍一下（手工 `tick` 没认领过
+就什么也不留）→ 按 `only_job`/`only_market` 选出这一轮的 job（一个都不匹配就拒绝）→
+构建这一轮的对象全集（一次 tick 只构建一份）→ 按注册顺序逐个判断到期并交给
+`JobRunner`。单个 job 的异常在 runner 里已经落账；这里只隔离**到期计算**的
+`SamsError`：日历源坏了不能让排在后面的市场也不跑，而日历实现里的编程错误不能被
+收成一句「这一轮算不出」——那会被读成一种等。
 
-心跳只由常驻循环认领（D100）：`sams run once` 是一次手工执行，不该留下一个让下一个
-常驻进程白等五分钟的行。认领读的是心跳表，所以第二个常驻进程会在这里被拒。
+拍放在做活之前：那一拍证明的是「循环还在转」，不是「这一轮做完了事」。两种放法的
+最坏年龄都是「一轮做活的时长 + 等待间隔」，挪到收尾换不来更准的读数；换来的只是
+一轮在打拍之前就失败时一拍都不留，于是「这一轮做不成」被读成「循环停了」。
+
+心跳只由常驻循环认领（D100）：`sams run once` 是一次手工执行，不该留下一行让下一个
+循环白等一个阈值。守卫读的是心跳表而不是进程内的标记，所以它挡得住「同一个进程里
+再造一个 `Scheduler` 去跑常驻循环」；它挡不住另一个操作系统进程——库文件上的锁先就
+让第二个进程连不上（`storage/db.py` 的 `Database.open` 把那个 `IO Error` 包成
+`StorageError`），那一类重复启动在走到这句守卫之前就炸在连接上了。这条事实同时决定
+Task 11/12 的形状，见下面的「往后的任务要注意」。
 
 - [ ] **Step 1: 写失败用例**
 
@@ -4599,24 +4613,29 @@ git commit -m "feat(scheduler): 系统告警投递给在线管理员（冷却跨
 
 runner 用记录型替身：这一层要钉的是「谁在什么时候被交给 runner」，
 执行本身的三条时间规则已经在 `test_scheduler_runner.py` 钉过。
+心跳那一半也两头钉：手工 `tick` 一行都不留、常驻循环每一拍打一拍，
+而过期那条判据只写在一处（`heartbeat.stale_at`），读数与单实例守卫必须同时翻。
 """
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from support import FrozenClock
+from support_scheduler import FakeCalendar
 
 from sams.core.errors import CalendarSourceError, SchedulerBusy, StorageError, ValidationError
-from sams.services.scheduler.report import HEARTBEAT_STALE_S, collect
+from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
+from sams.services.scheduler.report import STREAK_DISPLAY_PERIODS, collect
 from sams.services.scheduler.runner import RunResult
 from sams.services.scheduler.service import Scheduler
 from sams.services.scheduler.types import JobOutcome, JobSpec
 from sams.services.scheduler.universe import Universe
 from sams.storage.repos.task_runs import FAILED, OK, HeartbeatRepo, TaskRunRepo
 from sams.storage.repos.users import UserRepo
-from support import FrozenClock
-from support_scheduler import FakeCalendar
 
 MOMENT = datetime(2024, 10, 25, 8, 30, tzinfo=UTC)
 FRIDAY = date(2024, 10, 25)
@@ -4625,11 +4644,20 @@ PASSWORD = "correct-horse-battery"
 
 
 class RecordingRunner:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_for=()) -> None:
         self.calls: list[tuple[str, str | None, str, date]] = []
+        self.fail_for = set(fail_for)
 
     def execute(self, spec, due, universe):
         self.calls.append((spec.name, spec.market, due.period_key, due.as_of))
+        if spec.name in self.fail_for:
+            return RunResult(
+                job=spec.name,
+                market=spec.market,
+                period_key=due.period_key,
+                status=FAILED,
+                error="boom",
+            )
         return RunResult(
             job=spec.name,
             market=spec.market,
@@ -4648,8 +4676,17 @@ class StubUniverse:
 
 
 class BrokenUniverse:
+    """账本读不到：那是 `SamsError`，一轮 tick 的失败不该带走常驻循环。"""
+
     def build(self) -> Universe:
         raise StorageError("db 挂了")
+
+
+class ExplodingUniverse:
+    """不是 `SamsError`：这一层没有可信的下一步，只能让它炸出去。"""
+
+    def build(self) -> Universe:
+        raise RuntimeError("编程错误")
 
 
 def _noop(ctx):
@@ -4677,16 +4714,33 @@ def make(
     scheduler = Scheduler(
         settings,
         specs,
-        runner,
-        runs,
-        heartbeats,
-        universe or StubUniverse(),
-        UserRepo(db),
-        calendar or FakeCalendar(settings),
+        runner=runner,
+        runs=runs,
+        heartbeats=heartbeats,
+        universe=universe or StubUniverse(),
+        users=UserRepo(db),
+        calendar=calendar or FakeCalendar(settings),
         clock=clock,
         sleep=sleep or (lambda seconds: None),
     )
     return scheduler, heartbeats, runs
+
+
+def reading(db, specs=(), *, age_seconds=None, clock=None):
+    """一份只带心跳读数的 `ScheduleData`：`age_seconds` 是那一拍距今多久。"""
+    clock = clock or FrozenClock(MOMENT)
+    heartbeats = HeartbeatRepo(db, clock=clock)
+    if age_seconds is not None:
+        # 写的那一侧用的是自己的时钟：与 `collect` 读的那个相差 `age_seconds`
+        wrote_at = clock.now_utc() - timedelta(seconds=age_seconds)
+        HeartbeatRepo(db, clock=FrozenClock(wrote_at)).start(note="tick=60s")
+    return collect(
+        runs=TaskRunRepo(db, clock=clock),
+        heartbeats=heartbeats,
+        users=UserRepo(db),
+        specs=specs,
+        clock=clock,
+    )
 
 
 def test_jobs_run_in_registration_order(db, settings):
@@ -4703,9 +4757,23 @@ def test_jobs_run_in_registration_order(db, settings):
     report = scheduler.tick(as_of=FRIDAY)
 
     assert [call[0] for call in runner.calls] == ["bars", "recheck", "rules", "fx", "calendar"]
+    # 不传 `now` 时读的是注入的那个时钟，不是墙钟
+    assert report.now == MOMENT
     assert len(report.results) == 5
     assert report.errors == () and report.waiting == ()
     assert report.failed == ()
+
+
+def test_failed_results_are_picked_out_of_the_tick(db, settings):
+    runner = RecordingRunner(fail_for={"rules"})
+    specs = (job_spec("bars", "A"), job_spec("rules", "A"))
+    scheduler, _, _ = make(db, settings, specs, runner)
+
+    report = scheduler.tick(as_of=FRIDAY)
+
+    assert [result.job for result in report.results] == ["bars", "rules"]
+    # 只有 `failed` 那一支是 FAILED：跑成的那条不能跟着一起被判成失败
+    assert [result.job for result in report.failed] == ["rules"]
 
 
 def test_as_of_uses_the_period_key_of_its_week(db, settings):
@@ -4715,6 +4783,19 @@ def test_as_of_uses_the_period_key_of_its_week(db, settings):
     scheduler.tick(as_of=FRIDAY, only_job="recheck", only_market="A")
 
     assert runner.calls == [("recheck", "A", "2024-W43", FRIDAY)]
+
+
+def test_the_manual_anchor_is_not_the_clock_of_the_tick(db, settings):
+    """补跑的那一天是 `as_of`，`now` 只是这一轮的时间戳。
+    把锚点换成从时钟读出来的那一天，补跑会静默地写到另一个周期上（D98）。"""
+    runner = RecordingRunner()
+    scheduler, _, _ = make(db, settings, (job_spec("recheck", "A", "weekly"),), runner)
+    december = datetime(2024, 12, 3, 8, 30, tzinfo=UTC)
+
+    report = scheduler.tick(now=december, as_of=FRIDAY, only_job="recheck")
+
+    assert runner.calls == [("recheck", "A", "2024-W43", FRIDAY)]
+    assert report.now == december
 
 
 def test_the_market_filter_narrows_the_selection(db, settings):
@@ -4737,6 +4818,31 @@ def test_an_unmatched_filter_is_refused(db, settings):
         scheduler.tick(as_of=FRIDAY, only_market="US")
 
 
+def test_the_refusal_names_the_filter_and_the_registry(db, settings):
+    """一句话要能看出两件事：哪一个词打错了（`job=`/`market=`），以及这里有什么。"""
+    specs = (job_spec("bars", "A"), job_spec("fx", None, "fx"))
+    scheduler, _, _ = make(db, settings, specs, RecordingRunner())
+
+    with pytest.raises(ValidationError, match=r"job=nope"):
+        scheduler.tick(as_of=FRIDAY, only_job="nope")
+    with pytest.raises(ValidationError, match=r"market=US"):
+        scheduler.tick(as_of=FRIDAY, only_market="US")
+    # 两个条件都敲上时两个都要说：只说一个会让人去改那个没敲错的地方
+    with pytest.raises(ValidationError, match=r"job=bars、market=US"):
+        scheduler.tick(as_of=FRIDAY, only_job="bars", only_market="US")
+    with pytest.raises(ValidationError, match=r"现有 \['bars', 'fx'\]"):
+        scheduler.tick(as_of=FRIDAY, only_job="nope")
+
+
+def test_an_empty_registry_is_refused_too(db, settings):
+    """没登记 job 与「筛选条件敲错了」是两个原因：少了「全部」那一个字，
+    前者会被读成后者的一个特例，于是人去查命令，而该查的是这里登记了什么。"""
+    scheduler, _, _ = make(db, settings, (), RecordingRunner())
+
+    with pytest.raises(ValidationError, match="没有匹配的 job（全部）"):
+        scheduler.tick(as_of=FRIDAY)
+
+
 def test_a_broken_calendar_does_not_stop_the_next_market(db, settings):
     class BrokenCalendar(FakeCalendar):
         def is_trading_day(self, market, day):
@@ -4753,6 +4859,26 @@ def test_a_broken_calendar_does_not_stop_the_next_market(db, settings):
     assert len(report.errors) == 1
     assert "bars@A" in report.errors[0] and "日历源挂了" in report.errors[0]
     assert [call[1] for call in runner.calls] == ["HK"]
+
+
+def test_an_unexpected_calendar_error_is_not_collected_as_a_tick_error(db, settings):
+    """这里隔离的只有 `SamsError`：日历实现里的编程错误不能被收成一句「这一轮算不出」，
+    那样一种坏会被读成一种等。"""
+
+    class BoomingCalendar(FakeCalendar):
+        def is_trading_day(self, market, day):
+            raise RuntimeError("日历在读一个不存在的键")
+
+    scheduler, _, _ = make(
+        db,
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        calendar=BoomingCalendar(settings),
+    )
+
+    with pytest.raises(RuntimeError, match="不存在的键"):
+        scheduler.tick(now=MOMENT)
 
 
 def test_fx_waits_until_every_market_has_closed(db, settings):
@@ -4789,12 +4915,30 @@ def test_a_manual_tick_does_not_leave_a_heartbeat(db, settings):
     assert heartbeats.latest() is None
 
 
+def test_the_beat_goes_out_before_the_selection(db, settings):
+    """一个 job 都没选出的那一轮，那一拍也已经打出去了：选 job 失败同样是
+    「循环还在转」的一轮。挪到选取之后，读的那一侧就把它与「进程停了」混成一个。"""
+    clock = FrozenClock(MOMENT)
+    scheduler, heartbeats, _ = make(
+        db, settings, (job_spec("bars", "A"),), RecordingRunner(), clock=clock
+    )
+    scheduler.run_forever(max_ticks=1)
+    clock.advance(seconds=30)
+
+    with pytest.raises(ValidationError, match="没有匹配"):
+        scheduler.tick(as_of=FRIDAY, only_job="nope")
+
+    assert heartbeats.latest().beat_at == MOMENT + timedelta(seconds=30)
+
+
 def test_run_forever_beats_on_every_tick(db, settings):
     runner = RecordingRunner()
     clock = FrozenClock(MOMENT)
     reports = []
+    sleeps = []
 
     def sleep(seconds):
+        sleeps.append(seconds)
         clock.advance(seconds=seconds)
 
     scheduler, heartbeats, _ = make(
@@ -4807,7 +4951,55 @@ def test_run_forever_beats_on_every_tick(db, settings):
     assert len(reports) == 2
     beat = heartbeats.latest()
     assert beat.note == f"tick={settings.scheduler_tick_s}s"
+    # 第二拍是第二轮 tick 打的，不是认领时那一次：时钟只被 `sleep` 推过一格
     assert beat.beat_at == MOMENT + timedelta(seconds=settings.scheduler_tick_s)
+    # 等格数比拍数少一个：最后一拍之后不再等
+    assert sleeps == [settings.scheduler_tick_s]
+
+
+def test_zero_rounds_leave_no_tick_and_no_claim(db, settings):
+    """`max_ticks=0`（或负数）一轮都不跑，也不认领心跳：留下一行刚打的拍会把下一个常驻循环
+    挡在阈值外面，而这一次连活都还没开始。"""
+    for max_ticks in (0, -1):
+        runner = RecordingRunner()
+        scheduler, heartbeats, _ = make(db, settings, (job_spec("bars", "A"),), runner)
+        reports = []
+
+        ticks = scheduler.run_forever(max_ticks=max_ticks, on_tick=reports.append)
+
+        assert ticks == 0
+        assert reports == []
+        assert runner.calls == []
+        assert heartbeats.latest() is None
+
+
+def test_the_dependencies_are_passed_by_name(db, settings):
+    """`jobs` 之后六个依赖里有三个同为仓库对象、两个同为注入的替身：写错顺序的两份
+    都构造得出对象，症状要到第一次真跑才看得见。所以这一句 `TypeError` 是那道墙。"""
+    args = (
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        TaskRunRepo(db),
+        HeartbeatRepo(db),
+        StubUniverse(),
+        UserRepo(db),
+        FakeCalendar(settings),
+    )
+
+    with pytest.raises(TypeError, match="positional"):
+        Scheduler(*args)
+
+
+def test_the_same_scheduler_can_start_its_loop_again(db, settings):
+    scheduler, heartbeats, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+
+    scheduler.run_forever(max_ticks=1)
+    claimed = heartbeats.latest().id
+    scheduler.run_forever(max_ticks=1)
+
+    # 再次进循环不与自己抢心跳，也不另起一行
+    assert heartbeats.latest().id == claimed
 
 
 def test_a_second_daemon_is_refused(db, settings):
@@ -4818,6 +5010,19 @@ def test_a_second_daemon_is_refused(db, settings):
 
     with pytest.raises(SchedulerBusy, match="心跳"):
         second.run_forever(max_ticks=1)
+
+
+def test_the_guard_reads_the_last_beat_not_the_row_being_created(db, settings):
+    """`started_at` 是那一行被创建的时刻，「还活着」看的是最后一次 `beat_at`。
+    读错那一列，一个刚打过拍的循环会被看成六分钟前起、于是被接管。"""
+    beat_id = HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(minutes=6))).start(
+        note="tick=60s"
+    )
+    HeartbeatRepo(db, clock=FrozenClock(MOMENT)).beat(beat_id)
+    scheduler, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+
+    with pytest.raises(SchedulerBusy, match="心跳"):
+        scheduler.run_forever(max_ticks=1)
 
 
 def test_a_dead_heartbeat_does_not_block_a_new_daemon(db, settings):
@@ -4832,20 +5037,109 @@ def test_a_dead_heartbeat_does_not_block_a_new_daemon(db, settings):
     assert heartbeats.latest().id != old
 
 
-def test_a_tick_level_failure_is_reported_and_the_loop_survives(db, settings):
+def test_exactly_at_the_threshold_is_stale_and_open_to_takeover(db, settings):
+    data = reading(db, age_seconds=HEARTBEAT_STALE_S)
+    assert data.beat_age_s == HEARTBEAT_STALE_S
+    assert data.stale is True
+
+    scheduler, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+    assert scheduler.run_forever(max_ticks=1) == 1
+
+
+def test_one_second_under_the_threshold_is_fresh_and_refuses_takeover(db, settings):
+    data = reading(db, age_seconds=HEARTBEAT_STALE_S - 1)
+    assert data.stale is False
+
+    scheduler, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+    with pytest.raises(SchedulerBusy, match="心跳"):
+        scheduler.run_forever(max_ticks=1)
+
+
+def test_a_tick_not_shorter_than_the_heartbeat_threshold_is_refused(db, settings):
+    """等待间隔不比阈值短，形状就是「一个空转的循环也会把自己读成停了」：
+    读数与守卫共用同一个比较，两边一起翻错，所以在构造时就挡住，而不是等第一轮。"""
+    for tick_s in (HEARTBEAT_STALE_S - 1, 1):
+        make(
+            db,
+            replace(settings, scheduler_tick_s=tick_s),
+            (job_spec("bars", "A"),),
+            RecordingRunner(),
+        )
+    for tick_s in (HEARTBEAT_STALE_S, HEARTBEAT_STALE_S + 1):
+        with pytest.raises(ValidationError, match="scheduler_tick_s"):
+            make(
+                db,
+                replace(settings, scheduler_tick_s=tick_s),
+                (job_spec("bars", "A"),),
+                RecordingRunner(),
+            )
+
+
+def test_a_tick_level_failure_is_reported_and_the_loop_survives(db, settings, caplog):
     reports = []
+    clock = FrozenClock(MOMENT)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.advance(seconds=seconds)
+
+    scheduler, heartbeats, _ = make(
+        db,
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        clock=clock,
+        sleep=sleep,
+        universe=BrokenUniverse(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ticks = scheduler.run_forever(max_ticks=2, on_tick=reports.append)
+
+    assert ticks == 2
+    assert all("db 挂了" in report.errors[0] for report in reports)
+    # 那一拍在做活之前就打出去了：这一轮没做成事，不等于循环不转了
+    assert heartbeats.latest().beat_at == MOMENT + timedelta(seconds=settings.scheduler_tick_s)
+    # 每一轮失败都要留下一句：只留 `TickReport` 的话，日志里读不到「循环还在转但在失败」
+    logged = [rec for rec in caplog.records if "这一轮 tick 失败" in rec.getMessage()]
+    assert len(logged) == 2
+    # 栈只能留在这里：这一句把异常吞了，往上再没有人能打印它
+    assert "in build" in caplog.text
+
+
+def test_an_interrupt_leaves_a_line_in_the_log(db, settings, caplog):
+    """退出要留下一句：`run_forever` 正常返回，返回值看不出它是被打断的还是跑满了轮数——
+    那一行是日志里唯一的区别。"""
+
+    def interrupt(seconds):
+        raise KeyboardInterrupt
+
     scheduler, _, _ = make(
         db,
         settings,
         (job_spec("bars", "A"),),
         RecordingRunner(),
-        universe=BrokenUniverse(),
+        sleep=interrupt,
+    )
+    with caplog.at_level(logging.WARNING):
+        ticks = scheduler.run_forever()
+
+    assert ticks == 1
+    assert "收到中断，调度器退出" in caplog.text
+
+
+def test_an_unexpected_error_is_not_swallowed_by_the_loop(db, settings):
+    scheduler, _, _ = make(
+        db,
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        universe=ExplodingUniverse(),
     )
 
-    ticks = scheduler.run_forever(max_ticks=2, on_tick=reports.append)
-
-    assert ticks == 2
-    assert all("db 挂了" in report.errors[0] for report in reports)
+    with pytest.raises(RuntimeError, match="编程错误"):
+        scheduler.run_forever(max_ticks=3)
 
 
 def test_ctrl_c_stops_the_loop_cleanly(db, settings):
@@ -4857,7 +5151,10 @@ def test_ctrl_c_stops_the_loop_cleanly(db, settings):
     )
     reports = []
 
-    ticks = scheduler.run_forever(on_tick=reports.append)
+    try:
+        ticks = scheduler.run_forever(on_tick=reports.append)
+    except KeyboardInterrupt as exc:  # 中断是常驻循环的正常退出方式，不是要往上抛的错误
+        pytest.fail(f"中断没有被接住：{exc}")
 
     assert ticks == 1
     assert len(reports) == 1
@@ -4885,29 +5182,35 @@ def test_schedule_data_counts_admins_and_reads_the_heartbeat(db, settings):
 
     assert data.heartbeat.id == beat_id
     assert data.beat_age_s == 120
+    # 只认「启用且 is_admin」：被禁用的管理员与不是管理员的普通账号各挡住一半
     assert data.admins == 1
     assert data.stale is False and data.never_started is False
+    # 读数带着登记的那个周期：这一行读的是 `spec.period`，不是账本上那一行
+    assert data.jobs[0].period == "daily"
     assert data.jobs[0].latest is None and data.jobs[0].streak == 0
 
 
 def test_schedule_data_turns_stale_after_the_threshold(db, settings):
-    clock = FrozenClock(MOMENT)
-    heartbeats = HeartbeatRepo(db, clock=clock)
-    heartbeats.start(note="tick=60s")
-    clock.advance(seconds=HEARTBEAT_STALE_S + 1)
-
-    data = collect(
-        runs=TaskRunRepo(db, clock=clock),
-        heartbeats=heartbeats,
-        users=UserRepo(db),
-        specs=(),
-        clock=clock,
-    )
+    data = reading(db, age_seconds=HEARTBEAT_STALE_S + 1)
 
     assert data.stale is True
 
 
 def test_schedule_data_without_a_heartbeat_is_not_stale(db):
+    data = reading(db)
+
+    assert data.never_started is True
+    assert data.stale is False
+    assert data.beat_age_s is None
+
+
+def test_the_reading_ages_the_last_beat_not_the_row_being_created(db):
+    """与守卫读同一列：年龄从 `beat_at` 算。读成 `started_at` 时，一个一直在打的循环
+    会被显示成「六分钟前起的、之后再没动过」。"""
+    beat_id = HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(minutes=6))).start(
+        note="tick=60s"
+    )
+    HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(seconds=30))).beat(beat_id)
     clock = FrozenClock(MOMENT)
 
     data = collect(
@@ -4918,9 +5221,26 @@ def test_schedule_data_without_a_heartbeat_is_not_stale(db):
         clock=clock,
     )
 
-    assert data.never_started is True
+    assert data.beat_age_s == 30
     assert data.stale is False
-    assert data.beat_age_s is None
+
+
+def test_a_beat_written_ahead_of_the_reading_clock_reads_as_zero(db):
+    """写那一侧的时钟跑在读取侧前面（两个各自的 `Clock`、或系统时钟被校正过）时，
+    年龄不能是负数——负数打印出来是一个看不出原因的数。"""
+    heartbeats = HeartbeatRepo(db, clock=FrozenClock(MOMENT + timedelta(seconds=5)))
+    heartbeats.start(note="tick=60s")
+
+    data = collect(
+        runs=TaskRunRepo(db, clock=FrozenClock(MOMENT)),
+        heartbeats=heartbeats,
+        users=UserRepo(db),
+        specs=(),
+        clock=FrozenClock(MOMENT),
+    )
+
+    assert data.beat_age_s == 0
+    assert data.stale is False
 
 
 def test_schedule_data_reports_the_latest_run_and_streak(db):
@@ -4944,6 +5264,51 @@ def test_schedule_data_reports_the_latest_run_and_streak(db):
     assert data.jobs[1].latest is None and data.jobs[1].streak == 0
 
 
+def test_the_streak_counts_periods_not_rows(db):
+    """同一个周期重试五次只有一个结论：按**行**数窗口时它会被数成五个失败周期。"""
+    clock = FrozenClock(MOMENT)
+    runs = TaskRunRepo(db, clock=clock)
+    for _ in range(5):
+        run_id = runs.start("bars", market="A", period_key="2024-10-25")
+        runs.finish(run_id, status=FAILED, error="boom")
+        clock.advance(minutes=1)
+
+    data = collect(
+        runs=runs,
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        users=UserRepo(db),
+        specs=(job_spec("bars", "A"),),
+        clock=clock,
+    )
+
+    assert data.jobs[0].latest.period_key == "2024-10-25"
+    assert data.jobs[0].streak == 1
+
+
+def test_the_streak_saturates_at_the_display_cap(db):
+    """比 `STREAK_DISPLAY_PERIODS` 更长的连败显示那个上限本身，不显示真实周期数。"""
+    clock = FrozenClock(MOMENT)
+    runs = TaskRunRepo(db, clock=clock)
+    last_written = None
+    for index in range(STREAK_DISPLAY_PERIODS + 1):
+        day = FRIDAY - timedelta(days=index)
+        last_written = day.isoformat()
+        run_id = runs.start("bars", market="A", period_key=last_written)
+        runs.finish(run_id, status=FAILED, error="boom")
+        clock.advance(minutes=1)
+
+    data = collect(
+        runs=runs,
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        users=UserRepo(db),
+        specs=(job_spec("bars", "A"),),
+        clock=clock,
+    )
+
+    assert data.jobs[0].streak == STREAK_DISPLAY_PERIODS
+    assert data.jobs[0].latest.period_key == last_written
+
+
 def test_the_scheduler_reports_through_its_own_clock(db, settings):
     clock = FrozenClock(MOMENT)
     scheduler, heartbeats, _ = make(
@@ -4963,35 +5328,69 @@ def test_the_scheduler_reports_through_its_own_clock(db, settings):
 uv run pytest tests/services/test_scheduler_service.py -q
 ```
 
-Expected: FAIL（`sams.services.scheduler.service` 不存在）。
+Expected: FAIL，`ModuleNotFoundError: No module named 'sams.services.scheduler.heartbeat'`
+——收集阶段就在第一个 import 上炸，`report`/`service` 那两行要等这一行有了才会被读到，
+所以这里只可能报这一个名字。
 
-- [ ] **Step 3: 写 `report.py`**
+- [ ] **Step 3: 写 `heartbeat.py` 与 `report.py`**
+
+`src/sams/services/scheduler/heartbeat.py`：
+
+```python
+"""心跳的过期阈值与「那一拍还算不算活着」这条判据。
+
+判据只写在这一处，因为两头要同时翻：健康读数里的那个布尔（它可能死了）与
+`Scheduler._claim`（放不放第二个常驻循环进来）。各写一遍的话，恰好踩在阈值上的
+那一瞬会一个说「没停」、另一个已经放行。
+放在独立的一个模块而不是 `report.py`：读的那一层只把数取回来，不该拥有「该不该
+放一个常驻循环进来」这条策略。
+"""
+
+from __future__ import annotations
+
+#: 心跳的年龄到这一步就算「可能已经停了」（D100 的守卫等的也是这个数）。
+#: 它必须**大于**一轮的等待间隔（`scheduler_tick_s`）：否则一个什么都没做的循环
+#: 也会在两次拍之间把自己读成停了。`Scheduler.__init__` 挡住这一条。
+#: 一轮**做活**的时长不在这条约束里：那一拍只在每轮开头打，所以一轮如果做得比阈值
+#: 久，还在做活的进程会被读成停了；要修它得在做活中间补拍，这里没有那些拍。
+HEARTBEAT_STALE_S = 300
+
+
+def stale_at(age_seconds: float) -> bool:
+    """那一拍是不是已经过期。取 `>=`：恰好等于阈值算过期，两头共用这一个比较。"""
+    return age_seconds >= HEARTBEAT_STALE_S
+```
 
 `src/sams/services/scheduler/report.py`：
 
 ```python
-"""`sams health` 的 `[调度]` 一节：它还在不在跑、每个 job 上一轮跑成什么。
+"""调度器的健康读数：它还在不在跑、每个 job 上一轮跑成什么。
 
-只读：这一层不写 `task_runs`、不碰心跳，也不替调度器判断「该不该跑」。
-`streak` 用的是 runner 同一个函数——页面上数出来的连续失败必须与发不发
-`SystemAlarm` 的口径是同一条，否则「页面显示三次失败但没告警」会查不出原因。
+只读：这一层不写 `task_runs`、不碰心跳，也不决定「该不该放一个常驻循环进来」——
+「过期」那条判据归 `heartbeat.py`，这里只是拿它算一个布尔。
+`streak` 与 runner 用的是同一个函数、同一个「每周期一行」的形状：读数里数出来的
+连续失败必须与发不发 `SystemAlarm` 的口径是同一条（D103），否则「显示连败而管理员
+一条都没收到」会查不出原因。
+谁把这些数打印出来、退出码怎么定，由读它的那一侧决定。
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.services.scheduler.runner import STREAK_WINDOW, failure_streak
+from sams.services.actors import admin_users
+from sams.services.scheduler.heartbeat import stale_at
+from sams.services.scheduler.runner import failure_streak
 from sams.services.scheduler.types import JobSpec
 from sams.storage.repos.task_runs import Heartbeat, HeartbeatRepo, TaskRun, TaskRunRepo
-from sams.storage.repos.users import ACTIVE, UserRepo
+from sams.storage.repos.users import UserRepo
 
-#: 心跳超过这个秒数算「可能停了」。它同时是单实例守卫的阈值（D100/D101）：
-#: 比一个 tick 长得多，又短到一次崩溃重启不用等太久。
-HEARTBEAT_STALE_S = 300
+#: 连续失败最多数出多少个**周期**。它会**饱和**：比这个上限还长的连败显示的是上限本身，
+#: 不是真实的周期数——一屏要给的是「停了多久」的量级，而告警在第三个周期就响了（D103），
+#: 再往上数不改变任何人该做的事。
+STREAK_DISPLAY_PERIODS = 30
 
 
 @dataclass(frozen=True)
@@ -5012,11 +5411,14 @@ class ScheduleData:
 
     @property
     def stale(self) -> bool:
-        """有过心跳、但已经过期：D101 的「它可能死了」只有这一条判据。"""
-        return self.beat_age_s is not None and self.beat_age_s > HEARTBEAT_STALE_S
+        """有过心跳、且已经过期：「它可能死了」只有这一条判据。
+        发现它停了归外部（D101），所以这里只给读数，不发任何东西。
+        """
+        return self.beat_age_s is not None and stale_at(self.beat_age_s)
 
     @property
     def never_started(self) -> bool:
+        """没有那一行：与「有过但停了」是两件事，前者不该被读成一次事故。"""
         return self.heartbeat is None
 
 
@@ -5032,21 +5434,69 @@ def collect(
     beat = heartbeats.latest()
     age = None
     if beat is not None:
+        # 下限 0：那一拍可能由一个跑在前面的时钟写下（两个各自的 `Clock`、或系统时钟被
+        # 校正过），负年龄是一个看不出原因的数
         age = max(0, int((moment - beat.beat_at).total_seconds()))
-    admins = sum(1 for user in users.list_users() if user.is_admin and user.status == ACTIVE)
+    admins = len(admin_users(users))
     jobs = []
     for spec in specs:
-        recent = runs.recent(spec.name, spec.market, limit=STREAK_WINDOW)
+        # 按周期分组：一个一直失败的周期每轮重试都多写一行，按行数窗口会被它自己占满
+        periods = runs.latest_per_period(spec.name, spec.market, limit=STREAK_DISPLAY_PERIODS)
         jobs.append(
             JobHealth(
                 name=spec.name,
                 market=spec.market,
                 period=spec.period,
-                latest=recent[0] if recent else None,
-                streak=failure_streak(recent),
+                latest=periods[0] if periods else None,
+                streak=failure_streak(periods),
             )
         )
     return ScheduleData(heartbeat=beat, beat_age_s=age, admins=admins, jobs=tuple(jobs))
+```
+
+`src/sams/services/actors.py` 末尾补上两个消费者共用的那一个筛选：
+
+```python
+def admin_users(users: UserRepo) -> list[User]:
+    """要替「管理员」做的那一批人：启用且 `is_admin`。
+
+    同一个判据抄两份，迟早一份漏一个条件（`active_users` 的文档头说的就是这件事）。
+    这里两个消费者读的正是同一头：健康读数里那个「有几个管理员」与系统告警的收件人
+    名单——数出来的个数与真发出去的人数对不上，就是「显示有管理员而谁都没收到」
+    这种查不出原因的症状。
+    """
+    return [user for user in active_users(users) if user.is_admin]
+```
+
+`src/sams/services/scheduler/alarms.py` 的收件人循环改成读它：
+
+```python
+    def handle(self, alarm: SystemAlarm) -> None:
+        now = self.clock.now_utc()
+        since = now - timedelta(minutes=self.settings.cooldown_min)
+        for user in admin_users(self.users):
+            if self.alerts.has_system_alert(user.id, alarm.component, since=since):
+                continue
+            message = AlertMessage(
+                market=SYS_MARKET,
+                code=alarm.component,
+                severity=STRONG,
+                triggered_at=now,
+                name=SYS_LABEL,
+                account_name=SYS_LABEL,
+                rule_name=SYS_RULE_NAME,
+                value_text=alarm.component,
+                threshold_text=f"冷却 {self.settings.cooldown_min} 分钟",
+                stage=SYS_LABEL,
+                body=alarm.message,
+            )
+            try:
+                self.sender.dispatch(message, user_id=user.id, rule_id=None)
+            except Exception as exc:  # noqa: BLE001 — 一个收件人失败不能挡住其余收件人
+                # 栈只能在这里留：异常被逐个人包住之后到不了 `EventBus.publish`（那里是另一处
+                # 带栈的日志），少一个栈就没人能从那一句话找到抛出的是哪一段代码
+                # （`runner.py` 答同一个问题时用的也是 `logger.exception`）
+                logger.exception("系统告警发给 %s 失败：%s", user.id, exc)
 ```
 
 - [ ] **Step 4: 写 `service.py`**
@@ -5056,14 +5506,26 @@ def collect(
 ```python
 """`Scheduler`：tick 的顺序、心跳与常驻循环。
 
-一轮 tick 的顺序就是失败时的止损顺序：
-1. 构建这一轮的对象全集（一次 tick 只构建一次）；
-2. 给心跳打一拍（只有 `run_forever` 认领过才打）；
-3. 按注册顺序逐个 job 判断到期并交给 `JobRunner`；
-4. 把结果原样交回——打印与退出码是 CLI 的事。
+一轮 tick 做四件事，顺序就是代码里的顺序：
+
+1. 认领过心跳就打一拍（手工 `tick` 没认领过，什么也不留）；
+2. 按 `only_job`/`only_market` 选出这一轮要跑的 job，一个都不匹配就拒绝；
+3. 构建这一轮的对象全集——一次 tick 只构建一次，交给每个 job 的是同一份；
+4. 按注册顺序逐个 job 判断到期并交给 `JobRunner`，把结果原样交回。
+
+打拍放在做活之前：那一拍证明的是「循环还在转」，不是「这一轮做完了事」。挪到收尾
+之后，一轮在打拍之前就失败（账本读不到）会一拍都不留，读的那一侧把「这一轮做不成」
+看成「循环停了」——那是两件事：前者是这一轮的结论（`TickReport.errors`），后者才是
+那一拍要答的。
+两种放法的最坏年龄都是「一轮做活的时长 + 等待间隔」，挪到收尾换不来更准的读数。
+
+等待间隔不比心跳阈值短的话，一个空转的循环也会在两次拍之间把自己读成停了，
+所以构造时挡住（见 `heartbeat.py`）。
 
 单个 job 的异常在 runner 里已经落账；这里只隔离**到期计算**的异常：
 日历源坏了不能让排在后面的市场也不跑。
+
+打印与退出码都不在这里：谁造这个循环、结果怎么给人看，由装配与入口那一侧决定。
 """
 
 from __future__ import annotations
@@ -5078,14 +5540,15 @@ from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import SamsError, SchedulerBusy, ValidationError
 from sams.services.scheduler.due import CalendarView, Due, due_for, period_key
-from sams.services.scheduler.report import HEARTBEAT_STALE_S, ScheduleData, collect
+from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S, stale_at
+from sams.services.scheduler.report import ScheduleData, collect
 from sams.services.scheduler.runner import JobRunner, RunResult
 from sams.services.scheduler.types import JobSpec
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.storage.repos.task_runs import FAILED, HeartbeatRepo, TaskRunRepo
 from sams.storage.repos.users import UserRepo
 
-logger = logging.getLogger("sams.scheduler")
+logger = logging.getLogger("sams.services.scheduler.service")
 
 
 @dataclass(frozen=True)
@@ -5105,16 +5568,22 @@ class Scheduler:
         self,
         settings: Settings,
         jobs: Sequence[JobSpec],
+        *,
         runner: JobRunner,
         runs: TaskRunRepo,
         heartbeats: HeartbeatRepo,
         universe: UniverseBuilder,
         users: UserRepo,
         calendar: CalendarView,
-        *,
         clock: Clock = SYSTEM_CLOCK,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        if settings.scheduler_tick_s >= HEARTBEAT_STALE_S:
+            raise ValidationError(
+                f"scheduler_tick_s={settings.scheduler_tick_s} 不小于心跳阈值 "
+                f"{HEARTBEAT_STALE_S}：一个空转的循环也会在两次拍之间把自己读成停了，"
+                "而读数与守卫用的是同一个比较，两边一起翻错"
+            )
         self.settings = settings
         self.jobs = tuple(jobs)
         self.runner = runner
@@ -5135,7 +5604,7 @@ class Scheduler:
         only_job: str | None = None,
         only_market: str | None = None,
     ) -> TickReport:
-        moment = now or self.clock.now_utc()
+        moment = now if now is not None else self.clock.now_utc()
         if self._beat_id is not None:
             self.heartbeats.beat(self._beat_id)
         selected = self._selected(only_job, only_market)
@@ -5145,6 +5614,8 @@ class Scheduler:
         errors: list[str] = []
         for spec in selected:
             if as_of is not None:
+                # 手工补跑：指定的那一天就是这一轮的锚点，周期键仍按 job 自己的周期算，
+                # 于是它与到期计算写出来的那一串形状一致（D98），runner 不必认识两种输入
                 due = Due(period_key=period_key(spec.period, as_of), as_of=as_of)
             else:
                 try:
@@ -5156,9 +5627,12 @@ class Scheduler:
                         now=moment,
                     )
                 except SamsError as exc:
+                    # 只说这一个 job 这一轮算不出到期日：其余市场照常跑
                     errors.append(f"{spec.title}: {exc}")
                     continue
                 if due is None:
+                    # 没到期与算不出是两种结论：前者下一轮可能就到点了，后者是要人去修的，
+                    # 混进同一个列表里就分不出该等还是该查
                     waiting.append(spec.title)
                     continue
             results.append(self.runner.execute(spec, due, universe))
@@ -5175,7 +5649,18 @@ class Scheduler:
         on_tick: Callable[[TickReport], None] | None = None,
         max_ticks: int | None = None,
     ) -> int:
-        """认领心跳，然后循环 tick。返回实际跑过的 tick 数（测试与 `--once` 需要）。"""
+        """认领心跳，然后一轮一轮跑下去。返回实际跑过的 tick 数。
+
+        `max_ticks=0`（或负数）一轮都不跑，也不认领心跳：留下一个刚打过的拍会把
+        下一个常驻循环挡在阈值外面，而这一次连活都没开始。
+
+        这里只接 `SamsError`：那一类是「这一轮做不成」（账本读不到、一个 job 都没选出），
+        循环本身没坏，下一轮还得试。别的东西（编程错误）在这里没有可信的下一步，
+        炸出去比原地重入更值钱——循环接住它之后，每一拍照打，读的那一侧只会把一个
+        坏掉的实现看成「还在跑」。
+        """
+        if max_ticks is not None and max_ticks <= 0:
+            return 0
         self._claim()
         ticks = 0
         try:
@@ -5183,14 +5668,14 @@ class Scheduler:
                 try:
                     report = self.tick()
                 except SamsError as exc:
-                    logger.warning("这一轮 tick 失败：%s", exc)
+                    # 栈只能留在这里：这一句把异常吞了，`tick` 的那一层不再有人能打印它
+                    logger.exception("这一轮 tick 失败：%s", exc)
                     report = TickReport(now=self.clock.now_utc(), errors=(str(exc),))
                 if on_tick is not None:
                     on_tick(report)
                 ticks += 1
-                if max_ticks is not None and ticks >= max_ticks:
-                    break
-                self.sleep(self.settings.scheduler_tick_s)
+                if max_ticks is None or ticks < max_ticks:
+                    self.sleep(self.settings.scheduler_tick_s)
         except KeyboardInterrupt:
             logger.warning("收到中断，调度器退出")
         return ticks
@@ -5204,31 +5689,32 @@ class Scheduler:
             clock=self.clock,
         )
 
-    def _claim(self) -> str:
-        """认领心跳；已经有别的调度器在跳就拒绝启动（D100）。
+    def _claim(self) -> None:
+        """认领心跳；已经有一个循环在跳就拒绝启动（D100 的单实例守卫）。
 
-        只有 `run_forever` 调它：`tick` 是一次手工执行，不该留下一个让下一个
-        常驻进程白等五分钟的心跳。
+        只有 `run_forever` 调它：一次手工执行不该留下一行，让下一个常驻循环白等
+        一个阈值（`HEARTBEAT_STALE_S` 说的那个数）。
+
+        守卫读的是心跳表而不是进程内的一个标记，所以它挡得住「同一个进程里再造一个
+        `Scheduler` 去跑常驻循环」。它挡不住另一个操作系统进程：库文件上的锁先就让
+        第二个进程连不上（见 `storage/db.py` 里 `Database.open` 包 `duckdb.Error` 的
+        那一处），那一类重复启动在走到这句守卫之前就已经炸在连接上。
         """
         if self._beat_id is not None:
-            return self._beat_id
-        moment = self.clock.now_utc()
+            # 同一个实例再次进循环：上一轮自己认领的那一行不能把自己拒在外面
+            return
         latest = self.heartbeats.latest()
         if latest is not None:
-            age = (moment - latest.beat_at).total_seconds()
-            if age < HEARTBEAT_STALE_S:
+            age = (self.clock.now_utc() - latest.beat_at).total_seconds()
+            if not stale_at(age):
                 raise SchedulerBusy(
                     f"另一个调度器（{latest.id}）{int(age)} 秒前还有心跳："
-                    "两个常驻进程会让同一个周期各发一次告警"
+                    "同一份库上跳两个循环会把同一个周期各跑一遍，而 `task_runs` 里"
+                    "那一行是「这个周期跑过没有」的唯一依据（D98）"
                 )
-        self._beat_id = self.heartbeats.start(
-            note=f"tick={self.settings.scheduler_tick_s}s"
-        )
-        return self._beat_id
+        self._beat_id = self.heartbeats.start(note=f"tick={self.settings.scheduler_tick_s}s")
 
-    def _selected(
-        self, only_job: str | None, only_market: str | None
-    ) -> tuple[JobSpec, ...]:
+    def _selected(self, only_job: str | None, only_market: str | None) -> tuple[JobSpec, ...]:
         chosen = tuple(
             spec
             for spec in self.jobs
@@ -5243,6 +5729,8 @@ class Scheduler:
         if only_market is not None:
             wanted.append(f"market={only_market}")
         names = sorted({spec.name for spec in self.jobs})
+        # 一个都没匹配上是命令敲错了（`wanted`），还是这里本来就没登记 job（「全部」）：
+        # 后者不说清就会被读成「这一轮跑完了，只是什么都没做」
         raise ValidationError(
             f"没有匹配的 job（{'、'.join(wanted) or '全部'}）：现有 {names}"
         )
@@ -5251,19 +5739,122 @@ class Scheduler:
 - [ ] **Step 5: 跑绿**
 
 ```bash
-uv run pytest tests/services/test_scheduler_service.py -q
+uv run pytest tests/services/test_scheduler_service.py tests/services/test_scheduler_alarms.py -q
 ```
 
-Expected: PASS。
+Expected: PASS（37 + 11 = 48 枚）。
 
 - [ ] **Step 6: 提交**
 
+实现与评审收尾各一个提交：不改历史（`--amend` 与 `git reset --soft` 都不用），
+所以评审发现的那几处口径由第二个提交说明。
+
 ```bash
-git add src/sams/services/scheduler/report.py src/sams/services/scheduler/service.py tests/services/test_scheduler_service.py
-git commit -m "feat(scheduler): 常驻循环、心跳单实例守卫与健康读数"
+# 009e65e —— 实现
+git add src/sams/services/scheduler/report.py \
+    src/sams/services/scheduler/service.py \
+    tests/services/test_scheduler_service.py
+git commit -m "feat(scheduler): tick 的顺序、心跳单实例守卫与健康读数"
+
+# 1a25b36 —— 评审收尾
+git add src/sams/services/scheduler/heartbeat.py src/sams/services/scheduler/report.py \
+    src/sams/services/scheduler/service.py src/sams/services/scheduler/alarms.py \
+    src/sams/services/actors.py src/sams/core/errors.py \
+    tests/services/test_scheduler_service.py
+git commit -m "fix(scheduler): 评审收尾——守卫不再谎称跨进程，判据与收件人各收成一处"
 ```
 
----
+**评审收尾（2026-10-23）**：实现落在 `009e65e`，两路评审之后修在 `1a25b36`。
+
+- **「两个常驻进程会替同一个周期各下一次结论」这条理由被实测推翻**（`1a25b36`）。
+  DuckDB 对库文件持**独占锁，只读连接也要**：第二个进程连 `duckdb.connect(path)` 都过不去，
+  `IO Error: Could not set lock on file` 在 `storage/db.py` 的 `Database.open` 被包成
+  `StorageError`——它到不了 `_claim` 那一句。我复现过两次（两个 `python -c` 子进程，前一个
+  握着连接睡 5 秒）。于是守卫真正挡的是**同一个进程里再造一个 `Scheduler` 去跑常驻循环**，
+  `SchedulerBusy` 的消息、`_claim` 与 `stale_at` 的文档头、`core/errors.py` 里那句
+  「另一个进程正在做这件事」、`collect` 里那句「由另一个进程写下」全部按这条事实改写；
+  `report.py` 的「页面上数出来」与文件头里那节还不存在的 `[调度]` 也一并去掉
+  （D96：不许对没接线的生产作现在时的陈述）。用例只按 `match="心跳"` 认这条消息，
+  改文案不动断言形状。
+- **这条事实的真正后果在下一个任务**：`sams health` 作为旁观者**在常驻进程活着的时候读不到那个库**，
+  所以 D101 的「发现它停了归外部」不能实现成「另一个进程读心跳表」。Task 11/12 要重新决定
+  那一读从哪儿来（要么 health 只读自己那一份库、承认读不到正在跑的进程，要么把那一拍
+  写到一个不锁文件的载体上）。本轮没有替它做决定，只把话说清楚。
+- **`scheduler_tick_s` 与阈值的关系从注释改成构造期守卫**（`Scheduler.__init__`）。
+  原注释写「它必须长于一轮 tick，否则还在做活的进程会被读成停了」——那句把因果说反了：
+  还在做活的那一轮不打拍，被读成停的原因是**做活时长**，而不是等待间隔；等待间隔太长的
+  症状是**一个空转的循环**把自己读成停。现在 `tick_s >= HEARTBEAT_STALE_S` 直接
+  `ValidationError`，用例两头各钉一次（阈值减一与 `1` 放行、阈值与阈值加一拒绝）。
+  判据没搬进 `core/config.py`：`core` 不能 import `services`（分层测试就在那儿看着）。
+- **打拍位置的换法只换来一件事**：那一拍在每轮开头打，两种放法的最坏年龄都是
+  「一轮做活的时长 + 等待间隔」，所以「挪到收尾会更准」是假的；真的差别是一轮在打拍之前
+  就失败（账本读不到）时，挪到收尾会一拍都不留，于是「这一轮做不成」被读成「循环停了」。
+  钉它的是本来就有的 `test_a_tick_level_failure_is_reported_and_the_loop_survives`
+  （断言那一轮的拍已落库）与新加的 `test_the_beat_goes_out_before_the_selection`
+  （一个 job 都没选出的那一轮也已经打过拍）。
+- **过期判据搬出读数层**（F1）：`HEARTBEAT_STALE_S` 与 `stale_at` 原来住在 `report.py`，
+  而 `report.py` 的文件头写着「不替调度器判断该不该跑」——它却拥有「能不能放第二个常驻
+  循环进来」这条策略。现在判据在 `heartbeat.py`，读数与守卫都从那儿 import，
+  两头同时翻这条仍由 `test_exactly_at_the_threshold_is_stale_and_open_to_takeover`
+  与 `_one_second_under_the_threshold…` 两枚用例钉住（同一个年龄，一次问读数、一次问守卫）。
+- **「管理员」那半个谓词从两处收成一处**：`alarms.handle` 原来是 `active_users(...)` 里
+  `if not user.is_admin: continue`，`report.collect` 原来自己 `sum(1 for ... if is_admin)`。
+  两处读的是同一个谓词，收成 `services/actors.admin_users`（`active_users` 之上再加
+  `is_admin`），actors 的文件头从「两个形状」改成「三个形状」。删掉 `is_admin` 那半会同时
+  打红服务层与告警层（`2 failed, 10 passed`），删掉 `ACTIVE` 那半会打红
+  `test_schedule_data_counts_admins_and_reads_the_heartbeat`（被禁用的管理员也被数进去）。
+- **七枚原先站不住的钉补齐**（评审用变异找出来的洞，逐条对应一个变异）：`as_of` 与
+  `now` 混同（把锚点换成时钟读出来的那一天，原用例全绿，因为 `MOMENT` 与 `FRIDAY` 是同一天）；
+  `_claim` 与 `collect` 读错列（`beat_at` → `started_at`：一个六分钟前起、一直打到现在的循环
+  会被看成早就停了）；`_selected` 的三种文案（`job=`、`market=`、两个都敲、以及空注册表
+  要说「全部」——不说清就会被读成「这一轮跑完了，只是什么都没做」）；日历里的非
+  `SamsError` 必须炸出 `tick()`（`except SamsError` 写成 `except Exception` 原先全绿）；
+  「这一轮 tick 失败」那一句日志与它的栈（删掉 `logger.warning` 原先全绿，所以改成
+  `logger.exception` 并断言 `in build`）；中断那句要留在日志里（返回值看不出它是被打断的
+  还是跑满了轮数）。
+- **`max_ticks=0` 从「跑一轮」改成「一轮都不跑，也不认领」**。第一版把循环条件写成
+  `max_ticks is None or ticks < max_ticks`，与提前返回重复——变异「条件退回 `while True`」
+  实测仍全绿，说明有一处在说谎。现在轮数只由循环条件答，等待只由「还有下一轮吗」答，
+  提前返回只管认领；三个位置各有一枚变异打得红（`while True` 会挂死、去掉守卫的 sleep 会让
+  `sleeps == [tick_s]` 变红、`<= 0` 写成 `< 0` 会让零轮那枚变红）。
+- `Scheduler.__init__` 里 `jobs` 之后的六个依赖改成关键字参数：九个位置参数在装配那一步
+  （Task 12）会写错顺序，而写错的两种顺序都构造得出对象。
+- **一轮 21 枚变异**：16 枚（分层、阈值、`beat_at`、文案、`except`、两处日志、打拍顺序、
+  提前返回、构造守卫、`admin_users` 两半、`stale_at`）+ 5 枚 `run_forever`，全部 RED；
+  中途那一枚 GREEN 的（循环条件与提前返回重复）已按上一条修掉。变异脚本跑完逐字节还原，
+  `git status` 干净。
+- **修复轮的一次事故要说清**：接手时上一个后台子代理仍在写文件（它被派出去后我没收到完成
+  通知），于是 `services/actors.py` 里出现了两个同名 `admin_users`——后定义的那个会静默
+  盖掉前一个，ruff 与用例都不会叫。已停掉那个代理、去重、并把这一条写进后续 brief：
+  修复轮要么我自己写，要么先确认代理已经结束。
+- **第二轮评审（`1a25b36`）补的两枚**：① `max_ticks` 的负数——文档头写着「0（或负数）都不认领」，
+  而 `<= 0` 写成 `== 0` 时 36 枚用例全绿（负数照样落进 `_claim`，只是循环条件替它挡住了
+  跑轮，那一行心跳还是留下了：下一个常驻循环被挡 300 秒）。零轮那枚用例改成 `(0, -1)` 两轮
+  都问，`== 0` 的变异现在打红。② 关键字边界——把 `__init__` 里那个 `*` 删掉，用例全绿：
+  六个依赖里 `runs`/`heartbeats` 同为仓库对象、`runner`/`universe` 同为注入的替身，
+  写错顺序的两种形状都构造得出对象。补 `test_the_dependencies_are_passed_by_name`
+  （按位置构造必须 `TypeError`，与 `tests/core/test_retry.py` 那枚「必需关键字」同形）。
+- **没采纳的建议与理由**：把两处的「那一拍多久以前」并成一个共用函数（`_claim` 要的是一个
+  浮点年龄去比阈值，`collect` 要的是一个非负整数给人读；共用的只有判据 `stale_at`，
+  两边的精度本来就该不同——并成一个会逼着守卫也吃一次 clamp，而 clamp 在守卫那一侧
+  没有自己的用例可钉）。`report.py:34` 的 `JobHealth.period` 与 `service.py` 的
+  `schedule_data()` 这一轮都还没有消费者：前者留给 Task 11（要么打印它，要么删字段），
+  后者正是 Task 11 那条只读命令该走的入口，本轮不提前替它决定形状。
+- **往后的任务要注意**：
+  ① **DuckDB 的锁决定了 `sams health` 能读到什么**（见上），Task 11 不能假设旁观进程读得到
+  心跳表；`services/health.py:290` 那个「未处理 N 条」把 `market='SYS'` 的行也算进去了，
+  要按 `FILTER (WHERE market = 'SYS')` 拆开。
+  ② `JobHealth.period` 现在没有任何读者：`sams health` 计划里那枚 `_print_schedule` 打的是
+  `latest.period_key`，从不读 `job.period`。Task 11 要么把它打出来（一个 job 的周期是
+  「连败三个周期」那句话的分母），要么删掉这个字段——留着没有主人的字段是 D96 说的死 API。
+  ③ 计划后段的片段仍写着 `from sams.services.scheduler.report import HEARTBEAT_STALE_S`
+  与 `STREAK_WINDOW`：判据在 `heartbeat.py`，窗口叫 `STREAK_DISPLAY_PERIODS`（30 个**周期**，
+  会饱和）。
+  ④ Task 12 仍必须真的 `alerter.attach(event_bus)`，`run_forever` 的 `max_ticks=0` 已定义成
+  「不跑也不认领」，命令行映射时别把「零轮」当成「无限」。
+  ⑤ Task 12 那段装配里的 `Scheduler(settings, jobs, runner, runs, heartbeats, universe, users,
+  calendar, ...)` 是八个位置参数，现在 `jobs` 之后一律关键字——照抄那段会 `TypeError`
+  （这是要的：九个位置参数写错顺序时，两种顺序都构造得出对象）。
 
 ### Task 11: 健康页的 `[调度]` 与退出码
 
