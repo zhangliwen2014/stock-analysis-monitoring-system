@@ -614,8 +614,8 @@ class Settings:
     polling_interval_s: int
     cooldown_min: int
     markets: dict[str, MarketCfg]
-    #: 调度器的心跳/到期检查间隔（D100）。它**不是**盘中轮询间隔：
-    #: `polling_interval_s` 服务于 M4 的 10 秒快照，后者依赖 M4 的报价源；
+    #: 调度器的心跳/到期检查间隔（D97）。它**不是**盘中轮询间隔：
+    #: `polling_interval_s` 预留给 M4/U7 的 10 秒快照，那条链目前还没有消费者；
     #: 盘后任务按分钟级检查就够了，把一个盘中参数借给它，会让改盘中频率顺手改掉盘后
     scheduler_tick_s: int = 60
 ```
@@ -636,7 +636,7 @@ class Settings:
 `config/settings.example.toml` 的 `[general]` 段加一行：
 
 ```toml
-scheduler_tick_s = 60       # 调度器检查到期任务的间隔（秒）；不是盘中轮询
+scheduler_tick_s = 60        # 调度器检查到期任务的间隔（秒）；不是盘中轮询
 ```
 
 - [ ] **Step 4: 跑绿**
@@ -653,6 +653,18 @@ Expected: PASS。
 git add src/sams/core/config.py config/settings.example.toml tests/core/test_config.py
 git commit -m "feat(config): 调度器 tick 与盘中轮询分开（D97）"
 ```
+
+**评审收尾（2026-10-22）**：实现落在 `02b9875`，行为与计划一致；只修了三处
+措辞/对齐（`a7e9160`，上面两段代码已同步）：
+
+1. 注释把间隔归到 D100——D100 是单实例心跳守卫，**D97** 才是「调度器不进盘中」；
+   决策号改对。
+2. 「`polling_interval_s` 服务于 M4 的 10 秒快照」是前瞻句（那条链现在没有消费者）；
+   改成「预留给 M4/U7」。
+3. 示例配置那一行的 `#` 比同段其它行左一列；补一个空格。
+
+变异电池三条全红（默认 60、读取到的值、0 的校验）。四条闸：目标用例 **12 passed**、
+`ruff check` 全绿、分层 **384 passed**、离线 **2752 passed / 14 deselected**。
 
 ### Task 3: 三条链的失败归类（D88 延伸到 daily/actions/frames）
 
