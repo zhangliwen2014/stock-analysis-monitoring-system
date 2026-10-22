@@ -94,3 +94,15 @@ close = "09:30"
 """
     settings = Settings.load(write(tmp_path, text))
     assert settings.market_cfg("A").extended == (("pre", "08:00", "09:30"),)
+
+
+def test_scheduler_tick_defaults_to_60(tmp_path):
+    assert Settings.load(write(tmp_path)).scheduler_tick_s == 60
+
+
+def test_scheduler_tick_is_read_and_validated(tmp_path):
+    read = write(tmp_path, BASE.replace("[general]", "[general]\nscheduler_tick_s = 15"))
+    assert Settings.load(read).scheduler_tick_s == 15
+
+    with pytest.raises(ValidationError, match="scheduler_tick_s"):
+        Settings.load(write(tmp_path, BASE.replace("[general]", "[general]\nscheduler_tick_s = 0")))

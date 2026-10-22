@@ -15,6 +15,7 @@ report_currency = "CNY"      # 汇总页折算目标币种
 rate_limit_per_s = 5         # 单源请求上限（spec §6.1）
 polling_interval_s = 10      # 盘中轮询间隔
 cooldown_min = 30            # 同一规则命中后的冷却
+scheduler_tick_s = 60       # 调度器检查到期任务的间隔（秒）；不是盘中轮询
 
 # sources 是降级顺序：前一个失败才用后一个。
 # 这里的值只在**库里 data_sources 表为空**时生效（没跑过 0007 迁移的老库）。
