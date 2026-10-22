@@ -114,6 +114,23 @@ def test_latest_per_period_reports_only_the_last_row_of_a_period(db):
     assert latest[0].status == OK
 
 
+def test_two_rows_at_the_same_instant_report_the_last_written(db):
+    """同一瞬间写下的两行，报后写的那一行：决胜靠 `rowid`，不靠运气。
+
+    去掉分组排序里的 `rowid DESC`，DuckDB 会把**先**写的那一行当成这个周期的结论：
+    一个先失败、后跑成的周期就被数成一个失败周期，连续三个周期的告警因此能凑满，
+    而这一晚其实一次都没打挂。「最近的一行」如果由存储引擎的心情决定，就不是最近的一行。
+    """
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    first = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(first, status=FAILED, error="第一次")
+    second = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(second, status=OK)
+    latest = repo.latest_per_period("bars", "A", limit=5)
+    assert [row.id for row in latest] == [second]
+
+
 def test_latest_per_period_limit_counts_periods_not_rows(db):
     """`limit` 数的是**周期**：一个周期无论写了多少行，都只占一格。"""
     clock = Clock(datetime(2024, 10, 24, 8, 30, tzinfo=UTC))
