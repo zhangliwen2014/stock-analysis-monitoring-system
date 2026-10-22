@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Protocol
 
-from sams.core.clock import Clock
 from sams.core.config import Settings
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
@@ -20,22 +19,19 @@ from sams.services.fundamentals import FundamentalSyncService
 from sams.services.fx import FxSyncService
 from sams.services.rules.engine import RuleEngine
 from sams.services.rules.recheck import Rechecker
-from sams.services.scheduler.due import DAILY, FX, MONTHLY, WEEKLY
-from sams.services.scheduler.universe import Universe, UniverseBuilder
+from sams.services.scheduler.universe import Universe
 from sams.services.sync import SyncService
 from sams.storage.repos.users import UserRepo
 
-#: job 能声明的周期：值就是 `due.py` 算到期时认的那四个，这里只做一次转写，
-#: 让登记 job 的 jobs.py 不必回头认识调度器的另一半
-PERIODS = (DAILY, WEEKLY, MONTHLY, FX)
-
 
 class RegistryView(Protocol):
-    """调度器对数据源层的全部要求：问一句「这个市场这条能力链上有谁」。
+    """调度器对数据源层只问一句话：「这个市场这条能力链上有谁」（`chain_for`）。
 
-    只声明这一个方法（与 `due.py` 的 `CalendarView` 同一做法），`AdapterRegistry` 恰好实现了它。
-    不写死那个类，是为了让「装配一个 job 需要认识哪几层」这件事只有一条答案：
-    取数一律走 services，调度器拿不到 `fetch_*`，也就顺手绕不过去。
+    与 `due.py` 的 `CalendarView` 同一做法——`AdapterRegistry` 恰好实现了这一个方法，
+    这里不写死那个类。Protocol 真正买到的只有两件事：types/jobs 不 import 数据源层，
+    以及它们向数据源层问的只有 `chain_for` 这一句。它不构成取数禁令——每个服务都把
+    `registry` 存成了公开属性，`deps.sync.registry.fetch_*` 仍然够得着；拦在取数之外靠的是
+    「job 一律走 services」这条约定，不是这个 Protocol。
     """
 
     def chain_for(self, market: str, method: str) -> tuple[str, ...]: ...
@@ -82,7 +78,6 @@ class JobSpec:
 class JobDeps:
     settings: Settings
     registry: RegistryView
-    universe: UniverseBuilder
     sync: SyncService
     corp_actions: CorpActionSyncService
     fundamentals: FundamentalSyncService
@@ -91,4 +86,3 @@ class JobDeps:
     rules: RuleEngine
     recheck: Rechecker
     users: UserRepo
-    clock: Clock

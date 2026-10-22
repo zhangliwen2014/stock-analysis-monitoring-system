@@ -13,24 +13,29 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date, timedelta
 from functools import partial
 
 from sams.core.errors import DatasourceError, SamsError
 from sams.core.timeutil import HISTORY_START
+from sams.services.scheduler.due import DAILY
 from sams.services.scheduler.types import (
-    DAILY,
     JobContext,
     JobDeps,
     JobOutcome,
     JobSpec,
 )
 
-#: 首次见到一只票时回补多久：两年足够覆盖 PR 分位的样本地板（250 个交易日）
+#: 首次见到一只票时回补多久：对齐 PR 分位的样本地板 `MIN_SAMPLES = 250`
+#: （`analysis/valuation/percentile.py`：少于它，「分位说的是抽样噪声而不是估值位置」）。
+#: 730 个日历日是一个交易日年的约两倍，给足余量；但不保证一定凑够 250 个交易日——
+#: 长期停牌的票回补下来仍可能不足，那种票本就不该有分位。
 INITIAL_SYNC_DAYS = 730
 
 
 def _window(latest: date | None, as_of: date) -> date | None:
+    """增量窗口的起点；返回 None 表示已经追平到今天，没什么可问。"""
     start = latest + timedelta(days=1) if latest else as_of - timedelta(days=INITIAL_SYNC_DAYS)
     return None if start > as_of else start
 
@@ -40,7 +45,9 @@ def _units(ctx: JobContext) -> list[tuple[str, str]]:
     return [(ctx.market, code) for code in ctx.universe.codes(ctx.market)]
 
 
-def _collect(units: list[tuple[str, str]], action, label: str) -> JobOutcome:
+def _collect(
+    units: list[tuple[str, str]], action: Callable[[str, str], int], label: str
+) -> JobOutcome:
     rows = 0
     done = 0
     errors: list[str] = []
@@ -126,7 +133,7 @@ def _has(deps: JobDeps, market: str, method: str) -> bool:
 
     整个市场一个源都没配上时 `sources_for` 会抛 `DatasourceError`；
     「整块没配」与「缺这一个能力」对注册表来说是同一个答案：不登记这个 job。
-    启动不该因为一个市场没配源就整个失败——健康页的数据源那一节才是它该出声的地方。
+    启动不该因为一个市场没配源就整个失败——健康页的降级链那一节才是它该出声的地方。
     """
     try:
         return bool(deps.registry.chain_for(market, method))

@@ -8,13 +8,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 
 import polars as pl
 import pytest
-from support import FrozenClock, sample_bars
+from support import sample_actions, sample_bars
 from support_fundamentals import StubFundamentalsAdapter
-from support_valuation import financial_rows, valuation
+from support_valuation import financial_rows, flow_rows, valuation
 
 from sams.core.errors import RateLimited
 from sams.datasource.registry import AdapterRegistry
@@ -25,6 +25,7 @@ from sams.services.scheduler.jobs import (
     run_actions,
     run_bars,
     run_financials,
+    run_flow,
     run_valuation,
 )
 from sams.services.scheduler.types import JobContext, JobDeps
@@ -40,16 +41,24 @@ AS_OF = date(2024, 10, 25)
 
 
 class RecordingBarsAdapter:
-    """只有日线能力的 akshare 替身：记下每一次问出去的区间。
+    """日线 + 公司行为的记录替身：记下每一次问出去的区间。
 
-    `markets` 含 HK——注册表在构造时就校验「路由里的源支持该市场」，
-    而注册用例要把 akshare 同时排进 A 与 HK 的链上。
+    `name`/`markets` 按实例传入，以对齐真实源：`akshare` 只覆盖 A 股（`akshare_cn.py`），
+    港股日线另由 `yfinance` 供（`yfinance_us.py`）——注册表在构造时就校验「路由里的源
+    支持该市场」，把一个只吃 A 的名字排进 HK 的链上是这里要避开的谎。两个名字都只提供
+    真实源确实提供的那几种能力（日线、公司行为）。
     """
 
-    name = "akshare"
-    markets = frozenset({"A", "HK"})
-
-    def __init__(self, *, frame: pl.DataFrame | None = None, fail_on: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        name: str = "akshare",
+        markets: tuple[str, ...] = ("A",),
+        frame: pl.DataFrame | None = None,
+        fail_on: str | None = None,
+    ) -> None:
+        self.name = name
+        self.markets = frozenset(markets)
         self.frame = frame
         self.fail_on = fail_on
         self.calls: list[tuple[str, str, date, date]] = []
@@ -66,22 +75,25 @@ class RecordingBarsAdapter:
             & pl.col("date").is_between(start, end)
         )
 
+    def corp_actions(self, market, code, start, end):
+        return sample_actions(market=market, code=code, source=self.name)
 
-def deps(db, settings, *, bars=None, finance=None):
+
+def deps(db, settings, *, bars=None, finance=None, hk=None):
     """装配这条链上真正跑到的那几个服务；汇率/日历/规则那几个槽位这里是 None，本文件不跑它们。"""
     bars = bars or RecordingBarsAdapter()
+    hk = hk or RecordingBarsAdapter(name="yfinance", markets=("HK",))
     finance = finance or StubFundamentalsAdapter(["A"])
     finance.name = "eastmoney"
     registry = AdapterRegistry(
-        adapters={"akshare": bars, "eastmoney": finance},
-        market_sources={"A": ("akshare", "eastmoney"), "HK": ("akshare",)},
+        adapters={"akshare": bars, "yfinance": hk, "eastmoney": finance},
+        market_sources={"A": ("akshare", "eastmoney"), "HK": ("yfinance",)},
         sleep=lambda _: None,
     )
     symbols = SymbolRepo(db)
     return JobDeps(
         settings=settings,
         registry=registry,
-        universe=None,  # type: ignore[arg-type]  —— 本文件的用例自己造 Universe
         sync=SyncService(registry, BarRepo(db), symbols, settings.markets),
         corp_actions=CorpActionSyncService(
             registry, CorpActionRepo(db), CorpActionsCoverageRepo(db)
@@ -98,7 +110,6 @@ def deps(db, settings, *, bars=None, finance=None):
         rules=None,  # type: ignore[arg-type]
         recheck=None,  # type: ignore[arg-type]
         users=None,  # type: ignore[arg-type]
-        clock=FrozenClock(datetime(2024, 10, 25, 15, tzinfo=UTC)),
     )
 
 
@@ -178,6 +189,20 @@ def test_valuation_job_uses_the_latest_stored_day(db, settings):
     assert ValuationRepo(db).latest_date("A", "601088") == AS_OF
 
 
+def test_flow_job_uses_the_latest_stored_day(db, settings):
+    # 库里资金流停在 24 号 ⇒ 窗口从 25 号起（读的是 flow.latest_date）；桩无视传入区间，
+    # 所以把按日估值那一列也铺到 AS_OF：若 run_flow 误读 valuation.latest_date，窗口会算成
+    # 「已追平」而写 0 行——rows_affected 与 flow 最新日两处都会红。
+    FundingFlowRepo(db).upsert(flow_rows([date(2024, 10, 24)], net=1.0e8))
+    ValuationRepo(db).upsert(valuation([AS_OF]))
+    finance = StubFundamentalsAdapter(
+        ["A"], flow=flow_rows([date(2024, 10, 24), AS_OF], net=1.0e8)
+    )
+    outcome = run_flow(deps(db, settings, finance=finance), ctx("601088"))
+    assert outcome.rows_affected == 2
+    assert FundingFlowRepo(db).latest_date("A", "601088") == AS_OF
+
+
 def test_actions_job_skips_a_fully_covered_code(db, settings):
     CorpActionsCoverageRepo(db).record(
         "A",
@@ -189,7 +214,8 @@ def test_actions_job_skips_a_fully_covered_code(db, settings):
     )
     adapter = RecordingBarsAdapter()
     outcome = run_actions(deps(db, settings, bars=adapter), ctx("601088"))
-    # 没被问过才算「跳过」：这条链上没有任何源能给公司行为，真去取就会留下一条 errors
+    # 覆盖确认已经说到「全历史且到今天」，run_actions 直接跳过、不再问链：
+    # 链上现在有能给公司行为的源，若不跳过就会真取回一行并写进库——row_count 为 0 才算跳过
     assert outcome.errors == ()
     assert outcome.rows_affected == 0
     assert db.row_count("corp_actions") == 0
@@ -201,10 +227,18 @@ def test_build_jobs_registers_only_markets_with_capability(db, settings):
     )
     jobs = build_jobs(deps(db, only))
     registered = {(job.name, job.market) for job in jobs}
-    assert ("bars", "A") in registered and ("bars", "HK") in registered
+    # A：akshare 给日线与公司行为，eastmoney 给基本面/估值/资金流——五种全登记
+    assert ("bars", "A") in registered
+    assert ("actions", "A") in registered
     assert ("financials", "A") in registered
+    assert ("valuation", "A") in registered
+    assert ("flow", "A") in registered
+    # HK：yfinance 给日线与公司行为，没有任何基本面源 ⇒ 后三种不登记
+    assert ("bars", "HK") in registered
+    assert ("actions", "HK") in registered
     assert ("financials", "HK") not in registered
-    assert not any(job.name == "actions" for job in jobs)
+    assert ("valuation", "HK") not in registered
+    assert ("flow", "HK") not in registered
 
 
 def test_build_jobs_skips_a_market_without_any_source(db, settings):
