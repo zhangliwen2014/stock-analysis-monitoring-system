@@ -6678,10 +6678,13 @@ git commit -m "fix(health): 评审第二轮——未迁移那条线只留一个�
 
 **Files:**
 - Create: `src/sams/cli/schedule.py`
-- Modify: `src/sams/cli/__init__.py`（`COMMAND_MODULES` 加 `schedule`）
-- Modify: `src/sams/bootstrap.py`
-- Test: `tests/cli/test_run_cli.py`
-- Test: `tests/test_bootstrap.py`（追加三条）
+- Modify: `src/sams/cli/__init__.py`（import 块与 `COMMAND_MODULES` 各加 `schedule`）
+- Modify: `src/sams/bootstrap.py`（装配 `Scheduler`、`Container.scheduler`、`SystemAlerter` 接线、
+  `HealthService(schedule=…)`）
+- Modify: `src/sams/services/health.py` + `src/sams/cli/health.py`（未迁移容器的护栏，见 Step 11）
+- Test: `tests/cli/test_run_cli.py`（新建 10 枚）
+- Test: `tests/test_bootstrap.py`（追加 3 枚）
+- Test: `tests/services/test_health.py` + `tests/cli/test_health_cli.py`（护栏那 4 处）
 
 到这一步为止，调度器在代码里已经能跑，但没有任何进程会造它：`bootstrap` 不装配，
 命令行也够不着。这个 task 把两头接上，同时回答三个使用问题：
@@ -6694,18 +6697,29 @@ git commit -m "fix(health): 评审第二轮——未迁移那条线只留一个�
 
 两个容易踩的接线点，先写清楚：
 
-1. **模块名不能叫 `run.py`**。`sams/cli/__init__.py` 有一个包级的 `run()`，
-   `from sams.cli import run` 会先解析到同名子模块，`cli.run([...])` 变成
-   `Module` 不可调用——症状是所有 CLI 测试一起红，而报错停在测试的调用处。
+1. **模块名不能叫 `run.py`**。`sams/cli/__init__.py` 有一个包级的 `run()`。今天
+   `COMMAND_MODULES` 写在 `def run()` 之前，元组拿到的是子模块，所以不会坏；把两行的
+   顺序换一下，元组里装的就是那个函数，`module.add_to(...)` 当场 `AttributeError`。
+   换一个名字，这件事就不再依赖那两行的先后。
 2. **`iso_date` 必须在 handler 里调用，不能当 `type=`**。argparse 不认
    `ValidationError`，`--as-of 2024-13-40` 会吐一段栈而不是「这个日期该怎么写」；
    handler 里调用才能经 `exit_for` 变成退出码 2（D77）。
 
+还有第三个，是接线之后才显形的：**读数接进生产，就把「库里还没有那两张表」这一形状
+带进了每一次 `sams health`**（Step 11）。
+
 - [ ] **Step 1: 写失败的 CLI 用例**
 
-`tests/cli/test_run_cli.py`：
+`tests/cli/test_run_cli.py`（整份就是这些）：
 
 ```python
+"""`sams run start|once|jobs`：钉的是「给定一份读数，屏幕上该有什么、以什么码退出」。
+
+替身只回答三个问题——注册了什么、`tick` 收到哪些参数、循环推了几轮。「该不该跑这一轮」
+「连败几个周期才告警」那些判断在 `tests/services/test_scheduler_service.py` 里钉过；
+这一层去重演它们，同一句话就会有两份各自失效的主人。
+"""
+
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
@@ -6713,15 +6727,21 @@ from types import SimpleNamespace
 
 from sams.cli import build_parser
 from sams.core.errors import SchedulerBusy, ValidationError
+from sams.services.scheduler.due import DAILY, FX, WEEKLY
 from sams.services.scheduler.runner import SKIPPED, RunResult
 from sams.services.scheduler.service import TickReport
-from sams.services.scheduler.types import DAILY, FX, WEEKLY, JobOutcome, JobSpec
+from sams.services.scheduler.types import JobOutcome, JobSpec
 
 NOW = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
 DAY = date(2024, 10, 25)
 
 
 def result(**over) -> RunResult:
+    """一行执行结果，默认是「跑成了，并且有一句可说的话」。
+
+    用例要「没有尾巴」的那几格自己写 `note=""`：屏幕上那些尾巴判的就是空串，
+    默认值替它们说话会把「没话说」这一支钉不住。
+    """
     fields = {
         "job": "bars",
         "market": "A",
@@ -6738,8 +6758,11 @@ class FakeScheduler:
     """只回答三个问题：注册了什么、tick 收到了哪些参数、循环推了几轮。"""
 
     def __init__(self, *, report: TickReport | None = None, reports=(), error=None):
+        # 四个而不是三个：名字列的宽度要靠一个 10 个字符的名字才钉得住（`financials`），
+        # 而注册顺序的语义（数据 → 周检 → 规则 → 汇率 → 日历）由 period 那三样代表
         self.jobs = (
             JobSpec("bars", DAILY, "A", lambda context: JobOutcome()),
+            JobSpec("financials", DAILY, "A", lambda context: JobOutcome()),
             JobSpec("recheck", WEEKLY, "A", lambda context: JobOutcome()),
             JobSpec("fx", FX, None, lambda context: JobOutcome()),
         )
@@ -6765,15 +6788,23 @@ class FakeScheduler:
 
 
 def invoke(scheduler, argv: list[str]) -> int:
+    """走一遍真的 argparse：命令名、参数、`--help` 那一套都由 `build_parser` 负责。
+
+    容器是手搭的：装配归 `tests/test_bootstrap.py`，这里只给这两个 handler 读的那两样。
+    `scheduler_tick_s` 特意取一个不是默认值的数：屏幕上那一格读的是设置，
+    写死成 60 的用例分不出「读了设置」和「抄了默认值」。
+    """
     args = build_parser().parse_args(argv)
     container = SimpleNamespace(
         scheduler=scheduler,
-        settings=SimpleNamespace(scheduler_tick_s=60),
+        settings=SimpleNamespace(scheduler_tick_s=45),
     )
     return args.handler(container, args)
 
 
 def test_once_prints_each_result_and_counts_failures(capsys):
+    """三种结论各占一行，其中失败让退出码变 1：`once` 是排障入口，
+    敲它的人要知道「这一轮有没有需要人看的东西」。"""
     scheduler = FakeScheduler(
         report=TickReport(
             now=NOW,
@@ -6799,20 +6830,34 @@ def test_once_prints_each_result_and_counts_failures(capsys):
     )
     assert invoke(scheduler, ["run", "once"]) == 1
     out = capsys.readouterr().out
-    assert "ok     bars@A" in out and "入库 3 根" in out
-    assert "failed actions@HK" in out and "429" in out
-    assert "skipped fx@全局" in out and "10 分钟内重试过" in out
-    assert "等待  calendar@A" in out
+    lines = out.splitlines()
+    # 三行都钉整行：note / skip_reason / error 三格各自在一行上有值、在另两行上是空串，
+    # 「条件改成无条件」多出来的是一个 ` · ` 空尾巴，只查子串的断言拦不住
+    assert "ok     bars@A  周期 2024-10-25 · 入库 3 根" in lines
+    assert "failed actions@HK  周期 2024-10-25 · RateLimited: 429" in lines
+    assert "skipped fx@全局  周期 2024-10-25 · 10 分钟内重试过" in lines
+    assert "等待  calendar@A  还没到点" in out
 
 
 def test_once_exits_zero_when_nothing_failed(capsys):
+    """全成功 + 等待中也还是 0：「还没到点」不是故障，把两者合成一个码，
+    cron 就会每天为一个正常的下午报警。
+
+    三个旗标都不给时也钉：`None` 传下去才是「按各市场当地日期、全部 job」，替一个空旗标
+    填上「今天」会让三个市场共用同一个日期——屏幕上那一轮说的就不是「今晚」了。
+    """
     scheduler = FakeScheduler(
         report=TickReport(now=NOW, results=(result(),), waiting=("fx@全局",))
     )
     assert invoke(scheduler, ["run", "once"]) == 0
+    assert "等待  fx@全局  还没到点" in capsys.readouterr().out
+    assert scheduler.calls == [{"as_of": None, "only_job": None, "only_market": None}]
 
 
-def test_once_normalizes_market_and_parses_as_of(capsys):
+def test_once_normalizes_market_and_parses_as_of():
+    """钉的是「进调度器之前已经归一」：`Scheduler._selected` 按 `spec.market == only_market`
+    过滤，而注册表里的键是大写，所以原样传下去的 `hk` 会选出零个 job，屏幕上写着「跑了
+    一轮」而什么都没做。替身只记录自己收到了什么，真实的那道过滤在 `service.py`。"""
     scheduler = FakeScheduler()
     argv = ["run", "once", "--market", "hk", "--as-of", "2024-10-25", "--job", "bars"]
     assert invoke(scheduler, argv) == 0
@@ -6822,6 +6867,8 @@ def test_once_normalizes_market_and_parses_as_of(capsys):
 
 
 def test_a_malformed_date_is_a_usage_error(capsys):
+    """2 与 1 的分界（D77）：`--as-of 2024-13-40` 是敲错了，改参数就能重跑；
+    一段栈会让运维先去查那个抛错的文件。"""
     scheduler = FakeScheduler()
     assert invoke(scheduler, ["run", "once", "--as-of", "2024-13-40"]) == 2
     assert "YYYY-MM-DD" in capsys.readouterr().err
@@ -6829,12 +6876,33 @@ def test_a_malformed_date_is_a_usage_error(capsys):
 
 
 def test_an_unknown_job_is_a_usage_error(capsys):
+    """job 名敲错同样是 2：`_selected` 抛的是 `ValidationError`，
+    而「这一轮没选出 job」与「这一轮跑成了」在屏幕上必须分得开。"""
     scheduler = FakeScheduler(error=ValidationError("没有匹配的 job（name=ghost）"))
     assert invoke(scheduler, ["run", "once", "--job", "ghost"]) == 2
     assert "没有匹配的 job" in capsys.readouterr().err
 
 
+def test_once_prints_an_error_line_and_exits_1(capsys):
+    """到期计算算不出来的那些 job 不进 `results`，进 `errors`：只打结果的那一屏
+    会把「三个市场的日历读不到」说成「这一轮无事可做」。"""
+    scheduler = FakeScheduler(
+        report=TickReport(
+            now=NOW,
+            results=(),
+            waiting=("calendar@A",),
+            errors=("rules@A: 日历里没有 2024-10-25",),
+        )
+    )
+    assert invoke(scheduler, ["run", "once"]) == 1, "只有错误、没有失败也要非零"
+    out = capsys.readouterr().out
+    assert "错误  rules@A: 日历里没有 2024-10-25" in out
+    assert "等待  calendar@A  还没到点" in out
+
+
 def test_start_reports_the_job_count_and_suppresses_skipped_only_ticks(capsys):
+    """启动那一句先报「几个 job、多久一轮」：敲的人要知道自己启动的是不是刚改完的配置。
+    一轮里全是「这个周期已经跑过」时整轮不出声——几十秒一轮刷屏会把真正的失败冲走。"""
     skipped = TickReport(
         now=NOW,
         results=(result(status=SKIPPED, note="", skip_reason="成功过的周期不重跑"),),
@@ -6843,14 +6911,37 @@ def test_start_reports_the_job_count_and_suppresses_skipped_only_ticks(capsys):
     scheduler = FakeScheduler(reports=(skipped, alive))
     assert invoke(scheduler, ["run", "start"]) == 0
     out = capsys.readouterr().out
-    assert "3 个 job，每 60 秒一轮" in out
+    assert "4 个 job，每 45 秒一轮" in out
     assert "已停止（2 个 tick）" in out
-    # 常驻循环每 60 秒一轮；全是「已跑过」的 tick 每秒刷一行会把真正的失败冲走
     assert "成功过的周期不重跑" not in out
+    # 整行连缩进一起钉：少掉那一格缩进，这一行就和「出声的那一轮」的头一行分不出层级
+    assert "  ok     bars@A  周期 2024-10-25 · 入库 3 根" in out.splitlines()
     assert out.count("bars@A") == 1
+    # 静音连头一行一起静音：只挡结果行，一轮全 skipped 时仍然留一行光秃秃的时刻，
+    # 那一行读起来像「这一轮做了点什么」
+    assert out.count("2024-10-25 23:00:00 UTC") == 1
+
+
+def test_a_tick_with_an_error_speaks_even_when_every_job_was_skipped(capsys):
+    """「全 skipped」与「全 skipped 且这一轮有算不出来的东西」是两屏：
+    前一种该安静，后一种必须出声，否则静音规则会顺手吃掉真正的故障。"""
+    noisy = TickReport(
+        now=NOW,
+        results=(result(status=SKIPPED, note="", skip_reason="成功过的周期不重跑"),),
+        errors=("bars@A: 读不到账本",),
+    )
+    scheduler = FakeScheduler(reports=(noisy,))
+    assert invoke(scheduler, ["run", "start"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    # 连那一格缩进一起钉：错误行是这一轮头一行的下属，顶格打就看不出它属于哪一轮
+    assert "  错误  bars@A: 读不到账本" in lines
+    assert "[2024-10-25 23:00:00 UTC]" in lines, "出声的那一轮要带上它是哪一轮"
+    assert "成功过的周期不重跑" not in "\n".join(lines), "出声不等于把 skipped 也倒出来"
 
 
 def test_start_reports_a_second_daemon_as_a_message(capsys):
+    """认领心跳失败（已经有一个循环在跑）是一句话，不是一段栈；
+    也不是 2——命令行没错，是那个进程已经存在（D100）。"""
     scheduler = FakeScheduler(
         error=SchedulerBusy("已经有一个调度器在运行（心跳 30 秒前）")
     )
@@ -6862,30 +6953,58 @@ def test_start_reports_a_second_daemon_as_a_message(capsys):
 
 
 def test_jobs_lists_the_registration_order(capsys):
+    """「为什么今晚没有港股规则」只有两个答案来源：注册顺序，以及每条各自的市场与周期。
+
+    钉整行而不是列的位置：名字那一格少留一格时四行**仍然彼此对齐**（一起左移），
+    只查「齐不齐」拦不住改宽度。而 11 与 4 这两格的出处是「注册表里最长的名字
+    （`financials`）之后还留两格」，与健康页 `[调度]` 那一节同一条线——所以这里要红的是
+    那两格的具体间距，市场那一格同时给两种长度（`A` 与「全局」）。
+    """
     assert invoke(FakeScheduler(), ["run", "jobs"]) == 0
     out = capsys.readouterr().out
-    assert "注册 3 个 job" in out
-    assert out.index("bars") < out.index("recheck") < out.index("fx")
-    assert "全局" in out
+    assert "注册 4 个 job（执行顺序即下列顺序）：" in out
+    rows = [ln for ln in out.splitlines() if ln.startswith("  ")]
+    assert rows == [
+        "  bars        A    daily",
+        "  financials  A    daily",
+        "  recheck     A    weekly",
+        "  fx          全局   fx",
+    ]
+
 ```
+
+三处与「拿替身演一遍」有关的口径，都在文件里钉着，这里只点名为什么这么造：
+
+- **替身设置的 `scheduler_tick_s` 是 45，不是生产默认值 60**。屏幕上那一格填的必须是
+  设置里的数：把两处都写成 60，`每 60 秒一轮` 这个字面量就是绿的（变异「一轮多长写死在
+  屏幕上」正是这么打的）。
+- **注册表里放四个 job，其中一个是 `financials`**。名字列宽按注册表里最长的取值留，
+  三个短名字（`bars`/`recheck`/`fx`）钉不出这一格至少要 11 个字符。
+- **断言取整行、不取子串**。`"ok     bars@A  周期 2024-10-25 · 入库 3 根"` 这种整行断言
+  同时钉住状态列宽、`@` 后面的市场、分隔符那一个 `·` 与缩进；子串断言只钉得住文字，
+  把两格合成一格、或把缩进吞掉都是绿的。
 
 - [ ] **Step 2: 跑红**
 
 ```bash
-uv run pytest tests/cli/test_run_cli.py -q
+.venv/bin/python -m pytest tests/cli/test_run_cli.py -q
 ```
 
-Expected: FAIL（`run` 不是已注册的命令）。
+Expected: FAIL（`run` 不是已注册的子命令，`build_parser().parse_args(["run", …])` 在
+argparse 处就 `SystemExit(2)`）。
 
-- [ ] **Step 3: 写 `cli/schedule.py` 并注册**
-
-`src/sams/cli/schedule.py`：
+- [ ] **Step 3: 写 `cli/schedule.py`**
 
 ```python
-"""`sams run`：常驻调度、手工跑一轮、列出注册的 job。
+"""`sams run`：常驻调度、手工补一轮、按执行顺序列出注册的 job。
 
-模块名用 schedule 而不是 run：`sams/cli/__init__.py` 里已经有一个包级的 `run()`，
-同名模块会让 `from sams.cli import run` 解析成子命令模块，而不是那个入口。
+模块名用 `schedule` 而不是 `run`：`sams/cli/__init__.py` 里那个包级入口函数也叫 `run`。
+叫同一个名字今天不会坏，只因为 `COMMAND_MODULES` 写在 `def run()` 之前——元组拿到的是
+子模块，函数随后把包上那个名字改成自己。把两行的顺序换一下，元组里装的就是函数，
+`module.add_to(...)` 当场 `AttributeError`。换一个名字，这件事就不依赖那两行的先后了。
+
+这一层不认识「该不该跑这一轮」：到期计算、连败计数、心跳守卫都在 `services.scheduler`，
+这里只做三件事——把参数归一化、把一轮的结论落到屏幕上、把退出码分给脚本。
 """
 
 from __future__ import annotations
@@ -6938,7 +7057,12 @@ def _print_result(result, indent: str = "") -> None:
 
 
 def _print_tick(report: TickReport) -> None:
-    """常驻模式的一行Tick：全是 skipped 且没有错误时整轮不出声。"""
+    """常驻模式的一轮：全是「这个周期已经跑过」且没有错误时，整轮不出声。
+
+    常驻循环按 `scheduler_tick_s` 一轮接一轮，出声的那一屏会把真正的失败冲走。
+    但「有错误」必须能穿透这条静音——静音的理由是「无事可做」，
+    一个算不出到期日的 job 不是无事可做。
+    """
     shown = [result for result in report.results if result.status != SKIPPED]
     if not shown and not report.errors:
         return
@@ -6951,6 +7075,8 @@ def _print_tick(report: TickReport) -> None:
 
 def _start(container: Container, args: argparse.Namespace) -> int:
     scheduler = container.scheduler
+    # 启动那一句先报「几个 job、多久一轮」：敲的人要能确认自己启动的是刚改完的那份配置，
+    # 而不是一个还在跑旧注册表的进程
     print(
         f"调度器启动：{len(scheduler.jobs)} 个 job，"
         f"每 {container.settings.scheduler_tick_s} 秒一轮（Ctrl-C 停止）"
@@ -6958,8 +7084,11 @@ def _start(container: Container, args: argparse.Namespace) -> int:
     try:
         ticks = scheduler.run_forever(on_tick=_print_tick)
     except SamsError as exc:
-        # 认领心跳失败（另一个调度器在跑）走这里：顶层 run() 只会给退出码 1，
-        # 而「命令敲错了」与「已经有进程在跑」对脚本是两件事（D77）
+        # 走到这里的是「进不了循环」那一类：`run_forever` 先认领心跳，才进那个自己兜
+        # `SamsError` 的 try，所以「已经有一个循环在跑」与「心跳那一行写不进去」
+        # （库在那一刻读不了、迁移只应用了一半）是同一个出口。顶层 `run()` 也会兜住、
+        # 说同一句话、给同一个码（1，不是 2：命令行没错）；这里先兜一层，是为了这一层的
+        # 两个出口由这一层自己的用例钉住——顶层那一句目前没有用例
         print(f"错误: {exc}", file=sys.stderr)
         return exit_for(exc)
     print(f"已停止（{ticks} 个 tick）")
@@ -6968,6 +7097,8 @@ def _start(container: Container, args: argparse.Namespace) -> int:
 
 def _once(container: Container, args: argparse.Namespace) -> int:
     try:
+        # 归一化放在这里而不是交给 argparse 的 `type=`：`iso_date` 抛的是
+        # `ValidationError`，argparse 不认它，`--as-of 2024-13-40` 会吐一段栈（D77）
         market = canonical_market(args.market) if args.market else None
         as_of = iso_date(args.as_of) if args.as_of else None
         report = container.scheduler.tick(
@@ -6982,17 +7113,27 @@ def _once(container: Container, args: argparse.Namespace) -> int:
         print(f"等待  {title}  还没到点")
     for error in report.errors:
         print(f"错误  {error}")
+    # 错误也非零：那几条是「这一轮连该不该跑都算不出来」，与「跑过了、跳过」不同。
+    # 能走到这一行的 `errors` 只有到期计算那一条路：账本读不了那类是从上面那个
+    # `except SamsError` 出 screen 的（一句 stderr、同一个码 1），不留到屏幕上
     return 1 if report.failed or report.errors else 0
 
 
 def _jobs(container: Container, args: argparse.Namespace) -> int:
     print(f"注册 {len(container.scheduler.jobs)} 个 job（执行顺序即下列顺序）：")
     for spec in container.scheduler.jobs:
-        print(f"  {spec.name:<10} {spec.market or '全局':<4} {spec.period}")
+        # 周期紧跟着名字：它是「今晚该不该跑」的分母。两格宽度与健康页 `[调度]`
+        # 那一节一致（名字按注册表里最长的 `financials` 留宽），`:<` 只补不截，
+        # 留窄一格后面的列就跟着左移
+        print(f"  {spec.name:<11} {(spec.market or '全局'):<4} {spec.period}")
     return 0
+
 ```
 
-`src/sams/cli/__init__.py` 两处都按字母序插入 `schedule`（`rule` 之后、`screen` 之前）：
+- [ ] **Step 4: 注册进包入口**
+
+`src/sams/cli/__init__.py` 两处（import 块按字母序，`COMMAND_MODULES` 按命令分组顺序，
+`schedule` 落在 `rule` 之后）：
 
 ```python
 from sams.cli import (
@@ -7032,25 +7173,25 @@ COMMAND_MODULES = (
 )
 ```
 
-- [ ] **Step 4: 跑绿**
+- [ ] **Step 5: 跑绿**
 
 ```bash
-uv run pytest tests/cli/test_run_cli.py tests/cli/test_cli.py -q
+.venv/bin/python -m pytest tests/cli/test_run_cli.py tests/cli/test_cli.py -q
 ```
 
 Expected: PASS。`tests/cli/test_cli.py` 里的 `test_every_subcommand_help_page_formats`
 会自动走到新命令的三个 help 页。
 
-- [ ] **Step 5: 写失败的组装根用例**
+- [ ] **Step 6: 写失败的组装根用例**
 
 在 `tests/test_bootstrap.py` 末尾追加（`SystemAlarm` 已在文件顶部 import）：
 
 ```python
 def test_the_container_registers_jobs_in_execution_order(container):
-    """执行顺序是语义：周复检要在当晚规则之前，汇率要排在所有市场之后。
+    """执行顺序是语义：周复检排在当晚规则之前，汇率排在规则之后、日历之前。
 
-    这个用例只钉顺序与「按能力注册」，不钉 job 数量——`stub_adapters` 只给日线，
-    所以港股没有基本面 job，而这是 D106 想要的结果，不是缺数据。
+    这里不钉 job 的个数：`stub_adapters()` 只给日线，港美股因此没有基本面 job，
+    而那是 D106「按能力注册」要的结果，不是缺数据。
     """
     built, _ = container
     titles = [job.title for job in built.scheduler.jobs]
@@ -7061,10 +7202,11 @@ def test_the_container_registers_jobs_in_execution_order(container):
 
 
 def test_a_job_alarm_becomes_a_system_alert_for_admins(container):
-    """D102：同一条 `SystemAlarm` 在总线有两类订阅者——日志与管理员。
+    """D102：同一条 `SystemAlarm` 在总线有两类订阅者——日志（上面那枚钉的）与管理员。
 
-    路由的分支在 `test_scheduler_alarms.py` 逐条钉过，这里只验接线：
-    告警真的从总线走到了 `alerts` 那张表，且带上了系统告警的三件标记。
+    路由的分支在 `test_scheduler_alarms.py` 逐条钉过，这里只验接线：告警真的从总线
+    走到了 `alerts` 那张表，并带上系统告警那三件标记（`rule_id` 为空、市场是 `SYS`、
+    `code` 存组件名）。接线断了的形状是「日志里天天有、管理员一条都没收到」。
     """
     built, _ = container
     built.users.create("root", "correct-horse-battery", is_admin=True)
@@ -7081,6 +7223,8 @@ def test_a_job_alarm_becomes_a_system_alert_for_admins(container):
 
 
 def test_health_carries_the_schedule_reading(container):
+    """健康页那一节读的就是这里装的那台调度器：两处各造一份时，
+    屏幕上「最近一次的结论」说的不是真在跑的那一个。"""
     built, _ = container
     report = built.health.report()
     assert report.schedule is not None
@@ -7088,18 +7232,18 @@ def test_health_carries_the_schedule_reading(container):
     assert report.schedule.admins == 0
 ```
 
-- [ ] **Step 6: 跑红**
+- [ ] **Step 7: 跑红**
 
 ```bash
-uv run pytest tests/test_bootstrap.py -q
+.venv/bin/python -m pytest tests/test_bootstrap.py -q
 ```
 
 Expected: FAIL（`Container` 没有 `scheduler`；`HealthReport.schedule` 仍为 `None`；
 发布告警后 `alerts` 为空）。
 
-- [ ] **Step 7: 接线 `bootstrap.py`**
+- [ ] **Step 8: 接线 `bootstrap.py`**
 
-import 块按字母序补六行服务与两行仓库：
+六行服务 import（排在 `rules.snapshot` 之后、`screen` 之前，字母序）与一行仓库 import：
 
 ```python
 from sams.services.scheduler.alarms import SystemAlerter
@@ -7114,19 +7258,19 @@ from sams.services.scheduler.universe import UniverseBuilder
 from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
 ```
 
-`Container` 的 `rule_rechecker` 之后加：
+`Container` 的 `rule_rechecker` 之后：
 
 ```python
-    #: 常驻调度器（spec §12）：`run start/once/jobs` 与健康页的 `[调度]` 都读它
+    #: 常驻调度器（spec §12）：`sams run start|once|jobs` 与健康页的 `[调度]` 读的是同一台
     scheduler: Scheduler
 ```
 
-把 sender 提成变量（`RuleEngine` 与 `SystemAlerter` 共用同一条发送路径——
-两套 sender 意味着 DND 与通道选择有两份实现，admin 收不收得到系统告警
-会取决于它走的是哪一条）：
+sender 提成变量——`RuleEngine` 与 `SystemAlerter` 共用同一条发送路径，两套 sender 意味着
+DND 与通道选择有两份实现，admin 收不收得到系统告警会取决于它走的是哪一条：
 
 ```python
-    # 规则告警与系统告警走同一个 sender：不是复用技巧，是「只有一条发送路径」
+    # 规则告警与系统告警共用这一个 sender：DND、通道选择、`notify_log` 那一行都住在
+    # `NotifyService` 那一头，一个组装根里留两条发送路径，迟早一条带上这些而另一条不带
     sender = _NotifyAlertSender(notify)
     rule_engine = RuleEngine(
         rules=rules_store,
@@ -7141,15 +7285,19 @@ from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
     )
 ```
 
-`rule_rechecker = Rechecker(...)` 之后、`return Container(` 之前，加：
+`rule_rechecker = Rechecker(...)` 之后、`return Container(` 之前。四个同步服务与
+`UniverseBuilder` 一起提出来：同一个服务被造两份时，容器里那个与 job 里那个不是同一个
+对象，症状不是报错、是「改了没生效」。
 
 ```python
+    # D102：系统告警与规则告警共用上面那个 sender，订阅的是同一条总线
     SystemAlerter(
         alerts=alerts_store, users=users, sender=sender, settings=cfg, clock=clock
     ).attach(event_bus)
 
-    # 下面四个服务原本就地造在 `return Container(...)` 里：调度器也要吃它们，
-    # 而同一个服务被造两份时，「job 里跑的」与「命令行跑的」不再是同一条链
+    # 下面四个同步服务与 `UniverseBuilder` 原本就地造在 `return Container(...)` 的参数里。
+    # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
+    # 测试替换或事后调一处参数，另一处照旧跑——症状不是报错，是「改了没生效」
     sync = SyncService(registry, bars, symbols, cfg.markets)
     corp_action_sync = CorpActionSyncService(
         registry, corp_actions, corp_actions_coverage, clock=clock
@@ -7173,7 +7321,6 @@ from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
     deps = JobDeps(
         settings=cfg,
         registry=registry,
-        universe=universe_builder,
         sync=sync,
         corp_actions=corp_action_sync,
         fundamentals=fundamental_sync,
@@ -7182,17 +7329,16 @@ from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
         rules=rule_engine,
         recheck=rule_rechecker,
         users=users,
-        clock=clock,
     )
     scheduler = Scheduler(
         cfg,
         build_jobs(deps),
-        JobRunner(runs=task_runs, bus=event_bus, clock=clock),
-        task_runs,
-        heartbeats,
-        universe_builder,
-        users,
-        calendar,
+        runner=JobRunner(runs=task_runs, bus=event_bus, clock=clock),
+        runs=task_runs,
+        heartbeats=heartbeats,
+        universe=universe_builder,
+        users=users,
+        calendar=calendar,
         clock=clock,
     )
 ```
@@ -7200,6 +7346,7 @@ from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
 `return Container(...)` 里四处改成上面造好的对象，并补 `scheduler`：
 
 ```python
+        calendar=calendar,
         sync=sync,
         corp_action_sync=corp_action_sync,
         fundamental_sync=fundamental_sync,
@@ -7211,27 +7358,174 @@ from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
         scheduler=scheduler,
 ```
 
-`HealthService(...)` 的构造参数补一行：
+`HealthService(...)` 的构造参数补一行（那三行注释记的是「这一屏读的不是那个进程」，
+Task 11 的实测结论在接线之后仍然成立）：
 
 ```python
+            # 本机通道的可用性由 monitor 探测，health 只接这一个函数：多一条 import 就红了
+            local_status=notify.local_status,
+            # 健康页读的就是上面这台调度器留下的那两张台账：不是「它此刻活着吗」——
+            # 调度器持有库文件时，第二个进程连不上（DuckDB 的独占锁），这一屏说的是
+            # 「它上一次写下结论是什么时候」
             schedule=scheduler.schedule_data,
 ```
 
-- [ ] **Step 8: 跑绿与静态检查**
+- [ ] **Step 9: 跑绿与静态检查**
 
 ```bash
-uv run pytest tests/cli/test_run_cli.py tests/test_bootstrap.py tests/services/test_health.py -q
-uv run ruff check src tests --no-cache
+.venv/bin/python -m pytest tests/cli/test_run_cli.py tests/test_bootstrap.py \
+    tests/services/test_health.py -q
+.venv/bin/ruff check src tests --no-cache
 ```
 
-Expected: PASS；ruff 无输出。
+Expected: PASS；ruff `All checks passed!`。
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 10: 真进程冒烟（不是用例，是打开眼睛看）**
 
 ```bash
-git add src/sams/cli/schedule.py src/sams/cli/__init__.py src/sams/bootstrap.py tests/cli/test_run_cli.py tests/test_bootstrap.py
+SAMS_CONFIG=tmp/task12-smoke.toml SAMS_SECRET_KEY=… .venv/bin/sams run jobs
+SAMS_CONFIG=tmp/task12-smoke.toml SAMS_DB_PATH=/tmp/t12c.duckdb SAMS_SECRET_KEY=… \
+    .venv/bin/sams health
+```
+
+一份临时配置 + 一个空的 DuckDB 文件，跑的是真注册表：
+
+- `run jobs` 报 21 个 job（`A` 七个 / `HK` 五个 / `US` 五个 / `fx` 一个 / `calendar` 三个），
+  顺序与 `build_jobs` 一致，且**这个数量本身就是一次验收**——`stub_adapters` 造不出来
+  这个形状（D106 的能力门在真配置上是全开的）。
+- 那个空库被 `sams health` 顺手迁移之后，`[调度]` 说「从未启动」、21 行 job 全打
+  「从未运行」，`⚠ 没有在用的管理员` 露头（新库里确实一个用户都没有），退出码 0。
+- 两屏的列宽逐字符对齐（`:{11}` / `:{4}`）。**CJK 那一格在终端里仍然偏 2 个格**：
+  `f"{…:<4}"` 数的是字符数，`全局` 两个字符占四个显示格，所以只有 `fx` 那一行的第三列
+  比别行晚两列。今天按「接受」处理——它不是数据错、也不是行缺失，为它引入一套
+  显示宽度计算（`east_asian_width`）会把两屏的断言全换成宽度表；如果 Task 13 之后这一屏
+  真的多了全局 job，再回来算这笔。
+
+- [ ] **Step 11: 未迁移的容器不能炸掉整屏（接线带出来的回归）**
+
+接线前跑全量，`tests/test_adversarial_services.py::test_health_show_exit_codes` 直接红了：
+那枚用例造的是**没跑过迁移**的容器，而 `HealthService.report()` 现在无条件调
+`self.schedule()` → 对着不存在的 `scheduler_heartbeats` 发 SQL → `StorageError`。
+整屏出不来，与它想报的「哪个迁移还没应用」是同一个症状的两半。
+
+修法是发 SQL 之前问一次表在不在，把「还没迁移」与「没接入」分成两个字段：
+
+```python
+#: 调度器读数要查的两张表。`[表]` 那一节报的也是这两张：一处定义、另一处只引用，
+#: 免得「能不能查」与「报不报行数」两边各写一遍、然后有一边先失效。
+#: 两张表各答一个问题：`task_runs` 是「每个 job 上一轮跑成什么」，
+#: `scheduler_heartbeats` 是「还在跑吗」（D101：判「它还在不在跑」的读者必须在循环之外）
+SCHEDULE_TABLES = ("task_runs", "scheduler_heartbeats")
+```
+
+`HealthReport` 的两个字段与那道护栏：
+
+```python
+    #: 调度器的读数。「没有读数」在这一格上有两种，别读成同一种：`None` 是「没接入」
+    #: 或「库里还没有那两张表」（后者由下面那一格说清楚），而
+    #: `ScheduleData(heartbeat=None, ...)` 是「接入了、只是那一拍还没写下」。
+    #: 三种混成一屏，运维会去查一个从没跑过的调度器
+    schedule: ScheduleData | None = None
+    #: 读数接的是生产那台调度器，但库里还没应用 0018，于是这一问压根没发出去。
+    #: 单独一格是为了把「还没迁移」从 `None` 里分出来：两句的修法相反，
+    #: 一句跑 `sams db migrate`、一句查装配
+    schedule_unmigrated: bool = False
+```
+
+```python
+        # 调度器那一问要查 0018 那两张表，护栏放在发 SQL 之前：这一屏的合同是
+        # 「拿到一个没迁移的容器也要出得来」（`tests/test_adversarial_services.py`
+        # 直接喂 `show` 钉着它）。这里只问表在不在、不问列，靠的是 0018 一次做两件事：
+        # 建 `scheduler_heartbeats`、给 0001 那张 `task_runs` 补上 `period_key`/`note`。
+        # `_notify_data` 那边没有这个巧合（`channels`/`notify_log` 是 0001 的表，
+        # `outcome` 那一列要到 0015 才有），所以它多问了一句列在不在
+        schedule = None
+        schedule_unmigrated = False
+        if self.schedule is not None:
+            if set(SCHEDULE_TABLES) <= have:
+                schedule = self.schedule()
+            else:
+                schedule_unmigrated = True
+```
+
+屏幕上那一支排在「未接入」之前（两句的修法相反）：
+
+```python
+    if report.schedule_unmigrated:
+        # 排在「未接入」之前，两句的修法相反：一句跑迁移、一句查装配。
+        # 版本号写在这里是给个人去跑哪条命令，真要问「还差哪几个迁移」看这一屏最上面
+        # 那行的「待应用迁移」——那一句才是从库里读出来的
+        print("  库里还没有 0018 的形状：sams db migrate")
+        return
+```
+
+用例补 4 处（1 枚新建 + 3 枚追加断言）：`tests/services/test_health.py` 里那枚未迁移用例
+现在数着 `schedule` 被调了几次并钉 `asked == []`（护栏要在发 SQL 之前，不是发完再吞异常），
+`tests/cli/test_health_cli.py::test_an_unmigrated_db_says_the_schedule_shape_not_the_unwired_one`
+钉整行——子串断言在这一屏会被 `[通知]` 那节的「库里还没有 0015 的形状」顶掉。
+
+- [ ] **Step 12: 提交**
+
+不改历史（不 `--amend`、不 `reset --soft`），所以评审那两处由后面的提交说明。
+
+```bash
+# 02711a3 —— 实现
+git add src/sams/cli/schedule.py src/sams/cli/__init__.py src/sams/bootstrap.py \
+    tests/cli/test_run_cli.py tests/test_bootstrap.py
 git commit -m "feat(scheduler): sams run start|once|jobs 与组装根接线"
+
+# d50fc19 —— Step 11（回归 + 修法 + 4 处用例）
+git add src/sams/services/health.py src/sams/cli/health.py \
+    tests/services/test_health.py tests/cli/test_health_cli.py
+git commit -m "fix(health): 读数接进生产之后，未迁移的容器不能再炸掉整屏"
+
+# 0e2ca4e —— 评审收尾（只改注释与文档串，逻辑一行没动）
+git commit -m "docs(scheduler): 评审收尾——注释不再替走不到的路径打包票"
 ```
+
+**评审与实测（2026-10-23）**
+
+- **计划草稿里有三处与仓库对不上，落地时按仓库改**：
+  ① `Scheduler(cfg, build_jobs(deps), JobRunner(…), task_runs, heartbeats, universe_builder,
+  users, calendar, clock=clock)`——真实签名里 `runner` 之后全是**仅关键字**参数
+  （`service.py` 的 `__init__`），八 positional 直接 `TypeError`；现在是九个关键字。
+  ② `JobDeps` 草稿带 `universe=universe_builder` 与 `clock=clock`——真实 `JobDeps`
+  是十个字段，没有这两个：`UniverseBuilder` 与时钟由 `Scheduler` 自己拿（`Scheduler`
+  要在 tick 之外做心跳与到期，job 只在 `JobContext` 里拿到需要的东西）。
+  ③ 用例草稿 `from sams.services.scheduler.types import DAILY, FX, WEEKLY`——这四个周期
+  常量住在 `due.py`（`types.py` 只有 `JobSpec`/`JobOutcome`/`JobDeps`）。
+- **`_jobs` 的名字列宽从草稿的 `:<10` 改成 `:<11`**：`financials` 有 10 个字符，
+  留 10 格时它的周期紧跟一格、其余各行晚一格，与 `[调度]` 那节（Task 11 定的 11）不再一致。
+- **五枚变异第一轮是绿的，每枚的根因都是一处弱断言**：替身设置与屏幕字面量同为 60（改成
+  45）；子串断言看不出列宽整体变化与缩进（改整行）；`out.count(时间戳)` 缺位导致
+  「这一轮不打标题」也是绿的（补 `== 1`）。补强后 50 枚全红。
+- **变异电池两枚共 62**：`/tmp/mut12.py` 50 枚（`cli/schedule.py` 的三屏与退出码、
+  `cli/__init__.py` 的两处注册、`bootstrap.py` 的容器字段/健康读数来源/`SystemAlerter`
+  订阅/调度器四个依赖/空注册表），`/tmp/mut12b.py` 12 枚（Step 11 那道护栏：表不在也照查、
+  表在也不查、包含关系反着判、`schedule_unmigrated` 永远说假、接线了就不问表、两张表少一张、
+  屏幕那一支删掉/不走/排在「未接入」之后、版本号写错、只 `return` 不出声、修法指向不存在的
+  命令）。两份电池跑完都逐字节 sha256 还原校验。全红。
+- **评审接受（`0e2ca4e`）**：① `_start` 那个 `except` 的注释原来把「已经有一个循环在跑」
+  写成唯一来路——`run_forever` 先 `_claim()` 才进那个自己兜 `SamsError` 的 try，
+  所以心跳写不进去（`StorageError`）是同一个出口，注释改成两个出口；
+  ② `_once` 退出码那句要点名兄弟出口（账本读不了那类从 `except SamsError` 出 screen，
+  一句 stderr、同一个码 1，不留到屏幕上）；③ `HealthReport.schedule` 的 `None` 今天有
+  两种原因（没接入 / 库里还没有那两张表），字段注释原来只写一种；`schedule_stale` 的
+  文档串同理不再假装只有「从未启动」一个近亲；④ 那道护栏「只问表不问列」的理由要写下来
+  （0018 一次做两件事：建心跳表、给 0001 的 `task_runs` 补 `period_key`/`note`；
+  `_notify_data` 没有这个巧合，因为 `channels`/`notify_log` 是 0001 的表而 `outcome`
+  那一列要到 0015，所以它多问一句列在不在——两处不齐是有原因的，不是漏）。
+- **自己写下的两句假话，撤回**：① 「`sams health` 是迁移前的自检入口」——`cli/__init__.py`
+  的 `run()` 对**除 `db` 之外**的每个命令先 `container.migrate()`，所以从命令行走不到
+  未迁移的形状；那句改口成「这一支今天只由直接喂 `show` 的用例走到」。
+  ② 「库被别的进程占着」举作 `_start` 那个出口的来路之一——独占锁在更早的
+  `build_container` 就失败，到不了这里。
+- **评审提出、按仓库事实驳回两条**：① 把 `schedule_unmigrated` 也送进退出码——
+  未迁移这件事已经有主人（`report.pending_migrations`，非零），加第二个来源只会在
+  「迁移没跑」与「调度器停了」之间多一个说不清的组合；② 把容错下推到
+  `TaskRunRepo`/`HeartbeatRepo`（表不在就返回空）——那会把「问不了」变成「从未启动」，
+  正是这一片代码从头到尾在避免的那种混读。
+- 全量离线套件：2951 passed（14 deselected，`-m 'not live'`）。
 
 ### Task 13: 一个模拟交易日的端到端验收
 
