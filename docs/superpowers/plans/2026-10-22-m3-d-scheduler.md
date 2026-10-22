@@ -835,6 +835,24 @@ git add src/sams/datasource/registry.py tests/datasource/test_registry.py
 git commit -m "feat(datasource): 全链失败的重试分界延伸到日线/公司行为/基本面（D104）"
 ```
 
+**评审收尾（2026-10-22）**：实现落在 `742392b`，两路评审之后修在 `289341a`。评审发现的问题与处理：
+
+1. 两路评审同时指出同一处 BLOCKING：`_call`/`_call_fx` 的兜底分支把包装后的
+   `DatasourceError` 当作 `cause`，于是 `RETRYABLE` 里的裸 `OSError`/`TimeoutError`
+   永远不命中——docstring 说的「超时/网络算抖动」（D96）在实际路径上不成立。修复是
+   让 `cause` 保留原始异常；汇率报错文案改用 `_SourceFailed.error`，类型名不丢。
+2. actions 的 `no_answer` 置位、以及 `causes=[]`（一个能取日线的源都没有）时
+   `all([])==True` 的守卫，都没有用例钉住；补了三条用例与一条汇率用例，并把
+   structural 用例参数化成两种顺序。
+3. 「一个日线源都没有」原先仍报「所有源均失败 → 」，把配置缺口说成源故障；
+   改为「没有能取日线的源」并列出被跳过的源。
+
+变异电池九条全红（恒终端、恒瞬态、去掉 causes 守卫、忽略 no_answer、`any` 代
+`all`、cause 回退成包装异常、actions 不置 no_answer、日线不收集 causes、汇率恒终端）。
+
+四条闸：目标用例 **55 passed**、`ruff check` 全绿、分层 **384 passed**、离线
+**2762 passed / 14 deselected**。
+
 ---
 
 ### Task 4: 到期计算（`due.py`）
