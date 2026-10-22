@@ -131,6 +131,28 @@ class TaskRunRepo:
         )
         return [_to_run(row) for row in rows.to_dicts()]
 
+    def latest_per_period(
+        self, job_name: str, market: str | None, *, limit: int
+    ) -> list[TaskRun]:
+        """每个周期只报它最近的那一行，新到旧，最多 `limit` 个**周期**。
+
+        `recent` 数的是行，而一个一直失败的周期每 `RETRY_GAP_MIN` 分钟就多写一行：
+        按行数窗口，多大的数都会被同一个周期自己的重试占满。
+        一个周期的结论就是它的最后一行：成功之后这个周期不再被重跑，
+        所以最后一行不会被更早的行盖住。
+        """
+        rows = self.db.query(
+            f"SELECT {_COLUMNS} FROM ("
+            " SELECT *, rowid,"
+            " row_number() OVER ("
+            "   PARTITION BY period_key ORDER BY started_at DESC, rowid DESC"
+            " ) AS rnk"
+            " FROM task_runs WHERE job_name = ? AND market IS NOT DISTINCT FROM ?)"
+            " WHERE rnk = 1 ORDER BY started_at DESC, rowid DESC LIMIT ?",
+            [job_name, market, int(limit)],
+        )
+        return [_to_run(row) for row in rows.to_dicts()]
+
     def count(self) -> int:
         return int(self.db.scalar("SELECT count(*) FROM task_runs") or 0)
 

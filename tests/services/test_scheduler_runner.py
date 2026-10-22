@@ -180,6 +180,99 @@ def test_retries_inside_one_period_do_not_count_as_periods(db):
     assert len(alarms) == 1  # 三个周期
 
 
+def test_the_alarm_survives_a_retry_storm_inside_the_middle_period(db):
+    """窗口按行数时，一个周期的重试能把窗口全部占满。
+
+    第 2 个周期失败 29 次（每次隔 `RETRY_GAP_MIN`），最近 30 行就只剩
+    第 3 个周期的一行加第 2 个周期的 29 行：连续三个失败周期永远凑不满，
+    一个每晚都失败的 job 一条告警都不发。读取按周期分组后应当恰好告一条，
+    且是第 3 个周期出结论时告（D103）。
+    """
+
+    def job(ctx):
+        raise TransientError("akshare", "boom")
+
+    runner, _, clock, alarms, spec = harness(db, job)
+    runner.execute(spec, Due(period_key="2024-10-24", as_of=date(2024, 10, 24)), UNIVERSE)
+    for attempt in range(29):
+        if attempt:
+            clock.advance(minutes=RETRY_GAP_MIN)
+        runner.execute(spec, DUE, UNIVERSE)
+    clock.advance(minutes=RETRY_GAP_MIN)
+    runner.execute(spec, Due(period_key="2024-10-26", as_of=date(2024, 10, 26)), UNIVERSE)
+
+    assert len(alarms) == 1
+    assert "2024-10-26" in alarms[0].message
+
+
+def test_the_alarming_period_alarms_once_across_its_retries(db):
+    """告警的周期自己继续重试，不能每重试一次就再告一条。
+
+    第 3 个周期失败 5 次：每一次的连续失败周期数都恰好是 3，
+    若不看「这一行是不是这个周期的第一个结论」，这里会收到 5 条而不是 1 条（D103）。
+    """
+
+    def job(ctx):
+        raise TransientError("akshare", "boom")
+
+    runner, _, clock, alarms, spec = harness(db, job)
+    runner.execute(spec, Due(period_key="2024-10-24", as_of=date(2024, 10, 24)), UNIVERSE)
+    runner.execute(spec, Due(period_key="2024-10-25", as_of=date(2024, 10, 25)), UNIVERSE)
+    for attempt in range(5):
+        if attempt:
+            clock.advance(minutes=RETRY_GAP_MIN)
+        runner.execute(spec, Due(period_key="2024-10-26", as_of=date(2024, 10, 26)), UNIVERSE)
+
+    assert len(alarms) == 1
+
+
+def test_a_successful_period_resets_the_streak(db):
+    """连续失败必须是**连续**：中间成功过一个周期，计数就要从头来。
+
+    把 `failure_streak` 里的 `break` 换成 `continue`，第 4 个失败周期会数到
+    第 1、2 个（跳过第 3 个成功的），抖动一场也会发出告警。
+    """
+
+    def job(ctx):
+        if ctx.period_key == "2024-10-26":
+            return JobOutcome()
+        raise TransientError("akshare", "boom")
+
+    runner, _, _, alarms, spec = harness(db, job)
+    for period in ("2024-10-24", "2024-10-25", "2024-10-26", "2024-10-27"):
+        result = runner.execute(
+            spec, Due(period_key=period, as_of=date.fromisoformat(period)), UNIVERSE
+        )
+        assert result.status == (OK if period == "2024-10-26" else FAILED)
+
+    assert alarms == []
+
+
+def test_the_gap_is_measured_from_the_end_of_the_last_attempt(db):
+    """重试间隔从上一次**结束**起算，不是从它开始起算。
+
+    一个跑了 25 分钟才失败的 job，失败后立刻重来并没有「等满 10 分钟」：
+    从 `started_at` 起算的话，慢 job 的每次失败都像是早就过完了间隔，
+    打源的就不是重试，是循环。
+    """
+
+    def job(ctx):
+        clock.advance(minutes=25)
+        raise TransientError("akshare", "boom")
+
+    runner, _, clock, _, spec = harness(db, job)
+    first = runner.execute(spec, DUE, UNIVERSE)
+    assert first.status == FAILED
+
+    waiting = runner.execute(spec, DUE, UNIVERSE)
+    assert waiting.status == SKIPPED
+    assert "不足" in waiting.skip_reason
+
+    clock.advance(minutes=RETRY_GAP_MIN)
+    again = runner.execute(spec, DUE, UNIVERSE)
+    assert again.status == FAILED
+
+
 def test_outcome_errors_mark_failed_and_keep_the_note(db):
     def job(ctx):
         return JobOutcome(rows_affected=1, note="1/2 只日线", errors=("600519: boom",))
