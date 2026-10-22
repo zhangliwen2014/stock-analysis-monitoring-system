@@ -274,6 +274,26 @@ def test_unwired_reading_keeps_the_section_and_exits_0(invoke) -> None:
     assert code == 0
 
 
+def test_an_unmigrated_db_says_the_schedule_shape_not_the_unwired_one(invoke) -> None:
+    """还没迁移 ≠ 没接线：两句的修法相反，一句跑 `sams db migrate`、一句查装配，
+    不能在同一屏上显示成同一行。
+
+    这一格今天从 `sams health` 走不到（`run()` 在非 db 命令之前顺手补齐迁移），钉的是
+    `_print_schedule` 对一份 report 的显示合同——与 `[通知]` 那节的「库里还没有 0015 的形状」
+    同一条线，那一句也只在直接喂 `show` 的那条路上走得到。
+
+    钉整行：`[通知]` 那一节同屏也写着「sams db migrate」，只查子串的话两句会互相顶包。
+    """
+    report = HealthReport(
+        db_path=":memory:", schedule=None, schedule_unmigrated=True, notify=NotifyData()
+    )
+    code, text = invoke(report)
+    lines = text.splitlines()
+    assert "  库里还没有 0018 的形状：sams db migrate" in lines
+    assert "未接入调度器读数" not in lines
+    assert code == 0
+
+
 def test_an_unmigrated_db_says_the_version_and_no_backlog_numbers(invoke) -> None:
     """未迁移的那一屏只说「该跑迁移」，不接着报积压：`NotifyData()` 里那八个数是 `None`，
     而 `None` 是「没查过」不是「查出来是 0」。把两者印在同一屏上，读的人会在一个

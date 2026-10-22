@@ -96,12 +96,27 @@ def test_router_failures_show_up_in_the_report(db, settings):
 
 
 def test_unmigrated_database_lists_pending(tmp_path, settings):
+    """这一层对「拿到一个没迁移的容器」有一条既有的合同：屏幕上必须出得来迁移提示，
+    而不是 `Catalog Error`——`tests/test_adversarial_services.py` 直接喂 `show` 钉的就是它。
+    `schedule` 是这条路上最后一个还会发 SQL 的读数，它接进生产之后补上了同一道护栏。
+    """
     fresh = Database.open(tmp_path / "fresh.duckdb")
+    asked: list[int] = []
+
+    def reading():
+        asked.append(1)
+        return ScheduleData(heartbeat=None, beat_age_s=None, admins=0, jobs=())
+
     try:
-        report = service(fresh, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+        report = service(
+            fresh, settings, StubAdapter("akshare", ["A"], sample_bars()), schedule=reading
+        ).report()
         assert report.pending_migrations == [p.name for p in discover()]
         assert report.tables == {}
         assert report.calendar_years == {}, "未建库时日历覆盖应报空而不是崩"
+        assert asked == [], "表都不在，就不该发那一句查询"
+        assert report.schedule is None
+        assert report.schedule_unmigrated is True
     finally:
         fresh.close()
 
@@ -668,6 +683,7 @@ def test_report_carries_the_schedule_reading(db, settings) -> None:
     ).report()
     assert report.schedule is data
     assert report.schedule_stale is False
+    assert report.schedule_unmigrated is False, "表在，就不是「还没迁移」"
 
 
 def test_an_unwired_reader_gives_no_reading_rather_than_a_blank_one(db, settings) -> None:
@@ -676,6 +692,7 @@ def test_an_unwired_reader_gives_no_reading_rather_than_a_blank_one(db, settings
     report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
     assert report.schedule is None
     assert report.schedule_stale is False
+    assert report.schedule_unmigrated is False, "「没接入」与「还没迁移」是两句话"
 
 
 def make_sys_alert(alerts: AlertRepo, user_id: str, component: str, moment: datetime) -> Alert:

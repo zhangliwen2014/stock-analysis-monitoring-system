@@ -195,6 +195,10 @@ def _print_schedule(report) -> None:
     不盯屏幕的人读。
     """
     print("[调度]")
+    if report.schedule_unmigrated:
+        # 排在「未接入」之前，两句的修法相反：一句跑迁移，一句查装配
+        print("  库里还没有 0018 的形状：sams db migrate")
+        return
     if report.schedule is None:
         print("  未接入调度器读数")
         return

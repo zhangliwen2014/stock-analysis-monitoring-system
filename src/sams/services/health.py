@@ -36,6 +36,12 @@ def _as_date(value) -> date | None:
     return value.date() if isinstance(value, datetime) else value
 
 
+#: 调度器读数要查的两张表。`[表]` 那一节报的也是这两张：一处定义、另一处只引用，
+#: 免得「能不能查」与「报不报行数」两边各写一遍、然后有一边先失效。
+#: 两张表各答一个问题：`task_runs` 是「每个 job 上一轮跑成什么」，
+#: `scheduler_heartbeats` 是「还在跑吗」（D101：判「它还在不在跑」的读者必须在循环之外）
+SCHEDULE_TABLES = ("task_runs", "scheduler_heartbeats")
+
 #: 健康报告里点名关注数据量的表；其它表（M2/M3 才用到）只报存在与否
 KEY_TABLES = (
     "symbols",
@@ -55,10 +61,8 @@ KEY_TABLES = (
     "channels",
     "alerts",
     "notify_log",
-    # 调度器的两张台账各答一个问题：`task_runs` 是「每个 job 上一轮跑成什么」，
-    # `scheduler_heartbeats` 是「还在跑吗」（D101：判「它还在不在跑」的读者必须在循环之外）
-    "task_runs",
-    "scheduler_heartbeats",
+    # 调度器那两张台账：为什么两张都要在这一屏上，见上面的 `SCHEDULE_TABLES`
+    *SCHEDULE_TABLES,
 )
 
 
@@ -181,6 +185,9 @@ class HealthReport:
     #: （`ScheduleData(heartbeat=None, ...)`）是两件事，必须在类型上分得开：
     #: 把前者显示成后者，运维会去查一个从没跑过的调度器
     schedule: ScheduleData | None = None
+    #: 那两张表还不存在（`schedule` 接的是生产那台调度器，但库里还没应用 0018）。
+    #: 与「没接入」分开是因为两句的修法相反：一句查装配，一句跑 `sams db migrate`
+    schedule_unmigrated: bool = False
 
     @property
     def degraded_sources(self) -> list[SourceRecord]:
@@ -278,9 +285,18 @@ class HealthService:
         self.schedule = schedule
 
     def report(self) -> HealthReport:
-        tables = {
-            name: self.db.row_count(name) for name in KEY_TABLES if name in self.db.table_names()
-        }
+        have = set(self.db.table_names())
+        tables = {name: self.db.row_count(name) for name in KEY_TABLES if name in have}
+        # 调度器那一问要查 0018 那两张表，护栏放在发 SQL 之前，与 `_notify_data` 开头那一句
+        # 是同一条线：这一屏的合同是「拿到一个没迁移的容器也要出得来」
+        # （`tests/test_adversarial_services.py` 直接喂 `show` 那条路钉着它）
+        schedule = None
+        schedule_unmigrated = False
+        if self.schedule is not None:
+            if set(SCHEDULE_TABLES) <= have:
+                schedule = self.schedule()
+            else:
+                schedule_unmigrated = True
         return HealthReport(
             db_path=self.db.path,
             tables=tables,
@@ -291,7 +307,8 @@ class HealthService:
             fundamentals=self._fundamentals_coverage(),
             ledger=self._ledger_data(),
             notify=self._notify_data(),
-            schedule=self.schedule() if self.schedule is not None else None,
+            schedule=schedule,
+            schedule_unmigrated=schedule_unmigrated,
         )
 
     def _notify_data(self) -> NotifyData:
