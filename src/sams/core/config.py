@@ -41,8 +41,8 @@ class Settings:
     polling_interval_s: int
     cooldown_min: int
     markets: dict[str, MarketCfg]
-    #: 调度器的心跳/到期检查间隔（D100）。它**不是**盘中轮询间隔：
-    #: `polling_interval_s` 服务于 M4 的 10 秒快照，后者依赖 M4 的报价源；
+    #: 调度器的心跳/到期检查间隔（D97）。它**不是**盘中轮询间隔：
+    #: `polling_interval_s` 预留给 M4/U7 的 10 秒快照，那条链目前还没有消费者；
     #: 盘后任务按分钟级检查就够了，把一个盘中参数借给它，会让改盘中频率顺手改掉盘后
     scheduler_tick_s: int = 60
 
