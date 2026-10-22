@@ -83,6 +83,14 @@ class _Limited:
         raise RateLimited("limited", "Too Many Requests")
 
 
+class _Timeouting:
+    name = "timeouting"
+    markets = ("US",)
+
+    def fx_rate(self, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
+        raise TimeoutError("timed out")
+
+
 class _Drifted:
     name = "drifted"
     markets = ("US",)
@@ -194,6 +202,12 @@ def test_one_drift_in_the_chain_is_not_reported_as_transient(db: Database) -> No
         _service(_Limited(), _Drifted(), db=db).sync("USD", "CNY", D1, D2)
     assert not isinstance(exc.value, TransientError)
     assert "drifted" in str(exc.value)
+
+
+def test_a_bare_timeout_still_says_rerun_later(db: Database) -> None:
+    """裸超时被兜底包过一层，也要按原始类型判成抖动，而不是链坏了。"""
+    with pytest.raises(TransientError, match="TimeoutError"):
+        _service(_Timeouting(), db=db).sync("USD", "CNY", D1, D2)
 
 
 def test_every_source_saying_no_is_a_confirmed_empty(db: Database) -> None:

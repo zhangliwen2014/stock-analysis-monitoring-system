@@ -523,18 +523,42 @@ def test_all_daily_sources_rate_limited_is_transient():
         reg.fetch_daily("A", "600519", D1, D2)
 
 
-def test_one_structural_failure_makes_daily_terminal():
+@pytest.mark.parametrize(
+    "excs",
+    [
+        (RateLimited("akshare", "429"), FieldDrift("eastmoney", "少列")),
+        (FieldDrift("akshare", "少列"), RateLimited("eastmoney", "429")),
+    ],
+)
+def test_one_structural_failure_makes_daily_terminal(excs):
     """掺进一个改版 ⇒ 出声告警，不带「重试就好」的意思。"""
-    reg = _two_failing(RateLimited("akshare", "429"), FieldDrift("eastmoney", "少列"))
+    reg = _two_failing(*excs)
     with pytest.raises(DatasourceError) as caught:
         reg.fetch_daily("A", "600519", D1, D2)
     assert not isinstance(caught.value, TransientError)
+
+
+def test_bare_network_errors_are_transient():
+    """适配器漏归类的裸超时同样是「抖了一下」，不能因为被兜底包过一层就当成链坏了。"""
+    reg = _two_failing(TimeoutError("timed out"), TimeoutError("timed out"))
+    with pytest.raises(TransientError, match="所有源均失败"):
+        reg.fetch_daily("A", "600519", D1, D2)
 
 
 def test_actions_keep_retryability_in_the_terminal_error():
     reg = _two_failing(RateLimited("akshare", "429"), RateLimited("eastmoney", "429"))
     with pytest.raises(TransientError, match="取不到公司行为"):
         reg.fetch_actions("A", "600519", D1, D2)
+
+
+def test_actions_with_a_no_answer_are_terminal():
+    """公司行为的「答不上来」和基本面同理：一个源没把有无说清，就不能替它下结论。"""
+    reg = _two_failing(
+        RateLimited("akshare", "429"), EmptyResponse("eastmoney", "接口回空")
+    )
+    with pytest.raises(DatasourceError) as caught:
+        reg.fetch_actions("A", "600519", D1, D2)
+    assert not isinstance(caught.value, TransientError)
 
 
 def test_frames_with_a_no_answer_are_terminal_even_if_the_rest_are_retryable():
@@ -551,3 +575,16 @@ def test_frames_all_rate_limited_are_transient():
     reg = _two_failing(RateLimited("akshare", "429"), RateLimited("eastmoney", "429"))
     with pytest.raises(TransientError, match="取不到基本面"):
         reg.fetch_financials("A", "600519", D1, D2)
+
+
+class _NoDaily:
+    name = "nodaily"
+    markets = frozenset({"A"})
+
+
+def test_a_chain_with_no_daily_source_is_terminal():
+    """一个能取日线的源都没有：这是配置缺口，重试不会让能力长出来。"""
+    reg = registry(_NoDaily())
+    with pytest.raises(DatasourceError, match="没有能取日线的源") as caught:
+        reg.fetch_daily("A", "600519", D1, D2)
+    assert not isinstance(caught.value, TransientError)

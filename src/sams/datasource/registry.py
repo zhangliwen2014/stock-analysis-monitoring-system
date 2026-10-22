@@ -407,6 +407,12 @@ class AdapterRegistry:
                 empty_everywhere=True,
             )
         detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
+        if not attempts:
+            raise DatasourceError(
+                "registry",
+                f"{market} {code} 没有能取日线的源：链 {list(self.sources_for(market))} 里"
+                f"被跳过的源 {skipped or []}",
+            )
         raise _terminal_error(f"{market} {code} 所有源均失败 → {detail}", causes)
 
     def fetch_actions(self, market: str, code: str, start: date, end: date) -> ActionsResult:
@@ -607,7 +613,7 @@ class AdapterRegistry:
         attempts: list[Attempt] = []
         skipped: list[tuple[str, str]] = []
         empties: list[str] = []
-        failed: list[tuple[str, Exception]] = []
+        failed: list[tuple[str, str, Exception | None]] = []
         for name in self.adapters:
             adapter = self.adapter(name)
             if not has_fx(adapter):
@@ -618,7 +624,7 @@ class AdapterRegistry:
                 frame = self._call_fx(name, base, quote, start, end)
             except _SourceFailed as exc:
                 attempts.append(Attempt(name, False, exc.tries, exc.error))
-                failed.append((name, exc.cause))
+                failed.append((name, exc.error, exc.cause))
                 continue
             except EmptyResponse as exc:
                 attempts.append(Attempt(name, True, 1, f"无数据: {exc}"))
@@ -642,19 +648,19 @@ class AdapterRegistry:
                 confirmed_empty_by=tuple(empties),
             )
 
-        detail = "；".join(f"{name}: {cause}" for name, cause in failed) or "（无）"
+        detail = "；".join(f"{name}: {error}" for name, error, _ in failed) or "（无）"
         said_no = "、".join(empties)
         reason = (
             f"取不到 {base}→{quote} 的汇率。链 {list(self.adapters)} 里"
             f"被跳过的源 {skipped or []}；真调用过又失败的 {detail}"
             + (
-                f"；说这段没有数据的 {said_no}（因为 {'、'.join(n for n, _ in failed)} "
+                f"；说这段没有数据的 {said_no}（因为 {'、'.join(n for n, _, _ in failed)} "
                 f"没答上来，这些「没有」还不能写成确认）"
                 if empties and failed
                 else ""
             )
         )
-        raise _terminal_error(reason, [cause for _, cause in failed])
+        raise _terminal_error(reason, [cause for _, _, cause in failed])
 
     def _call_fx(self, name: str, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
         """对单个源的一次汇率取数：限速、退避、归类，与 `_call` 同一套预算。
@@ -689,7 +695,7 @@ class AdapterRegistry:
         except Exception as exc:  # noqa: BLE001 — 适配器漏归类时兜底，路由不能被打断
             wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
             self._mark_failure(name, wrapped)
-            raise _SourceFailed(name, calls, str(wrapped), wrapped) from exc
+            raise _SourceFailed(name, calls, str(wrapped), exc) from exc
         out = frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
         if out.is_empty():
             # 一个 0 行的帧与一次 `EmptyResponse` 是同一句话：这段没有。
@@ -746,7 +752,7 @@ class AdapterRegistry:
             # 兜住它等于让中断要等整条链每个源都试完才生效，还把一次取消记成源故障
             wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
             self._mark_failure(name, wrapped)
-            raise _SourceFailed(name, calls, str(wrapped), wrapped) from exc
+            raise _SourceFailed(name, calls, str(wrapped), exc) from exc
         return frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
 
     def _mark_ok(self, name: str) -> None:
