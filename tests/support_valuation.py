@@ -152,27 +152,51 @@ def flow_rows(
     )
 
 
-def make_container(db, settings, *, today: date = TODAY, notifier_factory=None, **seeded):
-    """一个铺好样本库、时钟冻在 `today` 的容器：命令行与服务用例都对着同一个世界跑。
+def make_container(
+    db,
+    settings,
+    *,
+    today: date = TODAY,
+    moment: datetime | None = None,
+    adapters: dict | None = None,
+    providers: dict | None = None,
+    notifier_factory=None,
+    **seeded,
+):
+    """一个铺好样本库、时钟冻在 `today`（或指定时刻）的容器。
 
     放这里而不是各测试文件里抄一份，是因为两边要验的是同一条链的两端（服务给的数 /
     屏幕上那句怎么说）；两份装配一旦分叉，一边改的数就再也对不上另一边说的话。
 
+    `adapters`/`providers` 是给调度器那一路的后门：验收要跑的那一晚需要五个能力都在的
+    源（只有日线的桩会让基本面三件根本不登记）与一张不看网络的日历（默认真 provider
+    会打外网）。不传就是原来那份世界。
+
+    `moment` 与 `today` 并存：前者到分钟（盘后延迟过没过只有时刻能答），后者是
+    「样本库铺到哪一天」，缺了前者就按后者的 15:00 UTC 冻。
+
     `notifier_factory` 是给通知那一路的后门：真通道会打网络，而这条链上每一个用例
     要断言的都是「路由把这条告警交给了哪个 kind」。
     """
-    adapter = StubFundamentalsAdapter(["A"])
-    container = build_container(
-        settings,
-        db=db,
-        adapters={
+    if adapters is None:
+        adapter = StubFundamentalsAdapter(["A"])
+        adapters = {
             "akshare": adapter,
             "eastmoney": adapter,
             "yfinance": support.StubAdapter(
                 "yfinance", ["HK", "US"], support.sample_bars(source="yfinance")
             ),
-        },
-        clock=support.FrozenClock(datetime(today.year, today.month, today.day, 15, tzinfo=UTC)),
+        }
+    container = build_container(
+        settings,
+        db=db,
+        adapters=adapters,
+        providers=providers,
+        clock=support.FrozenClock(
+            moment
+            if moment is not None
+            else datetime(today.year, today.month, today.day, 15, tzinfo=UTC)
+        ),
         notifier_factory=notifier_factory,
     )
     container.registry.sleep = lambda _seconds: None
