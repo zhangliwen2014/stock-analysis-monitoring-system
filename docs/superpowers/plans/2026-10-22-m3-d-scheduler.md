@@ -1678,16 +1678,23 @@ git commit -m "feat(scheduler): 盘后链的对象并集与币种对（四种来
 `tests/services/test_scheduler_jobs_data.py`：
 
 ```python
+"""五个数据 job 的两条规矩：窗口从库里已有的日子往前，失败按只隔离。
+
+窗口断言看的是**问出去的区间**（`adapter.calls`），不是写回来的行数：一个把 730 天
+写死的 job 也能把今天的 K 线放进库，只是每晚都把所有源重拉一遍。
+按只隔离看的是**其余那一只**：一只票的链断了，剩下那只照常入库，断的那只进 `errors`。
+"""
+
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 
 import polars as pl
 import pytest
-from support import FrozenClock, StubAdapter, sample_bars
+from support import sample_actions, sample_bars
 from support_fundamentals import StubFundamentalsAdapter
-from support_valuation import financial_rows, valuation
+from support_valuation import financial_rows, flow_rows, valuation
 
 from sams.core.errors import RateLimited
 from sams.datasource.registry import AdapterRegistry
@@ -1698,6 +1705,7 @@ from sams.services.scheduler.jobs import (
     run_actions,
     run_bars,
     run_financials,
+    run_flow,
     run_valuation,
 )
 from sams.services.scheduler.types import JobContext, JobDeps
@@ -1713,9 +1721,24 @@ AS_OF = date(2024, 10, 25)
 
 
 class RecordingBarsAdapter:
-    name = "akshare"
+    """日线 + 公司行为的记录替身：记下每一次问出去的区间。
 
-    def __init__(self, *, frame: pl.DataFrame | None = None, fail_on: str | None = None) -> None:
+    `name`/`markets` 按实例传入，以对齐真实源：`akshare` 只覆盖 A 股（`akshare_cn.py`），
+    港股日线另由 `yfinance` 供（`yfinance_us.py`）——注册表在构造时就校验「路由里的源
+    支持该市场」，把一个只吃 A 的名字排进 HK 的链上是这里要避开的谎。两个名字都只提供
+    真实源确实提供的那几种能力（日线、公司行为）。
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str = "akshare",
+        markets: tuple[str, ...] = ("A",),
+        frame: pl.DataFrame | None = None,
+        fail_on: str | None = None,
+    ) -> None:
+        self.name = name
+        self.markets = frozenset(markets)
         self.frame = frame
         self.fail_on = fail_on
         self.calls: list[tuple[str, str, date, date]] = []
@@ -1732,21 +1755,25 @@ class RecordingBarsAdapter:
             & pl.col("date").is_between(start, end)
         )
 
+    def corp_actions(self, market, code, start, end):
+        return sample_actions(market=market, code=code, source=self.name)
 
-def deps(db, settings, *, bars=None, finance=None):
+
+def deps(db, settings, *, bars=None, finance=None, hk=None):
+    """装配这条链上真正跑到的那几个服务；汇率/日历/规则那几个槽位这里是 None，本文件不跑它们。"""
     bars = bars or RecordingBarsAdapter()
+    hk = hk or RecordingBarsAdapter(name="yfinance", markets=("HK",))
     finance = finance or StubFundamentalsAdapter(["A"])
     finance.name = "eastmoney"
     registry = AdapterRegistry(
-        adapters={"akshare": bars, "eastmoney": finance},
-        market_sources={"A": ("akshare", "eastmoney"), "HK": ("akshare",)},
+        adapters={"akshare": bars, "yfinance": hk, "eastmoney": finance},
+        market_sources={"A": ("akshare", "eastmoney"), "HK": ("yfinance",)},
         sleep=lambda _: None,
     )
     symbols = SymbolRepo(db)
     return JobDeps(
         settings=settings,
         registry=registry,
-        universe=None,  # type: ignore[arg-type]  —— 本文件的用例自己造 Universe
         sync=SyncService(registry, BarRepo(db), symbols, settings.markets),
         corp_actions=CorpActionSyncService(
             registry, CorpActionRepo(db), CorpActionsCoverageRepo(db)
@@ -1763,7 +1790,6 @@ def deps(db, settings, *, bars=None, finance=None):
         rules=None,  # type: ignore[arg-type]
         recheck=None,  # type: ignore[arg-type]
         users=None,  # type: ignore[arg-type]
-        clock=FrozenClock(datetime(2024, 10, 25, 15, tzinfo=UTC)),
     )
 
 
@@ -1797,7 +1823,10 @@ def test_bars_job_backfills_when_the_code_is_new(db, settings):
 
 
 def test_one_bad_code_does_not_drop_the_rest(db, settings):
-    adapter = RecordingBarsAdapter(frame=sample_bars(), fail_on="600519")
+    frame = pl.concat([sample_bars(code="600519"), sample_bars(code="601088")]).filter(
+        pl.col("date") == date(2024, 1, 2)
+    )
+    adapter = RecordingBarsAdapter(frame=frame, fail_on="600519")
     outcome = run_bars(deps(db, settings, bars=adapter), ctx("600519", "601088"))
     assert len(outcome.errors) == 1 and "600519" in outcome.errors[0]
     assert outcome.rows_affected == 1
@@ -1807,6 +1836,20 @@ def test_one_bad_code_does_not_drop_the_rest(db, settings):
 def test_empty_universe_is_a_successful_noop(db, settings):
     outcome = run_bars(deps(db, settings), ctx())
     assert outcome.errors == () and outcome.rows_affected == 0
+
+
+def test_a_programming_error_is_not_collected_as_a_failed_code(db, settings, monkeypatch):
+    """`_collect` 只接本项目的失败：一个编程错误必须原样冒出去，而不是变成一条 `errors`。
+
+    被接住的编程错误出门时说的是「这只票取不到」，于是要修的那行代码没人会去修。
+    """
+
+    def boom(self, market, code):
+        raise TypeError("latest_date 收到了没有键的一行")
+
+    monkeypatch.setattr(BarRepo, "latest_date", boom)
+    with pytest.raises(TypeError):
+        run_bars(deps(db, settings), ctx("600519", "601088"))
 
 
 def test_financials_job_writes_what_the_chain_answers(db, settings):
@@ -1820,12 +1863,24 @@ def test_financials_job_writes_what_the_chain_answers(db, settings):
 
 def test_valuation_job_uses_the_latest_stored_day(db, settings):
     ValuationRepo(db).upsert(valuation([date(2024, 10, 24)]))
-    finance = StubFundamentalsAdapter(
-        ["A"], valuation=valuation([date(2024, 10, 24), AS_OF])
-    )
+    finance = StubFundamentalsAdapter(["A"], valuation=valuation([date(2024, 10, 24), AS_OF]))
     outcome = run_valuation(deps(db, settings, finance=finance), ctx("601088"))
     assert outcome.rows_affected == 2
     assert ValuationRepo(db).latest_date("A", "601088") == AS_OF
+
+
+def test_flow_job_uses_the_latest_stored_day(db, settings):
+    # 库里资金流停在 24 号 ⇒ 窗口从 25 号起（读的是 flow.latest_date）；桩无视传入区间，
+    # 所以把按日估值那一列也铺到 AS_OF：若 run_flow 误读 valuation.latest_date，窗口会算成
+    # 「已追平」而写 0 行——rows_affected 与 flow 最新日两处都会红。
+    FundingFlowRepo(db).upsert(flow_rows([date(2024, 10, 24)], net=1.0e8))
+    ValuationRepo(db).upsert(valuation([AS_OF]))
+    finance = StubFundamentalsAdapter(
+        ["A"], flow=flow_rows([date(2024, 10, 24), AS_OF], net=1.0e8)
+    )
+    outcome = run_flow(deps(db, settings, finance=finance), ctx("601088"))
+    assert outcome.rows_affected == 2
+    assert FundingFlowRepo(db).latest_date("A", "601088") == AS_OF
 
 
 def test_actions_job_skips_a_fully_covered_code(db, settings):
@@ -1839,6 +1894,9 @@ def test_actions_job_skips_a_fully_covered_code(db, settings):
     )
     adapter = RecordingBarsAdapter()
     outcome = run_actions(deps(db, settings, bars=adapter), ctx("601088"))
+    # 覆盖确认已经说到「全历史且到今天」，run_actions 直接跳过、不再问链：
+    # 链上现在有能给公司行为的源，若不跳过就会真取回一行并写进库——row_count 为 0 才算跳过
+    assert outcome.errors == ()
     assert outcome.rows_affected == 0
     assert db.row_count("corp_actions") == 0
 
@@ -1849,14 +1907,22 @@ def test_build_jobs_registers_only_markets_with_capability(db, settings):
     )
     jobs = build_jobs(deps(db, only))
     registered = {(job.name, job.market) for job in jobs}
-    assert ("bars", "A") in registered and ("bars", "HK") in registered
+    # A：akshare 给日线与公司行为，eastmoney 给基本面/估值/资金流——五种全登记
+    assert ("bars", "A") in registered
+    assert ("actions", "A") in registered
     assert ("financials", "A") in registered
+    assert ("valuation", "A") in registered
+    assert ("flow", "A") in registered
+    # HK：yfinance 给日线与公司行为，没有任何基本面源 ⇒ 后三种不登记
+    assert ("bars", "HK") in registered
+    assert ("actions", "HK") in registered
     assert ("financials", "HK") not in registered
-    assert not any(job.name == "actions" for job in jobs)
+    assert ("valuation", "HK") not in registered
+    assert ("flow", "HK") not in registered
 
 
 def test_build_jobs_skips_a_market_without_any_source(db, settings):
-    """库里一个启用源都没有的市场：装配已经警告过，注册表这里不许抛。
+    """库里一个启用源都没有的市场：注册表这里不许抛。
 
     否则「某个市场暂时没源」会让整个常驻调度器起不来，连其余两个市场也不跑。
     """
@@ -1904,8 +1970,8 @@ DEFAULT_ACTIONS_START = HISTORY_START
 """调度器的四种数据形状：job 吃到什么、吐出什么、怎么登记、靠什么活。
 
 `JobOutcome.errors` 不是异常：一个 job 覆盖很多只票，其中三只取不到不该让
-「另外七十只已经入库」这件事消失。runner 见到 `errors` 非空就记 `failed`，
-但行数与 note 照常留下——健康页要能同时看到「写了 70 行」和「3 只失败」。
+「另外七十只已经入库」这件事消失。所以失败与行数并存于同一个结果里——
+读它的一侧（`task_runs` 的一行）要能同时看到「写了 70 行」和「3 只失败」。
 """
 
 from __future__ import annotations
@@ -1913,22 +1979,31 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
+from typing import Protocol
 
-from sams.core.clock import Clock
 from sams.core.config import Settings
-from sams.datasource.registry import AdapterRegistry
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalSyncService
 from sams.services.fx import FxSyncService
 from sams.services.rules.engine import RuleEngine
 from sams.services.rules.recheck import Rechecker
-from sams.services.scheduler.due import DAILY, FX, MONTHLY, WEEKLY
-from sams.services.scheduler.universe import Universe, UniverseBuilder
+from sams.services.scheduler.universe import Universe
 from sams.services.sync import SyncService
 from sams.storage.repos.users import UserRepo
 
-PERIODS = (DAILY, WEEKLY, MONTHLY, FX)
+
+class RegistryView(Protocol):
+    """调度器对数据源层只问一句话：「这个市场这条能力链上有谁」（`chain_for`）。
+
+    与 `due.py` 的 `CalendarView` 同一做法——`AdapterRegistry` 恰好实现了这一个方法，
+    这里不写死那个类。Protocol 真正买到的只有两件事：types/jobs 不 import 数据源层，
+    以及它们向数据源层问的只有 `chain_for` 这一句。它不构成取数禁令——每个服务都把
+    `registry` 存成了公开属性，`deps.sync.registry.fetch_*` 仍然够得着；拦在取数之外靠的是
+    「job 一律走 services」这条约定，不是这个 Protocol。
+    """
+
+    def chain_for(self, market: str, method: str) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True)
@@ -1971,8 +2046,7 @@ class JobSpec:
 @dataclass(frozen=True)
 class JobDeps:
     settings: Settings
-    registry: AdapterRegistry
-    universe: UniverseBuilder
+    registry: RegistryView
     sync: SyncService
     corp_actions: CorpActionSyncService
     fundamentals: FundamentalSyncService
@@ -1981,7 +2055,6 @@ class JobDeps:
     rules: RuleEngine
     recheck: Rechecker
     users: UserRepo
-    clock: Clock
 ```
 
 - [ ] **Step 5: 写 `jobs.py` 的五个数据 job 与注册**
@@ -1989,10 +2062,10 @@ class JobDeps:
 `src/sams/services/scheduler/jobs.py`：
 
 ```python
-"""九个 job 的功能本体：只把已有服务拼成一条链，不决定自己何时跑。
+"""数据 job 的功能本体：只把已有服务拼成一条链，不决定自己何时跑。
 
 每个 job 覆盖一个市场的一批对象，**按只隔离**：一只票的链断了，剩下的照常入库，
-断的那几只进 `JobOutcome.errors`，由 runner 记成 `failed` 并在 10 分钟后重试。
+断的那几只进 `JobOutcome.errors`，与「已经写进行数」并存于同一个结果里。
 不按只隔离的后果是「一只停牌票让整个市场今晚没有数据」，而它看起来像一次正常失败。
 
 窗口规则：
@@ -2004,27 +2077,29 @@ class JobDeps:
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable
 from datetime import date, timedelta
 from functools import partial
 
 from sams.core.errors import DatasourceError, SamsError
 from sams.core.timeutil import HISTORY_START
+from sams.services.scheduler.due import DAILY
 from sams.services.scheduler.types import (
-    DAILY,
     JobContext,
     JobDeps,
     JobOutcome,
     JobSpec,
 )
 
-logger = logging.getLogger("sams.services.scheduler.jobs")
-
-#: 首次见到一只票时回补多久：两年足够覆盖 PR 分位的样本地板（250 个交易日）
+#: 首次见到一只票时回补多久：对齐 PR 分位的样本地板 `MIN_SAMPLES = 250`
+#: （`analysis/valuation/percentile.py`：少于它，「分位说的是抽样噪声而不是估值位置」）。
+#: 730 个日历日是一个交易日年的约两倍，给足余量；但不保证一定凑够 250 个交易日——
+#: 长期停牌的票回补下来仍可能不足，那种票本就不该有分位。
 INITIAL_SYNC_DAYS = 730
 
 
 def _window(latest: date | None, as_of: date) -> date | None:
+    """增量窗口的起点；返回 None 表示已经追平到今天，没什么可问。"""
     start = latest + timedelta(days=1) if latest else as_of - timedelta(days=INITIAL_SYNC_DAYS)
     return None if start > as_of else start
 
@@ -2035,7 +2110,7 @@ def _units(ctx: JobContext) -> list[tuple[str, str]]:
 
 
 def _collect(
-    units: list[tuple[str, str]], action, label: str
+    units: list[tuple[str, str]], action: Callable[[str, str], int], label: str
 ) -> JobOutcome:
     rows = 0
     done = 0
@@ -2044,8 +2119,8 @@ def _collect(
         try:
             rows += action(market, code)
         except SamsError as exc:
-            # 只接本项目的失败：一个编程错误（AttributeError 之类）必须冒到 runner，
-            # 否则它会被误记成「这只票取不到」，然后在每一轮重试里重复发生
+            # 只接本项目的失败：一个编程错误（AttributeError 之类）不许在这里被接住，
+            # 否则它出门的那一句就是「这只票取不到」，而该修的那行代码永远没人去修
             errors.append(f"{market} {code}: {exc}")
         else:
             done += 1
@@ -2074,18 +2149,14 @@ def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
         ):
             # 全历史源已经确认到今天：再拉一遍只会得到同一批行
             return 0
-        return deps.corp_actions.sync_actions(
-            market, code, HISTORY_START, ctx.as_of
-        ).written
+        return deps.corp_actions.sync_actions(market, code, HISTORY_START, ctx.as_of).written
 
     return _collect(_units(ctx), one, "公司行为")
 
 
 def run_financials(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     def one(market: str, code: str) -> int:
-        return deps.fundamentals.sync_financials(
-            market, code, HISTORY_START, ctx.as_of
-        ).written
+        return deps.fundamentals.sync_financials(market, code, HISTORY_START, ctx.as_of).written
 
     return _collect(_units(ctx), one, "财务")
 
@@ -2124,9 +2195,9 @@ _DATA_JOBS = (
 def _has(deps: JobDeps, market: str, method: str) -> bool:
     """这个市场有没有这个能力。
 
-    整个市场在库里没有任何启用的源时 `sources_for` 会抛 `DatasourceError`；
+    整个市场一个源都没配上时 `sources_for` 会抛 `DatasourceError`；
     「整块没配」与「缺这一个能力」对注册表来说是同一个答案：不登记这个 job。
-    启动不该因为一个市场没配源就整个失败——健康页的数据源那一节才是它该出声的地方。
+    启动不该因为一个市场没配源就整个失败——健康页的降级链那一节才是它该出声的地方。
     """
     try:
         return bool(deps.registry.chain_for(market, method))
@@ -2157,6 +2228,47 @@ Expected: PASS（后者确认 `DEFAULT_*_START` 别名没有改掉命令行的�
 git add src/sams/services/scheduler/types.py src/sams/services/scheduler/jobs.py src/sams/core/timeutil.py src/sams/cli/sync.py tests/services/test_scheduler_jobs_data.py
 git commit -m "feat(scheduler): job 形状与五个数据 job（增量窗口 + 按只隔离）"
 ```
+
+**评审收尾（2026-10-22）**：实现落在 `67362ef`，两路评审之后修在 `817352c`。评审发现的问题与处理：
+
+- **计划里的 `types.py` 会造出第二个组装根**（`67362ef` 的偏差，已确认是对的解法）。
+  `tests/test_layering.py::test_bootstrap_is_the_only_assembly_root` 禁止任何非 bootstrap
+  模块同时 import storage + datasource + services，而计划的 `JobDeps` 三者齐全（`Clock`/
+  `Settings` 之外还有 `AdapterRegistry`、`UserRepo` 与五个服务）。落地的解法是本地
+  `RegistryView` Protocol 只声明 `chain_for`，与 `due.py` 的 `CalendarView` 同一做法；
+  计划片段已按落地形状替换。往后 Task 7/8/10 若也要在同一个类型里握数据源层，走的仍是这条路。
+- **删掉三个没人读的东西**（`817352c`）：`types.PERIODS`（`due.py:29` 那份才是有人读的，
+  `due.py:157` 的报错引用它）、`JobDeps.universe`（`Scheduler` 自带 builder，见本计划
+  Step「Scheduler」里的 `self.universe.build()`）、`JobDeps.clock`（runner 与 scheduler
+  各自持有时钟）。**Task 7 要注意**：计划的运维 job 用例仍写着 `clock=FrozenClock(...)`
+  与 `universe=None`，那两个槽位已经不在了。
+- **`run_flow` 一条用例都没有**，登记表也只从正向没认过 `actions`：原来那句
+  `assert not any(job.name == "actions")` 抓不到「把 `_DATA_JOBS` 里那一行删掉」——这条链
+  本来就没有能给公司行为的源，删了那行照样全绿。现在 `RecordingBarsAdapter` 带
+  `corp_actions`，A 的五种能力逐条正向断言，HK 断言「bars/actions 在、financials/valuation/
+  flow 不在」；把 `run_flow` 里的 `flow` 换成 `valuation`、`sync_flow` 换成 `sync_valuation`
+  都会红。
+- **测试桩不再冒充真实源没有的能力**：`akshare` 在真实代码里只覆盖 A 股
+  （`akshare_cn.py:363-364`），港股日线来自 `yfinance`（`yfinance_us.py:256-257`，它确实
+  同时提供 `daily_bars` 与 `corp_actions`）。原来那个名叫 `akshare`、`markets={"A","HK"}`
+  的桩把假能力排进了 HK 的链。现在桩按实例接 `name`/`markets`，HK 走 `yfinance`。
+- **D96 四处过头话**：`_has` 指向的「健康页的数据源那一节」是错的，「没有任何可用源」
+  印在 `[降级链]` 下（`cli/health.py:181-190`），`[数据源]` 那节只报每个源的健康；
+  `RegistryView` 原来写「调度器拿不到 `fetch_*`」——每个服务都把 `registry` 存成公开属性
+  （`services/sync.py:48`、`fundamentals.py:76`、`corp_actions.py:60`、`fx.py:50`），
+  改成只说 Protocol 真正买到的两件事；`INITIAL_SYNC_DAYS` 原来断言「两年足够覆盖
+  250 个交易日」，长期停牌的票回补下来可能不足，改成点名 `MIN_SAMPLES = 250`
+  （`analysis/valuation/percentile.py:38`）并说明不保证；模块 docstring 的「九个 job」
+  与「runner 记 failed / 10 分钟后重试」「装配已经警告过」都是本轮还没有的东西。
+- **没采纳的建议与理由**：把 `JobDeps` 拆成 Data/Ops 两半——删完上面三个字段之后剩下的
+  每个字段在 Task 7 都有读者，拆开只是把 `# type: ignore` 换个地方放；给 `_collect` 加
+  `word=`/`sep=` 好让 `run_fx` 复用——第二个调用方还不存在，等 Task 7 真写出来再看要不要抽；
+  把 `AS_OF`/`ctx(...)` 挪进 `tests/support_scheduler.py`——Task 7 的用例用的是
+  `SimpleNamespace` 替身，现在共享只会共享一半。
+- **留下的两处不干净**：`StubFundamentalsAdapter` 不记问出去的区间，所以 flow/valuation
+  两条用例只能行为上钉窗口（把按日估值也铺到 `AS_OF`，读错列就写 0 行）；`deps(...)` 里
+  `fx/calendar/rules/recheck/users` 仍传 `None` + `# type: ignore[arg-type]`，等 Task 7
+  的运维 job 用例真把它们装上才消得掉。
 
 ### Task 7: 四个运维 job + 引擎/复检的市场过滤
 
