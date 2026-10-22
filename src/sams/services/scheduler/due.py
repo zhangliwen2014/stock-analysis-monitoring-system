@@ -1,4 +1,4 @@
-"""「现在该跑哪个周期」——只做日期算术，不读库、不发请求。
+"""「现在该跑哪个周期」——只做日期算术，日历的回答从哪里来由 `CalendarView` 决定。
 
 三个决定落在这里，因为它们都是**一行代码就能写错、而且错了不报错**的地方：
 
@@ -26,8 +26,8 @@ logger = logging.getLogger("sams.services.scheduler.due")
 DAILY, WEEKLY, MONTHLY, FX = "daily", "weekly", "monthly", "fx"
 PERIODS = (DAILY, WEEKLY, MONTHLY, FX)
 
-#: 补跑窗口：停机三天后启动，仍能把落下的三个交易日按各自的周期键补上。
-#: 再长的停机由人决定要不要补——自动跑一个月的链会在一个 tick 里打满所有源
+#: 最近到期日的回看窗口：停机十天之内重启，仍能找到一个到期日、照常触发；
+#: 再长的停机不自动认领——一个月的链在一个 tick 里跑完会打满所有源，要不要补由人决定
 CATCHUP_DAYS = 10
 #: 周任务往前找「本周最后一个交易日」的跨度：三个整周足够覆盖长假
 WEEK_SCAN_DAYS = 21
@@ -61,7 +61,7 @@ def _passed(view: CalendarView, settings: Settings, market: str, day: date, now:
 def daily_due(
     view: CalendarView, settings: Settings, market: str, now: datetime
 ) -> Due | None:
-    """最近一个「已经收盘且过了盘后延迟」的交易日；停机的日子按天补齐。"""
+    """最近一个「已经收盘且过了盘后延迟」的交易日；窗口内没有这样的日子就返回 None。"""
     today = _local_today(settings, market, now)
     for back in range(CATCHUP_DAYS + 1):
         day = today - timedelta(days=back)

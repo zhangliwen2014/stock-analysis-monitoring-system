@@ -12,16 +12,17 @@ from sams.services.scheduler.due import (
     weekly_due,
 )
 
-#: 2024-10-25 是周五；A/HK 收盘 15:00 本地，US 收盘 15:00 纽约时（EDT）。
+#: 2024-10-25 是周五；A 股 15:00 收盘，港股 16:00，美股 16:00 纽约时（EDT）。
 FRIDAY = date(2024, 10, 25)
 
 
 def test_each_market_uses_its_own_close(settings):
     cal = FakeCalendar(settings)
-    # 07:30 UTC = A 股 15:30（收盘 + 30 已过）、美股 03:30（还没开）
+    # 07:30 UTC = A 股 15:30（收盘 + 30 已过）、港股 15:30（其收盘 16:30 还没过）、
+    # 美股 03:30（还没开）
     now = datetime(2024, 10, 25, 7, 30, tzinfo=UTC)
     assert daily_due(cal, settings, "A", now).as_of == FRIDAY
-    assert daily_due(cal, settings, "HK", now).as_of == FRIDAY
+    assert daily_due(cal, settings, "HK", now).as_of == date(2024, 10, 24)
     assert daily_due(cal, settings, "US", now).as_of == date(2024, 10, 24)
 
 
@@ -59,6 +60,13 @@ def test_weekly_due_skips_a_closed_friday(settings):
     assert weekly_due(cal, settings, "A", friday).as_of == date(2024, 10, 24)
 
 
+def test_weekly_does_not_conclude_when_the_next_day_is_unknown(settings):
+    """下一交易日不可知 ⇒ 一周都不能宣布结束：这一轮不跑，而不是提前跑或认错周。"""
+    cal = FakeCalendar(settings, next_unknown=("A",))
+    friday = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
+    assert weekly_due(cal, settings, "A", friday) is None
+
+
 def test_monthly_due_is_the_daily_due_day_in_that_month(settings):
     cal = FakeCalendar(settings)
     friday = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
@@ -68,7 +76,7 @@ def test_monthly_due_is_the_daily_due_day_in_that_month(settings):
 
 def test_fx_waits_until_every_open_market_has_closed(settings):
     cal = FakeCalendar(settings)
-    # 周五 08:00 UTC：A/HK 已收盘，US 还在周五盘中（其最新到期日仍是周四）
+    # 周五 08:00 UTC：A 已收盘，港股的盘后时点（16:30 本地）还没到，美股还在周五盘中
     early = datetime(2024, 10, 25, 8, 0, tzinfo=UTC)
     assert fx_due(cal, settings, early) is None
     # 周五 23:00 UTC：US 周五收盘 + 60 分钟也已过
