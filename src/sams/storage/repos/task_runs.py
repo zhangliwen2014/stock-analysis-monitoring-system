@@ -4,9 +4,10 @@
 「上一轮跑成了什么」（task_runs）与「现在还有没有人在跑」（heartbeats）。
 分开放的话，单实例守卫与健康页要同时认识两个模块，而它们读的是同一次时钟。
 
-状态只有三种：`running` 是崩溃留下的证据（一行的 finished_at 为空就是「没走完」），
-`ok` 与 `failed` 是两种结论。没有 `skipped`：「这一轮不该跑」由到期计算决定，
-不会先写一行再跳过——那会让「没跑过」与「跑过但没做事」在健康页上长得一样。
+状态只有三种：`running` 是「这一跑还没收尾」；同一行超过六小时仍未收尾才是崩溃留下的
+证据（D105），读取侧不能把每个 `running` 都当成死进程。`ok` 与 `failed` 是两种结论。
+没有 `skipped`：「这一轮不该跑」由到期计算决定，不会先写一行再跳过——那会让「没跑过」
+与「跑过但没做事」在健康页上长得一样。
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from sams.storage.db import Database
 from sams.storage.ids import new_id
 
 RUNNING, OK, FAILED = "running", "ok", "failed"
-STATUSES = (RUNNING, OK, FAILED)
 _FINISHED = (OK, FAILED)
 
 
@@ -104,20 +104,11 @@ class TaskRunRepo:
             [self.clock.now_utc(), status, int(rows_affected), error, note, run_id],
         )
         row = self.get(run_id)
-        assert row is not None  # 刚写完，同一条连接里一定读得回来
+        assert row is not None
         return row
 
     def get(self, run_id: str) -> TaskRun | None:
         rows = self.db.query(f"SELECT {_COLUMNS} FROM task_runs WHERE id = ?", [run_id])
-        return _to_run(rows.to_dicts()[0]) if rows.height else None
-
-    def latest(self, job_name: str, market: str | None) -> TaskRun | None:
-        rows = self.db.query(
-            f"SELECT {_COLUMNS} FROM task_runs"
-            " WHERE job_name = ? AND market IS NOT DISTINCT FROM ?"
-            " ORDER BY started_at DESC, id DESC LIMIT 1",
-            [job_name, market],
-        )
         return _to_run(rows.to_dicts()[0]) if rows.height else None
 
     def latest_for_period(
@@ -126,7 +117,7 @@ class TaskRunRepo:
         rows = self.db.query(
             f"SELECT {_COLUMNS} FROM task_runs"
             " WHERE job_name = ? AND market IS NOT DISTINCT FROM ? AND period_key = ?"
-            " ORDER BY started_at DESC, id DESC LIMIT 1",
+            " ORDER BY started_at DESC, rowid DESC LIMIT 1",
             [job_name, market, period_key],
         )
         return _to_run(rows.to_dicts()[0]) if rows.height else None
@@ -135,7 +126,7 @@ class TaskRunRepo:
         rows = self.db.query(
             f"SELECT {_COLUMNS} FROM task_runs"
             " WHERE job_name = ? AND market IS NOT DISTINCT FROM ?"
-            " ORDER BY started_at DESC, id DESC LIMIT ?",
+            " ORDER BY started_at DESC, rowid DESC LIMIT ?",
             [job_name, market, int(limit)],
         )
         return [_to_run(row) for row in rows.to_dicts()]
@@ -168,7 +159,7 @@ class HeartbeatRepo:
     def latest(self) -> Heartbeat | None:
         rows = self.db.query(
             "SELECT id, started_at, beat_at, note FROM scheduler_heartbeats"
-            " ORDER BY beat_at DESC, started_at DESC LIMIT 1"
+            " ORDER BY beat_at DESC, rowid DESC LIMIT 1"
         )
         if rows.is_empty():
             return None

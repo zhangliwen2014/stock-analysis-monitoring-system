@@ -38,7 +38,7 @@ def test_start_and_finish_round_trip(db):
     assert done.rows_affected == 42
     assert done.note == "更新 3 只"
     assert done.finished_at is not None
-    assert repo.latest("bars", "A").id == run_id
+    assert repo.latest_for_period("bars", "A", "2024-10-25").id == run_id
 
 
 def test_latest_for_period_does_not_leak_across_periods(db):
@@ -55,9 +55,17 @@ def test_global_job_uses_null_market(db):
     repo = TaskRunRepo(db, clock=clock)
     run_id = repo.start("fx", period_key="2024-10-25")
     repo.finish(run_id, status=OK)
-    assert repo.latest("fx", None).id == run_id
+    market_run = repo.start("fx", market="A", period_key="2024-10-25")
+    repo.finish(market_run, status=OK)
+    assert repo.latest_for_period("fx", None, "2024-10-25").id == run_id
     # 市场维度不串：A 的那一行不是「全局那条」的替身
-    assert repo.latest("fx", "A") is None
+    assert repo.latest_for_period("fx", "A", "2024-10-25").id == market_run
+
+
+def test_start_rejects_an_empty_job_name(db):
+    repo = TaskRunRepo(db)
+    with pytest.raises(ValidationError, match="job_name"):
+        repo.start("", market="A")
 
 
 def test_finish_rejects_unknown_status(db):

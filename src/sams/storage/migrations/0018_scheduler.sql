@@ -9,7 +9,8 @@
 --
 -- 2) `scheduler_heartbeats` 是「这台机器上调度器还活着吗」的唯一依据。一行代表一次
 --    启动，`beat_at` 每 tick 原地更新（不增行）。单实例守卫读它（D100），健康页读它
---    （D101）。`beat_id` 不是外键：两个进程同时启动时，先写的那一行必须留下痕迹。
+--    （D101）。心跳不指向任何一行 `task_runs`：它记录的是进程，不是某次执行；
+--    两个进程同时启动时，先写的那一行也必须留下痕迹。
 CREATE TABLE IF NOT EXISTS scheduler_heartbeats (
     id         VARCHAR PRIMARY KEY,
     started_at TIMESTAMPTZ NOT NULL,
