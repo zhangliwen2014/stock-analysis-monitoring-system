@@ -40,14 +40,6 @@ class Universe:
     def codes(self, market: str) -> tuple[str, ...]:
         return self.by_market.get(canonical_market(market), ())
 
-    @property
-    def size(self) -> int:
-        return sum(len(codes) for codes in self.by_market.values())
-
-    @property
-    def empty(self) -> bool:
-        return self.size == 0
-
 
 class UniverseBuilder:
     def __init__(
@@ -95,8 +87,8 @@ class UniverseBuilder:
                 try:
                     targets = self.data.expand(rule)
                 except ValidationError as exc:
-                    # 一条引用已删对象的规则不该让整晚的采集停摆；它自己会在
-                    # `rules` job 的 `blocked` 里出声，这里只保证其余对象照常同步
+                    # 一条引用已删对象的规则不该让整晚的采集停摆：这里只保证其余
+                    # 对象照常同步，坏的是哪条规则靠下面这条 warning 定位
                     logger.warning("规则 %s 展开失败，跳过：%s", rule.id, exc)
                     continue
                 found.update(_key(target.market, target.code) for target in targets)
