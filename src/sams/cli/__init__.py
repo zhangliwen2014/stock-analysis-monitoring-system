@@ -20,6 +20,7 @@ from sams.cli import (
     health,
     ledger,
     rule,
+    schedule,
     screen,
     source,
     sync,
@@ -42,6 +43,7 @@ COMMAND_MODULES = (
     ledger,
     channel,
     rule,
+    schedule,
     alert,
 )
 

@@ -262,3 +262,48 @@ def test_a_real_dispatch_runs_through_the_container(db, settings):
         assert built.alerts_store.deliveries(result.alert_id)[0].outcome == "sent"
     finally:
         built.close()
+
+
+def test_the_container_registers_jobs_in_execution_order(container):
+    """执行顺序是语义：周复检排在当晚规则之前，汇率排在规则之后、日历之前。
+
+    这里不钉 job 的个数：`stub_adapters()` 只给日线，港美股因此没有基本面 job，
+    而那是 D106「按能力注册」要的结果，不是缺数据。
+    """
+    built, _ = container
+    titles = [job.title for job in built.scheduler.jobs]
+    assert titles.count("bars@A") == 1
+    assert titles.index("recheck@US") < titles.index("rules@US")
+    assert titles.index("rules@US") < titles.index("fx@全局")
+    assert titles.index("fx@全局") < titles.index("calendar@A")
+
+
+def test_a_job_alarm_becomes_a_system_alert_for_admins(container):
+    """D102：同一条 `SystemAlarm` 在总线有两类订阅者——日志（上面那枚钉的）与管理员。
+
+    路由的分支在 `test_scheduler_alarms.py` 逐条钉过，这里只验接线：告警真的从总线
+    走到了 `alerts` 那张表，并带上系统告警那三件标记（`rule_id` 为空、市场是 `SYS`、
+    `code` 存组件名）。接线断了的形状是「日志里天天有、管理员一条都没收到」。
+    """
+    built, _ = container
+    built.users.create("root", "correct-horse-battery", is_admin=True)
+    admin = built.users.get_by_username("root")
+
+    built.bus.publish(SystemAlarm(component="job.bars.A", message="连续 3 个周期失败"))
+
+    rows = built.alerts_store.list_for(admin.id)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.market == "SYS" and row.code == "job.bars.A"
+    assert row.rule_id is None
+    assert "连续 3 个周期失败" in row.payload["extra"]["body"]
+
+
+def test_health_carries_the_schedule_reading(container):
+    """健康页那一节读的就是这里装的那台调度器：两处各造一份时，
+    屏幕上「最近一次的结论」说的不是真在跑的那一个。"""
+    built, _ = container
+    report = built.health.report()
+    assert report.schedule is not None
+    assert {"bars", "rules", "fx"} <= {job.name for job in report.schedule.jobs}
+    assert report.schedule.admins == 0

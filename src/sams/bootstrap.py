@@ -36,6 +36,12 @@ from sams.services.rules.engine import RuleEngine
 from sams.services.rules.maintenance import RuleService
 from sams.services.rules.recheck import Rechecker
 from sams.services.rules.snapshot import RuleData
+from sams.services.scheduler.alarms import SystemAlerter
+from sams.services.scheduler.jobs import build_jobs
+from sams.services.scheduler.runner import JobRunner
+from sams.services.scheduler.service import Scheduler
+from sams.services.scheduler.types import JobDeps
+from sams.services.scheduler.universe import UniverseBuilder
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.sync import SyncService
@@ -59,6 +65,7 @@ from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
 from sams.storage.repos.symbols import SymbolRepo
+from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
 from sams.storage.repos.theses import ThesisRepo
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
@@ -150,6 +157,8 @@ class Container:
     rule_deriver: RuleDeriver
     #: 周复检（§9.3，`sams rule recheck`）
     rule_rechecker: Rechecker
+    #: 常驻调度器（spec §12）：`sams run start|once|jobs` 与健康页的 `[调度]` 读的是同一台
+    scheduler: Scheduler
 
     def close(self) -> None:
         self.db.close()
@@ -300,6 +309,9 @@ def build_container(
         watchlists=watchlists,
         settings=cfg,
     )
+    # 规则告警与系统告警共用这一个 sender：DND、通道选择、`notify_log` 那一行都住在
+    # `NotifyService` 那一头，一个组装根里留两条发送路径，迟早一条带上这些而另一条不带
+    sender = _NotifyAlertSender(notify)
     rule_engine = RuleEngine(
         rules=rules_store,
         alerts=alerts_store,
@@ -307,7 +319,7 @@ def build_container(
         calendar=calendar,
         fx=fx_store,
         bus=event_bus,
-        sender=_NotifyAlertSender(notify),
+        sender=sender,
         settings=cfg,
         clock=clock,
     )
@@ -327,6 +339,58 @@ def build_container(
     rule_deriver = RuleDeriver(rules_store, theses_store)
     rule_rechecker = Rechecker(
         theses=theses_store, data=rule_data, bus=event_bus, clock=clock
+    )
+
+    # D102：系统告警与规则告警共用上面那个 sender，订阅的是同一条总线
+    SystemAlerter(
+        alerts=alerts_store, users=users, sender=sender, settings=cfg, clock=clock
+    ).attach(event_bus)
+
+    # 下面四个同步服务与 `UniverseBuilder` 原本就地造在 `return Container(...)` 的参数里。
+    # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
+    # 测试替换或事后调一处参数，另一处照旧跑——症状不是报错，是「改了没生效」
+    sync = SyncService(registry, bars, symbols, cfg.markets)
+    corp_action_sync = CorpActionSyncService(
+        registry, corp_actions, corp_actions_coverage, clock=clock
+    )
+    fundamental_sync = FundamentalSyncService(
+        registry, financials_store, valuation_store, flow_store, symbols
+    )
+    fx_sync = FxSyncService(registry, fx_store)
+    universe_builder = UniverseBuilder(
+        users=users,
+        watchlists=watchlists,
+        accounts=sim_accounts,
+        orders=sim_orders,
+        rules=rules_store,
+        theses=theses_store,
+        data=rule_data,
+        settings=cfg,
+    )
+    task_runs = TaskRunRepo(database, clock=clock)
+    heartbeats = HeartbeatRepo(database, clock=clock)
+    deps = JobDeps(
+        settings=cfg,
+        registry=registry,
+        sync=sync,
+        corp_actions=corp_action_sync,
+        fundamentals=fundamental_sync,
+        fx=fx_sync,
+        calendar=calendar,
+        rules=rule_engine,
+        recheck=rule_rechecker,
+        users=users,
+    )
+    scheduler = Scheduler(
+        cfg,
+        build_jobs(deps),
+        runner=JobRunner(runs=task_runs, bus=event_bus, clock=clock),
+        runs=task_runs,
+        heartbeats=heartbeats,
+        universe=universe_builder,
+        users=users,
+        calendar=calendar,
+        clock=clock,
     )
 
     return Container(
@@ -354,14 +418,10 @@ def build_container(
         registry=registry,
         accounts=AccountService(users, sessions),
         calendar=calendar,
-        sync=SyncService(registry, bars, symbols, cfg.markets),
-        corp_action_sync=CorpActionSyncService(
-            registry, corp_actions, corp_actions_coverage, clock=clock
-        ),
-        fundamental_sync=FundamentalSyncService(
-            registry, financials_store, valuation_store, flow_store, symbols
-        ),
-        fx_sync=FxSyncService(registry, fx_store),
+        sync=sync,
+        corp_action_sync=corp_action_sync,
+        fundamental_sync=fundamental_sync,
+        fx_sync=fx_sync,
         fundamentals=fundamentals,
         screen=ScreenService(
             financials_store, valuation_store, symbols, scan_store, clock=clock
@@ -383,6 +443,7 @@ def build_container(
         rule_service=rule_service,
         rule_deriver=rule_deriver,
         rule_rechecker=rule_rechecker,
+        scheduler=scheduler,
         cipher=cipher,
         notify=notify,
         health=HealthService(
@@ -396,5 +457,9 @@ def build_container(
             fx=fx_store,
             # 本机通道的可用性由 monitor 探测，health 只接这一个函数：多一条 import 就红了
             local_status=notify.local_status,
+            # 健康页读的就是上面这台调度器留下的那两张台账：不是「它此刻活着吗」——
+            # 调度器持有库文件时，第二个进程连不上（DuckDB 的独占锁），这一屏说的是
+            # 「它上一次写下结论是什么时候」
+            schedule=scheduler.schedule_data,
         ),
     )
