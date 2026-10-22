@@ -868,10 +868,10 @@ git commit -m "feat(datasource): 全链失败的重试分界延伸到日线/公�
 `tests/support_scheduler.py`（第一段；后面的任务往同一个文件追加）：
 
 ```python
-"""调度器用例共用的世界：一个不看网络的日历、一个能记下每次调用的 job。
+"""调度器用例共用的世界：一个不看网络的日历。
 
-日历只按「工作日开市 + 15:00 收盘」回答，因此到期用例不必等真实日历源，
-也不会因为某个市场的真实节假日而改口径。
+日历只按「工作日开市 + 各市场本地的常规收盘时点」回答，因此到期用例不必等真实
+日历源，也不会因为某个市场的真实节假日而改口径。
 """
 
 from __future__ import annotations
@@ -882,26 +882,31 @@ from zoneinfo import ZoneInfo
 from sams.core.errors import CalendarSourceError
 from sams.core.timeutil import CalendarDay, SessionWindow
 
+#: 与真实日历提供者的常规时段一致：A 股 15:00，港股与美股 16:00（各自本地时区）
+CLOSE = {"A": time(15, 0), "HK": time(16, 0), "US": time(16, 0)}
+
 
 class FakeCalendar:
     """`CalendarService` 的最小替身：到期计算只用到这三个方法。"""
 
-    def __init__(self, settings, *, closed=()) -> None:
+    def __init__(self, settings, *, closed=None, next_unknown=()) -> None:
         self.settings = settings
-        self.closed = set(closed)
-        self.windows = (SessionWindow("regular", "09:30", "15:00"),)
+        self.closed = {market: set(days) for market, days in (closed or {}).items()}
+        self.next_unknown = set(next_unknown)
 
     def is_trading_day(self, market: str, day: date) -> bool:
-        return day.weekday() < 5 and day not in self.closed
+        return day.weekday() < 5 and day not in self.closed.get(market, set())
 
     def post_close_run_at(
         self, market: str, day: date, offset_min: int, *, extended=()
     ) -> datetime:
         zone = ZoneInfo(self.settings.market_cfg(market).tz)
-        close = datetime.combine(day, time(15, 0), tzinfo=zone)
+        close = datetime.combine(day, CLOSE[market], tzinfo=zone)
         return (close + timedelta(minutes=offset_min)).astimezone(UTC)
 
     def next_trading_day(self, market: str, after: date, *, horizon_days: int = 30) -> date:
+        if market in self.next_unknown:
+            raise CalendarSourceError(f"{market} 在 {after} 之后找不到交易日")
         cursor = after + timedelta(days=1)
         for _ in range(horizon_days):
             if self.is_trading_day(market, cursor):
@@ -949,16 +954,17 @@ from sams.services.scheduler.due import (
     weekly_due,
 )
 
-#: 2024-10-25 是周五；A/HK 收盘 15:00 本地，US 收盘 15:00 纽约时（EDT）。
+#: 2024-10-25 是周五；A 股 15:00 收盘，港股 16:00，美股 16:00 纽约时（EDT）。
 FRIDAY = date(2024, 10, 25)
 
 
 def test_each_market_uses_its_own_close(settings):
     cal = FakeCalendar(settings)
-    # 07:30 UTC = A 股 15:30（收盘 + 30 已过）、美股 03:30（还没开）
+    # 07:30 UTC = A 股 15:30（收盘 + 30 已过）、港股 15:30（其收盘 16:30 还没过）、
+    # 美股 03:30（还没开）
     now = datetime(2024, 10, 25, 7, 30, tzinfo=UTC)
     assert daily_due(cal, settings, "A", now).as_of == FRIDAY
-    assert daily_due(cal, settings, "HK", now).as_of == FRIDAY
+    assert daily_due(cal, settings, "HK", now).as_of == date(2024, 10, 24)
     assert daily_due(cal, settings, "US", now).as_of == date(2024, 10, 24)
 
 
@@ -989,7 +995,7 @@ def test_weekly_due_fires_on_the_last_trading_day_of_the_iso_week(settings):
 
 
 def test_weekly_due_skips_a_closed_friday(settings):
-    cal = FakeCalendar(settings, closed={FRIDAY})
+    cal = FakeCalendar(settings, closed={"A": {FRIDAY}})
     friday = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
     # 周五休市 ⇒ 本周最后交易日是周四 10/24，也属于 W43
     assert weekly_due(cal, settings, "A", friday).period_key == "2024-W43"
@@ -1003,9 +1009,16 @@ def test_monthly_due_is_the_daily_due_day_in_that_month(settings):
     assert due.period_key == "2024-10" and due.as_of == FRIDAY
 
 
+def test_weekly_does_not_conclude_when_the_next_day_is_unknown(settings):
+    """下一交易日不可知 ⇒ 一周都不能宣布结束：这一轮不跑，而不是提前跑或认错周。"""
+    cal = FakeCalendar(settings, next_unknown=("A",))
+    friday = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
+    assert weekly_due(cal, settings, "A", friday) is None
+
+
 def test_fx_waits_until_every_open_market_has_closed(settings):
     cal = FakeCalendar(settings)
-    # 周五 08:00 UTC：A/HK 已收盘，US 还在周五盘中（其最新到期日仍是周四）
+    # 周五 08:00 UTC：A 已收盘，港股的盘后时点（16:30 本地）还没到，美股还在周五盘中
     early = datetime(2024, 10, 25, 8, 0, tzinfo=UTC)
     assert fx_due(cal, settings, early) is None
     # 周五 23:00 UTC：US 周五收盘 + 60 分钟也已过
@@ -1014,7 +1027,7 @@ def test_fx_waits_until_every_open_market_has_closed(settings):
 
 
 def test_fx_does_not_wait_for_a_market_that_is_closed(settings):
-    cal = FakeCalendar(settings, closed={FRIDAY})
+    cal = FakeCalendar(settings, closed={"A": {FRIDAY}, "HK": {FRIDAY}})
     late = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
     # 美股周五仍开市且已收盘；A/HK 当天休市不参与等待
     assert fx_due(cal, settings, late).as_of == FRIDAY
@@ -1040,9 +1053,9 @@ Expected: FAIL（`sams.services.scheduler.due` 不存在）。
 `src/sams/services/scheduler/__init__.py` 先只写包说明与空的 `__all__`：
 
 ```python
-"""调度器：到期计算、对象展开、job、隔离执行、系统告警与健康读数。
+"""调度器：「现在该跑什么」的计算部分。
 
-包内分工写在 `service.py` 的文件头；`Scheduler` 在 Task 10 才接出去。
+到期计算在 `due.py`。
 """
 
 from __future__ import annotations
@@ -1053,11 +1066,13 @@ __all__: tuple[str, ...] = ()
 `src/sams/services/scheduler/due.py`：
 
 ```python
-"""「现在该跑哪个周期」——只做日期算术，不读库、不发请求。
+"""「现在该跑哪个周期」——只做日期算术，日历的回答从哪里来由 `CalendarView` 决定。
 
 三个决定落在这里，因为它们都是**一行代码就能写错、而且错了不报错**的地方：
 
-* 到期判断在**市场本地**收盘时点之后（D99）。用 UTC 日期判断，美股每天都会错一天。
+* 到期判断以**市场本地**的交易日与其收盘时点为准（D99）：同一瞬间，北京和纽约
+  不是同一个「今天」，锚定日必须按市场换算，收盘是否已过也要按市场的时区与
+  偏移去问 `CalendarView`。
 * 周期键不是「今天」（D98）：周五的任务可能周六补跑，周任务横跨两天，月任务跨月。
 * 汇率没有市场维度，但它的到期日要等**当天开市的市场都收盘**（D108）：
   周五晚上用周五的汇率，不能拿美股周四的收盘价去换算。
@@ -1081,8 +1096,8 @@ logger = logging.getLogger("sams.services.scheduler.due")
 DAILY, WEEKLY, MONTHLY, FX = "daily", "weekly", "monthly", "fx"
 PERIODS = (DAILY, WEEKLY, MONTHLY, FX)
 
-#: 补跑窗口：停机三天后启动，仍能把落下的三个交易日按各自的周期键补上。
-#: 再长的停机由人决定要不要补——自动跑一个月的链会在一个 tick 里打满所有源
+#: 最近到期日的回看窗口：停机十天之内重启，仍能找到一个到期日、照常触发；
+#: 再长的停机不自动认领——一个月的链在一个 tick 里跑完会打满所有源，要不要补由人决定
 CATCHUP_DAYS = 10
 #: 周任务往前找「本周最后一个交易日」的跨度：三个整周足够覆盖长假
 WEEK_SCAN_DAYS = 21
@@ -1116,7 +1131,7 @@ def _passed(view: CalendarView, settings: Settings, market: str, day: date, now:
 def daily_due(
     view: CalendarView, settings: Settings, market: str, now: datetime
 ) -> Due | None:
-    """最近一个「已经收盘且过了盘后延迟」的交易日；停机的日子按天补齐。"""
+    """最近一个「已经收盘且过了盘后延迟」的交易日；窗口内没有这样的日子就返回 None。"""
     today = _local_today(settings, market, now)
     for back in range(CATCHUP_DAYS + 1):
         day = today - timedelta(days=back)
@@ -1224,6 +1239,31 @@ Expected: PASS。
 git add src/sams/services/scheduler/__init__.py src/sams/services/scheduler/due.py tests/support_scheduler.py tests/services/test_scheduler_due.py
 git commit -m "feat(scheduler): 到期计算按市场本地收盘与周期键（D99/D108/D109）"
 ```
+
+**评审收尾（2026-10-22）**：实现落在 `7dd3642`，两路评审之后修在 `a3467ce`。
+
+1. 任务书自身有矛盾：`FakeCalendar.closed` 是无市场维度的集合，而
+   `test_fx_does_not_wait_for_a_market_that_is_closed` 要求「A/HK 休市、美股开市」。
+   实现者把它改成 `{market: {days}}`，这是必要偏差，测试代码段已同步。
+2. 假日历原先对所有市场统一 15:00 收盘——港股/美股真实常规收盘是 16:00
+   （`calendar_providers.py:135-136`），统一时点让「每个市场用自己的收盘」这条断言
+   只剩美股有区分度。改成按市场（A 15:00、HK/US 16:00），测试代码段已同步。
+3. D96 三处过头话：`__init__.py` 引用不存在的 `service.py` 与「Task 10」计划标签；
+   `due.py` 自称「不读库、不发请求」（`CalendarService.day()` 恰恰读库）；
+   `CATCHUP_DAYS` 注释声称停机三天「按各自的周期键补上」（`daily_due` 只返回最近一个
+   到期日）。均已改为只说得到的事实。模块头「用 UTC 日期判断，美股每天都会错一天」
+   经推演也不成立——回看窗口会吸收 UTC 与本地的日界差，改成了只陈述
+   「同一瞬间北京和纽约不是同一个今天、锚定日按市场换算」这句可验证的事实。
+4. `weekly_due` 的「下一交易日不可知 ⇒ 不跑」分支原先无用例钉住（删掉 try/except
+   全套仍绿），补 `next_unknown` 与该用例；`FakeCalendar.windows` 无读者，删除。
+   `WeekdayProvider` 保留——本计划 Task 8/13 消费它。
+5. 评审对 `WEEK_SCAN_DAYS` 长假场景的推演（连续休市 >21 个自然日）在 A/HK/US
+   不存在（最长春节连休约 10 天），且失败方向是「那一周不跑」而非「跑错周」，
+   与 D109 的保守侧一致，不改。
+
+变异电池：统一收盘时点、去掉不可知保护、`CATCHUP_DAYS=0` 三条全红。
+四条闸：目标用例 **10 passed**、`ruff check` 全绿、分层 **390 passed**、离线
+**2778 passed / 14 deselected**。
 
 ### Task 5: 对象与币种对（`universe.py`）
 
