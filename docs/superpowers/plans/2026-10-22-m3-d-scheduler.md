@@ -157,13 +157,15 @@ tests/
 ```python
 """0018：调度器的账。
 
-这一枚只验形状：老库里 `task_runs` 的旧行在加列之后仍然读得出来（`period_key`/`note`
-是 NULL），心跳表能存能读。行为契约在 `test_task_runs.py`。
+这一枚只验形状：旧式 INSERT（不写新列）落下的行读出来 `period_key`/`note` 是 NULL，
+心跳表能存能读且 `beat()` 真的推进时间。行为契约在 `test_task_runs.py`。
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+
+from support import FrozenClock
 
 from sams.storage.repos.task_runs import HeartbeatRepo
 
@@ -183,14 +185,18 @@ def test_task_runs_gains_period_key_and_note_nullable(db):
 
 
 def test_heartbeats_table_round_trips(db):
-    repo = HeartbeatRepo(db)
+    clock = FrozenClock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = HeartbeatRepo(db, clock=clock)
     beat_id = repo.start(note="tick=60s")
+    started = repo.latest().started_at
+    clock.advance(seconds=60)
     repo.beat(beat_id)
     latest = repo.latest()
     assert latest is not None
     assert latest.id == beat_id
     assert latest.note == "tick=60s"
-    assert latest.beat_at >= latest.started_at
+    assert latest.started_at == started
+    assert latest.beat_at == started + timedelta(seconds=60)
 ```
 
 `tests/storage/test_task_runs.py`：
@@ -236,7 +242,7 @@ def test_start_and_finish_round_trip(db):
     assert done.rows_affected == 42
     assert done.note == "更新 3 只"
     assert done.finished_at is not None
-    assert repo.latest("bars", "A").id == run_id
+    assert repo.latest_for_period("bars", "A", "2024-10-25").id == run_id
 
 
 def test_latest_for_period_does_not_leak_across_periods(db):
@@ -253,9 +259,17 @@ def test_global_job_uses_null_market(db):
     repo = TaskRunRepo(db, clock=clock)
     run_id = repo.start("fx", period_key="2024-10-25")
     repo.finish(run_id, status=OK)
-    assert repo.latest("fx", None).id == run_id
+    market_run = repo.start("fx", market="A", period_key="2024-10-25")
+    repo.finish(market_run, status=OK)
+    assert repo.latest_for_period("fx", None, "2024-10-25").id == run_id
     # 市场维度不串：A 的那一行不是「全局那条」的替身
-    assert repo.latest("fx", "A") is None
+    assert repo.latest_for_period("fx", "A", "2024-10-25").id == market_run
+
+
+def test_start_rejects_an_empty_job_name(db):
+    repo = TaskRunRepo(db)
+    with pytest.raises(ValidationError, match="job_name"):
+        repo.start("", market="A")
 
 
 def test_finish_rejects_unknown_status(db):
@@ -310,7 +324,8 @@ Expected: FAIL（`sams.storage.repos.task_runs` 不存在；`db` 里 `period_key
 --
 -- 2) `scheduler_heartbeats` 是「这台机器上调度器还活着吗」的唯一依据。一行代表一次
 --    启动，`beat_at` 每 tick 原地更新（不增行）。单实例守卫读它（D100），健康页读它
---    （D101）。`beat_id` 不是外键：两个进程同时启动时，先写的那一行必须留下痕迹。
+--    （D101）。心跳不指向任何一行 `task_runs`：它记录的是进程，不是某次执行；
+--    两个进程同时启动时，先写的那一行也必须留下痕迹。
 CREATE TABLE IF NOT EXISTS scheduler_heartbeats (
     id         VARCHAR PRIMARY KEY,
     started_at TIMESTAMPTZ NOT NULL,
@@ -335,9 +350,10 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS note VARCHAR;
 「上一轮跑成了什么」（task_runs）与「现在还有没有人在跑」（heartbeats）。
 分开放的话，单实例守卫与健康页要同时认识两个模块，而它们读的是同一次时钟。
 
-状态只有三种：`running` 是崩溃留下的证据（一行的 finished_at 为空就是「没走完」），
-`ok` 与 `failed` 是两种结论。没有 `skipped`：「这一轮不该跑」由到期计算决定，
-不会先写一行再跳过——那会让「没跑过」与「跑过但没做事」在健康页上长得一样。
+状态只有三种：`running` 是「这一跑还没收尾」；同一行超过六小时仍未收尾才是崩溃留下的
+证据（D105），读取侧不能把每个 `running` 都当成死进程。`ok` 与 `failed` 是两种结论。
+没有 `skipped`：「这一轮不该跑」由到期计算决定，不会先写一行再跳过——那会让「没跑过」
+与「跑过但没做事」在健康页上长得一样。
 """
 
 from __future__ import annotations
@@ -351,7 +367,6 @@ from sams.storage.db import Database
 from sams.storage.ids import new_id
 
 RUNNING, OK, FAILED = "running", "ok", "failed"
-STATUSES = (RUNNING, OK, FAILED)
 _FINISHED = (OK, FAILED)
 
 
@@ -435,20 +450,11 @@ class TaskRunRepo:
             [self.clock.now_utc(), status, int(rows_affected), error, note, run_id],
         )
         row = self.get(run_id)
-        assert row is not None  # 刚写完，同一条连接里一定读得回来
+        assert row is not None
         return row
 
     def get(self, run_id: str) -> TaskRun | None:
         rows = self.db.query(f"SELECT {_COLUMNS} FROM task_runs WHERE id = ?", [run_id])
-        return _to_run(rows.to_dicts()[0]) if rows.height else None
-
-    def latest(self, job_name: str, market: str | None) -> TaskRun | None:
-        rows = self.db.query(
-            f"SELECT {_COLUMNS} FROM task_runs"
-            " WHERE job_name = ? AND market IS NOT DISTINCT FROM ?"
-            " ORDER BY started_at DESC, id DESC LIMIT 1",
-            [job_name, market],
-        )
         return _to_run(rows.to_dicts()[0]) if rows.height else None
 
     def latest_for_period(
@@ -457,7 +463,7 @@ class TaskRunRepo:
         rows = self.db.query(
             f"SELECT {_COLUMNS} FROM task_runs"
             " WHERE job_name = ? AND market IS NOT DISTINCT FROM ? AND period_key = ?"
-            " ORDER BY started_at DESC, id DESC LIMIT 1",
+            " ORDER BY started_at DESC, rowid DESC LIMIT 1",
             [job_name, market, period_key],
         )
         return _to_run(rows.to_dicts()[0]) if rows.height else None
@@ -466,7 +472,7 @@ class TaskRunRepo:
         rows = self.db.query(
             f"SELECT {_COLUMNS} FROM task_runs"
             " WHERE job_name = ? AND market IS NOT DISTINCT FROM ?"
-            " ORDER BY started_at DESC, id DESC LIMIT ?",
+            " ORDER BY started_at DESC, rowid DESC LIMIT ?",
             [job_name, market, int(limit)],
         )
         return [_to_run(row) for row in rows.to_dicts()]
@@ -499,7 +505,7 @@ class HeartbeatRepo:
     def latest(self) -> Heartbeat | None:
         rows = self.db.query(
             "SELECT id, started_at, beat_at, note FROM scheduler_heartbeats"
-            " ORDER BY beat_at DESC, started_at DESC LIMIT 1"
+            " ORDER BY beat_at DESC, rowid DESC LIMIT 1"
         )
         if rows.is_empty():
             return None
@@ -537,6 +543,28 @@ Expected: PASS。
 git add src/sams/storage/migrations/0018_scheduler.sql src/sams/storage/repos/task_runs.py src/sams/core/errors.py tests/storage/test_migration_0018.py tests/storage/test_task_runs.py
 git commit -m "feat(storage): 0018 调度器的两本账（周期键 + 心跳）"
 ```
+
+**评审收尾（2026-10-22）**：实现落在 `abbc5c6`，两路评审之后修在 `575bc26`
+（代码与用例一起提交；上面五段代码已同步成修后的样子，别改回去）：
+
+1. **排序的第二个键不能是 uuid4**。`started_at DESC, id DESC` 在时间戳相同时按随机
+   十六进制挑行，`latest_for_period` 会随机选中同一周期里的哪一次；换成 DuckDB 的
+   `rowid DESC`（插入顺序），心跳的 `latest` 同改。钉它的用例：
+   `test_recent_is_newest_first_and_sized`。
+2. **心跳用例原先测不到 `beat()`**：`beat_at >= started_at` 在 `start()` 之后本来就真，
+   把 `beat()` 换成 no-op 仍然绿。改成冻时钟 + 前进 60 秒，断言 `started_at` 不变、
+   `beat_at` 恰好前进；市场隔离那枚也补了一行 A 股账，否则「None 匹配所有市场」的
+   实现仍会绿。
+3. **D96：三处话说过了头**。`running` 不全是崩溃证据（正在跑也是 running；六小时
+   未收尾才是 D105 的证据）；迁移头注里的 `beat_id` 根本不存在（表列名是 `id`）；
+   `finish` 里「刚写完」描述的是一次 UPDATE。前两处改口径，第三处删掉注释。
+   `assert` 保留：那是同一连接、刚 UPDATE 过的内部不变量，不为不可能的分支加域错误。
+4. **删掉没有 src 读者的 API**：`STATUSES` 与 `TaskRunRepo.latest` 在实现里没有调用方；
+   两枚读 `latest` 的用例改读 `latest_for_period`（Task 8 的市场隔离用例同改）。
+
+变异电池七条全红（周期隔离、NULL 市场隔离、心跳推进、recent 顺序、note 落库、
+status 校验、空 job_name）。四条闸：目标用例 **24 passed**、`ruff check` 全绿、
+分层 **384 passed**、离线 **2750 passed / 14 deselected**。
 
 ---
 
@@ -2555,8 +2583,8 @@ def test_global_jobs_and_market_jobs_keep_separate_ledgers(db):
     runner, runs, _, _, spec = harness(db, job, market=None)
     runner.execute(spec, DUE, UNIVERSE)
     # `job_name` 相同、market 不同：八小时后的 A 股那一行不是「全局那条」的替身
-    assert runs.latest("bars", None) is not None
-    assert runs.latest("bars", "A") is None
+    assert runs.latest_for_period("bars", None, DUE.period_key) is not None
+    assert runs.latest_for_period("bars", "A", DUE.period_key) is None
 ```
 
 - [ ] **Step 2: 跑红**
