@@ -10,7 +10,7 @@
 
 | 编号 | 决定 | 理由 |
 |---|---|---|
-| D121 | 批注复用 0001 的 `annotations`/`annotation_revisions`，迁移 0020 补软删除、目标快照与附件表；`team` 可见性**只对 `symbol` 生效**，thesis/rule/alert/order 一律私有；admin 只读全部 | 观点、规则、告警、成交都是个人决策数据，把一条 team 批注挂到别人的私有 thesis 上，等于用一条批注泄露「这个 thesis 存在」。symbol 是全实例共享的研究对象，才谈得上团队 |
+| D121 | 批注复用 0001 的 `annotations`/`annotation_revisions`，迁移 0020 补软删除、目标快照与附件表；`team` 可见性**只对 `symbol` 生效**，thesis/rule/alert/order 一律私有；admin 默认只读元数据，私有正文走 D139 break-glass | 观点、规则、告警、成交都是个人决策数据，把一条 team 批注挂到别人的私有 thesis 上，等于用一条批注泄露「这个 thesis 存在」。symbol 是全实例共享的研究对象，才谈得上团队 |
 | D122 | Markdown 存源码、服务端渲染；禁用原始 HTML、图片语法与危险链接协议（只放行 http/https/mailto）；推送上下文用同一份源码抽纯文本 | 批注是用户输入，直接渲染等于把 XSS 交给每个团队成员。禁用 HTML 比「先渲染再清洗」少一层依赖与一类漏网；截图只走附件，不走 Markdown 图片 |
 | D123 | 附件只收 PNG/JPEG/WebP，每张 ≤ 5 MB、每条 ≤ 5 张、每人 ≤ 512 MB；按魔数校验后用 Pillow 重编码（去 EXIF），存 `<db_dir>/attachments`，下载必须登录且过批注可见性 | 「截图」不需要 SVG/GIF/PDF；重编码同时解决伪造扩展名、图片炸弹与截图里的 GPS/设备元数据 |
 | D124 | 告警状态扩为 `new → acknowledged → handled/dismissed`；保留 `handled` 作为总 spec 的 **acted**（不迁移旧数据）；`dismissed` 必须同时有原因码与说明；终态不可回退 | 现有 M3 的 `handled` 数据与 CLI 不动，少一次有风险的数据迁移；ack 与 acted 分开，才能回答「看到了但没做」与「根本没看到」 |
@@ -20,9 +20,10 @@
 | D128 | 新增 `/review`：最近 7/30 天或本周的告警闭环率、忽略率、忽略原因、动作类型、超 24 小时未处理清单、本周批注；规则忽略率与胜率的深度分析仍归 M5 | 复盘闭环的最小可用形态是「这周哪些没关、为什么关、关了之后做了什么」；横向参数比较需要跨期样本，M4 没有 |
 | D129 | 批注不触发通知、不做 @ 提及、不做实时协作；发布与编辑后靠页面局部刷新可见 | 批注是研究留痕，不是 IM。把批注接进通知会在告警之外再造一条打扰源，而 M4 要解决的是告警疲劳 |
 | D135 | `/review` 首屏以**清单**为主：超 24 小时未处理、本周「忽略/触发」比最高的规则、本周处置→成交/观点/规则；已读率/闭环率/平均关闭时长降为脚注，并给出分母 | 产品评审指出四个比率不可行动：已读率受「是否点已读」影响、平均关闭时长混合分钟与隔夜、忽略数没有触发分母。复盘要回答「下一步改什么」，不是看仪表盘 |
-| D136 | 批注正文在软删 30 天后**硬清除**（正文、标签、revision 与附件；保留 id/目标/作者的墓碑）；写作框旁常驻「可见范围」说明；admin 全量只读按总 spec 保留，但管理页明确标注，且查看私有正文需二次确认并记日志 | 「删除」若只是隐藏、管理员还能永久读，用户就不会写真实想法。墓碑保留计数与审计，正文不无限期留着。admin 矩阵是总 spec 的显式选择，本版不改，但把代价说清楚 |
+| D136 | 批注正文在软删 30 天后**硬清除**（正文、标签、revision 与附件；保留 id/目标/作者的墓碑）；写作框旁常驻「可见范围」说明；admin 对私有正文默认不可读，break-glass 见 D139 | 「删除」若只是隐藏、管理员还能永久读，用户就不会写真实想法。墓碑保留计数与审计，正文不无限期留着 |
 | D137 | 推送上下文取「接收人可见的 symbol 批注 + 该告警同标的 thesis 批注」，合计最多 3 条；`alerts` 增 `thesis_id`。闭环时可一键「同时写一条标的批注」，预填告警与处置结论 | 交易者真正想先看到的是「为什么买/等」的观点批注，而不是标的页上零散的最新三条；处置说明只留在告警里，第二天推送与复盘都看不到，等于白写 |
 | D138 | 新增非终态 `defer`（`deferred_until`，到点重回收件箱，不计忽略率）与终态后 5 分钟 `undo`；所有 ack/defer/acted/dismiss/undo 写入 `alert_events` | 手机误点、开会中先放一放都是真实动作，二选一「处置/忽略」会逼出假数据。动作历史表同时解决「谁在什么时候改了什么」——现有列只有最后一态 |
+| D139 | admin 默认只读**元数据**（作者、目标类型、可见性、时间、计数与占用）；`team` 批注在策略开启时可直接读，`private`（以及策略关闭时的 `team`）正文/附件默认不可读。确需查看时对**单条**批注 break-glass：填理由（≥4 字）、授权 15 分钟、每管理员每小时最多 5 次；授权写 `admin_access_log`（谁、何时、哪条、理由、到期），附件与 revision 同权；不做批量查看/导出 | 总 spec 的「admin 全量只读」会让用户不敢写真实想法。break-glass 保留合规调查与滥用处置能力，又用单条、限时、限次、留痕把默认边界写死，避免管理员变成无痕浏览全部私人笔记 |
 
 ---
 
@@ -34,7 +35,7 @@
 2. 告警推送到手机时，正文里带该标的最近 3 条**接收人可见**的批注；打开网页能看到完整上下文。
 3. 每条告警都能走完「已读 → 已处置 / 已忽略」：忽略必须说原因；处置必须说做了什么，能直接跳到那笔成交、那条观点或那条规则。
 4. 每周在一屏里看清：多少告警没关、忽略都为什么、处置动作都是什么、这周写了什么。
-5. admin 能开关团队共享、看每个人的附件占用与全量批注（只读），但改不了别人的内容。
+5. admin 能开关团队共享、看每个人的附件占用与批注元数据；私有正文默认不可读，确需查看时逐条 break-glass（理由、限时、限次、留痕），且改不了别人的内容。
 
 ### 1.2 非目标（M4-B 不做）
 
@@ -131,6 +132,22 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by VARCHAR
 );
+
+-- 管理员 break-glass 授权审计：正文与附件内容不入日志
+CREATE TABLE IF NOT EXISTS admin_access_log (
+    id            VARCHAR PRIMARY KEY,
+    admin_user_id VARCHAR NOT NULL,
+    annotation_id VARCHAR NOT NULL,
+    owner_user_id VARCHAR NOT NULL,
+    action        VARCHAR NOT NULL DEFAULT 'break_glass',
+    reason        VARCHAR NOT NULL,
+    granted_until TIMESTAMPTZ NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_admin_access_admin
+    ON admin_access_log (admin_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_admin_access_annotation
+    ON admin_access_log (annotation_id, created_at);
 ```
 
 - `annotations.attachments_json`（0001 既有列）保持写入 `'[]'`；附件的唯一出处是 `annotation_attachments`。不删旧列是为了迁移只增不改。
@@ -138,6 +155,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 - `alerts.handled_at` 的语义在 M4-B 明确为「人把它关上（处置或忽略）的时刻」，不是「处置」专属；旧数据本来就是这么写的。`acknowledged_at` 单独记「已读」，`deferred_until` 记「到点再提醒」。
 - `alerts.thesis_id` 由规则评估时从快照带入（规则经 thesis 展开时才有）；用于推送上下文与告警详情跳转，不改变告警的归属键。
 - `alert_events` 是写多读少的审计表；`alerts` 上的状态列仍是当前结论，列表与统计主要读列，详情页读事件。
+- `admin_access_log` 既是 break-glass 的审计，也是授权与限次的唯一依据：授权时写一行，`granted_until` 决定该条是否仍可读；重启不丢授权，不存正文/附件内容，行不可删改。
 - 迁移幂等；`handled` 旧行保持原值，不重写。
 
 ---
@@ -157,7 +175,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 | `order` | sim_order id | 必须挂在本人账户下 | 强制私有 |
 
 - 非 symbol 目标写入 `visibility=team` 直接 `ValidationError`；读取时也按私有过滤，防止绕过 UI。
-- admin 对批注只读：可读全部（含私有与被删），不能创建到别人的目标上，不能编辑/删除别人的批注。
+- admin 对批注只读：`team` 且策略开启可直接读；`private` 与策略关闭时的 `team` 默认只读元数据，正文/附件需逐条 break-glass（D139）；不能创建到别人的目标上，不能编辑/删除别人的批注。
 - 目标不存在、不属于当前用户，统一 404（不泄露存在性）。
 
 ### 4.2 可见性与共享策略
@@ -167,7 +185,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
   - 本人的全部；
   - `team` 且策略开：本实例所有启用用户可读；
   - 其他人的 `private`：不可读；
-  - admin：可读全部，界面标注「管理员只读」。
+  - admin：`team` 且策略开可读；`private` 与策略关闭时的 `team` 默认只读元数据，break-glass 后 15 分钟内可读该条正文、revision 与附件。
 - 策略 `annotations.team_sharing`（`app_settings`，默认 `on`）：
   - `off` 时新写 `team` 被拒；
   - 既有 `team` 行不删，对**非作者**隐藏；作者仍可见并显示「团队共享当前已关闭」；
@@ -181,7 +199,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 - `edit`：只有作者；可改正文、标签、可见性、附件集合（增删）；每次编辑写一条 `annotation_revisions`，`before_md`/`after_md` 与 `meta_json`（前后标签、可见性、附件 id）一并落库。
 - 乐观并发：表单带隐藏的 `updated_at`；与服务端不一致返回 409 并保留用户输入提示刷新，不做静默覆盖。
 - `pin`：作者可置顶/取消；同一目标最多 3 条置顶；置顶不是编辑，不写 revision。
-- `delete`：软删除（`deleted_at`/`deleted_by`），作者可删；列表与目标页立即隐藏；admin 仍可在管理页看到并读正文；附件保留 30 天后由 prune 回收。
+- `delete`：软删除（`deleted_at`/`deleted_by`），作者可删；列表与目标页立即隐藏；admin 默认只看到墓碑元数据，私有正文需 break-glass（D139）；附件保留 30 天后由 prune 回收。
 - 编辑/删除被删批注返回 409/404；终态清晰。
 
 ### 4.4 标签
@@ -234,7 +252,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 
 ### 5.4 删除与回收
 
-- 软删除后批注与附件立即对普通列表/下载不可见；管理员仍可读到 `purged_at` 之前的内容（D136）。
+- 软删除后批注与附件立即对普通列表/下载不可见；管理员默认只看到墓碑元数据，私有正文在 break-glass 且未硬清除时可读（D136/D139）。
 - 软删满 30 天后由 prune 硬清除：正文置空、标签清空、`annotation_revisions` 删除、附件行与文件删除；保留 `id`、`user_id`、`target_type`、`target_ref`、`target_label`、`created_at`、`deleted_at`、`purged_at` 作为墓碑（计数与审计仍能成立）。
 - `sams db prune --annotations-purged-days 30 --attachments-orphan-days 30`：
   - 硬清除到期的软删批注；
@@ -264,8 +282,10 @@ CREATE TABLE IF NOT EXISTS app_settings (
 | `POST /alerts/{id}/defer` | POST | 稍后（1h/3h/下一开盘） | 收件人 |
 | `POST /alerts/{id}/undo` | POST | 5 分钟内撤销终态 | 收件人 |
 | `GET /review` | GET | 复盘工作台 | 登录 |
-| `GET /admin/annotations` | GET | 全量批注、策略、用量 | admin |
+| `GET /admin/annotations` | GET | 批注元数据、策略、用量、最近 break-glass 记录 | admin |
 | `POST /admin/annotations/policy` | POST | 团队共享开关 | admin |
+| `GET /admin/annotations/{id}` | GET | 元数据 + 正文（team 且策略开，或有效 break-glass） | admin |
+| `POST /admin/annotations/{id}/break-glass` | POST | 填理由，授权 15 分钟查看该条私有正文 | admin |
 
 - 所有 POST 走 CSRF；所有写操作记应用日志（user_id、动作、目标、结果）。
 - 标的/观点/规则/告警/成交详情页嵌入批注面板；告警页额外显示「该标的推送上下文」（与推送同源的 3 条）。
@@ -317,7 +337,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
 
 - 策略卡：团队共享开关（二次确认文案说明「关闭后既有 team 批注对他人隐藏，数据保留」）。
 - 用量：每用户批注数、附件数、占用字节；总计与配额。
-- 全量列表：按用户/目标类型/时间筛选；可读正文与附件；标注「管理员只读」。
+- 列表：按用户/目标类型/可见性/时间筛选，只出元数据——作者、可见性、目标类型、时间、revision 数、附件数与字节、标签数、是否软删。`team` 且策略开启时显示正文、标签与 `target_label`；`private` 与策略关闭时的 `team` 一律遮蔽正文、标签、附件内容与 `target_label`（symbol 只显示代码，非 symbol 显示「私有 thesis/rule/alert/order」），避免元数据本身泄露策略。
+- Break-glass：被遮蔽的行（`private` 或策略关闭时的 `team`）有「紧急查看」；必须填理由（4–200 字），提交后写 `admin_access_log` 并授权 **该条** 15 分钟。有效期内详情页显示正文、revision 与附件缩略图/下载，顶部常驻「临时授权至 HH:MM，理由：…」横幅；不做批量选择、列表内联正文或导出。过期后详情只回元数据，再看得重新授权。
+- 限次：每管理员每小时最多 5 次授权（按 `admin_access_log` 滑动窗口），超限 429 并给出等待时间；理由是自由文本，不做「常用理由」预设以免敷衍。
+- 附件下载：`GET /annotations/{id}/attachments/{att_id}` 对 admin 复用同一授权判断；无有效授权按不存在返回 404。
+- 审计：页面底部列出最近 50 条 break-glass（管理员、批注、作者、理由、授权时间与到期）；只读，不可删改。硬清除后的批注不再可授权，记录仍保留。
 - 回收：显示最近一次 prune 的附件回收结果；手动触发走后台任务，不在请求线程里删文件。
 
 ---
@@ -461,6 +485,8 @@ max_attachments = 5
 max_attachment_mb = 5
 max_user_total_mb = 512
 max_body_chars = 20000
+break_glass_minutes = 15       # admin 单条私有批注的临时查看时长
+break_glass_max_per_hour = 5   # 每管理员每小时最多授权次数
 
 [server]
 display_tz = "Asia/Shanghai"   # 复盘窗口与页面「今天」的边界
@@ -471,6 +497,7 @@ public_base_url = ""           # 推送深链根地址；空 = 不附链接
 - `public_base_url` 只接受 `http://`/`https://`，去掉末尾 `/`；LAN 部署时填 `http://192.168.x.x:8765`。
 - `app_settings` 白名单只有 `annotations.team_sharing`（`on`/`off`）；未知键读写都拒绝。策略变更立即生效，不需要重启。
 - `attachments_dir` 在启动时创建并检查可写；相对路径按当前工作目录解析，帮助里写明。
+- `break_glass_minutes` 与 `break_glass_max_per_hour` 必须为正整数；调大即放宽管理员的临时查看边界，README 提示这是治理参数而不是性能参数。
 
 ---
 
@@ -479,8 +506,8 @@ public_base_url = ""           # 推送深链根地址；空 = 不附链接
 - **越权读取**：所有批注查询先按 `visibility`/`user_id` 过滤，再按目标归属过滤；附件下载复用同一条可见性判断。URL 里的 id 一律服务端重查。
 - **XSS**：Markdown 禁 HTML/图片，链接白名单；Jinja 自动转义；CSP 无 `unsafe-inline` 脚本（样式允许内联，沿用 M4-A）。
 - **上传**：大小/数量/配额/魔数/像素上限/重编码五道；文件名不参与路径拼接；禁止 SVG。
-- **隐私**：推送只带接收人可见批注；team 只对 symbol；写作框旁常驻「可见范围：仅自己 / 本实例用户 / 管理员可只读查看全部」；admin 打开他人私有正文需二次确认并记日志（谁、何时、哪条）；软删 30 天后正文硬清除。日志不打印正文与文件名以外的路径。
-- **审计**：创建/编辑/删除/置顶、策略变更、闭环动作、成交闭环均记应用日志；批注 revision 与 `alert_events` 是不可变历史（正文按 D136 到期清除）。
+- **隐私**：推送只带接收人可见批注；team 只对 symbol；写作框旁常驻「可见范围：仅自己 / 本实例用户（仅标的）/ 管理员默认只见元数据」；admin 查看私有正文必须逐条 break-glass，理由与授权写 `admin_access_log`，附件与 revision 同权；软删 30 天后正文硬清除。日志不打印正文与附件路径。
+- **审计**：创建/编辑/删除/置顶、策略变更、闭环动作、成交闭环均记应用日志；`admin_access_log` 记录每次 break-glass 的授权人、批注、作者、理由与到期；批注 revision 与 `alert_events` 是不可变历史（正文按 D136 到期清除）。
 - **CSRF/会话**：沿用 M4-A；预览接口也要 CSRF。
 - **速率**：登录限速沿用；批注创建按用户 30 条/分钟、上传 10 张/分钟做进程内限速，超限 429（防止脚本刷盘）。
 - **数据备份**：附件在 DB 外，备份须知包含 `attachments_dir`；README 写明。
@@ -500,6 +527,7 @@ public_base_url = ""           # 推送深链根地址；空 = 不附链接
 - **稍后/撤销越界**：对终态点「稍后」、超过 5 分钟点「撤销」、或撤销已被别人改过的终态，返回 409 并刷新页面，不静默改。
 - **硬清除失败**：正文已清、文件删不掉时记日志并让下一轮 prune 重试；墓碑行不丢。
 - **批注正文超长/标签超限/附件超限**：400 + 字段级说明；不回写半条。
+- **break-glass 拒绝**：理由为空或不足 4 字 → 400；每小时超 5 次 → 429 并给等待秒数；批注已硬清除 → 409；无有效授权时管理详情页只返回元数据，附件直链返回 404（不泄露存在性）。授权到期后页面回到元数据，不自动续期。
 - **admin 关闭团队共享**：不删数据、不通知用户；页面徽标说明当前策略。
 
 ---
@@ -508,7 +536,7 @@ public_base_url = ""           # 推送深链根地址；空 = 不附链接
 
 ### 12.1 离线闸
 
-- 迁移 0020：旧库幂等、旧 `handled` 行不变、`context_json` 可空、`app_settings` 默认值。
+- 迁移 0020：旧库幂等、旧 `handled` 行不变、`context_json` 可空、`app_settings` 默认值、`admin_access_log` 可建可查。
 - 批注仓库/服务：五类目标的归属校验；team 仅 symbol；策略开关的写拒/读隐/恢复；标签规范化；置顶上限；软删除；revision 记录前后值与附件 id；目标删除后的 `target_label`。
 - Markdown：`<script>`、`<img onerror>`、`javascript:` 链接、`data:` 链接、原始 HTML、图片语法全部不产生可执行内容；表格/代码块正常。
 - 附件：魔数不符、SVG/GIF、超大、超数量、超配额、像素炸弹拒绝；EXIF 去除；下载越权 404；文件缺失降级；prune 保留边界。
@@ -518,6 +546,7 @@ public_base_url = ""           # 推送深链根地址；空 = 不附链接
 - 批注删除：软删立即隐藏；30 天后正文/revision/附件硬清除且墓碑保留；管理页不能再读已清除正文。
 - 闭环写批注：勾选后预填内容、生成 symbol 批注并关联；失败不改变告警状态。
 - Web：所有新页面 200；CSRF 缺失 403；A 用户不能读 B 的私有批注/附件/告警动作；非 admin 访问管理页 403；admin 不能编辑他人批注；策略开关即时生效。
+- admin 访问边界：默认管理页只返回私有批注的元数据，正文/标签/附件/非 symbol 的 `target_label` 均不出现；`team` 在策略开时可读、策略关时同样遮蔽；break-glass 缺理由 400、超每小时 5 次 429、授权 15 分钟到期后详情只回元数据（附件直链 404）、授权只覆盖单条（相邻批注仍不可读）、附件与 revision 同权；每次授权恰写一条 `admin_access_log`；硬清除后不可授权。
 - 分层：`web` 不写 SQL；新模块进分层守卫；`monitor` 通过注入的 context provider 拿批注，不 import `services/annotations` 的具体实现。
 
 ### 12.2 真实运行验收（人工）
@@ -528,8 +557,9 @@ public_base_url = ""           # 推送深链根地址；空 = 不附链接
 4. 忽略一条告警必须选原因码并写说明；`/review` 的忽略率与原因分布与手工计数一致。
 5. 超过 24 小时未处理的告警出现在复盘清单首屏；快捷闭环后从清单消失。
 6. 附件越权：退出登录或用另一个账号直接请求附件 URL，得到 404/403，不泄露文件。
-7. Windows/Linux：上传、预览、下载、prune 路径正常，无 macOS 专有命令。
-8. 备份：复制 DB 与 `attachments_dir` 到另一台机器，批注与附件可读。
+7. admin 默认看不到他人私有正文；对一条批注填理由 break-glass 后能看到正文与附件，15 分钟后自动失效；审计列表出现这次授权；另一条私有批注仍需单独授权。
+8. Windows/Linux：上传、预览、下载、prune 路径正常，无 macOS 专有命令。
+9. 备份：复制 DB 与 `attachments_dir` 到另一台机器，批注与附件可读。
 
 ---
 
@@ -549,7 +579,7 @@ M4-B 分两批上线：**B1 先让「私有批注 + 推送上下文 + 闭环 + �
 
 **B2（协作层）**
 
-8. **团队共享与治理**：开放 `visibility=team`（仅 symbol）、`app_settings` 策略开关、admin 全量只读页（含二次确认与日志）、全局 `/annotations` 搜索与标签云、附件编辑增删；补策略与越权测试。
+8. **团队共享与治理**：开放 `visibility=team`（仅 symbol）、`app_settings` 策略开关、admin 元数据页 + break-glass（理由、15 分钟、每小时 5 次、`admin_access_log`）、全局 `/annotations` 搜索与标签云、附件编辑增删；补策略、越权与授权到期测试。
 
 每步独立可测、可提交；B1 完成后即可进入真实使用，B2 不与 M5 绑定。第 5 步会改动 M4-A 的通知接线，必须先完成 M4-A 的队列实现。
 
@@ -557,12 +587,12 @@ M4-B 分两批上线：**B1 先让「私有批注 + 推送上下文 + 闭环 + �
 
 ## 14. 总 spec 需要同步的改动
 
-- §4.2 权限矩阵：批注的 team 仅 symbol；admin 只读全量（管理页二次确认 + 日志、软删 30 天后正文清除）。
-- §5.2 schema：`annotations` 增 `target_label`/软删除/`purged_at`；新增 `annotation_attachments`、`app_settings`、`alert_events`；`alerts` 增 ack/action/dismiss/thesis/defer 列。
+- §4.2 权限矩阵：批注的 team 仅 symbol；admin 默认只读元数据，私有正文逐条 break-glass（理由、15 分钟、每小时 5 次、`admin_access_log`、无批量/导出），软删 30 天后正文清除。
+- §5.2 schema：`annotations` 增 `target_label`/软删除/`purged_at`；新增 `annotation_attachments`、`app_settings`、`alert_events`、`admin_access_log`；`alerts` 增 ack/action/dismiss/thesis/defer 列。
 - §11 通知：文本通道附接收人可见的最近 3 条（symbol + thesis）；`notify_log.context_json`；`NotifyService.record/deliver_existing` 的拆分。
 - M4 范围：M4-A + M4-B 均已落设计，M4 不再有「待设计」项；M4-B 分 B1（私有批注/推送/闭环/复盘）与 B2（团队共享/管理/搜索）。M5 保留忽略率跨期分析、胜率回填与参数横向比较。
 - §10 内置模板与 §9：ack/defer 加入告警生命周期；`no_open_alert` 的「未处理」含 acknowledged；「被忽略最多的规则」改为「忽略/触发比 + 样本门槛」。
-- D12：补「team 仅 symbol」与运行时策略表；D12 的「admin 只读可见全部」保留，但补管理页二次确认与到期清除。
+- D12：补「team 仅 symbol」与运行时策略表；D12 的「admin 只读可见全部」**改为**「默认只读元数据 + 单条 break-glass（理由、限时、限次、`admin_access_log`）」，到期清除不变。
 - U7/U27：按 M4-A 的闭合口径更新；附件/批注回收并入 U27 的保留清单。
 
 ---
@@ -570,8 +600,8 @@ M4-B 分两批上线：**B1 先让「私有批注 + 推送上下文 + 闭环 + �
 ## 15. 已知限制与风险
 
 - **团队 = 全实例**：没有项目/角色 ACL；用户多起来之前够用，之后要重做可见性模型。
-- **admin 可读私有批注**：这是总 spec 的矩阵，但对用户是隐私让步；写作框与管理页都明示，管理页查看私有正文需二次确认并记日志。若用户后续要收紧，改成「admin 只看元数据/配额」是一次可见性策略变更，不需要动 schema。
-- **删除 30 天后才彻底**：软删到硬清除之间管理员仍可读；要即时彻底删除只能停服走维护命令（M5 可加）。
+- **break-glass 是流程约束，不是密码学隔离**：默认元数据、单条授权 15 分钟、每小时 5 次、全量留痕；但拥有 DB 文件的人仍可直接读，应用层无法阻止。作者在 B2 不会收到「管理员查看过」的通知，若团队规模扩大再评估。
+- **删除 30 天后才彻底**：软删到硬清除之间，管理员 break-glass 后仍可读；要即时彻底删除只能停服走维护命令（M5 可加）。
 - **附件在 DB 外**：备份/迁移必须同时复制目录；只复制 `.duckdb` 会得到「有行无图」。备份仍需停服（M4-A 的已知限制）。
 - **推送上下文固定 3 条**：重要的旧批注若不置顶会被更新内容挤出；界面要引导「重要结论置顶」。
 - **undo 只有 5 分钟**：超过窗口只能写批注更正；这是为了不让审计表变成可随意改写的编辑器。

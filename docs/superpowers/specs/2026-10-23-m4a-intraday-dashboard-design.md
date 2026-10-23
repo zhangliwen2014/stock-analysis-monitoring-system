@@ -358,7 +358,7 @@ CREATE TABLE IF NOT EXISTS quote_source_health (
 ## 7. 数据隔离与安全
 
 - 每个请求先解析会话得到 `user_id`；所有普通页面与动作强制 `user_id == current_user.id`。URL 里的 `account_id`/`thesis_id`/`alert_id` 等一律先用仓库按 `user_id` 读取，不存在或不属于当前用户都返回 404（不泄露「存在但不是你的」）。
-- admin 的全量只读页使用显式的 `list_all()`/跨用户查询入口；不复用普通用户的 `list_for`，也不允许 admin 页面直接拼 SQL。admin 不 impersonate 普通用户。
+- admin 的跨用户只读页（用户/源/健康）使用显式的 `list_all()`/跨用户查询入口；不复用普通用户的 `list_for`，也不允许 admin 页面直接拼 SQL。admin 不 impersonate 普通用户。批注的管理读取边界归 M4-B（D139）。
 - 用户输入（代码、参数、备注、原因）在服务层用现有校验；模板自动转义，`body_md`（M4-B）才需要 Markdown 渲染并做 HTML 清洗。
 - 通道凭据：页面只显示掩码；编辑表单留空表示保持原值；任何日志/异常不回显明文。普通用户在 `/settings/channels` 管理自己的通道；admin 只能看全局启用状态与掩码，不替用户改凭据。
 - 显示名：`display_name` 只用于展示，登录仍用 `username`；空值回退用户名；模板自动转义。
