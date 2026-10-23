@@ -9,6 +9,7 @@ from support_valuation import make_container
 
 from sams.core.errors import DatasourceError, RateLimited
 from sams.core.notify import FAILED, NO_CHANNEL, SENT, SUPPRESSED
+from sams.core.quotes import QuoteSourceRecord
 from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.datasource.registry import AdapterRegistry
 from sams.services.health import KEY_TABLES, HealthService
@@ -21,6 +22,7 @@ from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+from sams.storage.repos.quotes import QuoteHealthRepo
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
 
@@ -28,7 +30,9 @@ D = date(2024, 1, 2)
 PASSWORD = "correct horse battery"
 
 
-def service(db, settings, *adapters, local_status=None, schedule=None) -> HealthService:
+def service(
+    db, settings, *adapters, local_status=None, schedule=None, quote_health=None
+) -> HealthService:
     registry = AdapterRegistry(
         adapters={a.name: a for a in adapters},
         market_sources={"A": tuple(a.name for a in adapters)},
@@ -41,6 +45,7 @@ def service(db, settings, *adapters, local_status=None, schedule=None) -> Health
         settings,
         local_status=local_status,
         schedule=schedule,
+        quote_health=quote_health,
     )
 
 
@@ -779,3 +784,62 @@ def test_the_system_backlog_uses_the_same_maybe_line_as_the_rest(tmp_path, setti
         assert report.notify.unhandled_system_oldest is None
     finally:
         fresh.close()
+
+
+class QuoteOnly:
+    """只报价的适配器：能力按 `quotes` 这个方法判定，不按类名。
+
+    `markets` 是注册表的必填项（它反查「这个源被路由到哪些市场」），
+    不是报价协议的一部分；没有它，构造注册表时就会炸在能力判定之前。
+    """
+
+    name = "tencent"
+    markets = ("A",)
+
+    def quotes(self, market, codes):
+        raise AssertionError("健康页不该真的去取价")
+
+
+def test_quote_source_health_is_a_separate_section(db, settings):
+    """报价与日线是两条链、两张表：混在一行里，一句「腾讯挂了」说不清挂的是哪条。
+
+    日线那一节由 `sources` 回答，报价这一节由 `quote_sources` 回答——两个列表
+    不共享元素，屏幕上那两节也就不会替对方说话。
+    """
+    repo = QuoteHealthRepo(db)
+    repo.save(
+        QuoteSourceRecord(
+            name="tencent",
+            markets=("A",),
+            ok=False,
+            last_error="HTTP 502",
+            consecutive_failures=3,
+        )
+    )
+    report = service(
+        db,
+        settings,
+        StubAdapter("akshare", ["A"], sample_bars()),
+        quote_health=repo,
+    ).report()
+
+    assert [s.name for s in report.quote_sources] == ["tencent"]
+    assert [s.name for s in report.degraded_quote_sources] == ["tencent"]
+    assert [s.name for s in report.sources] == ["akshare"], "日线那一节不跟着多一行"
+    assert report.quote_sources[0].consecutive_failures == 3
+
+
+def test_quote_chains_show_each_market_and_an_unconfigured_market_is_empty(db, settings):
+    """A 市场没配报价源是这一屏要显示的事实，不是读不下去的理由。
+
+    `AdapterRegistry.chain_for` 在取数路径上对缺市场抛 `DatasourceError`；
+    健康页把它折成空链——配置决策不该让整份报告炸掉（同 `_ledger_data` 的表在不在）。
+    """
+    registry = AdapterRegistry(
+        adapters={"tencent": QuoteOnly()},
+        market_sources={"A": ("tencent",)},
+        sleep=lambda seconds: None,
+    )
+    report = HealthService(db, registry, CalendarRepo(db), settings).report()
+
+    assert report.quote_chains == {"A": ("tencent",), "HK": (), "US": ()}

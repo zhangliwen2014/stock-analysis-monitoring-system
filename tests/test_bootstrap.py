@@ -6,7 +6,14 @@ from datetime import UTC, datetime
 import pytest
 from support import FrozenClock, StubAdapter, sample_bars
 
-from sams.bootstrap import attach_log_sink, build_container, build_context, build_core
+import sams.bootstrap as bootstrap
+from sams.bootstrap import (
+    attach_log_sink,
+    build_container,
+    build_context,
+    build_core,
+    build_serve,
+)
 from sams.core.events import EventBus, SystemAlarm
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
@@ -359,3 +366,103 @@ def test_attaching_the_log_sink_twice_still_logs_each_alarm_once(caplog):
         bus.publish(SystemAlarm(component="dup", message="hello"))
 
     assert caplog.text.count("hello") == 1
+
+
+def test_serve_builds_three_contexts_on_one_core(migrated):
+    """三条线程各一条连接（D113），但板子、桶与请求队列是同一份。
+
+    板子不是同一个对象时，盘中线程写的那一份 Web 永远看不到；请求队列同理，
+    Web 的「立即同步」会入到一个没人读的队列里。
+    """
+    parts = build_serve(migrated, adapters=stub_adapters())
+    try:
+        assert len(parts.contexts) == 3
+        assert len({id(context.db) for context in parts.contexts}) == 3
+        assert all(context.registry is parts.core.registry for context in parts.contexts)
+        assert all(context.bus is parts.core.bus for context in parts.contexts)
+        assert all(
+            context.scheduler.requests is parts.core.requests
+            for context in parts.contexts
+        )
+        assert parts.contexts[1].quotes.board is parts.core.board
+        assert parts.contexts[1].intraday.quotes is parts.contexts[1].quotes
+        assert parts.runtime.board is parts.core.board
+        assert parts.runtime.monitor is parts.contexts[1].intraday
+    finally:
+        parts.close()
+
+
+def test_prepare_migrates_before_reading_the_snapshot_table(settings):
+    """顺序不能反：`load_board` 读的是 0019 才有的列。
+
+    这一枚把探针挂在 `load_board` 上：先迁移后灌板时它能看见 `quotes_snapshot`，
+    反过来则是 `CatalogException`——而那个异常在 `serve` 启动时才炸，最难查。
+    """
+    parts = build_serve(settings, adapters=stub_adapters())
+    quotes = parts.contexts[1].quotes
+    original = quotes.load_board
+    seen: dict[str, bool] = {}
+
+    def probe() -> int:
+        seen["table"] = "quotes_snapshot" in quotes.quotes.db.table_names()
+        return original()
+
+    quotes.load_board = probe
+    try:
+        assert parts.prepare() == 0
+        assert seen == {"table": True}
+    finally:
+        parts.close()
+
+
+def test_healthz_probes_never_touch_a_thread_context_connection(migrated):
+    """`/healthz` 在 HTTP 线程上跑（D113）：调度器的库连接属于调度线程。
+
+    把调度器那个方法换成一炸，`healthz` 仍要给出 ok——说明它走的是注入的探针
+    （`FreshScheduleProbe` 每次新开一条连接），而不是手里那台 `Scheduler`。
+    """
+    parts = build_serve(migrated, adapters=stub_adapters())
+    try:
+        parts.prepare()
+        parts.contexts[0].scheduler.schedule_data = lambda: pytest.fail(
+            "healthz 不该借调度线程的连接"
+        )
+
+        payload = parts.runtime.healthz()
+
+        assert payload["status"] == "ok"
+        assert payload["scheduler"] == {"beat_age_s": None, "stale": False}
+        assert payload["db"] == {"ok": True, "error": None}
+    finally:
+        parts.close()
+
+
+def test_a_failed_serve_build_closes_the_connections_it_opened(settings, monkeypatch):
+    """半成品也要收干净：第二条连接建不起来时，第一条与 core 的连接必须关。
+
+    留着它们时，重跑 `sams serve` 会撞上自己——DuckDB 把同一个进程里没关的连接
+    当成另一个写者，而报错是「数据库正被另一个进程打开」，指不到真正的原因。
+    """
+    real_context = bootstrap.build_context
+    calls = {"n": 0}
+
+    def flaky(core, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("第二条连接建不起来")
+        return real_context(core, **kwargs)
+
+    closed: list[int] = []
+    real_close = Database.close
+
+    def record_close(self):
+        closed.append(id(self))
+        real_close(self)
+
+    monkeypatch.setattr(bootstrap, "build_context", flaky)
+    monkeypatch.setattr(Database, "close", record_close)
+
+    with pytest.raises(RuntimeError, match="第二条连接建不起来"):
+        bootstrap.build_serve(settings, adapters=stub_adapters())
+
+    assert len(closed) == 2, "contexts[0] 与 core 各一条"

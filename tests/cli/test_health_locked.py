@@ -92,6 +92,7 @@ def test_health_and_the_other_commands_exit_3_while_a_writer_holds_the_database(
         assert code == EXIT_LOCKED
         assert f"PID {holder.pid}" in text
         assert "心跳" in text
+        assert "http://127.0.0.1:8765/healthz" in text
         assert "退出码 3" in text
 
         other = run(["--config", config, "user", "list"])
@@ -135,3 +136,36 @@ def test_without_a_beat_file_the_screen_does_not_pretend_to_know(tmp_path, capsy
     assert code == EXIT_LOCKED
     assert "没有心跳文件" in text
     assert "可能已经停了" not in text
+
+
+def test_a_wildcard_bind_is_advertised_as_loopback(tmp_path, capsys, settings) -> None:
+    """`0.0.0.0` 不是可访问的主机名：屏幕是这份配置唯一的展示处，
+    它不该把一行抄进浏览器才报错的地址印出来。"""
+    from dataclasses import replace
+
+    from sams.core.config import ServerCfg
+
+    wide = replace(settings, server=ServerCfg(host="0.0.0.0", allow_lan=True))
+    capsys.readouterr()
+
+    code = show_locked(DatabaseLocked(str(tmp_path / "sams.duckdb")), settings=wide)
+
+    text = capsys.readouterr().out
+    assert code == EXIT_LOCKED
+    assert "http://127.0.0.1:8765/healthz" in text
+    assert "0.0.0.0" not in text
+
+
+def test_an_ipv6_bind_gets_brackets_in_the_url(tmp_path, capsys, settings) -> None:
+    """IPv6 地址不带方括号时，冒号会被当成端口分隔符，URL 根本解析不了。"""
+    from dataclasses import replace
+
+    from sams.core.config import ServerCfg
+
+    v6 = replace(settings, server=ServerCfg(host="::1", allow_lan=True))
+    capsys.readouterr()
+
+    code = show_locked(DatabaseLocked(str(tmp_path / "sams.duckdb")), settings=v6)
+
+    assert code == EXIT_LOCKED
+    assert "http://[::1]:8765/healthz" in capsys.readouterr().out

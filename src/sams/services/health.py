@@ -14,14 +14,17 @@ from typing import TYPE_CHECKING
 from sams.core.calendar import CalendarStore
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
+from sams.core.errors import SamsError
 from sams.core.funds import FX_STALE_DAYS
 from sams.core.notify import FAILED, KINDS, NO_CHANNEL, SENT, SUPPRESSED, SYSTEM_MARKET
+from sams.core.quotes import QuoteSourceRecord
 from sams.core.sources import SourceHealthView, SourceRecord
 from sams.storage.db import Database
 from sams.storage.migrate import pending
 from sams.storage.repos.bars import ADJUST
 from sams.storage.repos.fx import FxPair, FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+from sams.storage.repos.quotes import QuoteHealthRepo
 
 if TYPE_CHECKING:
     # 只在注解里出现：健康这一层要的是 `ScheduleData` 的**形状**，不是调度器的循环
@@ -57,6 +60,8 @@ KEY_TABLES = (
     "valuation_daily",
     "funding_flow",
     "scan_results",
+    # 盘中快照：保留策略删的就是这张表，行数说明盘中线程写过没有
+    "quotes_snapshot",
     # 通知这一路的三张表：通道是配置、alerts 是事实、notify_log 是结果
     "channels",
     "alerts",
@@ -190,6 +195,12 @@ class HealthReport:
     #: 单独一格是为了把「还没迁移」从 `None` 里分出来：两句的修法相反，
     #: 一句跑 `sams db migrate`、一句查装配
     schedule_unmigrated: bool = False
+    #: 报价源健康单独一节：与日线源共用一张表时，「腾讯报价挂了」会跟
+    #: 「腾讯日线挂了」挤在同一行里，而两件事的修法不一样（盘中看报价，盘后看 K 线）
+    quote_sources: list[QuoteSourceRecord] = field(default_factory=list)
+    #: 每个市场的报价备源链：空链是「这个市场根本没配报价源」，单源是「挂了没有备源」。
+    #: 两句都不进退出码——它们是配置决策，不是故障（见 `cli/health.py`）
+    quote_chains: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def degraded_sources(self) -> list[SourceRecord]:
@@ -200,6 +211,14 @@ class HealthReport:
     @property
     def unverified_sources(self) -> list[SourceRecord]:
         return [s for s in self.sources if s.ok is None]
+
+    @property
+    def degraded_quote_sources(self) -> list[QuoteSourceRecord]:
+        return [s for s in self.quote_sources if s.ok is False]
+
+    @property
+    def unverified_quote_sources(self) -> list[QuoteSourceRecord]:
+        return [s for s in self.quote_sources if s.ok is None]
 
     @property
     def schedule_stale(self) -> bool:
@@ -267,6 +286,7 @@ class HealthService:
         fx: FxRepo | None = None,
         local_status: Callable[[], dict[str, str]] | None = None,
         schedule: Callable[[], ScheduleData] | None = None,
+        quote_health: QuoteHealthRepo | None = None,
     ) -> None:
         self.db = db
         self.registry = registry
@@ -286,6 +306,8 @@ class HealthService:
         #: 调度器读数同理，而且**函数比调度器对象更对**：健康这一层不认识循环，
         #: 只要一份 `ScheduleData` 的形状；传对象会把 `services.health` 连到调度器的依赖图上
         self.schedule = schedule
+        #: 报价源健康是另一张表：不传就是「这一节没接入」（老库、单测的手搭实例）
+        self.quote_health = quote_health
 
     def report(self) -> HealthReport:
         have = set(self.db.table_names())
@@ -308,6 +330,8 @@ class HealthService:
             tables=tables,
             calendar_years=self._calendar_years(),
             sources=self.registry.health(),
+            quote_sources=self._quote_sources(),
+            quote_chains=self._quote_chains(),
             pending_migrations=pending(self.db),
             market_data=self._market_data(),
             fundamentals=self._fundamentals_coverage(),
@@ -316,6 +340,32 @@ class HealthService:
             schedule=schedule,
             schedule_unmigrated=schedule_unmigrated,
         )
+
+    def _quote_sources(self) -> list[QuoteSourceRecord]:
+        """报价源健康：表还没建时给空列表，不抛。
+
+        `sams health` 是「先看看这个库怎么了」的入口，0019 之前的库照样要能出这一屏
+        （`_ledger_data`/`_notify_data` 同一条线）。空列表与「全部正常」不是同一句话，
+        屏幕上那句由 `cli/health.py` 说。
+        """
+        if self.quote_health is None:
+            return []
+        return sorted(self.quote_health.load().values(), key=lambda record: record.name)
+
+    def _quote_chains(self) -> dict[str, tuple[str, ...]]:
+        """每个市场的报价链；市场没配源时给空链而不是让整份报告炸掉。
+
+        `AdapterRegistry.chain_for` 对「不在路由里的市场」抛 `DatasourceError`
+        （那是取数路径该有的严格），健康页在这里是**读配置**：A 市场没有报价源
+        是一条要显示的事实，不是这一屏读不下去的理由。
+        """
+        chains: dict[str, tuple[str, ...]] = {}
+        for market in self.settings.markets:
+            try:
+                chains[market] = self.registry.chain_for(market, "quote")
+            except SamsError:
+                chains[market] = ()
+        return chains
 
     def _notify_data(self) -> NotifyData:
         """通道数 + 四态计数 + 积压 + 本机那两个通道的可用性 + 工厂不认识的 kind。

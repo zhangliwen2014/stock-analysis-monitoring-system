@@ -12,6 +12,7 @@ import re
 from argparse import _SubParsersAction
 from datetime import date
 
+from sams.core.config import ServerCfg
 from sams.core.errors import ValidationError
 from sams.core.fundamentals import RATIO_BOUNDS, out_of_caliber
 from sams.core.timeutil import format_utc_moment
@@ -47,6 +48,21 @@ def refused(args: argparse.Namespace, exc: Exception, code: int) -> int:
 def stamp(value) -> str:
     """时间戳的统一落屏格式；怎么折 UTC、为什么要到秒，见 `core.timeutil.format_utc_moment`。"""
     return "–" if value is None else format_utc_moment(value)
+
+
+def advertised_url(server: ServerCfg, path: str = "") -> str:
+    """屏幕上给人复制的地址：通配监听折成回环，IPv6 带方括号。
+
+    `0.0.0.0` 不是可访问的主机名，IPv6 地址不带方括号时冒号会被当成端口分隔符。
+    屏幕是这份配置唯一的展示处，它不该复述一个抄进浏览器才报错的字符串。
+    """
+    host = server.host
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    scheme = "https" if server.tls_certfile else "http"
+    return f"{scheme}://{host}:{server.port}{path}"
 
 
 def group(subparsers: _SubParsersAction, name: str, help_text: str) -> _SubParsersAction:

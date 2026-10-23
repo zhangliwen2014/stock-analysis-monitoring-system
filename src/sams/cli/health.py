@@ -6,7 +6,8 @@ import argparse
 from datetime import UTC, datetime
 
 from sams.bootstrap import Container
-from sams.cli.common import EXIT_LOCKED, stamp
+from sams.cli.common import EXIT_LOCKED, advertised_url, stamp
+from sams.core.config import Settings
 from sams.core.errors import DatabaseLocked
 from sams.services.scheduler.beatfile import beat_path, read_beat
 from sams.services.scheduler.heartbeat import stale_at
@@ -276,6 +277,43 @@ def _chain_shown(
     return " → ".join(parts)
 
 
+def _print_quotes(report) -> None:
+    """`[报价源]`：盘中那一路的健康与备源，与日线的 `[数据源]` 分开。
+
+    三态沿用日线那一节的措辞：`ok is None` 是「从未被问到」，不是故障——
+    刚启动的进程本来就没问过。空链与单源只标黄、不进退出码：那是配置决策，
+    而退出码 1 要留给「问过、而且失败了」。
+    """
+    print("[报价源]")
+    if not report.quote_sources:
+        print("  （还没有报价源记录：盘中线程未启动，或库里还没有 0019 的形状）")
+    for record in report.quote_sources:
+        state = (
+            "ok"
+            if record.ok is True
+            else "未知（未调用）"
+            if record.ok is None
+            else f"失败×{record.consecutive_failures}"
+        )
+        line = f"  {record.name:<10} {state:<13} 市场 {','.join(record.markets)}"
+        if record.last_error:
+            line += f"  最近错误 {record.last_error[:60]}"
+        print(line)
+    for market, chain in report.quote_chains.items():
+        shown = " → ".join(chain) or "（空）"
+        if not chain:
+            mark = "  ⚠ 这个市场没有报价源：盘中取不到价，价格类规则不会触发"
+        elif len(chain) == 1:
+            mark = f"  ⚠ 报价单源（{chain[0]}），挂了没有备源"
+        else:
+            mark = ""
+        print(f"  {market:<4} {shown}{mark}")
+    for record in report.degraded_quote_sources:
+        print(f"  ⚠ {record.name} 报价未恢复，检查网络或换源")
+    for record in report.unverified_quote_sources:
+        print(f"  · {record.name} 的报价尚未被调用过，健康状态未知")
+
+
 def show(container: Container, args: argparse.Namespace) -> int:
     report = container.health.report()
     print(f"库: {report.db_path}")
@@ -330,17 +368,26 @@ def show(container: Container, args: argparse.Namespace) -> int:
         print(f"  ⚠ {source.name} 未恢复，检查网络或换源")
     for source in report.unverified_sources:
         print(f"  · {source.name} 尚未被调用过，健康状态未知")
+    _print_quotes(report)
     # 退出码说的是同一件事（D101：死掉的调度器发不出「我死了」，判它的读者在循环之外）。
     # 用 `schedule_stale` 而不用「从未启动」：一次都没跑过的库不是事故，
     # 那一格由 `[调度]` 自己的文案说
     return (
         1
-        if report.degraded_sources or report.pending_migrations or report.schedule_stale
+        if report.degraded_sources
+        or report.degraded_quote_sources
+        or report.pending_migrations
+        or report.schedule_stale
         else 0
     )
 
 
-def show_locked(lock: DatabaseLocked, *, now: datetime | None = None) -> int:
+def show_locked(
+    lock: DatabaseLocked,
+    *,
+    now: datetime | None = None,
+    settings: Settings | None = None,
+) -> int:
     """库被另一个进程握着时的那一屏（D111）：只说还读得到的事实。
 
     DuckDB 单写者，连只读连接也打不开（1.5.6 实测），所以这一屏**不是**一份缩水的
@@ -349,6 +396,7 @@ def show_locked(lock: DatabaseLocked, *, now: datetime | None = None) -> int:
     不能借「没有文件」推出「它死了」。
 
     退出码 3 与 1 分开：1 是「读到了，而且有故障」，3 是「读不到，所以不知道」。
+    `settings` 给出时多指一条路：`/healthz` 走 HTTP，不受这把文件锁影响。
     """
     moment = now if now is not None else datetime.now(UTC)
     print(f"库: {lock.path}")
@@ -367,6 +415,11 @@ def show_locked(lock: DatabaseLocked, *, now: datetime | None = None) -> int:
             )
         else:
             print(f"  心跳 {_age(age)}前 · PID {beat.pid}（常驻循环还在写）")
+    if settings is not None:
+        print(
+            "  活体读数（HTTP，不受库锁影响）: "
+            f"{advertised_url(settings.server, '/healthz')}"
+        )
     print("  其余各节需要打开数据库，本次没有读")
     print(f"  退出码 {EXIT_LOCKED} 表示「未知」：库被占用不等于库坏了")
     return EXIT_LOCKED

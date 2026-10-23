@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from sams.cli.health import show
+from sams.core.quotes import QuoteSourceRecord
 from sams.services.health import HealthReport, NotifyData
 from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
 from sams.services.scheduler.report import JobHealth, ScheduleData
@@ -77,8 +78,19 @@ def reading(*, age: int | None, admins: int = 2, jobs: tuple[JobHealth, ...] = (
     )
 
 
-def report_with(schedule: ScheduleData | None = None, notify: NotifyData | None = None):
-    return HealthReport(db_path=":memory:", schedule=schedule, notify=notify or NotifyData())
+def report_with(
+    schedule: ScheduleData | None = None,
+    notify: NotifyData | None = None,
+    quotes: list[QuoteSourceRecord] | None = None,
+    chains: dict[str, tuple[str, ...]] | None = None,
+):
+    return HealthReport(
+        db_path=":memory:",
+        schedule=schedule,
+        notify=notify or NotifyData(),
+        quote_sources=quotes or [],
+        quote_chains=chains or {},
+    )
 
 
 @pytest.fixture
@@ -327,4 +339,48 @@ def test_system_backlog_gets_its_own_line_not_the_user_one(invoke) -> None:
     assert "`[调度]` 那一节按 job 列了最近一次的结论" in text
     assert "未处理告警 2 条" not in text, "用户那句说的还是用户的 0 条"
     assert "未处理告警 0 条" in text
+    assert code == 0
+
+
+def test_a_failed_quote_source_is_printed_and_exits_1(invoke) -> None:
+    """报价源失败与日线源失败是两条链上的两个结论，但都该让退出码变红。"""
+    record = QuoteSourceRecord(
+        name="tencent",
+        markets=("A",),
+        ok=False,
+        last_error="HTTP 502",
+        consecutive_failures=3,
+    )
+    code, text = invoke(report_with(quotes=[record], chains={"A": ("tencent",)}))
+    assert "[报价源]" in text
+    assert "tencent" in text and "失败×3" in text
+    assert "最近错误 HTTP 502" in text
+    assert "报价未恢复" in text
+    assert code == 1
+
+
+def test_a_quote_source_never_called_is_not_a_failure(invoke) -> None:
+    """`ok is None` 是「还没问过」，与「问过且失败」分开：刚启动的进程本来就没问过。"""
+    code, text = invoke(
+        report_with(
+            quotes=[QuoteSourceRecord(name="sina_quote", markets=("A",), ok=None)],
+            chains={"A": ("tencent", "sina_quote")},
+        )
+    )
+    assert "未知（未调用）" in text
+    assert "尚未被调用过" in text
+    assert code == 0
+
+
+def test_an_empty_or_single_quote_chain_warns_without_touching_the_exit_code(invoke) -> None:
+    """空链与单源是配置决策，不是故障：屏幕上标出来，退出码不动。
+
+    把空链算成失败的话，一个只做日线的人每次 `sams health` 都会看到 1，
+    而那个码很快就只剩「又有黄色的东西」一个意思。
+    """
+    code, text = invoke(
+        report_with(chains={"A": (), "HK": ("yfinance",), "US": ("yfinance", "sina_quote")})
+    )
+    assert "这个市场没有报价源" in text
+    assert "报价单源（yfinance）" in text
     assert code == 0

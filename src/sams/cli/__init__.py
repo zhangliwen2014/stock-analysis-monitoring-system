@@ -22,6 +22,7 @@ from sams.cli import (
     rule,
     schedule,
     screen,
+    serve,
     source,
     sync,
     thesis,
@@ -32,6 +33,7 @@ from sams.core.config import Settings
 from sams.core.errors import DatabaseLocked, SamsError
 
 COMMAND_MODULES = (
+    serve,
     db,
     user,
     sync,
@@ -68,12 +70,21 @@ def build_parser() -> argparse.ArgumentParser:
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        container = build_container(Settings.load(args.config_path))
+        settings = Settings.load(args.config_path)
+    except SamsError as exc:
+        print(f"配置错误: {exc}", file=sys.stderr)
+        return 1
+    if args.command == "serve":
+        # serve 要三条连接（D113）：它拿 Settings 自己装配，不走 build_container 那一条。
+        # 分派必须在这里、在容器之前——先造容器会白开一条并把它握在 CLI 手里
+        return serve.start(settings, args)
+    try:
+        container = build_container(settings)
     except DatabaseLocked as exc:
         # 「库被占用」不是配置错误：那个进程可能正在干活（D111）。
         # health 是唯一还能说出一点东西的命令——库旁那一拍没被锁
         if args.command == "health":
-            return health.show_locked(exc)
+            return health.show_locked(exc, settings=settings)
         print(f"数据库被占用: {exc}", file=sys.stderr)
         return EXIT_LOCKED
     except SamsError as exc:

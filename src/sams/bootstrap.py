@@ -30,20 +30,24 @@ from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
 from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
+from sams.services.intraday import IntradayMonitor
 from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
 from sams.services.prune import PruneService
+from sams.services.quotes import QuoteBoard, QuoteService
 from sams.services.rules.derive import RuleDeriver
 from sams.services.rules.engine import RuleEngine
 from sams.services.rules.maintenance import RuleService
 from sams.services.rules.recheck import Rechecker
 from sams.services.rules.snapshot import RuleData
+from sams.services.runtime import Runtime
 from sams.services.scheduler.alarms import SystemAlerter
 from sams.services.scheduler.beatfile import beat_path
 from sams.services.scheduler.jobs import build_jobs
+from sams.services.scheduler.report import ScheduleData, collect
 from sams.services.scheduler.runner import JobRunner
 from sams.services.scheduler.service import RunRequestQueue, Scheduler
-from sams.services.scheduler.types import JobDeps
+from sams.services.scheduler.types import JobDeps, JobSpec
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
@@ -115,6 +119,9 @@ class AppCore:
     registry: AdapterRegistry
     #: 手动请求队列：调度线程与 Web 共用，Web 的「立即同步」才落得到同一台调度器
     requests: RunRequestQueue
+    #: 行情板是进程级的一份：盘中线程写、`/healthz` 与 Web 读。
+    #: 每个上下文各造一块板时，页面看到的永远是自己那块空板
+    board: QuoteBoard
     registry_db: Database
 
     def close(self) -> None:
@@ -202,6 +209,10 @@ class ServiceContext:
     #: 报价快照与报价源健康：盘中线程写、Web 读，各走自己的连接
     quotes_store: QuoteRepo
     quote_health: QuoteHealthRepo
+    #: 取价服务：盘中线程那一份会真去问源；其它上下文也有，但没人调用 `poll`
+    quotes: QuoteService
+    #: 盘中节拍器：同样只有盘中线程那一份被 `run_forever`
+    intraday: IntradayMonitor
     task_runs: TaskRunRepo
     heartbeats: HeartbeatRepo
     #: 保留策略（D116）：CLI、serve 的常驻维护与 admin 健康页（计划 14/15）共用这一份
@@ -325,6 +336,7 @@ def build_core(
         cipher=cipher_for(cfg),
         registry=registry,
         requests=RunRequestQueue(),
+        board=QuoteBoard(),
         registry_db=core_db,
     )
 
@@ -359,6 +371,16 @@ def build_context(
     data_sources = DataSourceRepo(database)
     quotes_store = QuoteRepo(database)
     quote_health = QuoteHealthRepo(database)
+    quotes = QuoteService(
+        registry,
+        core.board,
+        quotes_store,
+        quote_health,
+        clock=clock,
+        # 与盘后同步共用同一个桶：两条线程各自限速等于把 rate_limit_per_s 放大一倍
+        bucket=registry.bucket,
+        bus=event_bus,
+    )
 
     providers = providers if providers is not None else default_providers(cfg)
     calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
@@ -448,6 +470,7 @@ def build_context(
         data=rule_data,
         settings=cfg,
     )
+    intraday = IntradayMonitor(cfg, quotes, calendar, universe_builder, clock=clock)
     task_runs = TaskRunRepo(database, clock=clock)
     heartbeats = HeartbeatRepo(database, clock=clock)
     prune = PruneService(
@@ -538,6 +561,8 @@ def build_context(
         rule_rechecker=rule_rechecker,
         quotes_store=quotes_store,
         quote_health=quote_health,
+        quotes=quotes,
+        intraday=intraday,
         task_runs=task_runs,
         heartbeats=heartbeats,
         prune=prune,
@@ -553,6 +578,7 @@ def build_context(
             sim_accounts=sim_accounts,
             sim_ledger=sim_orders,
             fx=fx_store,
+            quote_health=quote_health,
             # 本机通道的可用性由 monitor 探测，health 只接这一个函数：多一条 import 就红了
             local_status=notify.local_status,
             # 健康页读的就是上面这台调度器留下的那两张台账：不是「它此刻活着吗」——
@@ -605,3 +631,134 @@ def build_container(
     return Container(
         **{field.name: getattr(context, field.name) for field in fields(context)}
     )
+
+
+class FreshDbProbe:
+    """`/healthz` 的库探针：每次调用新开一条连接，用完就关。
+
+    HTTP 线程不该借任何后台线程的连接（D113）。`SELECT 1` 很便宜，而这条连接
+    只活一次查询——它不会把库文件长期握在手里，也不会把自己的事务深度借给别人。
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def scalar(self, sql: str) -> object:
+        database = Database.open(self.settings.db_path)
+        try:
+            return database.scalar(sql)
+        finally:
+            database.close()
+
+
+class FreshScheduleProbe:
+    """`/healthz` 的调度读数：每次新开一条连接，问的还是那两张台账。
+
+    `Runtime` 手里有一台 `Scheduler`，但它跑在调度线程上；HTTP 线程直呼
+    `scheduler.schedule_data()` 会用调度线程那条连接（D113）。这里把同一组查询
+    换成「自己的连接 + 同一个 clock」，读数因此与 `sams health` 同源。
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        specs: Sequence[JobSpec],
+        clock: Clock = SYSTEM_CLOCK,
+    ) -> None:
+        self.settings = settings
+        self.specs = tuple(specs)
+        self.clock = clock
+
+    def __call__(self) -> ScheduleData:
+        database = Database.open(self.settings.db_path)
+        try:
+            return collect(
+                runs=TaskRunRepo(database, clock=self.clock),
+                heartbeats=HeartbeatRepo(database, clock=self.clock),
+                users=UserRepo(database),
+                specs=self.specs,
+                clock=self.clock,
+            )
+        finally:
+            database.close()
+
+
+@dataclass
+class ServeParts:
+    """`sams serve` 的三条线程上下文与那一个 `Runtime`。
+
+    `contexts` 的顺序就是创建顺序：调度线程、盘中线程、维护线程。维护那一份只被
+    用来建 `PruneService`（它的连接随后归维护线程独占），三份都不是「主上下文」。
+    """
+
+    core: AppCore
+    contexts: tuple[ServiceContext, ServiceContext, ServiceContext]
+    runtime: Runtime
+
+    def prepare(self) -> int:
+        """迁移、再灌板。顺序不能反：`load_board` 读的是 0019 的列。"""
+        self.contexts[0].migrate()
+        return self.contexts[1].quotes.load_board()
+
+    def close(self) -> None:
+        for context in self.contexts:
+            context.close()
+        self.core.close()
+
+
+def build_serve(
+    settings: Settings | None = None,
+    *,
+    clock: Clock | None = None,
+    bus: EventBus | None = None,
+    adapters: dict[str, BarAdapter] | None = None,
+    providers: dict[str, CalendarProvider] | None = None,
+    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
+) -> ServeParts:
+    """`sams serve` 的装配：一条进程级 core + 三条线程上下文 + 一个运行时。
+
+    三个上下文依序造、依序记在 `opened` 里：造到第三个时炸掉，前两条也得关。
+    半成品留着连接时，重试会撞上自己的锁，而报错指的是「另一个进程」。
+    """
+    cfg = settings or Settings.load()
+    core = build_core(cfg, clock=clock, bus=bus, adapters=adapters)
+    opened: list[ServiceContext] = []
+    try:
+        for _ in range(3):
+            opened.append(
+                build_context(
+                    core, providers=providers, notifier_factory=notifier_factory
+                )
+            )
+        scheduler_ctx, intraday_ctx, maintenance_ctx = opened
+        prune = PruneService(
+            maintenance_ctx.db,
+            quotes=maintenance_ctx.quotes_store,
+            task_runs=maintenance_ctx.task_runs,
+            heartbeats=maintenance_ctx.heartbeats,
+            clock=core.clock,
+        )
+        runtime = Runtime(
+            cfg,
+            scheduler=scheduler_ctx.scheduler,
+            # 每次新开连接的读法：HTTP 线程不借调度线程的连接（D113）
+            schedule_reading=FreshScheduleProbe(
+                cfg, specs=scheduler_ctx.scheduler.jobs, clock=core.clock
+            ),
+            monitor=intraday_ctx.intraday,
+            prune=prune,
+            board=core.board,
+            database=FreshDbProbe(cfg),
+            clock=core.clock,
+        )
+        return ServeParts(
+            core=core,
+            contexts=(scheduler_ctx, intraday_ctx, maintenance_ctx),
+            runtime=runtime,
+        )
+    except BaseException:
+        for context in opened:
+            context.close()
+        core.close()
+        raise

@@ -39,6 +39,12 @@ class SourceHealthStore(Protocol):
 
 
 class SourceHealthView(Protocol):
-    """健康检查需要的全部能力：读出各源最近结果。AdapterRegistry 实现它。"""
+    """健康检查需要的全部能力：读出各源最近结果，以及各市场的备源顺序。
+
+    `chain_for` 只回答「这个市场、这项能力有哪些源」，不真的取数；健康页用它把
+    「这个源没有这个能力」与「这个市场只有一个源」分开说（D38 的口径）。
+    """
 
     def health(self) -> list[SourceRecord]: ...
+
+    def chain_for(self, market: str, method: str) -> tuple[str, ...]: ...
