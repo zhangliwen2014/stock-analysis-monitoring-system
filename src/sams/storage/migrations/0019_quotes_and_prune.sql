@@ -1,4 +1,4 @@
--- 0019：盘中报价的形状、测试告警与两条查询索引（spec §4.2/§4.3，D114/D116/D131）。
+-- 0019：盘中报价的形状、测试告警与收件箱索引（spec §4.2/§4.3，D114/D116/D131）。
 --
 -- 1) `quotes_snapshot` 在 0001 里只有价/涨跌幅/量/额/买卖一。盘中判 urgent 要开盘价与
 --    前收盘（跳空与当日振幅），页面也要一个不依赖 `bars_daily` 的当日高低。四列都可空：
@@ -14,20 +14,20 @@
 --    ParserException），所以分三步：加可空列 → 设默认值 → 回填旧行。只加列不设默认的话，
 --    服务层漏传一次就会写进 NULL；只回填不设默认的话，下一行仍是 NULL。
 --
--- 4) 两个索引各服务一条查询：`quotes_snapshot` 按 `(market, code)` 取最近一笔填
---    `QuoteBoard`；`alerts` 按 `(user_id, triggered_at)` 取某个用户的收件箱。
+-- 4) 一个索引服务一条查询：`alerts` 按 `(user_id, triggered_at)` 取某个用户的收件箱。
+--    `quotes_snapshot` 不再额外建索引——它的主键就是 `(market, code, ts)`，取最近一笔
+--    的查询直接走主键，重复索引只会在最热的表上白付一份写入税。
 --
 -- 5) `sina_quote` 追加到每个市场链末位（D114）。它只报 `quote` 能力，日线链按能力过滤后
 --    看不见它（D38）；放在同一张路由表里是因为「一个市场有哪些源」只能有一处答案。
 --    已经手工加过同名源的库不动它的配置；只在该市场还没有这条路由时追加。
+--    某个市场一条路由都没有时，`max(priority)` 无行可聚合，该市场被静默跳过——这是
+--    有意行为：空链说明这个市场还没人配置，不该由种子替它做决定。
 
 ALTER TABLE quotes_snapshot ADD COLUMN IF NOT EXISTS open DOUBLE;
 ALTER TABLE quotes_snapshot ADD COLUMN IF NOT EXISTS prev_close DOUBLE;
 ALTER TABLE quotes_snapshot ADD COLUMN IF NOT EXISTS high DOUBLE;
 ALTER TABLE quotes_snapshot ADD COLUMN IF NOT EXISTS low DOUBLE;
-
-CREATE INDEX IF NOT EXISTS idx_quotes_snapshot_lookup
-    ON quotes_snapshot (market, code, ts);
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR;
 

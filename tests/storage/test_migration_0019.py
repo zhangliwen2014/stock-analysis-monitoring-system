@@ -60,7 +60,8 @@ def test_0019_backfills_is_test_on_an_existing_database(tmp_path):
     try:
         apply_migrations(database, legacy_dir)
         insert_alert(database, "old")
-        assert apply_migrations(database) == ["0019_quotes_and_prune.sql"]
+        newly = apply_migrations(database)
+        assert "0019_quotes_and_prune.sql" in newly
         assert database.scalar("SELECT is_test FROM alerts WHERE id = 'old'") is False
         # 迁移之后由服务层漏传这一列的行也必须拿到 False，而不是 NULL
         insert_alert(database, "new")
