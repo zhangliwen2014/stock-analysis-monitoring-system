@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from sams.bootstrap import Container
 from sams.cli.common import EXIT_LOCKED, stamp
 from sams.core.errors import DatabaseLocked
+from sams.datasource.capabilities import CAPABILITIES
 from sams.services.scheduler.beatfile import beat_path, read_beat
 from sams.services.scheduler.heartbeat import stale_at
 
@@ -249,6 +250,35 @@ def _print_schedule(report) -> None:
         print(line)
 
 
+def _chain_shown(
+    container: Container,
+    market: str,
+    chain: tuple[str, ...],
+    bars: tuple[str, ...],
+) -> str:
+    """链上每一格按能力说话，不再把「不是日线源」一律读成「只有公司行为」。
+
+    `akshare_hk` 只有公司行为，`sina_quote` 只有报价——写死「仅公司行为」会把
+    报价源也标成公司行为源。标签从 `CAPABILITIES` 反推：日线由 `bars` 那条链说了算
+    （上面已按它数备源），其余能力各自问一次 `chain_for`（探针只查方法在不在，
+    不打网络）。链上一个能力都没有的源报裸名：有名字不代表有本事，不能给它编一个。
+    """
+    if not chain:
+        return "（空）"
+    parts = []
+    for n in chain:
+        if n in bars:
+            parts.append(n)
+            continue
+        caps = [
+            cap.label
+            for key, cap in CAPABILITIES.items()
+            if key != "daily_bars" and n in container.registry.chain_for(market, key)
+        ]
+        parts.append(f"{n}(仅{'、'.join(caps)})" if caps else n)
+    return " → ".join(parts)
+
+
 def show(container: Container, args: argparse.Namespace) -> int:
     report = container.health.report()
     print(f"库: {report.db_path}")
@@ -286,9 +316,7 @@ def show(container: Container, args: argparse.Namespace) -> int:
                 marks.append("没有公司行为源，跨除权日的区间涨跌无从计算")
             elif len(actions) == 1:
                 marks.append(f"公司行为单源（{actions[0]}）")
-        shown = " → ".join(
-            n if n in bars else f"{n}(仅公司行为)" for n in chain
-        ) or "（空）"
+        shown = _chain_shown(container, market, chain, bars)
         print(f"  {market:<4} {shown}" + "".join(f"  ⚠ {m}" for m in marks))
     print("[数据源]")
     for source in report.sources:

@@ -326,7 +326,7 @@ def test_source_add_then_remove(container, capsys):
     assert cli_run_on(container, add) == 0
     assert "tx2" in capsys.readouterr().out
     assert cli_run_on(container, ["source", "list"]) == 0
-    assert "yfinance → tencent → akshare_hk → tx2" in capsys.readouterr().out
+    assert "yfinance → tencent → akshare_hk → sina_quote → tx2" in capsys.readouterr().out
 
     assert cli_run_on(container, ["source", "remove", "tx2"]) == 0
     assert "连带移除路由 1 条" in capsys.readouterr().out
@@ -402,7 +402,8 @@ def test_health_shows_chains_and_flags_a_single_source_market(config_path, capsy
     out = capsys.readouterr().out
     assert "[降级链]（库里的记录）" in out
     assert "akshare → eastmoney → tencent → sina" in out
-    assert "yfinance  ⚠ 日线单源" in out, "每个源都健康 ≠ 有备源：这里必须看得见"
+    assert "yfinance → sina_quote(仅报价)" in out, "每个源都健康 ≠ 有备源：这里必须看得见"
+    assert "⚠ 日线单源" in out
 
 
 def test_a_lowercase_market_echoes_the_shape_that_was_written(config_path, capsys):
