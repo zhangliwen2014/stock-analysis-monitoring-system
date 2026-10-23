@@ -131,15 +131,13 @@ login_window_min = 2
 display_tz = "Asia/Hong_Kong"
 tls_certfile = "/tmp/cert.pem"
 tls_keyfile = "/tmp/key.pem"
-
-[general.quote_stale_s]
 """
-    # quote_stale_s 属于 [general]：上面那段只验证 [server] 的读取
-    read = write(tmp_path, text.replace("[general.quote_stale_s]\n", ""))
-    server = Settings.load(read).server
+    server = Settings.load(write(tmp_path, text)).server
     assert server.port == 9000 and server.session_ttl_days == 3
     assert server.login_max_failures == 4 and server.display_tz == "Asia/Hong_Kong"
     assert server.tls_certfile == "/tmp/cert.pem" and server.tls_keyfile == "/tmp/key.pem"
+    assert server.idle_timeout_min == 60
+    assert server.login_window_min == 2
 
 
 def test_quote_stale_seconds_is_read(tmp_path):
@@ -163,6 +161,12 @@ def test_tls_pair_must_be_complete(tmp_path):
         Settings.load(write(tmp_path, half))
 
 
+def test_tls_keyfile_alone_is_also_incomplete(tmp_path):
+    half = BASE + '\n[server]\ntls_keyfile = "/tmp/key.pem"\n'
+    with pytest.raises(ValidationError, match="tls"):
+        Settings.load(write(tmp_path, half))
+
+
 @pytest.mark.parametrize(
     "line, keyword",
     [
@@ -173,6 +177,7 @@ def test_tls_pair_must_be_complete(tmp_path):
         ("login_max_failures = 0", "login_max_failures"),
         ("login_window_min = 0", "login_window_min"),
         ('display_tz = "Mars/Olympus"', "display_tz"),
+        ('allow_lan = "false"', "allow_lan"),
     ],
 )
 def test_server_numbers_and_timezone_are_validated(tmp_path, line, keyword):

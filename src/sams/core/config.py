@@ -58,6 +58,10 @@ class ServerCfg:
         return self.host in LOOPBACK_HOSTS
 
     def validate(self) -> None:
+        # 安全闸必须 fail-closed：bool("false") 是 True，写错引号就会静默放开 LAN，
+        # 所以这里拒绝一切非布尔值而不是帮用户「纠正」
+        if not isinstance(self.allow_lan, bool):
+            raise ValidationError("server.allow_lan 必须是布尔值")
         if not (1 <= self.port <= 65535):
             raise ValidationError(f"server.port 非法: {self.port}")
         if self.session_ttl_days <= 0:
@@ -143,7 +147,7 @@ class Settings:
         server = ServerCfg(
             host=str(server_raw.get("host", "127.0.0.1")),
             port=int(server_raw.get("port", 8765)),
-            allow_lan=bool(server_raw.get("allow_lan", False)),
+            allow_lan=server_raw.get("allow_lan", False),
             session_ttl_days=int(server_raw.get("session_ttl_days", 7)),
             idle_timeout_min=int(server_raw.get("idle_timeout_min", 720)),
             login_max_failures=int(server_raw.get("login_max_failures", 5)),
