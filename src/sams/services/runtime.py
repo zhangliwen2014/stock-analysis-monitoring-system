@@ -193,7 +193,9 @@ class Runtime:
                     else max(0, int((now - newest.ts).total_seconds()))
                 ),
                 "source": None if newest is None else newest.source,
-                # 从未轮询（休市/刚启动）不是故障；轮过且有错才是
+                # 从未轮询（休市/刚启动）不是故障；轮过且有错才是。
+                # 这一条只看最后一次轮询的结果：线程本身死了它看不见——
+                # 那要靠「轮询节拍多久没动」另判（已知边界，计划 2 收口）
                 "ok": board is None or board.last_error is None,
             }
         return reading

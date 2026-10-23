@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from services.test_runtime import make_runtime
 
 from sams.web.app import create_app
 
@@ -31,3 +32,12 @@ def test_openapi_and_docs_are_off():
     client = TestClient(create_app(DegradedRuntime()))
     assert client.get("/docs").status_code == 404
     assert client.get("/openapi.json").status_code == 404
+
+
+def test_the_real_healthz_payload_serializes(settings):
+    """JSONResponse 用的是严格 json.dumps：Runtime 真实返回的字典里混进一个
+    datetime/NaN，这里就该当场炸，而不是等看门狗第一次拉 /healthz 才发现。
+    """
+    response = TestClient(create_app(make_runtime(settings))).get("/healthz")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
