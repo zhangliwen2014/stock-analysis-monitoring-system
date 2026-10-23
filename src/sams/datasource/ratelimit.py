@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 
@@ -51,6 +52,9 @@ class TokenBucket:
         self.sleep = sleep
         self._level = float(self.capacity)
         self._updated = self.clock()
+        #: 盘中轮询与盘后同步共用一个桶：没有锁时两边各自 `_refill` 再扣减，
+        #: 后写的 `_level` 会覆盖先写的，限速被悄悄放宽
+        self._lock = threading.Lock()
 
     def _refill(self) -> None:
         now = self.clock()
@@ -58,10 +62,15 @@ class TokenBucket:
         self._updated = now
 
     def reserve(self, tokens: float = 1.0) -> float:
-        """扣减 tokens，返回调用方应等待的秒数（0 表示可立即执行）。"""
-        self._refill()
-        self._level -= tokens
-        return 0.0 if self._level >= 0 else -self._level / self.rate
+        """扣减 tokens，返回调用方应等待的秒数（0 表示可立即执行）。
+
+        `sleep` 留在锁外（见 `acquire`）：持锁等待会把所有调用方串行到一次 HTTP 的
+        时长上，那不是限速，是排队超时。
+        """
+        with self._lock:
+            self._refill()
+            self._level -= tokens
+            return 0.0 if self._level >= 0 else -self._level / self.rate
 
     def acquire(self, tokens: float = 1.0) -> float:
         wait = self.reserve(tokens)

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from sams.datasource.ratelimit import TokenBucket
@@ -55,3 +59,27 @@ def test_refill_is_capped_at_capacity():
     clock.advance(1000)  # 长时间空闲也不能攒出无限额度
     assert bucket.reserve(3.0) == 0.0
     assert bucket.reserve(1.0) == 1.0
+
+
+def test_reserve_does_not_lose_tokens_under_threads():
+    """盘中轮询与盘后同步共用同一个桶：扣减必须串行。
+
+    没有锁时，两边可能读到同一个 `_level`、各自扣一次、后写的覆盖先写的——
+    症状不是报错，而是限速被悄悄放宽（或收紧）了一倍。
+    """
+    start = threading.Barrier(8)
+
+    def slow_clock():
+        time.sleep(0.002)
+        return 0.0
+
+    bucket = TokenBucket(rate=1.0, capacity=1.0, clock=slow_clock)
+
+    def take(_index):
+        start.wait()
+        return bucket.reserve(1.0)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        waits = list(pool.map(take, range(8)))
+
+    assert sorted(waits) == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
