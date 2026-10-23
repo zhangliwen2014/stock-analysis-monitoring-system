@@ -65,6 +65,8 @@ def test_the_five_states_are_ordered_by_what_the_user_must_do_first():
     assert quote_state(flagged, now=now, market_open=True, stale_s=60) == STALE
     delayed = quote(delayed=True)
     assert quote_state(delayed, now=now, market_open=True, stale_s=60) == DELAYED
+    late_delayed = quote(delayed=True, ts=datetime(2026, 10, 23, 1, 58, tzinfo=UTC))
+    assert quote_state(late_delayed, now=now, market_open=True, stale_s=60) == STALE
 
 
 def test_a_quote_from_the_future_is_not_reported_as_negative_age():
@@ -76,3 +78,16 @@ def test_a_quote_from_the_future_is_not_reported_as_negative_age():
 def test_an_empty_batch_is_still_a_batch():
     batch = QuoteBatch()
     assert batch.quotes == () and batch.skipped == () and batch.errors == ()
+
+
+def test_a_naive_now_is_a_caller_bug_not_a_state():
+    with pytest.raises(ValidationError, match="now"):
+        quote_state(quote(), now=datetime(2026, 10, 23, 10, 0), market_open=True, stale_s=60)
+
+
+def test_marked_stale_returns_a_new_quote_and_leaves_the_original():
+    original = quote()
+    flagged = original.marked_stale()
+    assert flagged.is_stale is True
+    assert original.is_stale is False
+    assert flagged.ts == original.ts and flagged.price == original.price

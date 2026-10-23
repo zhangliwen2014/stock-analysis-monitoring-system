@@ -55,6 +55,7 @@ class Quote:
             raise ValidationError(f"报价价格必须有限且为正: {self.price!r}")
         if self.ts.tzinfo is None:
             raise ValidationError("Quote.ts 必须是带时区的 UTC 时刻")
+        object.__setattr__(self, "ts", self.ts.astimezone(UTC))
 
     def marked_stale(self) -> Quote:
         return replace(self, is_stale=True)
@@ -109,6 +110,8 @@ def quote_state(
     `delayed` 排在 `stale` 之后：源自己说延迟 15 分钟、而这一笔已经 20 分钟没动，
     前者是常态、后者才是要查的事。
     """
+    if now.tzinfo is None:
+        raise ValidationError("quote_state 的 now 必须是带时区的时刻")
     if not market_open:
         return CLOSED
     if quote is None:
