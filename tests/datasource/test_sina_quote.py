@@ -6,11 +6,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from support import FrozenClock
 
-from sams.core.errors import EmptyResponse
+from sams.core.errors import EmptyResponse, RateLimited
 from sams.datasource.sina_quote import (
     QUOTE_URL,
     SinaQuoteAdapter,
     parse_sina_quotes,
+    quote_get,
     sina_quote_symbol,
 )
 
@@ -42,6 +43,17 @@ def test_symbols_for_three_markets():
     assert sina_quote_symbol("A", "600519") == "sh600519"
     assert sina_quote_symbol("HK", "700") == "hk00700"
     assert sina_quote_symbol("US", "AAPL.OQ") == "gb_aapl"
+
+
+def test_us_class_shares_have_no_sina_key_so_the_symbol_refuses():
+    # `.OQ` 是交易所后缀，剥掉后仍是同一只票；`.B`/`.A` 是类股，新浪的键表达不了
+    # （实测 gb_brk_b / gb_brk_a 都是空行，gb_brkb 是 2019 年的死行）。按点前裸代码
+    # 发 gb_brk 会拿到 A 类的报价且毫无异常——键就是回显，只能在这一步拒绝。
+    assert sina_quote_symbol("US", "AAPL.OQ") == "gb_aapl"
+    with pytest.raises(ValueError):
+        sina_quote_symbol("US", "BRK.B")
+    with pytest.raises(ValueError):
+        sina_quote_symbol("US", "BRK.A")
 
 
 def test_a_share_fields_and_derived_pct():
@@ -85,7 +97,7 @@ def test_hk_fields_use_chinese_name_and_hk_time():
     assert quote.volume == 1000000 and quote.amount == 380000000
 
 
-def test_us_fields_use_price_datetime_and_prev_close_columns():
+def us_cells():
     cells = [""] * 31
     cells[0] = "Apple Inc"
     cells[1] = "230.50"
@@ -98,8 +110,12 @@ def test_us_fields_use_price_datetime_and_prev_close_columns():
     cells[10] = "50000000"
     cells[26] = "227.65"
     cells[30] = "11525000000"
+    return cells
+
+
+def test_us_fields_use_price_datetime_and_prev_close_columns():
     quote = parse_sina_quotes(
-        line("gb_aapl", cells), market="US", codes=["AAPL"], now=NOW,
+        line("gb_aapl", us_cells()), market="US", codes=["AAPL"], now=NOW,
         zone=ZoneInfo("America/New_York"),
     ).quotes[0]
     assert quote.price == 230.5 and quote.prev_close == 227.65
@@ -163,7 +179,57 @@ def test_adapter_uses_gbk_endpoint_and_its_own_name():
     assert batch.quotes[0].source == "sina_quote"
 
 
+def test_a_us_class_share_is_skipped_not_served_the_class_a_price():
+    seen = {}
+
+    def fetch(url, params, *, timeout):
+        seen.update(params=params)
+        return line("gb_aapl", us_cells())
+
+    adapter = SinaQuoteAdapter(quote_fetch=fetch, clock=FrozenClock(NOW))
+    batch = adapter.quotes("US", ["AAPL", "BRK.B"])
+    assert [q.code for q in batch.quotes] == ["AAPL"]
+    # 这只票在这个源拿不到键，宁可出现在 skipped 也不能拿别的类股的价格
+    assert batch.skipped == ("BRK.B",)
+    # 请求清单里不得出现 gb_brk——那是伯克希尔 A 类的键
+    assert seen["params"]["list"] == "gb_aapl"
+
+
+def test_a_batch_of_only_class_shares_never_hits_the_endpoint():
+    seen = {}
+
+    def fetch(url, params, *, timeout):
+        seen.update(url=url)
+        return ""
+
+    adapter = SinaQuoteAdapter(quote_fetch=fetch, clock=FrozenClock(NOW))
+    batch = adapter.quotes("US", ["BRK.B"])
+    assert batch.skipped == ("BRK.B",)
+    assert seen == {}
+
+
+def test_quote_get_maps_429_to_rate_limited(monkeypatch):
+    # 429 必须在 raise_for_status 之前判成 RateLimited：路由器对限流退避重试，
+    # 对其他异常立刻换源——限流时换源等于把备源也打爆
+    class Response429:
+        status_code = 429
+
+    monkeypatch.setattr("requests.get", lambda *a, **k: Response429())
+    with pytest.raises(RateLimited):
+        quote_get(QUOTE_URL, {"list": "sh600519"}, timeout=1)
+
+
 @pytest.mark.live
 def test_live_sina_quote_smoke():
     batch = SinaQuoteAdapter().quotes("A", ["600519"])
     assert batch.quotes and batch.quotes[0].price > 0
+
+
+@pytest.mark.live
+def test_live_sina_quote_hk_and_us_smoke():
+    hk = SinaQuoteAdapter().quotes("HK", ["00700"])
+    assert hk.quotes and hk.quotes[0].price > 0
+    assert hk.quotes[0].ts.tzinfo is not None
+    us = SinaQuoteAdapter().quotes("US", ["AAPL"])
+    assert us.quotes and us.quotes[0].price > 0
+    assert us.quotes[0].ts.tzinfo is not None

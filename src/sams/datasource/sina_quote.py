@@ -28,8 +28,19 @@ from sams.datasource.base import a_share_symbol, classify_error
 from sams.datasource.quote import field_float, parse_moment
 from sams.datasource.sources import source
 
-QUOTE_URL = "https://hq.sinajs.cn/list="
+#: 不能带路径里那个 `=`：requests 会把 params 拼成查询串，`.../list=` 会变成
+#: `.../list=?list=...`，新浪把 `?list=...` 当成代码原样回显——每只票都是空行，
+#: 整批静默 skipped（live 冒烟抓出来的）。`/list?list=...` 实测三个市场都正常回键。
+QUOTE_URL = "https://hq.sinajs.cn/list"
 _LINE = re.compile(r'hq_str_([^=]+)="([^"]*)"')
+
+#: 美股代码里会被剥掉的交易所后缀（大写）。仓库里查得到的美股后缀形态只有：
+#: 腾讯 smartbox 解析的文档 `parse_us_hint`（tencent.py）给出 `ba.n`，
+#: 测试夹具出现 `usAAPL.OQ`（test_tencent.py）与回显 `BRK.A.N`（test_quote_helpers.py）。
+#: 没有现成的后缀集，这里只收 `.OQ`（纳斯达克）、`.N`（纽交所）、`.TO`（多伦多）
+#: 三种最常见形态。带点但不在这个集里的尾巴不是交易所而是类股（`BRK.B`）——
+#: 判错方向是把 B 类股的报价贴到 A 类的键下，所以宁可拒绝。
+_US_EXCHANGE_SUFFIXES = frozenset({".OQ", ".N", ".TO"})
 
 
 def sina_quote_symbol(market: str, code: str) -> str:
@@ -38,7 +49,15 @@ def sina_quote_symbol(market: str, code: str) -> str:
     if market == "HK":
         return f"hk{canonical_code('HK', code)}"
     if market == "US":
-        return f"gb_{canonical_code('US', code).split('.')[0].lower()}"
+        canonical = canonical_code("US", code)
+        base, _, tail = canonical.partition(".")
+        if tail and f".{tail}" not in _US_EXCHANGE_SUFFIXES:
+            # 类股（BRK.B）：实测新浪 `gb_brk_b`/`gb_brk_a` 都是空行、`gb_brkb` 是死行，
+            # 而按点前裸代码发 `gb_brk` 拿到的是 A 类的报价且毫无异常。新浪的载荷里
+            # 没有代码字段，键就是回显——`echo_matches` 救不了构造期，只能在这里拒绝，
+            # 让适配器把它记进 skipped，而不是拿别的类股的价格来顶。
+            raise ValueError(f"新浪报价的键表达不了美股同类股 {code}")
+        return f"gb_{base.lower()}"
     raise ValueError(f"未知市场 {market}")
 
 
@@ -101,7 +120,9 @@ class _BadRow(ValueError):
     pass
 
 
-def _to_quote(market: str, code: str, cells: list[str], *, now: datetime, zone):
+def _to_quote(
+    market: str, code: str, cells: list[str], *, now: datetime, zone: ZoneInfo
+) -> Quote:
     if market == "A":
         return _a_quote(code, cells, now=now, zone=zone)
     if market == "HK":
@@ -114,7 +135,8 @@ def _to_quote(market: str, code: str, cells: list[str], *, now: datetime, zone):
 def _price(cells: list[str], index: int) -> float:
     value = field_float(cells, index)
     if value is None or value <= 0:
-        raise _BadRow(f"报价价格不可用（{(cells[index] if index < len(cells) else '缺位')!r}）")
+        # 「缺位」分支到不了：每个市场入口先按字段表设长度下限（32/19/31），都盖过价格位
+        raise _BadRow(f"报价价格不可用（{cells[index]!r}）")
     return value
 
 
@@ -222,22 +244,38 @@ class SinaQuoteAdapter:
         wanted = list(dict.fromkeys(canonical_code(market, code) for code in codes))
         if not wanted:
             return QuoteBatch()
-        symbols = [sina_quote_symbol(market, code) for code in wanted]
+        symbols: list[str] = []
+        quotable: list[str] = []
+        pre_skipped: list[str] = []
+        for code in wanted:
+            try:
+                symbols.append(sina_quote_symbol(market, code))
+            except ValueError:
+                # 这只票在这个源拿不到键，宁可出现在 skipped 也不能拿别的类股的价格
+                pre_skipped.append(code)
+            else:
+                quotable.append(code)
+        if not quotable:
+            return QuoteBatch(skipped=tuple(pre_skipped))
         try:
             text = self._quote_fetch(
                 QUOTE_URL, {"list": ",".join(symbols)}, timeout=self._timeout
+            )
+            # 解析也要在 try 里：解析层的意外 bug 同样按 DatasourceError 分类上报，
+            # 而不是以裸异常穿透到路由层（与 tencent 同一口径）
+            batch = parse_sina_quotes(
+                text,
+                market=market,
+                codes=quotable,
+                now=self._clock.now_utc(),
+                zone=MARKET_ZONES[market],
             )
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
-        return parse_sina_quotes(
-            text,
-            market=market,
-            codes=wanted,
-            now=self._clock.now_utc(),
-            zone=MARKET_ZONES[market],
-        )
+        # 预跳过的并到批次末尾：parse 只见过能成键的代码，它的 skipped 是「源没给」
+        return QuoteBatch(batch.quotes, batch.skipped + tuple(pre_skipped), batch.errors)
 
 
 source(
