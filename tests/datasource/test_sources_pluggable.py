@@ -20,6 +20,7 @@ ADAPTER_MODULES = {
     "akshare_ths",
     "eastmoney",
     "sina",
+    "sina_quote",
     "tencent",
     "yfinance_us",
 }
