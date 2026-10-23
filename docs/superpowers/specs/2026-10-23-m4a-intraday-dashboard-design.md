@@ -102,12 +102,12 @@ src/sams/datasource/quote.py         QuoteAdapter 协议、批量/回显校验�
 src/sams/datasource/sina_quote.py    Sina 仅报价适配器（A/HK/US）
 src/sams/datasource/tencent.py       增加 quotes(...)
 src/sams/storage/migrations/0019_quotes_and_prune.sql
-src/sams/storage/repos/quotes.py     QuoteRepo
-src/sams/storage/repos/quote_health.py
+src/sams/storage/repos/quotes.py     QuoteRepo、QuoteHealthRepo（一张表的两个读者放一处）
 src/sams/services/quotes.py          QuoteService：轮询、降级、入库、QuoteBoard
-src/sams/services/intraday.py        IntradayMonitor：时段判断、universe、评估循环
-src/sams/services/rules/intraday.py  日线快照缓存 + 报价叠加（SnapshotOverlay）
-src/sams/services/notify_queue.py    QueuedAlertSender + NotifyWorker
+src/sams/services/intraday.py        IntradayMonitor：时段判断、universe、轮询循环
+src/sams/services/rules/cache.py     SnapshotCache：日线快照缓存与 VersionGate 失效
+src/sams/services/rules/intraday.py  IntradayEvaluator：每轮评估启用的盘中规则
+src/sams/monitor/queue.py            AlertQueue、QueuedAlertSender、NotifyWorker、SystemAlarmRelay
 src/sams/services/runtime.py         Runtime：线程生命周期、/healthz 数据、维护任务
 src/sams/web/                        FastAPI 应用
   app.py, auth.py, context.py, forms.py
@@ -122,8 +122,9 @@ tests/...                            见 §10
 
 - `src/sams/bootstrap.py`：拆出进程级 `AppCore`（settings/clock/bus/cipher/registry）与线程级 `ServiceContext`（Database + repos + services）；`build_container` 保持 CLI 兼容，`serve` 用新工厂。
 - `src/sams/core/rules.py`、`src/sams/services/rules/templates.py`：`Template.intraday` 标志。
-- `src/sams/services/rules/snapshot.py`：`RuleData.read(..., quote=...)` 与日线部分拆分。
-- `src/sams/services/rules/engine.py`：接受报价叠加与缓存；发送端口可注入队列版。
+- `src/sams/services/rules/snapshot.py`：`RuleData.read` 保持只读日线；新增纯函数
+  `apply_quote` 与 `Snapshot.cross_from`（报价叠加不碰 IO，缓存才存得下日线那一份）。
+- `src/sams/services/rules/engine.py`：接受 `QuoteView` 与 `SnapshotCache`；发送端口可注入队列版。
 - `src/sams/services/health.py`：增加报价源健康与 `/healthz` 需要的数据。
 - `src/sams/services/scheduler/service.py`：增加 `request_run(job_name, market)` 的线程安全请求队列，由调度线程在下一拍执行（手动同步走这里，不新开写线程）。
 - `src/sams/storage/repos/users.py`：`display_name` 读写、本人改密码。
@@ -207,9 +208,12 @@ ALTER TABLE quotes_snapshot ADD COLUMN IF NOT EXISTS low DOUBLE;
 CREATE INDEX IF NOT EXISTS idx_quotes_snapshot_lookup
     ON quotes_snapshot (market, code, ts);
 
--- 首运行与降噪
+-- 首运行与降噪。DuckDB 不支持 `ADD COLUMN ... NOT NULL`（即使带 DEFAULT）：
+-- 分三步「加可空列 → SET DEFAULT → 回填旧行」，详见 0019 的注释
 ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR;
-ALTER TABLE alerts ADD COLUMN IF NOT EXISTS is_test BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS is_test BOOLEAN;
+ALTER TABLE alerts ALTER COLUMN is_test SET DEFAULT FALSE;
+UPDATE alerts SET is_test = FALSE WHERE is_test IS NULL;
 CREATE INDEX IF NOT EXISTS idx_alerts_user_triggered
     ON alerts (user_id, triggered_at);
 CREATE TABLE IF NOT EXISTS quote_source_health (
@@ -245,13 +249,19 @@ CREATE TABLE IF NOT EXISTS quote_source_health (
 
 ### 5.2 报价叠加到 Snapshot
 
-`RuleData.read(target, as_of, position, quote=None)`：
+`RuleData.read(target, as_of, position)` **保持不变**：它只读日线，不知道报价。报价叠加是纯函数
+`services/rules/snapshot.py::apply_quote(snapshot, *, quote, previous, zone) -> Snapshot`，由引擎在缓存命中或
+未命中之后调用——缓存因此存的是**日线那一份**，报价每轮现叠加，不会被缓存陈旧。
 
-- `quote` 存在时覆盖：`price=quote.price`、`price_on=today`、`price_age_days=0`、`day_open=quote.open`、`prev_close=quote.prev_close`。
+- `apply_quote` 覆盖：`price=quote.price`、`price_on=报价的市场本地日`、`price_age_days=0`、
+  `day_open=quote.open`（源没给就保留日线的）、`prev_close=quote.prev_close`（源没给就保留日线的）。
 - 日线部分（MA、ATR、止损线、目标价、持仓期最高价、赔率、财报日）照常从上一收盘读。
 - `holding_high = max(日线持仓期最高价, quote.high or quote.price)`：让 trailing/breakeven 在当天创新高后立刻把线抬上去；日线部分为 `None` 时仍为 `None`（不足 `TRAILING_MIN_BARS` 时不拿现价硬凑）。
-- `price.cross_*` 的「另一侧」：盘中用**上一轮报价**；当天首轮用 `prev_close`。这样穿越只报一次，不会每 10 秒重报；首轮仍保留「昨收在另一侧、现价已穿」的跳空语义。
-- 报价 `is_stale` 或 `age > quote_stale_s`（默认 60 秒）：不评估价格类，返回 `Skipped(reason=...)`，不落告警。
+- `price.cross_*` 的「另一侧」走新字段 `Snapshot.cross_from`：盘中用**上一轮报价**（同一市场本地日）的价；
+  当天首轮、跨日或没有上一轮时用 `quote.prev_close`。`prev_close` **不**被改写——`stop_stage` 的
+  `urgent` 判据读的就是「昨收在线上、今开在线下」，把它换成上一轮价会让跳空语义消失。
+- 报价 `is_stale`、源标记不可信、或 `age > quote_stale_s`（默认 60 秒）：这一条 `Skipped(reason=...)`，
+  不评估、不落告警。这条闸在引擎里、在缓存之前判：陈旧报价不该让缓存里那份日线被算一次。
 
 ### 5.3 评估循环
 
@@ -279,15 +289,22 @@ CREATE TABLE IF NOT EXISTS quote_source_health (
 
 - `NotifyService` 拆成两段，`dispatch` 保留为二者的组合（CLI/盘后同步路径行为不变）：
   - `record(message, *, user_id, channel_ids, rule_id, account_id) -> Alert`：只写 `alerts`，不发送；
-  - `deliver_existing(alert_id) -> DispatchResult`：从 `alerts` 行重建 `AlertMessage`（正文在 `payload_json.extra.body`，其余字段在行与 payload 顶层），走现有选路/发送并写 `notify_log`。消息**不靠内存对象传递**，所以进程重启后仍能重发。
+  - `deliver_existing(alert_id, *, context_provider=None) -> DispatchResult`：从 `alerts` 行重建 `AlertMessage`（正文在 `payload_json.extra.body`，其余字段在行与 payload 顶层），走现有选路/发送并写 `notify_log`。消息**不靠内存对象传递**，所以进程重启后仍能重发。
+  - `abandon(alert_id, *, reason)`：队列放不下时写下那一行 `notify_log`（见下）。
 - 引擎的发送端口改为 `AlertSender` 的两个实现：
   - 现有 `NotifyService.dispatch`（CLI/盘后同步路径）；
   - `QueuedAlertSender`：先 `record` 落库，再把 `alert_id` 入 `queue.Queue`，立即返回「已排队」。
 - `NotifyWorker` 单线程：从队列取 `alert_id` → `NotifyService.deliver_existing`。失败按现有 3 次退避；仍失败发 `NotifyFailed` 事件并在 admin 告警详情显示。
 - `deliver_existing` 预留一个可注入的上下文提供者（默认 `None`）；M4-B 的「推送带最近 3 条批注」在发送时接在这里，不改变队列与路由。
-- 队列有界（默认 1000）；满时阻塞 1 秒后丢弃**发送**（告警已落库）并记 `notify_log.outcome='failed'`，绝不丢告警行。
+- 队列有界（默认 1000）；满时阻塞 1 秒后丢弃**发送**（告警已落库）并记 `notify_log.outcome='no_channel'`，
+  理由写明「通知队列已满」——`failed` 在 `AlertRepo.record` 里必须带 `channel_id`，而这一条根本没走到选路；
+  绝不丢告警行。
 - 停机：停止事件后最多排空 10 秒；剩余项保留在库中，admin 可手动「重发」。
+- 队列与 worker 住在 `monitor/queue.py`（`monitor` 只许认识 `core` 与 `storage`）：系统告警的转发由
+  `SystemAlarmRelay(queue, handle)` 注入 `SystemAlerter.handle`，`monitor` 不 import 调度器；
+  `Runtime` 用结构化 `_Worker` 协议收它，`services` 不 import `monitor`。
 - 盘中线程不直接调用任何网络/语音通道；`EventBus` 同步分发的订阅者只允许轻量操作（本版只有 `QuoteUpdated` 的记账/调试订阅）。
+  系统告警在发布线程上**只入队**，写库与发通知都在通知线程。
 
 ---
 
