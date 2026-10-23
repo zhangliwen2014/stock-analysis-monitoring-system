@@ -51,7 +51,8 @@ class Due:
     as_of: date
 
 
-def _local_today(settings: Settings, market: str, now: datetime) -> date:
+def local_today(settings: Settings, market: str, now: datetime) -> date:
+    """这个市场此刻的本地日期（D99）：同一瞬间，北京和纽约不是同一个「今天」。"""
     return now.astimezone(ZoneInfo(settings.market_cfg(market).tz)).date()
 
 
@@ -64,7 +65,7 @@ def daily_due(
     view: CalendarView, settings: Settings, market: str, now: datetime
 ) -> Due | None:
     """最近一个「已经收盘且过了盘后延迟」的交易日；窗口内没有这样的日子就返回 None。"""
-    today = _local_today(settings, market, now)
+    today = local_today(settings, market, now)
     for back in range(CATCHUP_DAYS + 1):
         day = today - timedelta(days=back)
         if view.is_trading_day(market, day) and _passed(view, settings, market, day, now):
@@ -79,7 +80,7 @@ def weekly_due(
 
     判据是**下一个交易日**而不是「周五」：周五休市时，周四就是本周最后一个交易日。
     """
-    today = _local_today(settings, market, now)
+    today = local_today(settings, market, now)
     for back in range(WEEK_SCAN_DAYS + 1):
         day = today - timedelta(days=back)
         if not (view.is_trading_day(market, day) and _passed(view, settings, market, day, now)):

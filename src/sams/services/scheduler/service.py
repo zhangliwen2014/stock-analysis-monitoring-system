@@ -28,9 +28,12 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
+import threading
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -40,16 +43,76 @@ from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import SamsError, SchedulerBusy, ValidationError
 from sams.services.scheduler.beatfile import write_beat
-from sams.services.scheduler.due import CalendarView, Due, due_for, period_key
+from sams.services.scheduler.due import CalendarView, Due, due_for, local_today, period_key
 from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S, stale_at
 from sams.services.scheduler.report import ScheduleData, collect
 from sams.services.scheduler.runner import JobRunner, RunResult
 from sams.services.scheduler.types import JobSpec
-from sams.services.scheduler.universe import UniverseBuilder
+from sams.services.scheduler.universe import Universe, UniverseBuilder
 from sams.storage.repos.task_runs import FAILED, HeartbeatRepo, TaskRunRepo
 from sams.storage.repos.users import UserRepo
 
 logger = logging.getLogger("sams.services.scheduler.service")
+
+
+@dataclass(frozen=True)
+class RunRequest:
+    """一次「现在就跑」的请求：跑哪些 job、锚在哪一天。"""
+
+    id: str
+    job: str | None
+    market: str | None
+    as_of: date | None
+    requested_at: datetime
+
+
+class RunRequestQueue:
+    """跨线程的请求队列：Web 只排队，调度线程在下一拍执行。
+
+    `task_runs` 只有一个写入方（D105），所以 Web 的「立即同步」不能另开写线程；
+    它把请求放进这里，由同一条调度线程执行。id 用序号而不是时间戳：时钟可能被
+    冻住（测试）或两个请求落在同一微秒，而按钮回显要求两个 id 不同。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._items: deque[RunRequest] = deque()
+        self._seq = itertools.count(1)
+
+    def put(
+        self,
+        *,
+        job: str | None,
+        market: str | None,
+        as_of: date | None,
+        requested_at: datetime,
+    ) -> RunRequest:
+        with self._lock:
+            request = RunRequest(
+                id=f"req-{next(self._seq)}",
+                job=job,
+                market=market,
+                as_of=as_of,
+                requested_at=requested_at,
+            )
+            self._items.append(request)
+            return request
+
+    def drain(self) -> tuple[RunRequest, ...]:
+        with self._lock:
+            items = tuple(self._items)
+            self._items.clear()
+            return items
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
+@dataclass(frozen=True)
+class RequestReport:
+    request: RunRequest
+    results: tuple[RunResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,6 +121,8 @@ class TickReport:
     results: tuple[RunResult, ...] = ()
     waiting: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    #: 手动请求按请求分组；`results` 里也有它们，按执行顺序排在到期 job 之前
+    requests: tuple[RequestReport, ...] = ()
 
     @property
     def failed(self) -> tuple[RunResult, ...]:
@@ -79,6 +144,7 @@ class Scheduler:
         clock: Clock = SYSTEM_CLOCK,
         sleep: Callable[[float], None] = time.sleep,
         beat_path: Path | None = None,
+        requests: RunRequestQueue | None = None,
     ) -> None:
         if settings.scheduler_tick_s >= HEARTBEAT_STALE_S:
             raise ValidationError(
@@ -99,6 +165,8 @@ class Scheduler:
         #: 库旁那一拍（D111）。库被这个循环握着时，外部读者打不开库，只能读它；
         #: 内存库没有文件，`None`
         self.beat_path = beat_path
+        #: 手动请求队列：`serve` 里的 Web 线程与本调度线程共用这一个实例
+        self.requests = requests if requests is not None else RunRequestQueue()
         self._beat_id: str | None = None
 
     def tick(
@@ -113,7 +181,10 @@ class Scheduler:
         self._beat()
         selected = self._selected(only_job, only_market)
         universe = self.universe.build()
-        results: list[RunResult] = []
+        # 手工请求排在到期 job 之前：人点了按钮，这件事先做。清空放在 universe
+        # 构建之后——构建失败时请求还留在队列里，下一拍仍能再试
+        manual = self._run_requests(self.requests.drain(), universe, moment)
+        results: list[RunResult] = [result for report in manual for result in report.results]
         waiting: list[str] = []
         errors: list[str] = []
         for spec in selected:
@@ -149,18 +220,83 @@ class Scheduler:
             results=tuple(results),
             waiting=tuple(waiting),
             errors=tuple(errors),
+            requests=manual,
         )
+
+    def request_run(
+        self,
+        job: str | None = None,
+        market: str | None = None,
+        *,
+        as_of: date | None = None,
+    ) -> RunRequest:
+        """把手动请求排进下一拍；敲错的名字在这里就拒绝。
+
+        入队前跑一遍与 `tick` 相同的筛选：请求线程还拿得到异常，能当场告诉人哪一段
+        敲错了；交给调度线程之后，那条错只剩日志里的一行。
+        """
+        self._selected(job, market)
+        return self.requests.put(
+            job=job,
+            market=market,
+            as_of=as_of,
+            requested_at=self.clock.now_utc(),
+        )
+
+    @property
+    def pending_requests(self) -> int:
+        return len(self.requests)
+
+    def _run_requests(
+        self,
+        requests: Sequence[RunRequest],
+        universe: Universe,
+        moment: datetime,
+    ) -> tuple[RequestReport, ...]:
+        """这里绕过的只有到期计算：本周期已成功、上一轮还在跑、失败后十分钟内
+        这三条仍由 runner 回答（D105）——它们保护的是源与账本，不是时间表。
+        """
+        reports: list[RequestReport] = []
+        for request in requests:
+            results: list[RunResult] = []
+            for spec in self._selected(request.job, request.market):
+                day = request.as_of or self._anchor_day(spec, moment)
+                self._beat()
+                results.append(
+                    self.runner.execute(
+                        spec,
+                        Due(period_key=period_key(spec.period, day), as_of=day),
+                        universe,
+                    )
+                )
+            reports.append(RequestReport(request=request, results=tuple(results)))
+        return tuple(reports)
+
+    def _anchor_day(self, spec: JobSpec, moment: datetime) -> date:
+        """手动触发没有「到期日」：锚在这次请求的市场本地今天（D99）。
+
+        全局 job（汇率）没有市场时区，按 `moment` 自己的日期定锚；M4-A 的管理页
+        只按市场触发日线，不走这一支。
+        """
+        if spec.market is None:
+            return moment.date()
+        return local_today(self.settings, spec.market, moment)
 
     def run_forever(
         self,
         *,
         on_tick: Callable[[TickReport], None] | None = None,
         max_ticks: int | None = None,
+        stop: threading.Event | None = None,
     ) -> int:
         """认领心跳，然后一轮一轮跑下去。返回实际跑过的 tick 数。
 
         `max_ticks=0`（或负数）一轮都不跑，也不认领心跳：留下一个刚打过的拍会把
         下一个常驻循环挡在阈值外面，而这一次连活都没开始。
+
+        `stop` 是给同进程的 `serve` 用的：它在两拍之间（以及等待中）结束循环，
+        不必发信号；有 `stop` 时等待走 `stop.wait`，停止请求不用等满一个间隔。
+        没有 `stop` 时仍用注入的 `sleep`，CLI 与既有测试的行为不变。
 
         这里只接 `SamsError`：那一类是「这一轮做不成」（账本读不到、一个 job 都没选出），
         循环本身没坏，下一轮还得试。别的东西（编程错误）在这里没有可信的下一步，
@@ -169,6 +305,9 @@ class Scheduler:
         """
         if max_ticks is not None and max_ticks <= 0:
             return 0
+        if stop is not None and stop.is_set():
+            # 与 `max_ticks<=0` 同理：认领一行刚打过的心跳会把下一个循环挡在阈值外
+            return 0
         self._claim()
         # 认领之后先打一拍：文件从第一轮开始就该存在，而不是等第一个 job 走到
         self._beat()
@@ -176,6 +315,8 @@ class Scheduler:
         try:
             try:
                 while max_ticks is None or ticks < max_ticks:
+                    if stop is not None and stop.is_set():
+                        break
                     try:
                         report = self.tick()
                     except SamsError as exc:
@@ -185,7 +326,12 @@ class Scheduler:
                     if on_tick is not None:
                         on_tick(report)
                     ticks += 1
-                    if max_ticks is None or ticks < max_ticks:
+                    if max_ticks is not None and ticks >= max_ticks:
+                        break
+                    if stop is not None:
+                        if stop.wait(self.settings.scheduler_tick_s):
+                            break
+                    else:
                         self.sleep(self.settings.scheduler_tick_s)
             except KeyboardInterrupt:
                 logger.warning("收到中断，调度器退出")
