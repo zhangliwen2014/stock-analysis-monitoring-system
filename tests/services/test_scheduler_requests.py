@@ -14,7 +14,7 @@ import pytest
 from support import FrozenClock
 from support_scheduler import FakeCalendar
 
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError, ValidationError
 from sams.services.scheduler.runner import RunResult
 from sams.services.scheduler.service import RunRequestQueue, Scheduler
 from sams.services.scheduler.types import JobOutcome, JobSpec
@@ -48,6 +48,13 @@ class StubUniverse:
         return UNIVERSE
 
 
+class BrokenUniverse:
+    """`build` 抛 `StorageError`：构建失败的那一拍整个炸出去。"""
+
+    def build(self) -> Universe:
+        raise StorageError("db 挂了")
+
+
 class _Stop:
     """`threading.Event` 的替身：只记下等待，不等真时间。"""
 
@@ -72,7 +79,7 @@ def job_spec(name, market, period="daily"):
     return JobSpec(name=name, period=period, market=market, run=_noop)
 
 
-def make(db, settings, specs, runner, *, clock=None, sleep=None):
+def make(db, settings, specs, runner, *, clock=None, sleep=None, universe=None):
     clock = clock or FrozenClock(MOMENT)
     return Scheduler(
         settings,
@@ -80,7 +87,7 @@ def make(db, settings, specs, runner, *, clock=None, sleep=None):
         runner=runner,
         runs=TaskRunRepo(db, clock=clock),
         heartbeats=HeartbeatRepo(db, clock=clock),
-        universe=StubUniverse(),
+        universe=universe or StubUniverse(),
         users=UserRepo(db),
         calendar=FakeCalendar(settings),
         clock=clock,
@@ -152,6 +159,23 @@ def test_request_ids_stay_unique_when_the_clock_does_not_move(db, settings):
     assert first.requested_at == second.requested_at == MOMENT
     assert [request.id for request in scheduler.requests.drain()] == [first.id, second.id]
     assert scheduler.pending_requests == 0
+
+
+def test_a_failed_build_leaves_the_queued_request_for_the_next_tick(db, settings):
+    """universe 构建炸在 drain 之前：那一拍整个失败，排着的请求原样留到下一拍。"""
+    scheduler, _ = make(
+        db,
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        universe=BrokenUniverse(),
+    )
+
+    scheduler.request_run("bars", "A")
+    with pytest.raises(StorageError):
+        scheduler.tick()
+
+    assert scheduler.pending_requests == 1
 
 
 def test_the_queue_loses_nothing_when_many_threads_enqueue():

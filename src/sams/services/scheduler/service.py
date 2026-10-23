@@ -1,11 +1,13 @@
 """`Scheduler`：tick 的顺序、心跳与常驻循环。
 
-一轮 tick 做四件事，顺序就是代码里的顺序：
+一轮 tick 做五件事，顺序就是代码里的顺序：
 
 1. 认领过心跳就打一拍（手工 `tick` 没认领过，什么也不留）；
 2. 按 `only_job`/`only_market` 选出这一轮要跑的 job，一个都不匹配就拒绝；
 3. 构建这一轮的对象全集——一次 tick 只构建一次，交给每个 job 的是同一份；
-4. 按注册顺序逐个 job 判断到期并交给 `JobRunner`，把结果原样交回。
+4. 把队列里的手动同步取空先跑（`request_run` 入队的；手动跑没有「到期日」，锚在
+   市场本地今天，见 `_anchor_day`）；
+5. 按注册顺序逐个 job 判断到期并交给 `JobRunner`，把结果原样交回。
 
 打拍放在做活之前：那一拍证明的是「循环还在转」，不是「这一轮做完了事」。挪到收尾
 之后，一轮在打拍之前就失败（账本读不到）会一拍都不留，读的那一侧把「这一轮做不成」
@@ -182,7 +184,9 @@ class Scheduler:
         selected = self._selected(only_job, only_market)
         universe = self.universe.build()
         # 手工请求排在到期 job 之前：人点了按钮，这件事先做。清空放在 universe
-        # 构建之后——构建失败时请求还留在队列里，下一拍仍能再试
+        # 构建之后——构建失败时请求还留在队列里，下一拍仍能再试。队列里的请求
+        # 也不受 `only_job`/`only_market` 拦：那个筛只挑这一轮的到期 job，带
+        # 筛选的 tick 照样把排着的请求做掉
         manual = self._run_requests(self.requests.drain(), universe, moment)
         results: list[RunResult] = [result for report in manual for result in report.results]
         waiting: list[str] = []
