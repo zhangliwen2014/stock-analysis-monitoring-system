@@ -1,7 +1,8 @@
 """保留策略：把只增不删的三张表按各自的粒度裁掉（D116）。
 
-为什么是一个服务而不是三段 SQL：CLI、常驻进程的每日维护、admin 健康页的按钮
-是三个入口，但「保留几天、按什么排序、算多少行」只能有一份答案。dry-run 与实删
+为什么是一个服务而不是三段 SQL：CLI 现在就有；常驻进程的每日维护与 admin 健康页的
+按钮在 serve（计划 14/15）里接进来。三个入口，但「保留几天、按什么排序、算多少行」
+只能有一份答案。dry-run 与实删
 必须走同一个计数路径，否则「预演说 10 行、实删 12 行」只是时间差，没人查得出来。
 """
 
@@ -19,7 +20,7 @@ from sams.storage.repos.task_runs import OK, HeartbeatRepo, TaskRunRepo
 
 logger = logging.getLogger("sams.services.prune")
 
-#: `sams db prune` 的三个默认值（spec D116）。它们也是服务与 Web 按钮的默认值：
+#: `sams db prune` 的三个默认值（spec D116）。它们也是 serve（计划 14/15）里 Web 按钮的默认值：
 #: 三处各写一个 5/90/1000，改一处就会得到「命令行说 5 天、健康页按钮删 7 天」
 KEEP_QUOTE_SESSIONS = 5
 KEEP_TASK_RUN_DAYS = 90
@@ -81,8 +82,9 @@ class PruneService:
             steps, _, _ = self._measure(quotes_sessions, task_runs_days, heartbeats_keep)
             return PruneReport(dry_run=True, steps=steps)
 
-        # 计数与删除在同一个事务里：盘中线程随时会写新快照，先数后删的话，
-        # 中间落地的一天会把第 N 新的边界推后，实际删掉的行数与报告对不上
+        # 计数与删除走同一个事务：中间失败时已删的行随事务一起回来（回滚用例钉着）。
+        # 盘中线程随时会写新快照，但快照隔离让本事务看不到它们——新行永远比截止日新，
+        # 既不进计数也不进删除，报告与实际删掉的行数因此一致
         with self.db.transaction():
             steps, day_cutoffs, run_cutoff = self._measure(
                 quotes_sessions, task_runs_days, heartbeats_keep

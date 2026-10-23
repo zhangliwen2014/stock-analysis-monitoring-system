@@ -204,7 +204,7 @@ class ServiceContext:
     quote_health: QuoteHealthRepo
     task_runs: TaskRunRepo
     heartbeats: HeartbeatRepo
-    #: 保留策略（D116）：CLI、常驻维护与 admin 健康页共用这一份
+    #: 保留策略（D116）：CLI、serve 的常驻维护与 admin 健康页（计划 14/15）共用这一份
     prune: PruneService
     #: 常驻调度器（spec §12）：`sams run start|once|jobs` 与健康页的 `[调度]` 读的是同一台
     scheduler: Scheduler

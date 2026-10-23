@@ -32,6 +32,8 @@ def test_session_cutoff_is_the_nth_newest_day_per_market(db):
         add_quote(db, "HK", "00700", date(2026, 10, 1) + timedelta(days=offset))
     for offset in range(3):
         add_quote(db, "A", "600519", date(2026, 10, 1) + timedelta(days=offset))
+    # 同一天两个代码也算一天：数的是交易日，不是行（按行数会把边界推到 10-04）
+    add_quote(db, "HK", "00388", date(2026, 10, 4))
     # HK 的第 5 新是 10-03；A 只有 3 天，不足 5 天就整段保留（不出现在字典里）
     assert QuoteRepo(db).session_cutoffs(5) == {"HK": date(2026, 10, 3)}
 
