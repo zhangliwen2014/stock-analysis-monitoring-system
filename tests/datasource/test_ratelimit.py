@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -79,7 +80,12 @@ def test_reserve_does_not_lose_tokens_under_threads():
         start.wait()
         return bucket.reserve(1.0)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        waits = list(pool.map(take, range(8)))
+    original = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            waits = list(pool.map(take, range(8)))
+    finally:
+        sys.setswitchinterval(original)
 
     assert sorted(waits) == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]

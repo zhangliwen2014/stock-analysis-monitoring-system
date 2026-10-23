@@ -141,7 +141,7 @@ class QuotePollResult:
     quotes: tuple[Quote, ...] = ()
     skipped: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
-    #: 这一轮真正给出报价的源（按尝试顺序）；全失败时为空
+    #: 首个应答的源；全失败时为空（链在首个成功源后即停）
     sources: tuple[str, ...] = ()
 
 
@@ -154,6 +154,8 @@ class _Attempt:
 
 
 class QuoteService:
+    """取价链的执行者：`poll` 由盘中节拍器的单个线程调用，内部状态无需加锁。"""
+
     def __init__(
         self,
         registry: AdapterRegistry,
@@ -226,6 +228,8 @@ class QuoteService:
                 # 换成下一个源等于替用户猜「另一家更可能有这只票」
                 break
             collected.extend(attempt.quotes)
+            skipped.extend(attempt.skipped)
+            errors.extend(attempt.errors)
             degraded.append(f"{name}: {attempt.failure}")
             errors.append(f"{name}: {attempt.failure}")
             self._record_source(name, adapter, ok=False, error=attempt.failure, moment=moment)
@@ -237,10 +241,15 @@ class QuoteService:
             self._persist(market, collected, moment)
             self.board.update(market, collected, now=moment, error=summary)
             self._note_outage(market, moment, got=True)
+        elif answered:
+            # 源应答了但一只价都没给（比如整单停牌）：这不是取价失败——不标 stale，
+            # 也不开始「三分钟无报价」的事故钟；跳过原因留在板上解释「为什么没有新报价」
+            detail = summary or "；".join(errors) or "源应答但未返回报价"
+            self.board.skip(market, detail, now=moment)
+            self._note_outage(market, moment, got=True)
         else:
             self.board.fail(market, summary or f"{market} 本轮没有取得任何报价", now=moment)
             self._note_outage(market, moment, got=False)
-            self._persist(market, [], moment)
 
         if self.bus is not None:
             for quote in collected:

@@ -238,3 +238,83 @@ def test_a_permanently_failing_snapshot_write_does_not_kill_the_poll(db):
 
     assert result.quotes, "这一轮的价格仍然是事实"
     assert board.get("A", "600519") is not None, "板子先服务页面，落库下一轮再试"
+
+
+def test_an_all_skipped_round_is_neither_stale_nor_an_outage(db):
+    alarms: list[SystemAlarm] = []
+    bus = EventBus()
+    bus.subscribe(SystemAlarm, alarms.append)
+    primary = StubQuoteAdapter("p", batch_for)
+    service, board = make_service(db, {"p": primary}, bus=bus)
+    service.poll("A", ["600519"], now=T0)
+
+    primary.behaviour = lambda market, codes: QuoteBatch((), tuple(codes))
+    late = T0 + timedelta(seconds=QUOTE_OUTAGE_ALARM_S)
+    service.poll("A", ["600519"], now=late)
+    service.poll("A", ["600519"], now=late + timedelta(seconds=60))
+    service.poll("A", ["600519"], now=late + timedelta(seconds=180))
+
+    assert alarms == [], "源明确回答了：跳过不是事故，不该响起「检查报价源与网络」"
+    view = board.snapshot()["A"]
+    assert view.quotes["600519"].is_stale is False
+    assert view.skip_reason is not None
+
+
+def test_a_failing_source_still_reports_what_it_skipped(db):
+    class TwoPhase:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, market, codes):
+            self.calls += 1
+            if self.calls == 1:
+                return QuoteBatch((), (codes[0],))
+            raise TransientError("p", "boom")
+
+    primary = StubQuoteAdapter("p", TwoPhase())
+    backup = StubQuoteAdapter("s", batch_for)
+    registry = AdapterRegistry(
+        adapters={"p": primary, "s": backup}, market_sources={"A": ("p", "s")}
+    )
+    service = QuoteService(
+        registry,
+        QuoteBoard(),
+        QuoteRepo(db),
+        QuoteHealthRepo(db),
+        clock=FrozenClock(T0),
+        batch=1,
+        sleep=lambda _s: None,
+    )
+
+    result = service.poll("A", ["600519", "000001"], now=T0)
+
+    assert result.skipped == ("600519",)
+    assert [q.code for q in result.quotes] == ["000001"]
+    assert result.sources == ("s",)
+
+
+def test_each_batch_acquires_from_the_bucket(db):
+    class CountingBucket:
+        def __init__(self):
+            self.acquires = 0
+
+        def acquire(self, tokens: float = 1.0) -> float:
+            self.acquires += 1
+            return 0.0
+
+    bucket = CountingBucket()
+    primary = StubQuoteAdapter("p", batch_for)
+    registry = AdapterRegistry(adapters={"p": primary}, market_sources={"A": ("p",)})
+    service = QuoteService(
+        registry,
+        QuoteBoard(),
+        QuoteRepo(db),
+        QuoteHealthRepo(db),
+        clock=FrozenClock(T0),
+        bucket=bucket,
+        sleep=lambda _s: None,
+    )
+
+    service.poll("A", [f"{i:06d}" for i in range(120)], now=T0)
+
+    assert bucket.acquires == 3
