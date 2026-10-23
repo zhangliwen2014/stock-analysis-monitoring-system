@@ -19,6 +19,7 @@ from sams.datasource.base import has_bars
 from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
 from sams.datasource.fx import has_fx
 from sams.datasource.listed_date import has_listed_date
+from sams.datasource.quote import has_quotes
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,8 @@ CAPABILITIES: dict[str, Capability] = {
     # 与 `_walk`，由 `registry.fetch_fx` 自己按注册顺序走一遍。登记在这张表里是为了让
     # 「谁能给汇率」与其余五种共用同一份判据：健康页、目录、降级链三处不会各说一套
     "fx_rate": Capability(label="汇率", lacking="不提供汇率", probe=has_fx),
+    # 报价没有窗口，一次问一批；`chain_for(market, "quote")` 仍按这份判据过滤
+    "quote": Capability(label="报价", lacking="不提供报价", probe=has_quotes),
 }
 
 

@@ -263,6 +263,8 @@ def test_the_three_new_kinds_are_registered_as_capabilities():
         # 汇率也没有市场维度，走 `registry.fetch_fx` 那条独立链；登记在这里是为了让
         # 「谁能给汇率」与其余五种共用同一份判据（D38）
         "汇率",
+        # 报价没有窗口，一次问一批（U18）
+        "报价",
     ]
 
 

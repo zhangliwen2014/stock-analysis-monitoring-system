@@ -29,6 +29,7 @@ def test_the_kind_name_is_the_adapter_method_name():
         "funding_flow",
         "listed_date",
         "fx_rate",
+        "quote",
     }
 
 
