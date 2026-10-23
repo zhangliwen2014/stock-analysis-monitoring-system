@@ -8,9 +8,9 @@ from datetime import UTC, datetime
 from sams.bootstrap import Container
 from sams.cli.common import EXIT_LOCKED, stamp
 from sams.core.errors import DatabaseLocked
-from sams.datasource.capabilities import CAPABILITIES
 from sams.services.scheduler.beatfile import beat_path, read_beat
 from sams.services.scheduler.heartbeat import stale_at
+from sams.services.sources import capability_labels
 
 
 def add_to(subparsers) -> None:
@@ -259,9 +259,10 @@ def _chain_shown(
     """链上每一格按能力说话，不再把「不是日线源」一律读成「只有公司行为」。
 
     `akshare_hk` 只有公司行为，`sina_quote` 只有报价——写死「仅公司行为」会把
-    报价源也标成公司行为源。标签从 `CAPABILITIES` 反推：日线由 `bars` 那条链说了算
-    （上面已按它数备源），其余能力各自问一次 `chain_for`（探针只查方法在不在，
-    不打网络）。链上一个能力都没有的源报裸名：有名字不代表有本事，不能给它编一个。
+    报价源也标成公司行为源。标签由 services 的 `capability_labels` 从 `CAPABILITIES`
+    反推：日线由 `bars` 那条链说了算（上面已按它数备源），其余能力各自问一次
+    `chain_for`（探针只查方法在不在，不打网络）。链上一个能力都没有的源报裸名：
+    有名字不代表有本事，不能给它编一个。
     """
     if not chain:
         return "（空）"
@@ -270,11 +271,7 @@ def _chain_shown(
         if n in bars:
             parts.append(n)
             continue
-        caps = [
-            cap.label
-            for key, cap in CAPABILITIES.items()
-            if key != "daily_bars" and n in container.registry.chain_for(market, key)
-        ]
+        caps = capability_labels(container.registry, market, n)
         parts.append(f"{n}(仅{'、'.join(caps)})" if caps else n)
     return " → ".join(parts)
 

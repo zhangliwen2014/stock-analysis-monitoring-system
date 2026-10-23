@@ -23,14 +23,32 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 from time import monotonic
+from typing import TYPE_CHECKING
 
 from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import DatasourceError, SamsError, StorageError, ValidationError
+from sams.datasource.capabilities import CAPABILITIES
 from sams.datasource.sources import SourceEntry, build, catalog, known
 from sams.storage.repos.data_sources import DataSourceRepo, SourceRow
 
+if TYPE_CHECKING:
+    from sams.datasource.registry import AdapterRegistry
+
 logger = logging.getLogger("sams.services.sources")
+
+
+def capability_labels(registry: AdapterRegistry, market: str, name: str) -> tuple[str, ...]:
+    """链上某个源在本市场提供的能力标签（日线除外）：health 页的「仅…」标注取这一份。
+
+    探针只看方法在不在，不打网络；cli 层不许 import datasource（分层守卫），
+    这个换算只能住在 services。
+    """
+    return tuple(
+        cap.label
+        for key, cap in CAPABILITIES.items()
+        if key != "daily_bars" and name in registry.chain_for(market, key)
+    )
 
 
 @dataclass(frozen=True)
