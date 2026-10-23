@@ -70,7 +70,7 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
     entries = catalog().by_kind()
     assert entries["akshare_hk"].capabilities == ("corp_actions",)
     assert entries["akshare_ths"].capabilities == ("corp_actions",)
-    assert entries["tencent"].capabilities == ("daily_bars",)
+    assert entries["tencent"].capabilities == ("daily_bars", "quote")
     assert entries["akshare"].capabilities == (
         "daily_bars",
         "corp_actions",

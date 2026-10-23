@@ -17,19 +17,24 @@ spec §5.5 定死库里只存 raw。若哪天要 qfq，去请求 `...,qfq` 拿�
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
+from sams.core.quotes import Quote, QuoteBatch
 from sams.datasource.base import (
     LOTS_TO_SHARES,
     a_share_symbol,
     classify_error,
     normalize_bars,
 )
+from sams.datasource.quote import echo_matches, field_float, parse_moment
 from sams.datasource.sources import source
 
 KLINE_PATHS = {
@@ -41,6 +46,29 @@ KLINE_PATHS = {
 SMARTBOX_URL = "https://smartbox.gtimg.cn/s3/"
 #: 行内六个字段的含义（腾讯给的顺序，收盘价在第 3 个）
 FIELD_ORDER = ("date", "open", "close", "high", "low", "volume")
+QUOTE_URL = "https://qt.gtimg.cn/q"
+_TENCENT_LINE = re.compile(r'v_([^=]+)="([^"]*)"')
+#: 三个市场的时间格式各不相同：同一列 30 的字符串，A 股没有分隔符，港股是斜杠
+_QUOTE_TS_FORMATS = {
+    "A": ("%Y%m%d%H%M%S",),
+    "HK": ("%Y/%m/%d %H:%M:%S",),
+    "US": ("%Y-%m-%d %H:%M:%S",),
+}
+
+
+def tencent_quote_symbol(market: str, code: str) -> str:
+    """报价接口的 symbol 与日线不同：美股**不能**带交易所后缀。
+
+    实测 `usAAPL.OQ` 返回空行，而 `usAAPL` 返回正常报价且字段里的代码仍是
+    `AAPL.OQ`。所以这里只取裸代码，回显校验由 `echo_matches` 按点前比较。
+    """
+    if market == "A":
+        return a_share_symbol(code)
+    if market == "HK":
+        return f"hk{canonical_code('HK', code)}"
+    if market == "US":
+        return f"us{canonical_code('US', code).split('.')[0].upper()}"
+    raise ValueError(f"未知市场 {market}")
 
 
 def tencent_symbol(market: str, code: str) -> str:
@@ -132,6 +160,87 @@ def parse_tencent_daily(payload: object, *, market: str, code: str, symbol: str)
     )
 
 
+def parse_tencent_quotes(
+    text: str,
+    *,
+    market: str,
+    codes: list[str],
+    now: datetime,
+    zone: ZoneInfo,
+) -> QuoteBatch:
+    """腾讯 `v_xxx="..."` 批量响应 → QuoteBatch。
+
+    字段位置是接口的硬事实：3 价、4 昨收、5 开、6 量、30 时间、32 涨跌幅、
+    33 高、34 低、9 买一、19 卖一。A 股的量是「手」，港美股是「股」；
+    A 股的成交额藏在第 35 个复合字段的第三段，港美股直接给在第 37 位。
+    """
+    if not (text or "").strip():
+        raise EmptyResponse("tencent", f"{market} 报价响应为空")
+    parsed: list[list[str]] = []
+    for raw in text.splitlines():
+        match = _TENCENT_LINE.search(raw)
+        if match is not None and match.group(2).strip():
+            parsed.append(match.group(2).split("~"))
+    if not parsed:
+        raise EmptyResponse("tencent", f"{market} 报价响应里没有可读的行")
+
+    quotes: list[Quote] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    for code in codes:
+        canonical = canonical_code(market, code)
+        row = next(
+            (
+                fields
+                for fields in parsed
+                if len(fields) > 2 and echo_matches(market, canonical, fields[2])
+            ),
+            None,
+        )
+        if row is None:
+            skipped.append(canonical)
+            continue
+        if len(row) < 35:
+            errors.append(f"{canonical}: 字段不足（{len(row)} 个）")
+            continue
+        price = field_float(row, 3)
+        if price is None or price <= 0:
+            errors.append(f"{canonical}: 报价价格不可用（{row[3]!r}）")
+            continue
+        moment = parse_moment(row[30], _QUOTE_TS_FORMATS[market], zone)
+        volume = field_float(row, 6)
+        if volume is not None and market == "A":
+            volume *= LOTS_TO_SHARES
+        # 复合字段只在 A 股的第 35 位，且行可能短于它；港股/美股直接读第 37 位。
+        # 越界会抛 IndexError，而这里要的是「没有这一格」→ None
+        if market == "A":
+            amount = field_float(row[35].split("/"), 2) if len(row) > 35 else None
+        else:
+            amount = field_float(row, 37)
+        bid = field_float(row, 9)
+        ask = field_float(row, 19)
+        quotes.append(
+            Quote(
+                market=market,
+                code=canonical,
+                ts=moment or now,
+                price=price,
+                open=field_float(row, 5),
+                prev_close=field_float(row, 4),
+                high=field_float(row, 33),
+                low=field_float(row, 34),
+                pct_chg=field_float(row, 32),
+                volume=volume,
+                amount=amount,
+                bid1=bid if bid and bid > 0 else None,
+                ask1=ask if ask and ask > 0 else None,
+                source="tencent",
+                is_stale=moment is None,
+            )
+        )
+    return QuoteBatch(tuple(quotes), tuple(skipped), tuple(errors))
+
+
 def http_get(url: str, params: dict[str, str], *, timeout: int = 15) -> dict:
     import requests
 
@@ -163,6 +272,22 @@ def smartbox_get(url: str, params: dict[str, str], *, timeout: int = 15) -> str:
     return response.text
 
 
+def quote_get(url: str, params: dict[str, str], *, timeout: int = 15) -> str:
+    """腾讯报价是 GBK 的 JS 赋值语句，不是 JSON。"""
+    import requests
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=timeout,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
+    )
+    if response.status_code == 429:
+        raise RateLimited("tencent", "HTTP 429 被限流")
+    response.raise_for_status()
+    return response.content.decode("gbk", errors="replace")
+
+
 class TencentAdapter:
     """一个实现覆盖三个市场；`markets` 如实声明，registry 据此校验路由合法性。"""
 
@@ -176,12 +301,16 @@ class TencentAdapter:
         hint_get: Callable[..., str] = smartbox_get,
         resolve: Callable[[str], str] | None = None,
         timeout: int = 15,
+        quote_fetch: Callable[..., str] = quote_get,
+        clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self._get = get
         self._hint_get = hint_get
         self._timeout = timeout
         self._hints: dict[str, str] = {}
         self._resolve = resolve or self._smartbox_resolve
+        self._quote_fetch = quote_fetch
+        self._clock = clock
 
     def _smartbox_resolve(self, symbol: str) -> str:
         text = self._hint_get(
@@ -216,6 +345,33 @@ class TencentAdapter:
             raise
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
+
+    def quotes(self, market: str, codes: list[str]) -> QuoteBatch:
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        wanted = list(dict.fromkeys(canonical_code(market, code) for code in codes))
+        if not wanted:
+            return QuoteBatch()
+        symbols = [tencent_quote_symbol(market, code) for code in wanted]
+        try:
+            text = self._quote_fetch(
+                QUOTE_URL, {"q": ",".join(symbols)}, timeout=self._timeout
+            )
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+        return parse_tencent_quotes(
+            text,
+            market=market,
+            codes=wanted,
+            now=self._clock.now_utc(),
+            zone=ZoneInfo(
+                {"A": "Asia/Shanghai", "HK": "Asia/Hong_Kong", "US": "America/New_York"}[
+                    market
+                ]
+            ),
+        )
 
 
 def kline_param(market: str, symbol: str, start: date, end: date, count: int) -> str:

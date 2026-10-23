@@ -56,3 +56,5 @@ def test_the_lacking_reason_is_per_kind_and_states_the_capability():
     assert CAPABILITIES["daily_bars"].lacking == "不提供日线"
     assert CAPABILITIES["corp_actions"].lacking == "不提供公司行为"
     assert known()["akshare_hk"].capabilities == ("corp_actions",)
+    entries = catalog().by_kind()
+    assert entries["tencent"].capabilities == ("daily_bars", "quote")
