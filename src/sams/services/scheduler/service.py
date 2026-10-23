@@ -10,8 +10,12 @@
 打拍放在做活之前：那一拍证明的是「循环还在转」，不是「这一轮做完了事」。挪到收尾
 之后，一轮在打拍之前就失败（账本读不到）会一拍都不留，读的那一侧把「这一轮做不成」
 看成「循环停了」——那是两件事：前者是这一轮的结论（`TickReport.errors`），后者才是
-那一拍要答的。
-两种放法的最坏年龄都是「一轮做活的时长 + 等待间隔」，挪到收尾换不来更准的读数。
+那一拍要答的。每个 job 之前再补一拍：整条链可能比阈值长，只在轮首打的那一拍会把
+「还在做活」读成「已经停了」。单个 job 自身超过阈值的那一段仍补不了（没有第二个
+线程），这条边界写在 `heartbeat.py` 里。
+
+库旁还要写一份同样的拍（`beatfile`，D111）：循环握着库时外部读者打不开库，
+`[调度]` 在锁住时唯一能读的就是那个文件。
 
 等待间隔不比心跳阈值短的话，一个空转的循环也会在两次拍之间把自己读成停了，
 所以构造时挡住（见 `heartbeat.py`）。
@@ -25,14 +29,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import SamsError, SchedulerBusy, ValidationError
+from sams.services.scheduler.beatfile import write_beat
 from sams.services.scheduler.due import CalendarView, Due, due_for, period_key
 from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S, stale_at
 from sams.services.scheduler.report import ScheduleData, collect
@@ -71,6 +78,7 @@ class Scheduler:
         calendar: CalendarView,
         clock: Clock = SYSTEM_CLOCK,
         sleep: Callable[[float], None] = time.sleep,
+        beat_path: Path | None = None,
     ) -> None:
         if settings.scheduler_tick_s >= HEARTBEAT_STALE_S:
             raise ValidationError(
@@ -88,6 +96,9 @@ class Scheduler:
         self.calendar = calendar
         self.clock = clock
         self.sleep = sleep
+        #: 库旁那一拍（D111）。库被这个循环握着时，外部读者打不开库，只能读它；
+        #: 内存库没有文件，`None`
+        self.beat_path = beat_path
         self._beat_id: str | None = None
 
     def tick(
@@ -99,8 +110,7 @@ class Scheduler:
         only_market: str | None = None,
     ) -> TickReport:
         moment = now if now is not None else self.clock.now_utc()
-        if self._beat_id is not None:
-            self.heartbeats.beat(self._beat_id)
+        self._beat()
         selected = self._selected(only_job, only_market)
         universe = self.universe.build()
         results: list[RunResult] = []
@@ -129,6 +139,10 @@ class Scheduler:
                     # 混进同一个列表里就分不出该等还是该查
                     waiting.append(spec.title)
                     continue
+            # 每个 job 之前补一拍：整条链可能比阈值长，只在轮首打的那一拍会把
+            # 「还在做活」读成「已经停了」（D111）。单个 job 自身超过阈值的那一段
+            # 仍然补不了——这里没有第二个线程，`heartbeat.py` 把这条边界写明了
+            self._beat()
             results.append(self.runner.execute(spec, due, universe))
         return TickReport(
             now=moment,
@@ -156,23 +170,30 @@ class Scheduler:
         if max_ticks is not None and max_ticks <= 0:
             return 0
         self._claim()
+        # 认领之后先打一拍：文件从第一轮开始就该存在，而不是等第一个 job 走到
+        self._beat()
         ticks = 0
         try:
-            while max_ticks is None or ticks < max_ticks:
-                try:
-                    report = self.tick()
-                except SamsError as exc:
-                    # 栈只能留在这里：这一句把异常吞了，`tick` 的那一层不再有人能打印它
-                    logger.exception("这一轮 tick 失败：%s", exc)
-                    report = TickReport(now=self.clock.now_utc(), errors=(str(exc),))
-                if on_tick is not None:
-                    on_tick(report)
-                ticks += 1
-                if max_ticks is None or ticks < max_ticks:
-                    self.sleep(self.settings.scheduler_tick_s)
-        except KeyboardInterrupt:
-            logger.warning("收到中断，调度器退出")
-        return ticks
+            try:
+                while max_ticks is None or ticks < max_ticks:
+                    try:
+                        report = self.tick()
+                    except SamsError as exc:
+                        # 栈只能留在这里：这一句把异常吞了，`tick` 的那一层不再有人能打印它
+                        logger.exception("这一轮 tick 失败：%s", exc)
+                        report = TickReport(now=self.clock.now_utc(), errors=(str(exc),))
+                    if on_tick is not None:
+                        on_tick(report)
+                    ticks += 1
+                    if max_ticks is None or ticks < max_ticks:
+                        self.sleep(self.settings.scheduler_tick_s)
+            except KeyboardInterrupt:
+                logger.warning("收到中断，调度器退出")
+            return ticks
+        finally:
+            # 正常退出要把文件带走：留下一个越来越旧的文件，会把「我停了」说成「我卡住了」。
+            # 被 SIGKILL 的那一种留得下，那正是「没人正常收尾」的证据
+            self._drop_beat_file()
 
     def schedule_data(self) -> ScheduleData:
         return collect(
@@ -183,6 +204,32 @@ class Scheduler:
             clock=self.clock,
         )
 
+    def _beat(self) -> None:
+        """库里的那一拍与库旁的那一拍一起翻：两处读数不能有一个落后于轮次。
+
+        手工 `tick` 没有认领过心跳（`_beat_id` 为空），什么也不留。
+        """
+        if self._beat_id is None:
+            return
+        self.heartbeats.beat(self._beat_id)
+        self._write_beat_file()
+
+    def _write_beat_file(self) -> None:
+        try:
+            write_beat(self.beat_path, pid=os.getpid(), beat_at=self.clock.now_utc())
+        except OSError as exc:
+            # 库里的那一拍仍然写得进去：文件写不进去只是「外部读者少一条路」，
+            # 不是「这一轮不该跑」
+            logger.warning("心跳文件写不进去（%s）：库里的那一拍仍然有效", exc)
+
+    def _drop_beat_file(self) -> None:
+        if self.beat_path is None:
+            return
+        try:
+            self.beat_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("心跳文件删不掉（%s）：它会在下一次读数里变旧", exc)
+
     def _claim(self) -> None:
         """认领心跳；已经有一个循环在跳就拒绝启动（D100 的单实例守卫）。
 
@@ -191,8 +238,8 @@ class Scheduler:
 
         守卫读的是心跳表而不是进程内的一个标记，所以它挡得住「同一个进程里再造一个
         `Scheduler` 去跑常驻循环」。它挡不住另一个操作系统进程：库文件上的锁先就让
-        第二个进程连不上（见 `storage/db.py` 里 `Database.open` 包 `duckdb.Error` 的
-        那一处），那一类重复启动在走到这句守卫之前就已经炸在连接上。
+        第二个进程连不上（`DatabaseLocked`，D111），那一类重复启动在走到这句守卫之前
+        就已经炸在连接上。
         """
         if self._beat_id is not None:
             # 同一个实例再次进循环：上一轮自己认领的那一行不能把自己拒在外面

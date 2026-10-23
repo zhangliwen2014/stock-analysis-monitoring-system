@@ -9,6 +9,7 @@ runner 用记录型替身：这一层要钉的是「谁在什么时候被交给 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
@@ -17,6 +18,7 @@ from support import FrozenClock
 from support_scheduler import FakeCalendar
 
 from sams.core.errors import CalendarSourceError, SchedulerBusy, StorageError, ValidationError
+from sams.services.scheduler.beatfile import BeatFile, read_beat
 from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
 from sams.services.scheduler.report import STREAK_DISPLAY_PERIODS, collect
 from sams.services.scheduler.runner import RunResult
@@ -96,6 +98,7 @@ def make(
     sleep=None,
     universe=None,
     calendar=None,
+    beat_path=None,
 ):
     clock = clock or FrozenClock(MOMENT)
     heartbeats = HeartbeatRepo(db, clock=clock)
@@ -111,6 +114,7 @@ def make(
         calendar=calendar or FakeCalendar(settings),
         clock=clock,
         sleep=sleep or (lambda seconds: None),
+        beat_path=beat_path,
     )
     return scheduler, heartbeats, runs
 
@@ -302,6 +306,79 @@ def test_a_manual_tick_does_not_leave_a_heartbeat(db, settings):
     scheduler.tick(as_of=FRIDAY)
 
     assert heartbeats.latest() is None
+
+
+def test_the_beat_file_follows_the_loop_and_disappears_on_exit(db, settings, tmp_path):
+    """库被这个循环握着时，外部读者打不开库；库旁那一拍就是它能看见的唯一东西（D111）。
+
+    正常退出要把文件带走：留下一个越来越旧的文件，会把「我停了」说成「我卡住了」。
+    """
+    path = tmp_path / "sams.duckdb.heartbeat.json"
+    scheduler, _, _ = make(
+        db,
+        settings,
+        (job_spec("bars", "A"),),
+        RecordingRunner(),
+        beat_path=path,
+    )
+    seen = []
+    scheduler.run_forever(max_ticks=1, on_tick=lambda report: seen.append(read_beat(path)))
+
+    assert seen == [BeatFile(pid=os.getpid(), beat_at=MOMENT)]
+    assert not path.exists()
+
+
+def test_a_long_chain_refreshes_the_beat_between_jobs(db, settings, tmp_path):
+    """一个 job 做上十分钟时，只在每轮开头打的那一拍会把「还在做活」读成「已经停了」。
+
+    补拍的位置必须在 job 之间：这样最坏年龄是「最长的单个 job」，不再是「整条链」。
+    单个 job 自身超过阈值的那一段仍然补不了（这里没有第二个线程），这一点写在
+    `heartbeat.py` 里，不假装它被修好了。
+    """
+    clock = FrozenClock(MOMENT)
+    path = tmp_path / "sams.duckdb.heartbeat.json"
+
+    class SlowFirstJob(RecordingRunner):
+        def execute(self, spec, due, universe):
+            result = super().execute(spec, due, universe)
+            if len(self.calls) == 1:
+                clock.advance(seconds=HEARTBEAT_STALE_S + 60)
+            return result
+
+    runner = SlowFirstJob()
+    specs = (job_spec("bars", "A"), job_spec("rules", "A"))
+    scheduler, heartbeats, _ = make(
+        db, settings, specs, runner, clock=clock, beat_path=path
+    )
+    seen = {}
+
+    def on_tick(report):
+        seen["db"] = heartbeats.latest()
+        seen["file"] = read_beat(path)
+        seen["now"] = clock.now_utc()
+
+    scheduler.run_forever(max_ticks=1, on_tick=on_tick)
+
+    assert seen["now"] - seen["db"].beat_at == timedelta(0)
+    assert seen["file"].beat_at == seen["now"]
+
+
+def test_a_broken_beat_file_does_not_stop_the_loop(db, settings, tmp_path, caplog):
+    """库里的那一拍仍然写得进去，文件写不进去只是「外部读者少一条路」，
+    不是「这一轮不该跑」。磁盘满或路径被人改成目录时，调度器要继续做活。
+    """
+    path = tmp_path / "sams.duckdb.heartbeat.json"
+    path.mkdir()
+    scheduler, heartbeats, _ = make(
+        db, settings, (job_spec("bars", "A"),), RecordingRunner(), beat_path=path
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ticks = scheduler.run_forever(max_ticks=1)
+
+    assert ticks == 1
+    assert heartbeats.latest() is not None
+    assert "心跳文件写不进去" in caplog.text
 
 
 def test_the_beat_goes_out_before_the_selection(db, settings):

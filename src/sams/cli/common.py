@@ -16,6 +16,11 @@ from sams.core.errors import ValidationError
 from sams.core.fundamentals import RATIO_BOUNDS, out_of_caliber
 from sams.core.timeutil import format_utc_moment
 
+#: 库被另一个进程以读写方式打开时的退出码（D111）。与 1 分开：
+#: 1 是「读到了，而且有故障」，3 是「读不到，所以不知道」。看门狗对这两件事的处置不同——
+#: 前者该叫人，后者该先看一眼那个占着库的进程是不是还活着。
+EXIT_LOCKED = 3
+
 
 def exit_for(exc: Exception) -> int:
     """1 与 2 的分界只在这里写一遍（D77）：认得出的错在参数上就是 2，其余是业务拒绝。

@@ -37,6 +37,7 @@ from sams.services.rules.maintenance import RuleService
 from sams.services.rules.recheck import Rechecker
 from sams.services.rules.snapshot import RuleData
 from sams.services.scheduler.alarms import SystemAlerter
+from sams.services.scheduler.beatfile import beat_path
 from sams.services.scheduler.jobs import build_jobs
 from sams.services.scheduler.runner import JobRunner
 from sams.services.scheduler.service import Scheduler
@@ -273,7 +274,7 @@ def build_container(
     data_sources = DataSourceRepo(database)
 
     registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
-    providers = providers if providers is not None else default_providers()
+    providers = providers if providers is not None else default_providers(cfg)
     calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
     fundamentals = FundamentalService(financials_store, valuation_store, clock=clock)
     analysis = AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock)
@@ -391,6 +392,9 @@ def build_container(
         users=users,
         calendar=calendar,
         clock=clock,
+        # 库被这个循环握着时，外部读者只能读库旁那一拍（D111）。
+        # 内存库里 `beat_path` 是 `None`，什么也不写
+        beat_path=beat_path(database.path),
     )
 
     return Container(

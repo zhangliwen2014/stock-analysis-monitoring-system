@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date
 
 import pytest
 
+from sams.core.config import MarketCfg, Settings
 from sams.core.errors import CalendarSourceError
 from sams.core.timeutil import day_sessions
 from sams.datasource.calendar_providers import (
@@ -14,10 +16,36 @@ from sams.datasource.calendar_providers import (
 )
 
 
+def make_settings(**tz) -> Settings:
+    """三个市场各一个时区；用例要改哪一个就传哪一个。"""
+    zones = {
+        "A": "Asia/Shanghai",
+        "HK": "Asia/Hong_Kong",
+        "US": "America/New_York",
+    }
+    zones.update(tz)
+    return Settings(
+        db_path=":memory:",
+        secret_key="test",
+        report_currency="CNY",
+        rate_limit_per_s=1,
+        polling_interval_s=10,
+        cooldown_min=30,
+        markets={
+            market: MarketCfg(market, zone, currency, 30, ())
+            for market, zone, currency in (
+                ("A", zones["A"], "CNY"),
+                ("HK", zones["HK"], "HKD"),
+                ("US", zones["US"], "USD"),
+            )
+        },
+    )
+
+
 @pytest.fixture(scope="module")
 def providers() -> dict:
     """exchange_calendars 的日历数据随包发布，不需要联网，因此整模块共用一次拉取。"""
-    return default_providers()
+    return default_providers(make_settings())
 
 
 def test_registry_covers_all_three_markets(providers):
@@ -25,6 +53,21 @@ def test_registry_covers_all_three_markets(providers):
     assert providers["A"].tz == "Asia/Shanghai"
     assert providers["HK"].source == "exchange_calendars:XHKG"
     assert providers["US"].source == "exchange_calendars:XNYS"
+
+
+def test_the_provider_timezone_comes_from_settings():
+    """时区只从 `Settings` 来（§3.2）：provider 自带一个写死的值就是「今天」的第二个主人。
+    改配置里的时区，provider 必须跟着改——不然 `due` 与 `is_market_open` 会各说各话。
+    """
+    providers = default_providers(make_settings(US="America/Chicago"))
+    assert providers["US"].tz == "America/Chicago"
+    assert providers["HK"].tz == "Asia/Hong_Kong"
+
+
+def test_only_configured_markets_get_a_provider():
+    settings = make_settings()
+    only_a = replace(settings, markets={"A": settings.markets["A"]})
+    assert set(default_providers(only_a)) == {"A"}
 
 
 def test_us_daylight_saving_moves_the_utc_open_without_moving_local_hours(providers):
@@ -72,7 +115,7 @@ def test_unknown_calendar_fails_as_calendar_error():
 
 
 def test_cn_provider_declares_two_sessions_and_its_own_identity():
-    provider = CnSinaProvider()
+    provider = CnSinaProvider(tz="Asia/Shanghai")
     assert (provider.market, provider.tz, provider.typical_windows) == (
         "A",
         "Asia/Shanghai",
@@ -82,7 +125,7 @@ def test_cn_provider_declares_two_sessions_and_its_own_identity():
 
 @pytest.mark.live
 def test_live_cn_calendar_knows_the_national_day_break():
-    provider = CnSinaProvider()
+    provider = CnSinaProvider(tz="Asia/Shanghai")
     days = {d.day for d in provider.days_for_year(2026)}
     assert date(2026, 10, 1) not in days, "国庆休市必须由官方日历给出"
     assert date(2026, 10, 9) in days

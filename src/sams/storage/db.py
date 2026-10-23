@@ -14,9 +14,17 @@ from typing import Any
 import duckdb
 import polars as pl
 
-from sams.core.errors import StorageError
+from sams.core.errors import DatabaseLocked, StorageError
 
 MEMORY = ":memory:"
+#: DuckDB 那句冲突锁的两种稳定片段。只认文本是因为 `duckdb.Error` 没有子类型区分
+#: 「锁」与「权限/损坏」；认错会让一个真正的坏文件被报成「等一下就好」。
+_LOCK_MARKERS = ("Could not set lock on file", "Conflicting lock")
+
+
+def _is_lock_error(exc: duckdb.Error) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in _LOCK_MARKERS)
 
 
 class Database:
@@ -34,6 +42,8 @@ class Database:
         try:
             return cls(duckdb.connect(target), target)
         except duckdb.Error as exc:
+            if _is_lock_error(exc):
+                raise DatabaseLocked(target, detail=str(exc)) from exc
             raise StorageError(f"无法打开数据库 {target}: {exc}") from exc
 
     @property

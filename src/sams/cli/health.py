@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 
 from sams.bootstrap import Container
-from sams.cli.common import stamp
+from sams.cli.common import EXIT_LOCKED, stamp
+from sams.core.errors import DatabaseLocked
+from sams.services.scheduler.beatfile import beat_path, read_beat
+from sams.services.scheduler.heartbeat import stale_at
 
 
 def add_to(subparsers) -> None:
@@ -309,3 +313,35 @@ def show(container: Container, args: argparse.Namespace) -> int:
         if report.degraded_sources or report.pending_migrations or report.schedule_stale
         else 0
     )
+
+
+def show_locked(lock: DatabaseLocked, *, now: datetime | None = None) -> int:
+    """库被另一个进程握着时的那一屏（D111）：只说还读得到的事实。
+
+    DuckDB 单写者，连只读连接也打不开（1.5.6 实测），所以这一屏**不是**一份缩水的
+    健康报告：它读不到表、源、日历、账本。能读的只有库旁那一拍，而且那一拍只证明
+    「一个 `sams run start` 还活着」——一条长采集占着库时，这里必须说「不知道」，
+    不能借「没有文件」推出「它死了」。
+
+    退出码 3 与 1 分开：1 是「读到了，而且有故障」，3 是「读不到，所以不知道」。
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    print(f"库: {lock.path}")
+    print("[调度]")
+    print(f"  ⚠ {lock}")
+    beat = read_beat(beat_path(lock.path))
+    if beat is None:
+        print("  ⚠ 没有心跳文件：占着库的可能不是常驻调度器（也可能它刚启动）")
+    else:
+        # 时钟回拨会让年龄为负：报「未来的一拍」没有意义，折成 0
+        age = max(0, int((moment - beat.beat_at).total_seconds()))
+        if stale_at(age):
+            print(
+                f"  ⚠ 心跳已经 {_age(age)}没更新：占着库的那个进程可能已经卡住或退出"
+                "（锁还没释放）"
+            )
+        else:
+            print(f"  心跳 {_age(age)}前 · PID {beat.pid}（常驻循环还在写）")
+    print("  其余各节需要打开数据库，本次没有读")
+    print(f"  退出码 {EXIT_LOCKED} 表示「未知」：库被占用不等于库坏了")
+    return EXIT_LOCKED

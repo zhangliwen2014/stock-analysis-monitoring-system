@@ -68,7 +68,7 @@ def daily_due(
     for back in range(CATCHUP_DAYS + 1):
         day = today - timedelta(days=back)
         if view.is_trading_day(market, day) and _passed(view, settings, market, day, now):
-            return Due(day.isoformat(), day)
+            return Due(period_key(DAILY, day), day)
     return None
 
 
@@ -93,8 +93,7 @@ def weekly_due(
             continue
         if following.isocalendar()[:2] == day.isocalendar()[:2]:
             continue
-        iso = day.isocalendar()
-        return Due(f"{iso.year}-W{iso.week:02d}", day)
+        return Due(period_key(WEEKLY, day), day)
     return None
 
 
@@ -105,7 +104,7 @@ def monthly_due(
     day = daily_due(view, settings, market, now)
     if day is None:
         return None
-    return Due(day.as_of.strftime("%Y-%m"), day.as_of)
+    return Due(period_key(MONTHLY, day.as_of), day.as_of)
 
 
 def fx_due(view: CalendarView, settings: Settings, now: datetime) -> Due | None:
@@ -122,7 +121,7 @@ def fx_due(view: CalendarView, settings: Settings, now: datetime) -> Due | None:
         if view.is_trading_day(market, newest) and latest.get(market) != newest:
             # 这个市场那天开市、但它的收盘还没过：等它
             return None
-    return Due(newest.isoformat(), newest)
+    return Due(period_key(FX, newest), newest)
 
 
 def period_key(period: str, as_of: date) -> str:

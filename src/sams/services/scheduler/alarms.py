@@ -22,15 +22,13 @@ from datetime import timedelta
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.events import EventBus, SystemAlarm
-from sams.core.notify import STRONG, AlertMessage, AlertSender
+from sams.core.notify import STRONG, SYSTEM_MARKET, AlertMessage, AlertSender
 from sams.services.actors import admin_users
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.users import UserRepo
 
 logger = logging.getLogger("sams.services.scheduler.alarms")
 
-#: `alerts.market` 里代表「这不是一只票」的那一个值：去重查询靠它与规则告警分开
-SYS_MARKET = "SYS"
 #: 读的一侧看到的「系统」：占的是标的位、账户位与阶段位
 #: （用户告警在这三段上写的是股票名、账户名与阶段，而这里没有一只票）
 SYS_LABEL = "系统"
@@ -55,7 +53,7 @@ class SystemAlerter:
             if self.alerts.has_system_alert(user.id, alarm.component, since=since):
                 continue
             message = AlertMessage(
-                market=SYS_MARKET,
+                market=SYSTEM_MARKET,
                 code=alarm.component,
                 severity=STRONG,
                 triggered_at=now,

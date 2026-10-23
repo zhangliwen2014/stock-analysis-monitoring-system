@@ -654,9 +654,12 @@ def test_corp_action_count_is_global(actions):
 # ==================== 4. 单写者 / 连接 ====================
 
 
-def test_second_process_on_the_same_file_gets_a_storage_error(tmp_path):
-    """跨进程抢同一个 DuckDB 文件：`Database.open` 包成 StorageError，
-    消息带「哪个文件 + 谁持锁 + 官方文档链接」——可处置，不是不透明崩溃。
+def test_second_process_on_the_same_file_gets_a_database_locked_error(tmp_path):
+    """跨进程抢同一个 DuckDB 文件：`Database.open` 抛 `DatabaseLocked`（D111），
+    消息带「哪个文件 + 谁持锁（PID）+ 换只读连接也打不开」——可处置，不是不透明崩溃。
+
+    不再是笼统的 `StorageError`：健康页要据此把「库被占用」与「库坏了」分成两个结论，
+    那个类型就是这条分界的执行点。
     """
     path = tmp_path / "single_writer.duckdb"
     holder = Database.open(path)
@@ -675,9 +678,10 @@ def test_second_process_on_the_same_file_gets_a_storage_error(tmp_path):
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
     )
     try:
-        assert result.stdout.startswith("StorageError"), result.stdout + result.stderr
-        assert "无法打开数据库" in result.stdout
-        assert "lock" in result.stdout.lower(), result.stdout
+        assert result.stdout.startswith("DatabaseLocked"), result.stdout + result.stderr
+        assert str(path) in result.stdout
+        assert "PID" in result.stdout
+        assert "只读连接也打不开" in result.stdout
     finally:
         holder.close()
 

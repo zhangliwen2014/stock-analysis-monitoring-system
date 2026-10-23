@@ -17,8 +17,8 @@ from support import FrozenClock
 
 from sams.core.errors import TransientError
 from sams.core.events import EventBus, SystemAlarm
-from sams.core.notify import STRONG, AlertMessage
-from sams.services.scheduler.alarms import SYS_LABEL, SYS_MARKET, SystemAlerter
+from sams.core.notify import STRONG, SYSTEM_MARKET, AlertMessage
+from sams.services.scheduler.alarms import SYS_LABEL, SystemAlerter
 from sams.services.scheduler.due import Due
 from sams.services.scheduler.runner import JobRunner
 from sams.services.scheduler.types import JobSpec
@@ -107,7 +107,7 @@ def test_the_alarm_goes_to_active_admins_only(db, settings):
     assert len(users.list_users()) == 3
     assert [call[0] for call in sender.calls] == [admin.id]
     _, message, rule_id = sender.calls[0]
-    assert message.market == SYS_MARKET
+    assert message.market == SYSTEM_MARKET
     assert message.code == "job.bars.A"
     assert message.severity == STRONG
     assert message.body == "boom"
@@ -123,7 +123,7 @@ def test_the_alert_row_is_a_system_alert(db, settings):
 
     row = alerts.list_for(admin.id)[0]
     assert row.rule_id is None
-    assert (row.market, row.code, row.stage) == (SYS_MARKET, "calendar", SYS_LABEL)
+    assert (row.market, row.code, row.stage) == (SYSTEM_MARKET, "calendar", SYS_LABEL)
     assert row.severity == STRONG
     assert row.rule_name == "系统告警"
     assert row.payload["extra"]["body"] == "日历源全挂"
@@ -279,7 +279,7 @@ def test_the_runner_alarm_is_delivered_by_the_attached_alerter(db, settings):
 
     assert len(sender.calls) == 1
     row = alerts.list_for(admin.id)[0]
-    assert (row.market, row.code, row.rule_id) == (SYS_MARKET, "job.bars.A", None)
+    assert (row.market, row.code, row.rule_id) == (SYSTEM_MARKET, "job.bars.A", None)
 
     # 同一个组件再告一次（换市场才算换组件）：窗口内沉默
     bus.publish(SystemAlarm(component="job.bars.A", message="再来一次"))

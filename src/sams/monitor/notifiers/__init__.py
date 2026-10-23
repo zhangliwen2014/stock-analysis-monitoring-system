@@ -18,7 +18,7 @@ from importlib import import_module
 from typing import Protocol
 
 from sams.core.errors import ValidationError
-from sams.core.notify import KINDS, WEAK, AlertMessage, NotifyResult
+from sams.core.notify import KINDS, SYSTEM_MARKET, WEAK, AlertMessage, NotifyResult
 from sams.monitor.env import DESKTOP, VOICE, LocalEnv
 
 __all__ = [
@@ -185,7 +185,7 @@ def probe_message(channel_name: str) -> AlertMessage:
     构造参数多一个没人需要的依赖。
     """
     return AlertMessage(
-        market="SYS",
+        market=SYSTEM_MARKET,
         code=channel_name,
         severity=WEAK,
         triggered_at=datetime.now(UTC),

@@ -27,8 +27,9 @@ from sams.cli import (
     thesis,
     user,
 )
+from sams.cli.common import EXIT_LOCKED
 from sams.core.config import Settings
-from sams.core.errors import SamsError
+from sams.core.errors import DatabaseLocked, SamsError
 
 COMMAND_MODULES = (
     db,
@@ -68,6 +69,13 @@ def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         container = build_container(Settings.load(args.config_path))
+    except DatabaseLocked as exc:
+        # 「库被占用」不是配置错误：那个进程可能正在干活（D111）。
+        # health 是唯一还能说出一点东西的命令——库旁那一拍没被锁
+        if args.command == "health":
+            return health.show_locked(exc)
+        print(f"数据库被占用: {exc}", file=sys.stderr)
+        return EXIT_LOCKED
     except SamsError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 1

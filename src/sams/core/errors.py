@@ -1,5 +1,11 @@
 """SAMS 异常类型。分层原则：数据源异常与领域校验异常不混用。"""
 
+import re
+
+#: DuckDB 冲突锁那句话里唯一还是「谁在拿库」的证据：PID。
+#: 解析放在异常里而不是调用方：库打不开的那一刻，除了这条消息没有别的来源。
+_HOLDER_PID = re.compile(r"\(PID (\d+)\)")
+
 
 class SamsError(Exception):
     """所有本项目异常的基类。"""
@@ -11,6 +17,27 @@ class ValidationError(SamsError):
 
 class StorageError(SamsError):
     """仓库层错误：迁移失败、约束冲突等。"""
+
+
+class DatabaseLocked(StorageError):
+    """库文件被另一个进程以读写方式打开（DuckDB 单写者）。
+
+    单独一个类型而不是「又一种 `StorageError`」：处置完全不同。配置错误去改文件，
+    这个去等常驻调度器退出；而「锁住」本身不是故障——那个进程可能正在干活。
+    DuckDB 1.5.6 的实测是另一个进程**连只读连接也打不开**，所以这里没有
+    「绕开锁只读」的中间道路：读不到就是读不到，只能改读库旁那一拍（`beatfile`）。
+    """
+
+    def __init__(self, path: str, detail: str = "") -> None:
+        self.path = path
+        self.detail = detail
+        match = _HOLDER_PID.search(detail)
+        self.holder_pid = int(match.group(1)) if match else None
+        message = f"数据库 {path} 正被另一个进程以读写方式打开"
+        if self.holder_pid is not None:
+            message += f"（PID {self.holder_pid}）"
+        message += "；DuckDB 单写者，换只读连接也打不开"
+        super().__init__(message)
 
 
 class DatasourceError(SamsError):

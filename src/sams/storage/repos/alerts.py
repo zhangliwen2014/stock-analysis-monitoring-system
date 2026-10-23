@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import StorageError, ValidationError
-from sams.core.notify import FAILED, NO_CHANNEL, OUTCOMES, SENT, SEVERITIES
+from sams.core.notify import FAILED, NO_CHANNEL, OUTCOMES, SENT, SEVERITIES, SYSTEM_MARKET
 from sams.storage.db import Database
 from sams.storage.ids import new_id
 
@@ -231,9 +231,9 @@ class AlertRepo:
             self.db.scalar(
                 "SELECT EXISTS ("
                 " SELECT 1 FROM alerts"
-                " WHERE user_id = ? AND market = 'SYS' AND code = ? AND rule_id IS NULL"
+                " WHERE user_id = ? AND market = ? AND code = ? AND rule_id IS NULL"
                 " AND triggered_at >= ?)",
-                [user_id, component, _moment(since)],
+                [user_id, SYSTEM_MARKET, component, _moment(since)],
             )
         )
 

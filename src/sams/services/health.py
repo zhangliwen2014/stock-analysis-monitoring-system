@@ -15,7 +15,7 @@ from sams.core.calendar import CalendarStore
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.funds import FX_STALE_DAYS
-from sams.core.notify import FAILED, KINDS, NO_CHANNEL, SENT, SUPPRESSED
+from sams.core.notify import FAILED, KINDS, NO_CHANNEL, SENT, SUPPRESSED, SYSTEM_MARKET
 from sams.core.sources import SourceHealthView, SourceRecord
 from sams.storage.db import Database
 from sams.storage.migrate import pending
@@ -346,13 +346,16 @@ class HealthService:
         # 混进来的话「2 个组件、2 个管理员」会显示成「未处理 4 条」
         unhandled = int(
             self.db.scalar(
-                "SELECT count(*) FROM alerts WHERE status = 'new' AND market <> 'SYS'"
-            ) or 0
+                "SELECT count(*) FROM alerts WHERE status = 'new' AND market <> ?",
+                [SYSTEM_MARKET],
+            )
+            or 0
         )
         oldest = (
             self.db.scalar(
                 "SELECT min(triggered_at) FROM alerts"
-                " WHERE status = 'new' AND market <> 'SYS'"
+                " WHERE status = 'new' AND market <> ?",
+                [SYSTEM_MARKET],
             )
             if unhandled
             else None
@@ -361,12 +364,15 @@ class HealthService:
         system_unhandled = int(
             self.db.scalar(
                 "SELECT count(DISTINCT code) FROM alerts"
-                " WHERE status = 'new' AND market = 'SYS'"
-            ) or 0
+                " WHERE status = 'new' AND market = ?",
+                [SYSTEM_MARKET],
+            )
+            or 0
         )
         system_oldest = (
             self.db.scalar(
-                "SELECT min(triggered_at) FROM alerts WHERE status = 'new' AND market = 'SYS'"
+                "SELECT min(triggered_at) FROM alerts WHERE status = 'new' AND market = ?",
+                [SYSTEM_MARKET],
             )
             if system_unhandled
             else None

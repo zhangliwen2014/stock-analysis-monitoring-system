@@ -39,6 +39,12 @@ DEFAULT_ROUTE: dict[str, tuple[str, ...]] = {
 #: 而 `services` 不许 import `monitor`。「有哪些通道」是域知识，不是实现细节。
 KINDS = ("wecom", "dingtalk", "pushplus", "email", "desktop", "voice")
 
+#: `alerts.market` 里代表「这不是一只票」的那一个值（D102）。
+#: 系统告警与规则告警共用一张表，靠它与 `rule_id IS NULL` 分开；写入方（调度器的
+#: `SystemAlerter`、通知探针）、读取方（健康页的积压统计、告警仓库的去重查询）
+#: 必须是同一个字面量——两处写得不一样，系统告警会被算进用户积压，或者去重永远不命中。
+SYSTEM_MARKET = "SYS"
+
 #: 每条通道的正文字节上限（实测/文档值）。超出就按 UTF-8 边界剪，末尾补一个省略号。
 LIMITS: dict[str, int] = {
     "wecom": 4000,

@@ -11,6 +11,7 @@ from collections import Counter
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+from sams.core.config import Settings
 from sams.core.errors import CalendarSourceError
 from sams.core.timeutil import CalendarDay, SessionWindow
 
@@ -27,8 +28,11 @@ class CnSinaProvider:
 
     market = "A"
     source = "akshare:sina"
-    tz = "Asia/Shanghai"
     typical_windows = CN_WINDOWS
+
+    def __init__(self, *, tz: str) -> None:
+        # 时区只从 `Settings` 来（§3.2）：这里写死一个，配置里改了就成了一处改、一处不改
+        self.tz = tz
 
     def days_for_year(self, year: int) -> list[CalendarDay]:
         try:
@@ -136,14 +140,29 @@ HK_WINDOWS = (SessionWindow("regular", "09:30", "16:00"),)
 US_WINDOWS = (SessionWindow("regular", "09:30", "16:00"),)
 
 
-def default_providers() -> dict[str, object]:
-    """市场 → 日历来源的注册表。"""
-    return {
-        "A": CnSinaProvider(),
-        "HK": XcalProvider(
-            market="HK", xcal_code="XHKG", tz="Asia/Hong_Kong", typical_windows=HK_WINDOWS
-        ),
-        "US": XcalProvider(
-            market="US", xcal_code="XNYS", tz="America/New_York", typical_windows=US_WINDOWS
-        ),
-    }
+def default_providers(settings: Settings) -> dict[str, object]:
+    """市场 → 日历来源的注册表。
+
+    每个 provider 的时区都取自 `Settings`：provider 自己再带一个写死的值，就是
+    「今天」的第二个主人——配置改了而它没改，`due` 与 `is_market_open` 会在同一个
+    瞬间对「今天」给出两个日期，而两边都不会报错。
+    只给配置里有的市场建 provider：没有配置的市场本来就没有日历可用。
+    """
+    providers: dict[str, object] = {}
+    if "A" in settings.markets:
+        providers["A"] = CnSinaProvider(tz=settings.market_cfg("A").tz)
+    if "HK" in settings.markets:
+        providers["HK"] = XcalProvider(
+            market="HK",
+            xcal_code="XHKG",
+            tz=settings.market_cfg("HK").tz,
+            typical_windows=HK_WINDOWS,
+        )
+    if "US" in settings.markets:
+        providers["US"] = XcalProvider(
+            market="US",
+            xcal_code="XNYS",
+            tz=settings.market_cfg("US").tz,
+            typical_windows=US_WINDOWS,
+        )
+    return providers
