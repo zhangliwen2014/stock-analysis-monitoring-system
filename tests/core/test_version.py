@@ -35,6 +35,14 @@ def test_changed_since_answers_the_question_the_cache_asks():
     assert gate.changed_since(seen)
 
 
+def test_changed_since_only_judges_kinds_in_the_snapshot():
+    gate = VersionGate()
+    gate.bump("bars")
+    assert not gate.changed_since({"rules": 0})
+    assert gate.changed_since({"bars": 0})
+    assert not gate.changed_since({})
+
+
 def test_an_unknown_kind_is_a_programming_error_with_the_known_list():
     gate = VersionGate()
     with pytest.raises(KeyError, match="rules"):
@@ -45,10 +53,22 @@ def test_an_unknown_kind_is_a_programming_error_with_the_known_list():
         gate.changed_since({"rulse": 0})
 
 
+def test_a_custom_kinds_gate_is_a_separate_registry():
+    gate = VersionGate(kinds=("rules",))
+    assert gate.kinds == ("rules",)
+    assert gate.snapshot() == {"rules": 0}
+    with pytest.raises(KeyError, match="rules"):
+        gate.bump("theses")
+
+
 def test_concurrent_bumps_do_not_lose_counts():
     gate = VersionGate(kinds=("rules",))
+    barrier = threading.Barrier(8)
     threads = [
-        threading.Thread(target=lambda: [gate.bump("rules") for _ in range(100)]) for _ in range(8)
+        threading.Thread(
+            target=lambda: (barrier.wait(), [gate.bump("rules") for _ in range(100)])
+        )
+        for _ in range(8)
     ]
     for thread in threads:
         thread.start()

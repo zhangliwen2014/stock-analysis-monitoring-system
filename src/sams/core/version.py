@@ -4,6 +4,10 @@
 观点，或盘后 job 刚补了日线——这些都不经过盘中线程。缓存若没有失效判据，最坏的样子是
 「用户刚把止损改到 9 元，页面显示已生效，盘中仍按 10 元在判」，而且没有任何报错。
 计数只在这个进程里有意义：它答的是「这份缓存」与「当前库」的差，不是数据版本。
+
+用法协议：先 `snapshot()` 再读库，缓存建立后每轮用 `changed_since(那份快照)`
+判断要不要重读；为真时重新 `snapshot()` 再重读。反过来「读完才记快照」会把
+读取与记快照之间落进来的 bump 吞掉，而且没有任何报错。
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ class VersionGate:
 
     @property
     def kinds(self) -> tuple[str, ...]:
+        # 键集在 __init__ 后不再变化，读它不需要锁（值会变，键不会增删）
         return tuple(self._versions)
 
     def _check(self, kind: str) -> None:
