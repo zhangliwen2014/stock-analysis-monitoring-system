@@ -27,7 +27,7 @@ import polars as pl
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
-from sams.core.quotes import Quote, QuoteBatch
+from sams.core.quotes import MARKET_ZONES, Quote, QuoteBatch
 from sams.datasource.base import (
     LOTS_TO_SHARES,
     a_share_symbol,
@@ -63,11 +63,12 @@ def tencent_quote_symbol(market: str, code: str) -> str:
     `AAPL.OQ`。所以这里只取裸代码，回显校验由 `echo_matches` 按点前比较。
     """
     if market == "A":
-        return a_share_symbol(code)
+        return tencent_symbol(market, code)
     if market == "HK":
-        return f"hk{canonical_code('HK', code)}"
+        return tencent_symbol(market, code)
+    # 美股报价必须剥掉交易所后缀（与日线共用 symbol 会拿到空行），所以不走 tencent_symbol
     if market == "US":
-        return f"us{canonical_code('US', code).split('.')[0].upper()}"
+        return f"us{canonical_code('US', code).split('.')[0]}"
     raise ValueError(f"未知市场 {market}")
 
 
@@ -347,6 +348,7 @@ class TencentAdapter:
             raise classify_error(self.name, exc) from exc
 
     def quotes(self, market: str, codes: list[str]) -> QuoteBatch:
+        """一次请求的代码清单由调用方按 `QUOTE_BATCH` 分批（service 层负责），本方法不切片。"""
         if market not in self.markets:
             raise ValueError(f"{self.name} 不支持市场 {market}")
         wanted = list(dict.fromkeys(canonical_code(market, code) for code in codes))
@@ -357,21 +359,19 @@ class TencentAdapter:
             text = self._quote_fetch(
                 QUOTE_URL, {"q": ",".join(symbols)}, timeout=self._timeout
             )
+            # 解析也要在 try 里：解析层的意外 bug 同样按 DatasourceError 分类上报，
+            # 而不是以裸异常穿透到路由层（与 daily_bars 同一口径）
+            return parse_tencent_quotes(
+                text,
+                market=market,
+                codes=wanted,
+                now=self._clock.now_utc(),
+                zone=MARKET_ZONES[market],
+            )
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
-        return parse_tencent_quotes(
-            text,
-            market=market,
-            codes=wanted,
-            now=self._clock.now_utc(),
-            zone=ZoneInfo(
-                {"A": "Asia/Shanghai", "HK": "Asia/Hong_Kong", "US": "America/New_York"}[
-                    market
-                ]
-            ),
-        )
 
 
 def kline_param(market: str, symbol: str, start: date, end: date, count: int) -> str:

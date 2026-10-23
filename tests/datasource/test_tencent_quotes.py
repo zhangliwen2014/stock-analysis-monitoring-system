@@ -6,10 +6,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from support import FrozenClock
 
+from sams.core.errors import RateLimited
 from sams.datasource.tencent import (
     QUOTE_URL,
     TencentAdapter,
     parse_tencent_quotes,
+    quote_get,
     tencent_quote_symbol,
 )
 
@@ -133,6 +135,17 @@ def test_a_quote_without_a_tradable_price_is_an_error_not_a_zero():
     assert batch.errors and "价格" in batch.errors[0]
 
 
+def test_a_row_shorter_than_the_quote_layout_is_an_error():
+    # fields() 给 40 格，砍到 34（< 35）：第 35 格起的字段缺失要走 errors 而不是当 0
+    text = line("sh600519", fields(code="600519")[:34])
+    batch = parse_tencent_quotes(
+        text, market="A", codes=["600519"], now=NOW,
+        zone=ZoneInfo("Asia/Shanghai"),
+    )
+    assert batch.quotes == ()
+    assert batch.errors and "字段不足" in batch.errors[0]
+
+
 def test_an_unreadable_time_falls_back_to_fetch_time_and_is_marked_stale():
     text = line("sh600519", fields(code="600519", ts="not-a-time"))
     quote = parse_tencent_quotes(
@@ -169,6 +182,17 @@ def test_the_adapter_posts_the_batch_to_the_quote_endpoint():
     assert seen["params"] == {"q": "sh600519"}
     assert seen["timeout"] == 7
     assert batch.quotes[0].code == "600519"
+
+
+def test_quote_get_maps_429_to_rate_limited(monkeypatch):
+    # 429 必须在 raise_for_status 之前判成 RateLimited：路由器对限流退避重试，
+    # 对其他异常立刻换源——限流时换源等于把备源也打爆
+    class Response429:
+        status_code = 429
+
+    monkeypatch.setattr("requests.get", lambda *a, **k: Response429())
+    with pytest.raises(RateLimited):
+        quote_get("https://qt.gtimg.cn/q", {"q": "sh600519"}, timeout=1)
 
 
 @pytest.mark.live
