@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from datetime import date, datetime
 
+from sams.core.errors import ValidationError
 from sams.core.quotes import Quote, QuoteSourceRecord
 from sams.storage.db import Database
 
@@ -23,6 +25,20 @@ _QUOTE_COLUMNS = (
     "market, code, ts, price, open, prev_close, high, low, pct_chg,"
     " volume, amount, bid1, ask1, status, is_stale, source"
 )
+
+
+def _day(value) -> date:
+    return value.date() if isinstance(value, datetime) else value
+
+
+def _before_where(cutoffs: Mapping[str, date]) -> tuple[str, list]:
+    """把「每个市场各自的截止日」拼成一条 WHERE：A 股的截止日与港股的不是同一天。"""
+    clauses: list[str] = []
+    params: list = []
+    for market, day in sorted(cutoffs.items()):
+        clauses.append("(market = ? AND CAST(ts AS DATE) < ?)")
+        params.extend([market, day])
+    return " OR ".join(clauses), params
 
 
 class QuoteRepo:
@@ -72,6 +88,42 @@ class QuoteRepo:
         return tuple(
             quote for quote in (_to_quote(row) for row in rows.to_dicts()) if quote is not None
         )
+
+    def session_cutoffs(self, keep_sessions: int) -> dict[str, date]:
+        """每个市场各留最近 N 个**有快照的交易日**，返回第 N 新的那一天。
+
+        按市场分开数，不按全库日期数：A 股长假那一周港股照常开市，全库数法会把
+        A 股节前最后一日的快照当成「第 8 天」删掉。用快照里出现过的日期而不是交易日历：
+        这个函数回答的是「表里有哪些天」，一张空表不该被日历判成「有 5 天要保留」。
+        某个市场不足 N 天时不出现在返回值里——那不是「删到空」，而是没有可删的。
+        """
+        if keep_sessions < 1:
+            raise ValidationError("keep_sessions 至少是 1：0 会把每个市场当前的快照全删掉")
+        rows = self.db.query(
+            "WITH days AS ("
+            "  SELECT DISTINCT market, CAST(ts AS DATE) AS d FROM quotes_snapshot"
+            "), ranked AS ("
+            "  SELECT market, d, row_number() OVER (PARTITION BY market ORDER BY d DESC) AS rn"
+            "  FROM days"
+            ")"
+            " SELECT market, d FROM ranked WHERE rn = ?",
+            [keep_sessions],
+        )
+        return {str(row["market"]): _day(row["d"]) for row in rows.to_dicts()}
+
+    def count_before(self, cutoffs: Mapping[str, date]) -> int:
+        where, params = _before_where(cutoffs)
+        if not where:
+            return 0
+        return int(
+            self.db.scalar(f"SELECT count(*) FROM quotes_snapshot WHERE {where}", params) or 0
+        )
+
+    def delete_before(self, cutoffs: Mapping[str, date]) -> None:
+        where, params = _before_where(cutoffs)
+        if not where:
+            return
+        self.db.execute(f"DELETE FROM quotes_snapshot WHERE {where}", params)
 
 
 def _to_quote(row: dict) -> Quote | None:

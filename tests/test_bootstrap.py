@@ -314,6 +314,14 @@ def test_health_carries_the_schedule_reading(container):
     assert report.schedule.admins == 0
 
 
+def test_the_container_carries_the_prune_service(container):
+    """三个入口共用一份保留策略：命令行删 5 天、健康页按钮删 7 天，是两种故障。"""
+    from sams.services.prune import PruneService
+
+    built, _ = container
+    assert isinstance(built.prune, PruneService)
+
+
 def test_contexts_get_their_own_connection_but_share_the_core(migrated):
     """DuckDB 同进程多连接共享同一个库；连接、事务深度、注册视图都不得跨线程。
 

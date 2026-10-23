@@ -153,6 +153,19 @@ class TaskRunRepo:
         )
         return [_to_run(row) for row in rows.to_dicts()]
 
+    def count_before(self, cutoff: datetime) -> int:
+        return int(
+            self.db.scalar("SELECT count(*) FROM task_runs WHERE started_at < ?", [cutoff]) or 0
+        )
+
+    def delete_before(self, cutoff: datetime) -> None:
+        """超过保留期的执行台账一律删，包括一直没收尾的 `running`。
+
+        九十天还停在 `running` 的唯一解释是崩溃留下的：D105 的六小时判据早就把它
+        标成「上一跑没收尾」，再留着只会把「最近一次」永远占住。
+        """
+        self.db.execute("DELETE FROM task_runs WHERE started_at < ?", [cutoff])
+
     def count(self) -> int:
         return int(self.db.scalar("SELECT count(*) FROM task_runs") or 0)
 
@@ -191,4 +204,27 @@ class HeartbeatRepo:
             started_at=row["started_at"],
             beat_at=row["beat_at"],
             note=row["note"],
+        )
+
+    def count_beyond(self, keep: int) -> int:
+        if keep < 1:
+            raise ValidationError("keep 至少是 1：0 会把全部心跳删掉")
+        return int(
+            self.db.scalar(
+                "SELECT count(*) FROM scheduler_heartbeats WHERE id NOT IN ("
+                "  SELECT id FROM scheduler_heartbeats"
+                "  ORDER BY beat_at DESC, rowid DESC LIMIT ?)",
+                [keep],
+            )
+            or 0
+        )
+
+    def delete_beyond(self, keep: int) -> None:
+        if keep < 1:
+            raise ValidationError("keep 至少是 1：0 会把全部心跳删掉")
+        self.db.execute(
+            "DELETE FROM scheduler_heartbeats WHERE id NOT IN ("
+            "  SELECT id FROM scheduler_heartbeats"
+            "  ORDER BY beat_at DESC, rowid DESC LIMIT ?)",
+            [keep],
         )

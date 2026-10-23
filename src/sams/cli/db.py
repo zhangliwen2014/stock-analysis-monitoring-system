@@ -1,8 +1,21 @@
-"""`sams db` —— 建库与迁移状态。"""
+"""`sams db` —— 建库、迁移状态与保留策略。"""
 
 from __future__ import annotations
 
+import argparse
+
 from sams.cli.common import group
+from sams.services.prune import KEEP_HEARTBEATS, KEEP_QUOTE_SESSIONS, KEEP_TASK_RUN_DAYS
+
+
+def _positive(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} 不是整数") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("要大于 0")
+    return value
 
 
 def add_to(subparsers) -> None:
@@ -13,6 +26,34 @@ def add_to(subparsers) -> None:
     ):
         parser = actions.add_parser(name, help=help_text)
         parser.set_defaults(handler=handler)
+
+    parser = actions.add_parser(
+        "prune",
+        help="按保留策略清理报价快照、任务台账与调度心跳（sams serve 每日 UTC 03:30 也执行）",
+    )
+    parser.add_argument(
+        "--quotes-sessions",
+        type=_positive,
+        default=KEEP_QUOTE_SESSIONS,
+        metavar="N",
+        help=f"每个市场保留最近 N 个有快照的交易日（默认 {KEEP_QUOTE_SESSIONS}）",
+    )
+    parser.add_argument(
+        "--task-runs-days",
+        type=_positive,
+        default=KEEP_TASK_RUN_DAYS,
+        metavar="N",
+        help=f"task_runs 保留最近 N 天（默认 {KEEP_TASK_RUN_DAYS}）",
+    )
+    parser.add_argument(
+        "--heartbeats-keep",
+        type=_positive,
+        default=KEEP_HEARTBEATS,
+        metavar="N",
+        help=f"调度心跳只留最近 N 条（默认 {KEEP_HEARTBEATS}）",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="只打印将删行数，不动库")
+    parser.set_defaults(handler=prune)
 
 
 def migrate(container, args) -> int:
@@ -31,4 +72,18 @@ def status(container, args) -> int:
     print(f"已应用 {len(done)} 个: {', '.join(done) or '（无）'}")
     print(f"待应用 {len(todo)} 个: {', '.join(todo) or '（无）'}")
     print(f"数据库路径: {container.db.path}")
+    return 0
+
+
+def prune(container, args) -> int:
+    report = container.prune.run(
+        quotes_sessions=args.quotes_sessions,
+        task_runs_days=args.task_runs_days,
+        heartbeats_keep=args.heartbeats_keep,
+        dry_run=args.dry_run,
+    )
+    verb = "将删除" if report.dry_run else "删除"
+    for step in report.steps:
+        print(f"{step.name}: {verb} {step.rows} 行")
+    print(f"{'预计' if report.dry_run else '合计'}: {report.total} 行")
     return 0

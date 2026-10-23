@@ -32,6 +32,7 @@ from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
 from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
+from sams.services.prune import PruneService
 from sams.services.rules.derive import RuleDeriver
 from sams.services.rules.engine import RuleEngine
 from sams.services.rules.maintenance import RuleService
@@ -203,6 +204,8 @@ class ServiceContext:
     quote_health: QuoteHealthRepo
     task_runs: TaskRunRepo
     heartbeats: HeartbeatRepo
+    #: 保留策略（D116）：CLI、常驻维护与 admin 健康页共用这一份
+    prune: PruneService
     #: 常驻调度器（spec §12）：`sams run start|once|jobs` 与健康页的 `[调度]` 读的是同一台
     scheduler: Scheduler
 
@@ -447,6 +450,13 @@ def build_context(
     )
     task_runs = TaskRunRepo(database, clock=clock)
     heartbeats = HeartbeatRepo(database, clock=clock)
+    prune = PruneService(
+        database,
+        quotes=quotes_store,
+        task_runs=task_runs,
+        heartbeats=heartbeats,
+        clock=clock,
+    )
     deps = JobDeps(
         settings=cfg,
         registry=registry,
@@ -530,6 +540,7 @@ def build_context(
         quote_health=quote_health,
         task_runs=task_runs,
         heartbeats=heartbeats,
+        prune=prune,
         scheduler=scheduler,
         cipher=cipher,
         notify=notify,
