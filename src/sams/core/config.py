@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -32,6 +32,54 @@ class MarketCfg:
             raise ValidationError(f"市场 {self.market} 时区非法: {self.tz}") from exc
 
 
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+@dataclass(frozen=True)
+class ServerCfg:
+    """`sams serve` 的监听与登录策略（spec §7/§8）。
+
+    默认只绑回环地址：这个产品先服务「本机一个人」。`0.0.0.0` 与「允许局域网」
+    必须同时成立——单独一个 host 就开门，等于让一次改端口顺手把库暴露给整层楼。
+    """
+
+    host: str = "127.0.0.1"
+    port: int = 8765
+    allow_lan: bool = False
+    session_ttl_days: int = 7
+    idle_timeout_min: int = 720
+    login_max_failures: int = 5
+    login_window_min: int = 5
+    tls_certfile: str | None = None
+    tls_keyfile: str | None = None
+    display_tz: str = "Asia/Shanghai"
+
+    def is_loopback(self) -> bool:
+        return self.host in LOOPBACK_HOSTS
+
+    def validate(self) -> None:
+        if not (1 <= self.port <= 65535):
+            raise ValidationError(f"server.port 非法: {self.port}")
+        if self.session_ttl_days <= 0:
+            raise ValidationError("server.session_ttl_days 必须为正数")
+        if self.idle_timeout_min <= 0:
+            raise ValidationError("server.idle_timeout_min 必须为正数")
+        if self.login_max_failures <= 0:
+            raise ValidationError("server.login_max_failures 必须为正数")
+        if self.login_window_min <= 0:
+            raise ValidationError("server.login_window_min 必须为正数")
+        if bool(self.tls_certfile) != bool(self.tls_keyfile):
+            raise ValidationError("server.tls_certfile 与 tls_keyfile 必须成对给出")
+        if not self.is_loopback() and not self.allow_lan:
+            raise ValidationError(
+                f"server.host={self.host!r} 不是回环地址：要监听局域网请同时设置 allow_lan = true"
+            )
+        try:
+            ZoneInfo(self.display_tz)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValidationError(f"server.display_tz 非法: {self.display_tz}") from exc
+
+
 @dataclass(frozen=True)
 class Settings:
     db_path: str
@@ -45,6 +93,9 @@ class Settings:
     #: `polling_interval_s` 预留给 M4/U7 的 10 秒快照，那条链目前还没有消费者；
     #: 盘后任务按分钟级检查就够了，把一个盘中参数借给它，会让改盘中频率顺手改掉盘后
     scheduler_tick_s: int = 60
+    #: 报价超过这么久没更新 ⇒ `stale`，价格类规则不评估（spec D134）
+    quote_stale_s: int = 60
+    server: ServerCfg = field(default_factory=ServerCfg)
 
     def market_cfg(self, market: str) -> MarketCfg:
         try:
@@ -88,6 +139,22 @@ class Settings:
         if not markets:
             raise ValidationError("配置缺少 [markets.*] 段")
 
+        server_raw = raw.get("server") or {}
+        server = ServerCfg(
+            host=str(server_raw.get("host", "127.0.0.1")),
+            port=int(server_raw.get("port", 8765)),
+            allow_lan=bool(server_raw.get("allow_lan", False)),
+            session_ttl_days=int(server_raw.get("session_ttl_days", 7)),
+            idle_timeout_min=int(server_raw.get("idle_timeout_min", 720)),
+            login_max_failures=int(server_raw.get("login_max_failures", 5)),
+            login_window_min=int(server_raw.get("login_window_min", 5)),
+            tls_certfile=(
+                str(server_raw["tls_certfile"]) if server_raw.get("tls_certfile") else None
+            ),
+            tls_keyfile=str(server_raw["tls_keyfile"]) if server_raw.get("tls_keyfile") else None,
+            display_tz=str(server_raw.get("display_tz", "Asia/Shanghai")),
+        )
+
         settings = cls(
             db_path=str(db_path),
             secret_key=str(secret_key),
@@ -97,6 +164,8 @@ class Settings:
             cooldown_min=int(general.get("cooldown_min", 30)),
             markets=markets,
             scheduler_tick_s=int(general.get("scheduler_tick_s", 60)),
+            quote_stale_s=int(general.get("quote_stale_s", 60)),
+            server=server,
         )
         settings.validate()
         return settings
@@ -110,6 +179,9 @@ class Settings:
             raise ValidationError("cooldown_min 不能为负")
         if self.scheduler_tick_s <= 0:
             raise ValidationError("scheduler_tick_s 必须为正数")
+        if self.quote_stale_s <= 0:
+            raise ValidationError("quote_stale_s 必须为正数")
+        self.server.validate()
         if not self.report_currency:
             raise ValidationError("report_currency 不能为空")
         for market, cfg in self.markets.items():
