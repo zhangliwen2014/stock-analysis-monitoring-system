@@ -47,6 +47,11 @@ def test_echo_must_name_the_code_we_asked_for():
     assert not echo_matches("A", "600519", "600518")
     assert not echo_matches("US", "AAPL", "MSFT.OQ")
     assert not echo_matches("HK", "00700", "")
+    # 同类股只差尾部段：裸代码相同而股类不同，回显比对不能把它们折成一只
+    assert echo_matches("US", "BRK.A", "BRK.A.N")
+    assert not echo_matches("US", "BRK.A", "BRK.B")
+    assert not echo_matches("US", "BRK.A", "BRK.B.N")
+    assert not echo_matches("US", "BRK.A", "BRK")
 
 
 def test_field_float_never_turns_garbage_into_zero():

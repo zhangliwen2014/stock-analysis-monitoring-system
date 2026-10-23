@@ -13,7 +13,8 @@ from datetime import datetime
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from sams.core.codes import canonical_code
+from sams.core.codes import canonical_code, canonical_market
+from sams.core.errors import ValidationError
 from sams.core.quotes import QuoteBatch, as_utc
 
 #: 一次请求问多少只。免费接口对 URL 长度与 QPS 都有脾气，50 是实测能稳过的量级
@@ -43,23 +44,29 @@ def chunks(items: list[str], size: int = QUOTE_BATCH) -> list[list[str]]:
 def echo_matches(market: str, requested: str, echoed: str) -> bool:
     """源回显的代码是不是我们问的那一只。
 
-    美股回显带交易所后缀（问 `AAPL` 回 `AAPL.OQ`），所以按点前的裸代码比；
-    A/HK 用 `canonical_code` 归一（`sh600519` 与 `600519` 同一只）。
-    回显不符必须整只拒绝：错一位就是把别家公司的价格写进这只票的键下。
+    美股回显带交易所后缀（问 `AAPL` 回 `AAPL.OQ`），所以认「与请求一致，或恰好多一个
+    尾部段」；不能按点前的裸代码比——`BRK.A` 与 `BRK.B` 是同一公司的两类股，裸代码
+    相同而语义不同，按裸代码比会把 B 类股的价格写进 A 类的键下。A/HK 用
+    `canonical_code` 归一（`sh600519` 与 `600519` 同一只）。回显不符必须整只拒绝：
+    错一位就是把别家公司的价格写进这只票的键下。
     """
     text = (echoed or "").strip()
     if not text:
         return False
-    if market == "US":
-        return text.split(".")[0].upper() == requested.split(".")[0].strip().upper()
+    if canonical_market(market) == "US":
+        req = requested.strip().upper()
+        text = text.upper()
+        return text == req or (text.startswith(req + ".") and text.count(".") == req.count(".") + 1)
     try:
         return canonical_code(market, text) == canonical_code(market, requested)
-    except ValueError:
+    except ValidationError:
         return False
 
 
 def field_float(fields: Sequence[str], index: int) -> float | None:
-    """按位置取一个数：空、缺位、`N/A`、NaN 一律 None，绝不折成 0。"""
+    """按位置取一个数：空、缺位、`N/A`、NaN 一律 None，绝不折成 0。
+    取不到数的调用方必须把它记进批次的 errors，不能只进 skipped——少了谁要让值班的人看见。
+    """
     try:
         text = fields[index]
     except IndexError:
