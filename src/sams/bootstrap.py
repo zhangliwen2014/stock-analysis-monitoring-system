@@ -102,8 +102,9 @@ def attach_log_sink(bus: EventBus) -> None:
 class AppCore:
     """进程级共享件：后台线程与 HTTP 线程都拿这一份（D113）。
 
-    `registry_db` 只服务 registry 的源健康落库；它不是任何线程上下文的那条连接。
-    `build_container` 让两者共用同一条连接，以保持 CLI「一个进程一条连接」的形状。
+    `registry_db` 只服务 registry 的源健康落库；在 serve（计划 14/15）里它不是任何
+    线程上下文的那条连接，而 `build_container` 让两者共用同一条连接，
+    以保持 CLI「一个进程一条连接」的形状。
     """
 
     settings: Settings
@@ -116,6 +117,8 @@ class AppCore:
     registry_db: Database
 
     def close(self) -> None:
+        # build_container 里 registry_db 与上下文共用同一条连接：两边各有一个 close，
+        # 重复 close 无害，关一边就够
         self.registry_db.close()
 
 
@@ -123,8 +126,8 @@ class AppCore:
 class ServiceContext:
     """一条线程的一整套仓库与服务：一条 DuckDB 连接，不跨线程（D113）。
 
-    每条上下文各造一台调度器，但只有调度线程会 `run_forever`；请求队列来自
-    `AppCore.requests`，所以别的线程 `request_run` 入队的是同一批请求。
+    每条上下文各造一台调度器，serve（计划 14/15）里只有调度线程会 `run_forever`；
+    请求队列来自 `AppCore.requests`，所以别的线程 `request_run` 入队的是同一批请求。
     """
 
     settings: Settings
@@ -301,8 +304,8 @@ def build_core(
     """进程级共享件，一次进程只造一份。
 
     `database` 给进来时（`build_container` 就这么做）registry 的源健康与 CLI 的其余
-    仓库共用一条连接；不给就自己开一条，只给 registry 用。quote 与调度两条线程
-    各开各的连接，不碰这一条。
+    仓库共用一条连接；不给就自己开一条，只给 registry 用。serve（计划 14/15）里
+    quote 与调度两条线程各开各的连接，不碰这一条。
     """
     cfg = settings or Settings.load()
     event_bus = bus or EventBus()
