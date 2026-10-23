@@ -3,7 +3,7 @@
 「模块化、边界清晰」这种要求只有被机器检查，才不会被下一个人顺手破坏，
 所以规则写在这里而不是文档里。
 
-  core  ←  storage / datasource  ←  services  ←  cli
+  core  ←  storage / datasource  ←  services  ←  web / cli
   bootstrap（组装根）是唯一可以同时认识所有实现的地方。
 """
 
@@ -34,7 +34,11 @@ ALLOWED: dict[str, set[str]] = {
     # 不许 import monitor——放宽这三项等于把 monitor 与 services 长成一块
     "monitor": {"core", "storage"},
     "trading": {"core", "storage", "services", "analysis"},
-    "cli": {"core", "services"},
+    # web 是 HTTP 适配器：业务判断住在 services，模板只拿视图数据。
+    # 它不认识 datasource：某个源能不能报价由 services 转述（D112），
+    # 否则模板会开始自己查能力表，页面的行为就不在服务层的测试里了
+    "web": {"core", "storage", "services"},
+    "cli": {"core", "services", "web"},
 }
 
 #: 组装根不受限（它的工作就是认识所有实现），但只有 cli 可以引用它取依赖
@@ -248,6 +252,15 @@ def test_monitor_may_only_reach_core_and_storage():
     「谁认识谁」这件事不再有一个可检查的答案。
     """
     assert ALLOWED["monitor"] == {"core", "storage"}
+
+
+def test_web_and_cli_do_not_reach_data_implementations():
+    """web 不认识 datasource，cli 不认识 storage/datasource（bootstrap 除外）。
+
+    放宽这两项不会当场报错，只会让「换存储只动一层」在第一次有人图方便时失效。
+    """
+    assert ALLOWED["web"] == {"core", "storage", "services"}
+    assert ALLOWED["cli"] == {"core", "services", "web"}
 
 
 def test_notify_transports_have_a_home_and_nowhere_else():
