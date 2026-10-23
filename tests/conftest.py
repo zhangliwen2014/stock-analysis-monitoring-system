@@ -54,3 +54,18 @@ def settings(tmp_path) -> Settings:
 def bars_frame() -> pl.DataFrame:
     """三天标准列集（数据本体见 support.bars_frame）：够验幂等与区间读取。"""
     return support.bars_frame()
+
+
+@pytest.fixture
+def migrated(settings) -> Settings:
+    """db_path 指向一个已迁移的临时文件库。
+
+    `build_core`/`build_context` 会各自 `Database.open` 同一个路径：内存库开不出
+    第二条连接，所以这一份必须是真文件（`settings` 夹具的 db_path 已经在 tmp_path 里）。
+    """
+    database = Database.open(settings.db_path)
+    try:
+        apply_migrations(database)
+    finally:
+        database.close()
+    return settings

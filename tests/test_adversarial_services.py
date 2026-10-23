@@ -166,17 +166,16 @@ def test_handler_exception_does_not_break_other_subscribers():
     assert not result.ok
 
 
-def test_rebuilding_container_on_same_bus_double_subscribes_the_log_sink(db, settings, caplog):
-    """已知边界：build_container 每次都往传入的 bus 上再挂一个 log sink，复用同一 bus 会重复告警行。
-
-    CLI 单进程只 build 一次，不受影响；常驻进程若复用 bus 需自己只挂一次 sink。
-    """
+def test_rebuilding_container_on_same_bus_keeps_one_log_sink(db, settings, caplog):
+    """同一个 bus 上只挂一个 log sink：反复装配不该让告警在日志里翻倍。"""
     bus = EventBus()
     build_container(settings, db=db, bus=bus, adapters=stub_all())
     build_container(settings, db=db, bus=bus, adapters=stub_all())
+
     with caplog.at_level(logging.ERROR, logger="sams.bootstrap"):
         bus.publish(SystemAlarm(component="dup", message="hello"))
-    assert caplog.text.count("hello") == 2, "同一 bus 上 sink 被挂了两次"
+
+    assert caplog.text.count("hello") == 1
 
 
 def test_health_service_survives_unmigrated_database(tmp_path, settings):

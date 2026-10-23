@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 from sams.core.calendar import CalendarProvider
 from sams.core.clock import SYSTEM_CLOCK, Clock
@@ -40,7 +41,7 @@ from sams.services.scheduler.alarms import SystemAlerter
 from sams.services.scheduler.beatfile import beat_path
 from sams.services.scheduler.jobs import build_jobs
 from sams.services.scheduler.runner import JobRunner
-from sams.services.scheduler.service import Scheduler
+from sams.services.scheduler.service import RunRequestQueue, Scheduler
 from sams.services.scheduler.types import JobDeps
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.services.screen import ScreenService
@@ -61,6 +62,7 @@ from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+from sams.storage.repos.quotes import QuoteHealthRepo, QuoteRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
@@ -74,22 +76,57 @@ from sams.storage.repos.watchlists import WatchlistRepo
 logger = logging.getLogger("sams.bootstrap")
 
 
+#: 已经挂过 sink 的总线。`serve` 里 core 只造一次，但 CLI 的测试与「重建装配」
+#: 会反复经过这里：同一个 bus 上挂两个 sink，一条系统告警会在日志里出现两遍。
+_SINKED: weakref.WeakSet[EventBus] = weakref.WeakSet()
+
+
 def attach_log_sink(bus: EventBus) -> None:
-    """让 SystemAlarm 至少有一条落地路径。
+    """让 SystemAlarm 至少有一条落地路径（同一个 bus 只挂一次）。
 
     总线没有订阅者时 publish 是静默 no-op：spec §12 的「采集连续失败降系统告警」
     会在没人察觉的情况下不成立。日志是那条最小路径，
     M3 的 admin 通知渠道订阅同一事件即可，不必改这里。
     """
+    if bus in _SINKED:
+        return
 
     def log_alarm(event: SystemAlarm) -> None:
         logger.error("[alarm] %s: %s", event.component, event.message)
 
     bus.subscribe(SystemAlarm, log_alarm)
+    _SINKED.add(bus)
+
+
+@dataclass(frozen=True)
+class AppCore:
+    """进程级共享件：后台线程与 HTTP 线程都拿这一份（D113）。
+
+    `registry_db` 只服务 registry 的源健康落库；它不是任何线程上下文的那条连接。
+    `build_container` 让两者共用同一条连接，以保持 CLI「一个进程一条连接」的形状。
+    """
+
+    settings: Settings
+    clock: Clock
+    bus: EventBus
+    cipher: Cipher
+    registry: AdapterRegistry
+    #: 手动请求队列：调度线程与 Web 共用，Web 的「立即同步」才落得到同一台调度器
+    requests: RunRequestQueue
+    registry_db: Database
+
+    def close(self) -> None:
+        self.registry_db.close()
 
 
 @dataclass
-class Container:
+class ServiceContext:
+    """一条线程的一整套仓库与服务：一条 DuckDB 连接，不跨线程（D113）。
+
+    每条上下文各造一台调度器，但只有调度线程会 `run_forever`；请求队列来自
+    `AppCore.requests`，所以别的线程 `request_run` 入队的是同一批请求。
+    """
+
     settings: Settings
     db: Database
     bus: EventBus
@@ -158,6 +195,11 @@ class Container:
     rule_deriver: RuleDeriver
     #: 周复检（§9.3，`sams rule recheck`）
     rule_rechecker: Rechecker
+    #: 报价快照与报价源健康：盘中线程写、Web 读，各走自己的连接
+    quotes_store: QuoteRepo
+    quote_health: QuoteHealthRepo
+    task_runs: TaskRunRepo
+    heartbeats: HeartbeatRepo
     #: 常驻调度器（spec §12）：`sams run start|once|jobs` 与健康页的 `[调度]` 读的是同一台
     scheduler: Scheduler
 
@@ -173,6 +215,11 @@ class Container:
 
     def applied_migrations(self) -> set[str]:
         return applied(self.db)
+
+
+@dataclass
+class Container(ServiceContext):
+    """CLI 的容器：与线程级上下文同一形状，名字留给 CLI 的签名。"""
 
 
 class _NotifyAlertSender:
@@ -243,21 +290,53 @@ def _registry(
     )
 
 
-def build_container(
+def build_core(
     settings: Settings | None = None,
     *,
-    db: Database | None = None,
-    bus: EventBus | None = None,
     clock: Clock | None = None,
+    bus: EventBus | None = None,
+    database: Database | None = None,
     adapters: dict[str, BarAdapter] | None = None,
-    providers: dict[str, CalendarProvider] | None = None,
-    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
-) -> Container:
+) -> AppCore:
+    """进程级共享件，一次进程只造一份。
+
+    `database` 给进来时（`build_container` 就这么做）registry 的源健康与 CLI 的其余
+    仓库共用一条连接；不给就自己开一条，只给 registry 用。quote 与调度两条线程
+    各开各的连接，不碰这一条。
+    """
     cfg = settings or Settings.load()
-    database = db or Database.open(cfg.db_path)
     event_bus = bus or EventBus()
     attach_log_sink(event_bus)
     clock = clock or SYSTEM_CLOCK
+    core_db = database or Database.open(cfg.db_path)
+    source_health = SourceHealthRepo(core_db)
+    data_sources = DataSourceRepo(core_db)
+    registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
+    return AppCore(
+        settings=cfg,
+        clock=clock,
+        bus=event_bus,
+        cipher=cipher_for(cfg),
+        registry=registry,
+        requests=RunRequestQueue(),
+        registry_db=core_db,
+    )
+
+
+def build_context(
+    core: AppCore,
+    *,
+    database: Database | None = None,
+    providers: dict[str, CalendarProvider] | None = None,
+    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
+) -> ServiceContext:
+    """一条线程的一整套仓库与服务。不传 `database` 时自己开一条（D113）。"""
+    cfg = core.settings
+    database = database or Database.open(cfg.db_path)
+    clock = core.clock
+    event_bus = core.bus
+    registry = core.registry
+    cipher = core.cipher
     bars = BarRepo(database)
     symbols = SymbolRepo(database)
     calendar_store = CalendarRepo(database)
@@ -272,8 +351,9 @@ def build_container(
     theses_store = ThesisRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
+    quotes_store = QuoteRepo(database)
+    quote_health = QuoteHealthRepo(database)
 
-    registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
     providers = providers if providers is not None else default_providers(cfg)
     calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
     fundamentals = FundamentalService(financials_store, valuation_store, clock=clock)
@@ -286,7 +366,6 @@ def build_container(
     ledger = LedgerService(sim_accounts, sim_orders, theses_store, users, cfg)
     fx_store = FxRepo(database)
     portfolio = PortfolioService(sim_accounts, sim_orders, bars, fx_store, users, clock=clock)
-    cipher = cipher_for(cfg)
     channels_store = ChannelRepo(database, cipher=cipher, clock=clock)
     alerts_store = AlertRepo(database, clock=clock)
     notify = NotifyService(
@@ -342,11 +421,6 @@ def build_container(
         theses=theses_store, data=rule_data, bus=event_bus, clock=clock
     )
 
-    # D102：系统告警与规则告警共用上面那个 sender，订阅的是同一条总线
-    SystemAlerter(
-        alerts=alerts_store, users=users, sender=sender, settings=cfg, clock=clock
-    ).attach(event_bus)
-
     # 下面四个同步服务与 `UniverseBuilder` 原本就地造在 `return Container(...)` 的参数里。
     # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
     # 测试替换或事后调一处参数，另一处照旧跑——症状不是报错，是「改了没生效」
@@ -395,9 +469,11 @@ def build_container(
         # 库被这个循环握着时，外部读者只能读库旁那一拍（D111）。
         # 内存库里 `beat_path` 是 `None`，什么也不写
         beat_path=beat_path(database.path),
+        # 所有上下文共用同一只队列：只有调度线程跑循环，但谁都能往里放请求
+        requests=core.requests,
     )
 
-    return Container(
+    return ServiceContext(
         settings=cfg,
         db=database,
         bus=event_bus,
@@ -447,6 +523,10 @@ def build_container(
         rule_service=rule_service,
         rule_deriver=rule_deriver,
         rule_rechecker=rule_rechecker,
+        quotes_store=quotes_store,
+        quote_health=quote_health,
+        task_runs=task_runs,
+        heartbeats=heartbeats,
         scheduler=scheduler,
         cipher=cipher,
         notify=notify,
@@ -466,4 +546,48 @@ def build_container(
             # 「它上一次写下结论是什么时候」
             schedule=scheduler.schedule_data,
         ),
+    )
+
+
+def attach_system_alerter(context: ServiceContext) -> SystemAlerter:
+    """把系统告警写进管理员收件箱；一个进程只挂一次。
+
+    `build_context` 不挂：`serve` 里每条线程一个上下文，各挂一次会让同一条系统告警
+    变成 N 条管理员告警。CLI 在 `build_container` 末尾挂；`serve` 在通知队列接入后
+    由 `Runtime` 挂一次（计划 2）。
+    """
+    alerter = SystemAlerter(
+        alerts=context.alerts_store,
+        users=context.users,
+        sender=_NotifyAlertSender(context.notify),
+        settings=context.settings,
+        clock=context.clock,
+    )
+    alerter.attach(context.bus)
+    return alerter
+
+
+def build_container(
+    settings: Settings | None = None,
+    *,
+    db: Database | None = None,
+    bus: EventBus | None = None,
+    clock: Clock | None = None,
+    adapters: dict[str, BarAdapter] | None = None,
+    providers: dict[str, CalendarProvider] | None = None,
+    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
+) -> Container:
+    """CLI 的单一入口：core 与上下文共用一条连接，形状与 M3 完全一致。"""
+    cfg = settings or Settings.load()
+    database = db or Database.open(cfg.db_path)
+    core = build_core(cfg, clock=clock, bus=bus, database=database, adapters=adapters)
+    context = build_context(
+        core,
+        database=database,
+        providers=providers,
+        notifier_factory=notifier_factory,
+    )
+    attach_system_alerter(context)
+    return Container(
+        **{field.name: getattr(context, field.name) for field in fields(context)}
     )

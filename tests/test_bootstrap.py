@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 import pytest
 from support import FrozenClock, StubAdapter, sample_bars
 
-from sams.bootstrap import attach_log_sink, build_container
+from sams.bootstrap import attach_log_sink, build_container, build_context, build_core
 from sams.core.events import EventBus, SystemAlarm
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
@@ -312,3 +312,42 @@ def test_health_carries_the_schedule_reading(container):
     assert report.schedule is not None
     assert {"bars", "rules", "fx"} <= {job.name for job in report.schedule.jobs}
     assert report.schedule.admins == 0
+
+
+def test_contexts_get_their_own_connection_but_share_the_core(migrated):
+    """DuckDB 同进程多连接共享同一个库；连接、事务深度、注册视图都不得跨线程。
+
+    调度器是每条上下文各造一台的对象，但请求队列是进程级的：从第二个上下文入队，
+    第一个上下文的那台调度器要能看见——否则 Web 的「立即同步」永远到不了调度线程。
+    """
+    core = build_core(migrated)
+    first = build_context(core)
+    second = build_context(core)
+    try:
+        assert first.db is not second.db
+        assert first.registry is core.registry
+        assert first.bus is core.bus and first.clock is core.clock
+        assert first.scheduler.requests is core.requests
+        first.users.create("alice", "correct-horse-battery")
+        assert second.users.get_by_username("alice") is not None
+
+        request = second.scheduler.request_run("bars", "A")
+        assert first.scheduler.pending_requests == 1
+        assert [item.id for item in first.scheduler.requests.drain()] == [request.id]
+    finally:
+        first.close()
+        second.close()
+        core.close()
+
+
+def test_attaching_the_log_sink_twice_still_logs_each_alarm_once(caplog):
+    """`serve` 只有一个进程一条总线：重建装配、或 core 与上下文各挂一次，
+    同一条系统告警都不该在日志里出现两遍。"""
+    bus = EventBus()
+    attach_log_sink(bus)
+    attach_log_sink(bus)
+
+    with caplog.at_level(logging.ERROR, logger="sams.bootstrap"):
+        bus.publish(SystemAlarm(component="dup", message="hello"))
+
+    assert caplog.text.count("hello") == 1
