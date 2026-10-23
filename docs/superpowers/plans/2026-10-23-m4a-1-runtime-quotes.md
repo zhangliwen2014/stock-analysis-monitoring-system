@@ -4043,6 +4043,7 @@ git commit -m "feat(scheduler): 手动同步排进下一拍，停止事件收得
 
 **Files:**
 - Modify: `src/sams/bootstrap.py`
+- Modify: `tests/conftest.py`（追加 `migrated` 夹具）
 - Test: `tests/test_bootstrap.py`、`tests/test_adversarial_services.py`
 
 拆分的判据只有一条：**连接属于线程**。`AppCore` 里放的是「全进程一份才正确」的东西（配置、时钟、总线、加密器、数据源路由、手动请求队列）；`ServiceContext` 是一条线程的一整套仓库与服务，各持一条 DuckDB 连接（D113）。调度器也在上下文里造，但只有调度线程会跑它；请求队列来自 `core.requests`，所以 Web 线程 `request_run` 入队的就是同一批请求。
@@ -4055,6 +4056,25 @@ git commit -m "feat(scheduler): 手动同步排进下一拍，停止事件收得
 
 ```python
 from sams.bootstrap import attach_log_sink, build_container, build_context, build_core
+```
+
+`tests/conftest.py` 末尾追加 `migrated` 夹具（`Database` 与 `apply_migrations` 文件头
+已经 import 过，不用再加）：
+
+```python
+@pytest.fixture
+def migrated(settings) -> Settings:
+    """db_path 指向一个已迁移的临时文件库。
+
+    `build_core`/`build_context` 会各自 `Database.open` 同一个路径：内存库开不出
+    第二条连接，所以这一份必须是真文件（`settings` 夹具的 db_path 已经在 tmp_path 里）。
+    """
+    database = Database.open(settings.db_path)
+    try:
+        apply_migrations(database)
+    finally:
+        database.close()
+    return settings
 ```
 
 追加两条用例：
