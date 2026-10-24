@@ -459,6 +459,17 @@ class RuleRepo:
         sql += " ORDER BY created_at, id"
         return [_to_rule(row) for row in self.db.query(sql, params).to_dicts()]
 
+    def list_enabled(self) -> list[Rule]:
+        """所有用户的启用规则（§5.3 盘中那一趟的入口）。
+
+        与 `list_for` 差在两维：跨全部用户、只 `enabled = TRUE`。次序按 user 再 id：
+        盘中一趟按用户逐个求值，读进来就聚好，调用方不必再排。
+        """
+        rows = self.db.query(
+            f"SELECT {_COLUMNS} FROM rules WHERE enabled = TRUE ORDER BY user_id, id"
+        )
+        return [_to_rule(row) for row in rows.to_dicts()]
+
     def by_thesis(self, thesis_id: str) -> list[Rule]:
         rows = self.db.query(
             f"SELECT {_COLUMNS} FROM rules WHERE thesis_id = ? ORDER BY created_at, id",
