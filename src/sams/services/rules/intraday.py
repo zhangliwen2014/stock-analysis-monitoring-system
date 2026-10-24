@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from sams.core.errors import SamsError
 from sams.core.rules import RULE_KINDS, is_intraday
+from sams.services.intraday import MarketPoll
 from sams.services.quotes import QuoteBoard
 from sams.storage.repos.rules import RuleRepo
 
@@ -33,7 +34,7 @@ class IntradayEvaluator:
         self.engine = engine
         self.board = board
 
-    def after_poll(self, outcomes: tuple) -> IntradayRound:
+    def after_poll(self, outcomes: tuple[MarketPoll, ...]) -> IntradayRound:
         """一轮报价之后的求值。有报价的市场才叫「活」：skip 与 fail 的市场不动。"""
         live = sorted(
             {

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from support_rules import NOW, USER, Harness
 
-from sams.core.errors import StorageError
+from sams.core.errors import SamsError, StorageError
 from sams.core.quotes import Quote
 from sams.services.intraday import MarketPoll
 from sams.services.quotes import QuoteBoard, QuotePollResult
@@ -84,10 +84,53 @@ def test_each_user_gets_its_own_pass_per_market(db, settings):
             calls.append((user_id, kw["market"]))
             return SimpleNamespace(raised=())
 
+    # 两个活市场：外层按用户（`users` 已按 id 排好，"u-rule" < "u-two"）、内层按市场
+    # （`live` 已 sorted，"A" < "HK"），于是每个用户 × 每个市场各一趟，次序固定可查
     q = quote()
-    got = IntradayEvaluator(h.rules, CountingEngine(), live_board(q)).after_poll(outcome(q))
-    assert set(calls) == {(USER, "A"), ("u-two", "A")}
+    hk = quote(market="HK", code="00700")
+    outcomes = (
+        MarketPoll("A", result=QuotePollResult(quotes=(q,), skipped=(), errors=(), sources=())),
+        MarketPoll(
+            "HK", result=QuotePollResult(quotes=(hk,), skipped=(), errors=(), sources=())
+        ),
+    )
+    got = IntradayEvaluator(h.rules, CountingEngine(), live_board(q)).after_poll(outcomes)
+    assert calls == [(USER, "A"), (USER, "HK"), ("u-two", "A"), ("u-two", "HK")]
+    assert got.markets == ("A", "HK")
     assert got.rules == 2 and got.hits == 0
+
+
+def test_a_failing_user_does_not_swallow_the_others(db, settings):
+    """引擎内部对**某个用户**这一趟崩了（`SamsError`）：不能吞掉别的用户，也不能拖垮整轮。
+
+    外层那条 `test_a_sams_error_is_isolated_not_fatal` 钉的是「读规则列表」整段崩，
+    这里钉的是循环体内部那道 per-(user, market) 的 `except`：删掉它，崩掉的那个用户会把
+    异常抛出 `after_poll`，后面的用户根本不跑，hits 也无从谈起。
+    """
+    h = Harness(db, settings)
+    h.add()
+    h.rules.create(
+        "u-two",
+        kind="stop.fixed",
+        name="另一条",
+        target_type="symbol",
+        target_ref="A/601088",
+        params={"price": 10.0},
+    )
+    calls: list[str] = []
+
+    class HalfBrokenEngine:
+        # u-rule 这一趟引擎内部坏了；u-two 正常返回一条触发
+        def check(self, user_id, **kw):
+            calls.append(user_id)
+            if user_id == USER:
+                raise SamsError("这一趟引擎内部坏了")
+            return SimpleNamespace(raised=(object(),))
+
+    q = quote()
+    got = IntradayEvaluator(h.rules, HalfBrokenEngine(), live_board(q)).after_poll(outcome(q))
+    assert calls == [USER, "u-two"]  # 两个用户都被试过：崩掉的不吞掉后面的
+    assert got.hits == 1  # 只算成功那一趟的触发
 
 
 def test_a_sams_error_is_isolated_not_fatal(db, settings):
