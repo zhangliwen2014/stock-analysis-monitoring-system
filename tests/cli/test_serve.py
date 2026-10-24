@@ -42,9 +42,10 @@ class FakeParts:
         self.loaded = loaded
         self.prepared = False
         self.closed = False
-        # `start()` 现在要把 core 顺手交给 ThreadContexts：替身得镜像真 ServeParts
-        # 的字段，否则接线测试炸的是替身的 AttributeError 而不是被测的接线
-        self.core = SimpleNamespace()
+        # `start()` 现在要把 core 顺手交给 ThreadContexts 与 create_app：替身得镜像
+        # 真 ServeParts 的字段，否则接线测试炸的是替身的 AttributeError 而不是被测的接线。
+        # create_app 要读 settings.server 才配得出登录闸，所以这半份配置不能省。
+        self.core = SimpleNamespace(settings=SimpleNamespace(server=ServerCfg()))
 
     def prepare(self):
         self.prepared = True

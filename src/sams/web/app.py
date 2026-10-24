@@ -10,17 +10,30 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.templating import Jinja2Templates
 
 from sams.bootstrap import AppCore
+from sams.core.errors import DatabaseLocked, SamsError
 from sams.services.runtime import Runtime
+from sams.web.auth import (
+    ACTIVE_COOKIE,
+    CSRF_COOKIE,
+    SESSION_COOKIE,
+    LoginLimiter,
+    LoginRequired,
+    _stamp_active,
+    require_user,
+)
+from sams.web.auth import router as auth_router
 from sams.web.context import ThreadContexts
 
 _STATIC = Path(__file__).parent / "static"
@@ -35,6 +48,16 @@ class WebState:
     core: AppCore
     contexts: ThreadContexts
     templates: Jinja2Templates
+    limiter: LoginLimiter
+
+    def render(self, request: Request, name: str, *, status_code: int = 200, **ctx):
+        from sams.web.auth import csrf_value
+
+        ctx.setdefault("csrf", csrf_value(request))
+        ctx.setdefault("user", getattr(request.state, "sams_user", None))
+        return self.templates.TemplateResponse(
+            request=request, name=name, context=ctx, status_code=status_code
+        )
 
 
 def create_app(
@@ -71,6 +94,69 @@ def create_app(
         core=core,
         contexts=contexts,
         templates=Jinja2Templates(directory=str(_TEMPLATES)),
+        limiter=LoginLimiter(
+            max_failures=core.settings.server.login_max_failures,
+            window_s=core.settings.server.login_window_min * 60,
+        ),
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
+
+    app.include_router(auth_router)
+
+    @app.get("/")
+    def home(request: Request):
+        """占位首页：Task 4 换成看板。它同时是认证测试的靶子。"""
+        require_user(request)
+        return app.state.web.render(request, "home.html", title="看板")
+
+    def _login_redirect(_request: Request, _exc: LoginRequired) -> RedirectResponse:
+        """会话失效要连 CSRF 与心跳一起抹掉：留任何一枚都是可用的半成品凭据。"""
+        response = RedirectResponse("/login", status_code=303)
+        for name in (SESSION_COOKIE, CSRF_COOKIE, ACTIVE_COOKIE):
+            response.delete_cookie(name, path="/")
+        return response
+
+    def _error_response(request: Request, status: int, title: str, error: str):
+        web = getattr(request.app.state, "web", None)
+        if web is None:
+            return PlainTextResponse(error, status_code=status)
+        return web.render(request, "error.html", status_code=status, title=title, error=error)
+
+    def _on_sams_error(request: Request, exc: SamsError):
+        status = 503 if isinstance(exc, DatabaseLocked) else 400
+        return _error_response(request, status, "出错了", str(exc))
+
+    def _on_http_error(request: Request, exc: StarletteHTTPException):
+        response = _error_response(request, exc.status_code, "打不开这一页", str(exc.detail))
+        if exc.headers:
+            for key, value in exc.headers.items():
+                response.headers[key] = value
+        return response
+
+    def _on_boom(request: Request, exc: Exception):
+        logger = logging.getLogger("sams.web")
+        logger.exception("页面 500：%s %s", request.method, request.url.path)
+        return _error_response(request, 500, "内部错误", "服务器内部错误，已记入日志")
+
+    app.add_exception_handler(LoginRequired, _login_redirect)
+    app.add_exception_handler(DatabaseLocked, _on_sams_error)
+    app.add_exception_handler(SamsError, _on_sams_error)
+    app.add_exception_handler(StarletteHTTPException, _on_http_error)
+    app.add_exception_handler(Exception, _on_boom)
+
+    @app.middleware("http")
+    async def security_and_active(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline';"
+            " script-src 'self'",
+        )
+        if getattr(request.state, "sams_user", None) is not None:
+            _stamp_active(response, request)
+        return response
+
     return app

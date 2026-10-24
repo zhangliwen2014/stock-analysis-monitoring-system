@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}SAMS{% endblock %} · SAMS</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/vendor/htmx.min.js" defer></script>
+  <script src="/static/vendor/echarts.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <nav class="topbar">
+    <a class="brand" href="/">SAMS</a>
+    {% if user %}
+    <div class="nav-links">
+      <a href="/">看板</a>
+      <a href="/watchlist">自选</a>
+      <a href="/portfolio">持仓</a>
+      <a href="/theses">论点</a>
+      <a href="/rules">规则</a>
+      <a href="/alerts">告警</a>
+      <a href="/settings">设置</a>
+      {% if user.is_admin %}<a href="/admin">管理</a>{% endif %}
+    </div>
+    <form method="post" action="/logout" class="inline-form">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <span class="muted">{{ user.username }}</span>
+      <button type="submit">退出</button>
+    </form>
+    {% endif %}
+  </nav>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

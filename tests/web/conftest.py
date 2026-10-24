@@ -116,3 +116,16 @@ def web_app(make_web_app):
             context=context,
             runtime=web.app.state.web.runtime,
         )
+
+
+@pytest.fixture
+def logged(web_app):
+    """已登录的 alice：client 里带着三枚 cookie，csrf 取签名前的那段。"""
+    response = web_app.client.post(
+        "/login",
+        data={"username": "alice", "password": "correct-horse-battery"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    web_app.csrf = web_app.client.cookies.get("sams_csrf").rpartition(".")[0]
+    return web_app
