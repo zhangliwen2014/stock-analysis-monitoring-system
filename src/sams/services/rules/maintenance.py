@@ -84,10 +84,14 @@ class RuleService:
         #: 不会因这一改而重读
         self.versions = versions
 
-    def _bump(self) -> None:
-        """写面动过就 bump：盘中缓存整表失效（§5.4）。没接闸的构造点静默跳过。"""
+    def _bump(self, kind: str = "rules") -> None:
+        """写面动过就 bump：盘中缓存整表失效（§5.4）。没接闸的构造点静默跳过。
+
+        默认响 `rules`，因为这一层的写几乎都动规则表；`edit` 回写论上价位时另外响一次
+        `theses`——`changed_since` 按种类各问各的，只响一头的另一头就读到旧快照。
+        """
         if self.versions is not None:
-            self.versions.bump("rules")
+            self.versions.bump(kind)
 
     # --- 写 -----------------------------------------------------------------------------
 
@@ -178,6 +182,8 @@ class RuleService:
                     **columns,
                 )
         self._bump()
+        if columns and before.thesis_id:
+            self._bump("theses")
         return EditReport(rule=moved, written_back=columns, thesis_id=before.thesis_id)
 
     def set_enabled(self, user_id: str, rule_id: str, enabled: bool) -> RuleView:

@@ -76,6 +76,41 @@ def test_edit_bumps_too(db, settings):
     assert gate.current("rules") == base + 1
 
 
+def test_edit_writing_back_to_a_thesis_bumps_theses_too(db, settings):
+    """改一条派生规则会回写论上的价位（`stop_price`），那一头也得响。
+
+    `changed_since` 是按种类各问各的（`core/version.py`）：只 bump `rules` 的话，
+    读「论的那几列」的使用者拿到的仍是旧快照，而屏幕上那条止损线已经动了。
+    """
+    gate = VersionGate()
+    service = make_service(db, settings, gate)
+    user = service.users.create(NAME, PWD)
+    thesis = service.theses.create(
+        user_id=user.id,
+        market="A",
+        code="601088",
+        style="value",
+        actor_id=user.id,
+        now=T0,
+        status="proposed",
+        stop_price=28.0,
+    )
+    added = service.add(
+        user.id,
+        kind="stop.fixed",
+        name="跌破 10 元",
+        target_type="symbol",
+        target_ref="A/601088",
+        params={"price": 10.0},
+        thesis_id=thesis.id,
+    )
+    before = gate.snapshot()
+    report = service.edit(user.id, added.rule.id, params={"price": 11.0})
+    assert report.written_back == {"stop_price": 11.0}
+    assert gate.current("rules") == before["rules"] + 1
+    assert gate.current("theses") == before["theses"] + 1
+
+
 def test_deriver_bumps_only_when_it_created_something(db, settings):
     gate = VersionGate()
     theses = ThesisRepo(db)

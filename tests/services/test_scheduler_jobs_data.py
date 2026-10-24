@@ -17,6 +17,7 @@ from support_fundamentals import StubFundamentalsAdapter
 from support_valuation import financial_rows, flow_rows, valuation
 
 from sams.core.errors import RateLimited
+from sams.core.version import VersionGate
 from sams.datasource.registry import AdapterRegistry
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalSyncService
@@ -135,6 +136,32 @@ def test_bars_job_is_incremental(db, settings):
     assert BarRepo(db).latest_date("A", "600519") == AS_OF
 
 
+def test_bars_job_bumps_the_version_gate(db, settings):
+    """写回来的日线必须让盘中缓存那一侧知道（§5.4）：`rows_affected` 就是那句「写了几行」。
+
+    这里不测缓存（缓存在 `test_rules_cache.py`），只测这一头有没有把闸敲响：
+    漏掉这一行的后果不是报错，是盘中线程拿着昨天的复权价继续判今天的规则。
+    """
+    gate = VersionGate()
+    BarRepo(db).upsert(
+        sample_bars(start=date(2024, 10, 24)).filter(pl.col("date") == date(2024, 10, 24))
+    )
+    adapter = RecordingBarsAdapter(
+        frame=sample_bars(start=date(2024, 10, 25)).filter(pl.col("date") == date(2024, 10, 25))
+    )
+    run_bars(
+        replace(deps(db, settings, bars=adapter), versions=gate), ctx("600519")
+    )
+    assert gate.current("bars") == 1
+
+
+def test_a_noop_bars_job_leaves_the_gate_alone(db, settings):
+    """一只票都没写就不 bump：清空整张缓存换来的是一次全市场重读，而库里什么都没变。"""
+    gate = VersionGate()
+    outcome = run_bars(replace(deps(db, settings), versions=gate), ctx())
+    assert outcome.rows_affected == 0 and gate.current("bars") == 0
+
+
 def test_bars_job_backfills_when_the_code_is_new(db, settings):
     adapter = RecordingBarsAdapter(frame=sample_bars())
     run_bars(deps(db, settings, bars=adapter), ctx("600519"))
@@ -219,6 +246,18 @@ def test_actions_job_skips_a_fully_covered_code(db, settings):
     assert outcome.errors == ()
     assert outcome.rows_affected == 0
     assert db.row_count("corp_actions") == 0
+
+
+def test_actions_job_bumps_the_gate_because_factors_moved(db, settings):
+    """公司行为改的是复权口径：只 bump 自己的表不够，盘中缓存的那份日线读数同样作废。
+
+    这一条与 `test_bars_job_bumps_the_version_gate` 是两处独立代码：`run_actions` 里那句
+    bump 删掉不会让上面那枚用例变红，而它的后果是除权那天整市场的止损线照旧价判。
+    """
+    gate = VersionGate()
+    outcome = run_actions(replace(deps(db, settings), versions=gate), ctx("601088"))
+    assert outcome.rows_affected > 0
+    assert gate.current("bars") == 1
 
 
 def test_build_jobs_registers_only_markets_with_capability(db, settings):
