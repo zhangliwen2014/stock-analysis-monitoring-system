@@ -68,8 +68,8 @@
     </label>
     <label>市场
       <select name="market">
-        {% for code in markets %}
-        <option value="{{ code }}"{% if loop.first %} selected{% endif %}>{{ code }}</option>
+        {% for option in markets %}
+        <option value="{{ option }}"{% if loop.first %} selected{% endif %}>{{ option }}</option>
         {% endfor %}
       </select>
     </label>
