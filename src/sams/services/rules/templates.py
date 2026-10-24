@@ -455,24 +455,32 @@ def tp_tiered(ask: Ask) -> Outcome:
 
 
 def _cross(ask: Ask, *, upward: bool) -> Outcome:
-    """两个 `price.cross_*` 的共用体：穿过去 = 前一根还在另一侧，这一根到了这一侧。
+    """两个 `price.cross_*` 的共用体：穿过去 = 上一根还在另一侧，这一根到了这一侧。
 
-    `>=` / `<=` 里带等号：前收盘**正好**压在线上也算在另一侧起跳——那是最典型的
-    回踩确认，把它算成「已经穿过了」会让这一天不报。
+    「上一根」有两处来处（§5.2）：盘中是**同一个交易日的上一轮报价**（`cross_from`），
+    日线是前收盘。`cross_from` 在手时**不**退回前收盘——那一跳该用两轮行情比，
+    退回昨收盘报的是更早那一段。`>=` / `<=` 里带等号：另一侧**正好**压在线上也算
+    从那侧起跳——那是最典型的回踩确认，把它算成「已经穿过了」会让这一天不报。
     """
     snapshot = ask.snapshot
     if snapshot.price is None:
         return Outcome(why_not=_no_price(snapshot))
-    if snapshot.prev_close is None:
+    if snapshot.cross_from is not None:
+        baseline, origin = snapshot.cross_from, "上一轮"
+    else:
+        baseline, origin = snapshot.prev_close, "前收盘"
+    if baseline is None:
         return Outcome(
-            why_not="没有前收盘：「穿」说的是从今天上一根到今天的这一跳，"
-            "只用现价判的话，一条早就在下面的线每个交易日都会重报一次"
+            why_not="没有可比较的另一侧（没有前收盘，也没有上一轮报价）："
+            "「穿」说的是从上一根到这一跳，只用现价判的话，一条早就在下面的线"
+            "每个交易日都会重报一次"
         )
     line = float(ask.params["price"])
-    if upward:
-        crossed = snapshot.prev_close <= line < snapshot.price
-    else:
-        crossed = snapshot.prev_close >= line > snapshot.price
+    crossed = (
+        baseline <= line < snapshot.price
+        if upward
+        else baseline >= line > snapshot.price
+    )
     if not crossed:
         return Outcome()
     verb = "上穿" if upward else "下穿"
@@ -483,7 +491,7 @@ def _cross(ask: Ask, *, upward: bool) -> Outcome:
             threshold=line,
             value_text=money(snapshot.price, snapshot.currency),
             threshold_text=money(line, snapshot.currency),
-            why=f"前收盘 {money(snapshot.prev_close, snapshot.currency)} 在线 "
+            why=f"{origin} {money(baseline, snapshot.currency)} 在线 "
             f"{money(line, snapshot.currency)} 的另侧，现价 "
             f"{money(snapshot.price, snapshot.currency)} 已{verb}",
         )
