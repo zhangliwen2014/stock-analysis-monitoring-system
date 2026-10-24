@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}改配置{% endblock %}
+{% block content %}
+<h1>改配置：{{ channel.name }}（{{ channel.kind }}）</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <p class="muted">已配置的键：{{ keys }}</p>
+  <p class="muted">
+    只填要覆盖的键。留空的那个键保持不变——屏幕上从来没有明文，
+    所以你也没法把旧值重打一遍。要删掉一个键就删掉这条通道重建。
+  </p>
+  <form method="post" action="/settings/channels/{{ channel.id }}/edit">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>配置（一行一个 key=value）
+      <textarea name="config" rows="4" placeholder="url=新的整条 webhook 地址">{{ config }}</textarea>
+    </label>
+    <button type="submit">保存</button>
+  </form>
+</section>
+
+<p><a href="/settings">返回设置</a></p>
+{% endblock %}

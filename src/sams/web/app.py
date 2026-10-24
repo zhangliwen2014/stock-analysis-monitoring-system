@@ -30,12 +30,13 @@ from sams.web.auth import (
     SESSION_COOKIE,
     LoginLimiter,
     LoginRequired,
+    RateCard,
     _stamp_active,
 )
 from sams.web.auth import router as auth_router
 from sams.web.context import ThreadContexts
 from sams.web.display import alert_status, hms, money, pct, state_label
-from sams.web.pages import alerts, dashboard, portfolio, rules, symbol, theses
+from sams.web.pages import alerts, dashboard, portfolio, rules, settings, symbol, theses
 
 _STATIC = Path(__file__).parent / "static"
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -59,6 +60,9 @@ class WebState:
     contexts: ThreadContexts
     templates: Jinja2Templates
     limiter: LoginLimiter
+    #: /settings/test-alert 的每用户 5 分钟一张卡（spec §6.3）：进程内的计数，
+    #: 重启就重置——这一条挡的是连点，不是攻击
+    test_alerts: RateCard
 
     def render(self, request: Request, name: str, *, status_code: int = 200, **ctx):
         from sams.web.auth import csrf_value
@@ -108,6 +112,7 @@ def create_app(
             max_failures=core.settings.server.login_max_failures,
             window_s=core.settings.server.login_window_min * 60,
         ),
+        test_alerts=RateCard(300),
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
@@ -116,6 +121,7 @@ def create_app(
     app.include_router(dashboard.router)
     app.include_router(portfolio.router)
     app.include_router(rules.router)
+    app.include_router(settings.router)
     app.include_router(symbol.router)
     app.include_router(theses.router)
 

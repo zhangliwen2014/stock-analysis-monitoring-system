@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}设置{% endblock %}
+{% block content %}
+<h1>设置</h1>
+{% if saved %}<p class="flash-ok">已保存。</p>{% endif %}
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+{% if probe %}
+<section class="card">
+  <h2>探针：{{ probe_label }}</h2>
+  {# 探针不写 notify_log（它不是告警），所以这一句是它唯一的现场答案 #}
+  <p>{{ probe.outcome }}｜试了 {{ probe.attempts }} 次{% if probe.error %}｜{{ probe.error }}{% endif %}</p>
+</section>
+{% endif %}
+
+{% if dispatch %}
+<section class="card">
+  <h2>测试告警的投递</h2>
+  <ul>
+    {% for item in dispatch.deliveries %}
+    <li>{{ item.kind or "没有选到通道" }} → {{ item.outcome }}{% if item.error %}｜{{ item.error }}{% endif %}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>资料</h2>
+  <p class="muted">登录名 {{ user.username }}</p>
+  <form method="post" action="/settings/profile" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>显示名 <input type="text" name="display_name" value="{{ user.display_name }}"></label>
+    <button type="submit">保存</button>
+  </form>
+  <p class="muted">显示名只是页面上的称呼，登录还是用上面那个名字。</p>
+</section>
+
+<section class="card">
+  <h2>改密码</h2>
+  <form method="post" action="/settings/password">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>当前密码 <input type="password" name="current" required></label>
+    <label>新密码 <input type="password" name="new" required></label>
+    <button type="submit">改密码并下线其他设备</button>
+  </form>
+  <p class="muted">改完这台机器还留着登录状态，别的设备要重新登录。</p>
+</section>
+
+<section class="card">
+  <h2>免打扰</h2>
+  <p class="muted">三格全空=清除；strong 级不受挡。跨午夜写成 23:00 / 07:00。</p>
+  <form method="post" action="/settings/dnd" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="time" name="dnd_start" value="{{ dnd.start }}">
+    <input type="time" name="dnd_end" value="{{ dnd.end }}">
+    <input type="text" name="dnd_tz" value="{{ dnd.tz }}" placeholder="Asia/Shanghai">
+    <button type="submit">保存</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>通知通道</h2>
+  <table>
+    <tr>
+      <th>名字</th><th>类型</th><th>默认</th><th>状态</th>
+      <th>最近成功</th><th>最近错误</th><th>操作</th>
+    </tr>
+    {% for row in channels %}
+    <tr>
+      <td>{{ row.name }}</td>
+      <td class="muted">{{ row.kind }}</td>
+      <td>{{ "默认" if row.is_default else "" }}</td>
+      <td>{{ "启用" if row.enabled else "停用" }}</td>
+      {# 时刻已按 display_tz 折成文字（`pages/settings.py` 的 `_channel_rows`） #}
+      <td>{{ row.ok_at }}</td>
+      <td>
+        {% if row.error %}{{ row.error }}<span class="muted"> {{ row.error_at }}</span>{% else %}—{% endif %}
+      </td>
+      <td class="row-actions">
+        <a href="/settings/channels/{{ row.id }}/edit">改配置</a>
+        <form method="post" class="inline-form"
+          action="/settings/channels/{{ row.id }}/{{ "disable" if row.enabled else "enable" }}">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">{{ "停用" if row.enabled else "启用" }}</button>
+        </form>
+        <form method="post" class="inline-form" action="/settings/channels/{{ row.id }}/probe">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">发探针</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="muted">还没有通道：告警发不出去时先来这里加一条</td></tr>
+    {% endfor %}
+  </table>
+
+  <h3>添加通道</h3>
+  <form method="post" action="/settings/channels">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>类型
+      <select name="kind">
+        {% for kind in kinds %}<option value="{{ kind }}">{{ kind }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>名字 <input type="text" name="name" required></label>
+    <label>配置（一行一个 key=value）
+      <textarea name="config" rows="3"
+        placeholder="url=整条 webhook 地址（key 就在那条地址里）"></textarea>
+    </label>
+    <button type="submit">添加</button>
+  </form>
+  <p class="muted">desktop 与 voice 是本机通道，没有要配的字段，那一格空着就行。</p>
+</section>
+
+<section class="card">
+  <h2>测试告警</h2>
+  <p class="muted">每 5 分钟一条：走一遍真实选路与免打扰，结果直接显示在页面上。</p>
+  <form method="post" action="/settings/test-alert" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">发一条测试告警</button>
+  </form>
+</section>
+{% endblock %}
