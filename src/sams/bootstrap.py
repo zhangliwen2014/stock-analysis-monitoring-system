@@ -272,6 +272,7 @@ class _NotifyAlertSender:
         channel_ids: Sequence[str] = (),
         rule_id: str | None = None,
         account_id: str | None = None,
+        is_test: bool = False,
     ) -> str:
         return self._notify.dispatch(
             message,
@@ -279,6 +280,7 @@ class _NotifyAlertSender:
             channel_ids=channel_ids,
             rule_id=rule_id,
             account_id=account_id,
+            is_test=is_test,
         ).alert_id
 
 

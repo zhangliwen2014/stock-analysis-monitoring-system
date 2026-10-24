@@ -174,6 +174,10 @@ class AlertSender(Protocol):
 
     参数表与 `NotifyService.dispatch` 逐字对齐（`tests/core/test_notify_alert_sender.py`
     钉这一条）：差一个参数名，红的是 M3-D 挂机跑到某条规则时，而不是这里。
+
+    `is_test` 不属于引擎：它只会按 `False` 走（规则告警与系统告警都是真的）。它在端口
+    上是因为 `NotifyService.dispatch` 有这一格（`/settings/test-alert` 要按 D131 记下
+    「这条是测试」），而两份参数表差一个字就是「接得上」这句话没被钉住。
     """
 
     def dispatch(
@@ -184,4 +188,5 @@ class AlertSender(Protocol):
         channel_ids: Sequence[str] = (),
         rule_id: str | None = None,
         account_id: str | None = None,
+        is_test: bool = False,
     ) -> str: ...

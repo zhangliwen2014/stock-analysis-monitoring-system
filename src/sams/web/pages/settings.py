@@ -15,13 +15,17 @@
 两道闸的形状值得单说：
 
 * 归属闸写在每一次写之前（`_own_channel`）。`ChannelRepo.update_config`/`set_enabled`
-  都不收 `user_id`，少了这一道就是拿着别人的 id 改别人的行。
+  都不收 `user_id`，少了这一道就是拿着别人的 id 改别人的行；改配置因此走
+  `NotifyService.update_config`——它认 `user_id`，而且与 `add` 同一道工厂闸，
+  拼错的值进不了库（进了就是「配了却不发」）。
 * 改密码走 `authenticate` + `set_password` + `revoke_others`，**不**走
   `AccountService.reset_password`：那个服务只会 `revoke_all`，会把人刚站着改密码的
   这台机器一起踢下线。
 
 时刻全部在 Python 里折到 `display_tz` 才上屏（`display.moment_label`）：模板不碰
-datetime。仓库调用全在端点体内走 `web.contexts.current()`（D113）。
+datetime，页面模块也不 `strftime`——连回填 `<input type=time>` 那一格都住在
+`display.hhmm`，一个屏幕上认得出的时钟写法只有一个出处。仓库调用全在端点体内走
+`web.contexts.current()`（D113）。
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from sams.core.errors import DatabaseLocked, SamsError, ValidationError
 from sams.core.notify import KINDS, MID, SYSTEM_MARKET, AlertMessage
 from sams.storage.repos.channels import Channel
 from sams.web.auth import audit, csrf_protect, require_user
-from sams.web.display import moment_label
+from sams.web.display import hhmm, moment_label
 from sams.web.forms import form_data, one
 
 router = APIRouter()
@@ -93,12 +97,6 @@ def _clock_time(text: str, label: str) -> dtime | None:
         raise ValidationError(f"{label} 要的是 HH:MM（24 小时），收到 {cleaned!r}") from exc
 
 
-def _hhmm(value: dtime | None) -> str:
-    """回填 `<input type=time>` 的写法：到分。带秒的那一份这个控件收不下，
-    浏览器会把它当成没填——于是「打开看一眼」就成了一次清除窗口的提交。"""
-    return "" if value is None else value.strftime("%H:%M")
-
-
 def _channel_rows(ctx, channels: list[Channel], tz: str) -> list[dict[str, object]]:
     """通道那一表的行。`last_ok_at`/`last_error_at` 在这里折成文字，模板不碰 datetime。"""
     return [
@@ -141,10 +139,10 @@ def _page(
         status_code=status_code,
         channels=_channel_rows(ctx, ctx.channels_store.list_for(user.id), tz),
         kinds=KINDS,
-        # 框里的值是库里那一双折出来的文字：`time` 对象直接渲染会带着秒（见 `_hhmm`）
+        # 框里的值是库里那一双折出来的文字：`time` 对象直接渲染会带着秒（见 `display.hhmm`）
         dnd={
-            "start": _hhmm(user.dnd_start),
-            "end": _hhmm(user.dnd_end),
+            "start": hhmm(user.dnd_start),
+            "end": hhmm(user.dnd_end),
             "tz": user.dnd_tz or "",
         },
         error=error,
@@ -190,6 +188,10 @@ def save_password(
     # 当前密码要验：这一页开着不等于人不在旁边（离开座位两分钟就是一次改密机会）。
     # `authenticate` 顺带刷了 `last_login_at`，可接受：那是登录审计，不是这里的判据
     if ctx.users.authenticate(user.username, one(data, "current")) is None:
+        # 失败也留一行：「有人试过这台账号的密码」是几天后要回头看的那件事。
+        # 只留日志，不上锁也不限速——这个会话已经改得动显示名、清得掉免打扰、
+        # 停得了通道，多一道闸挡不住真正的攻击者，却可能把人锁在自己的改密页外面
+        audit(request, action="settings.password", target=user.id, ok=False, detail="current")
         return _page(request, status_code=400, error="当前密码不对")
     try:
         # 长度与那 72 字节的闸都在仓库（`MIN_PASSWORD_LEN`），这里不复写一遍
@@ -294,8 +296,12 @@ def save_channel(
     ctx = request.app.state.web.contexts.current()
     channel = _own_channel(ctx, channel_id, user.id)
     try:
-        # 只写填了的那些键：空值=不动（见 `ChannelRepo.update_config` 的那段为什么）
-        ctx.channels_store.update_config(channel.id, _parse_config(one(data, "config")))
+        # 只写填了的那些键：空值=不动（见 `ChannelRepo.update_config` 的那段为什么）。
+        # 走 `NotifyService.update_config` 而不是仓库：它跟 `add` 共用同一道闸——
+        # 工厂先跑，跑不过就在落库之前被拒，库里不会躺一条「配了却不发」的通道
+        ctx.notify.update_config(
+            channel.id, _parse_config(one(data, "config")), user_id=user.id
+        )
     except DatabaseLocked:
         raise
     except SamsError as exc:
@@ -341,8 +347,14 @@ def disable_channel(request: Request, channel_id: str, _csrf: None = Depends(csr
 @router.post("/settings/channels/{channel_id}/probe")
 def probe_channel(request: Request, channel_id: str, _csrf: None = Depends(csrf_protect)):
     user = require_user(request)
-    ctx = request.app.state.web.contexts.current()
+    web = request.app.state.web
+    ctx = web.contexts.current()
     channel = _own_channel(ctx, channel_id, user.id)
+    wait = web.probes.try_take(user.id)
+    if wait:
+        # 每用户一张卡（`WebState.probes`）：这一条也会真发到手机上，而它跑的
+        # 是三次带退避的尝试，就压在这条线程池线程上
+        raise HTTPException(status_code=429, detail=f"探针每 30 秒一次：请再等 {wait} 秒")
     try:
         # 一次真发送（带退避重试）就发生在这个网页线程里，而且不写 `notify_log`：
         # 探针不是告警，但它会改变那条通道在健康页上的状态
@@ -375,11 +387,12 @@ def test_alert(request: Request, _csrf: None = Depends(csrf_protect)):
         body=_TEST_BODY,
     )
     try:
-        # 记一条真告警再走一遍投递：与 `queue.py` 那个 worker 同一条链，所以「测试」
-        # 走的选路、免打扰与 `notify_log` 与真告警一字不差。`is_test` 让它不进
-        # `no_open_alert` 与健康积压（D131）
-        alert = ctx.notify.record(message, user_id=user.id, is_test=True)
-        dispatch = ctx.notify.deliver_existing(alert.id)
+        # 与真告警共用 `NotifyService.dispatch` 那一条链：记一行 `alerts`、再走
+        # `deliver_existing` 的选路、免打扰与 `notify_log`，所以「测试」这两个字
+        # 不换任何口径。**不**经过 `AlertQueue`：这个 id 没有交给队列，那个 worker
+        # 看不见它，所以不存在第二次发送（`queue.py` 那条链是调度线程的）。
+        # `is_test=True` 让它不进 `no_open_alert` 与健康积压（D131）
+        dispatch = ctx.notify.dispatch(message, user_id=user.id, is_test=True)
     except DatabaseLocked:
         raise
     except SamsError as exc:
@@ -387,7 +400,7 @@ def test_alert(request: Request, _csrf: None = Depends(csrf_protect)):
     audit(
         request,
         action="settings.test_alert",
-        target=alert.id,
+        target=dispatch.alert_id,
         ok=dispatch.any_sent,
         detail=f"deliveries={len(dispatch.deliveries)}",
     )

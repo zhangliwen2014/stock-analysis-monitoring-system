@@ -13,7 +13,7 @@ import pytest
 from support import FrozenClock
 
 from sams.core.errors import StorageError, ValidationError
-from sams.storage.crypto import cipher_for
+from sams.storage.crypto import MASK_PREFIX, cipher_for
 from sams.storage.repos.channels import (
     Channel,
     ChannelRepo,
@@ -256,3 +256,25 @@ def test_update_config_can_add_a_key_and_refuses_an_unknown_channel(repo, seeded
 
     with pytest.raises(StorageError, match="不存在"):
         repo.update_config("nope", {"url": "https://x"})
+
+
+def test_update_config_refuses_a_mask_as_if_it_were_a_credential(repo, seeded_user):
+    """`***` 开头的一律不是凭据：那是 `mask_secret` 画在屏幕上的样子，不是值。
+
+    今天表单不收掩码，但「把屏幕上那份填回输入框」这类改动迟早会有人做——一旦做成，
+    库里那条真的 webhook 就被 `***` 覆盖掉了，而屏幕上看着一切正常。在这一刀拦下来
+    比在每一个调用方记得拦下来可靠。
+    """
+    channel = create(repo, seeded_user, token="old-token-value")
+    masked = repo.show(channel.id).config
+    assert masked["token"].startswith(MASK_PREFIX)
+    assert masked["url"].startswith(MASK_PREFIX)
+
+    for key, value in masked.items():
+        with pytest.raises(ValidationError, match="掩码"):
+            repo.update_config(channel.id, {key: value})
+
+    assert repo.credentials(channel.id) == {
+        "url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc123456789",
+        "token": "old-token-value",
+    }, "被拒的一次写入一个字都不该留下"

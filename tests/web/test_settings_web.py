@@ -1,4 +1,4 @@
-"""设置页：资料、密码（踢别的设备）、免打扰、通道维护、测试告警限频。
+"""设置页：资料、密码（踢别的设备）、免打扰、通道维护、测试告警与探针限频。
 
 这里断言的都是只有页面会弄错的事：状态码、哪一格进了库、谁的行被动过。
 仓库与路由自己的规矩（密码长度、时区合法性、默认通道不能停用、参数的措辞）不在这里
@@ -6,12 +6,14 @@
 
 不联网是这些用例能跑的前提：fixture 里 alice 一条通道都没有，所以
 `deliver_existing` 在选路那一步就答 `no_channel`（不发送）；`wecom` 用的地址是
-`example.invalid`，只落库。探针真的会发东西，那段行为由 monitor 层自己的测试覆盖
-（`tests/monitor/test_router.py`），这里只钉它接的是哪根线、以及归属闸挡在它前面。
+`example.invalid`，只落库。探针真的会发东西，所以那一段把 `requests.post` 换成替身：
+留住的正是「点按钮 → 建工厂 → 打到那条 url → 结论回到这一屏」这根接线，
+而退避重试那些细节仍由 monitor 层自己覆盖（`tests/monitor/test_router.py`）。
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import time
 
 from sams.core.errors import DatabaseLocked
@@ -47,8 +49,44 @@ def _add(logged, *, name="主群", kind="wecom", config="url=https://example.inv
     )
 
 
+def _probe(logged, channel_id):
+    return logged.client.post(
+        f"/settings/channels/{channel_id}/probe",
+        data={"csrf": logged.csrf},
+        follow_redirects=False,
+    )
+
+
+def _stub_network(monkeypatch) -> list:
+    """把探针与发送共用的那一个网络出口（`requests.post`）换成替身，记下它收到过的 url。
+
+    换的是最外面那一层，所以工厂、正文构造、`errcode` 那一刀、`mark_ok` 全照真走。
+    返回的替身对象带 `.json()`：`_real_post` 拿的就是 `requests` 的响应对象。
+    """
+    seen: list[str] = []
+
+    class Reply:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict:
+            return {"errcode": 0, "errmsg": "ok"}
+
+    def fake_post(url, **_kwargs):
+        seen.append(url)
+        return Reply()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    return seen
+
+
 def test_settings_page_renders(logged):
-    assert logged.client.get("/settings").status_code == 200
+    page = logged.client.get("/settings")
+    assert page.status_code == 200
+    # 页面真正拥有的三样：这个人是谁、免打扰此刻是空的、还没有通道
+    assert "登录名 alice" in page.text
+    assert 'name="dnd_start" value=""' in page.text
+    assert "还没有通道" in page.text
 
 
 def test_profile_saves_display_name(logged):
@@ -100,6 +138,27 @@ def test_password_change_keeps_this_device_and_drops_the_others(logged):
     assert logged.client.get("/settings").status_code == 200
 
 
+def test_a_wrong_current_password_is_denied_in_the_log(logged, caplog):
+    """改密码失败也要留一行审计：每一次「有人试过这台账号的密码」都值得回头看一眼。
+
+    只留日志、**不**上锁或限速：这个会话已经能改显示名、清免打扰、动通道，多一道
+    闸挡不住真正的攻击者，却可能把人锁在自己的改密页外面。
+    """
+    ctx = logged.context
+    other = ctx.sessions.issue(_alice_id(logged))
+    with caplog.at_level(logging.INFO, logger="sams.web"):
+        resp = logged.client.post(
+            "/settings/password",
+            data={"csrf": logged.csrf, "current": "guess-me-not", "new": NEW_PASSWORD},
+            follow_redirects=False,
+        )
+    assert resp.status_code == 400
+    assert "deny settings.password" in caplog.text
+    assert "current" in caplog.text, "那一句要说清失败的是哪一格"
+    assert ctx.users.authenticate("alice", PASSWORD) is not None
+    assert ctx.sessions.verify(other) is not None
+
+
 def test_a_too_short_new_password_changes_nothing(logged):
     """密码长度的闸在仓库（`MIN_PASSWORD_LEN`），这里只转述；被拒时连会话都不该动。"""
     ctx = logged.context
@@ -147,6 +206,22 @@ def test_dnd_saves_clears_and_rejects_partial(logged):
     )
     assert partial.status_code == 400
     assert "三个一起给" in partial.text
+
+
+def test_a_window_stored_with_seconds_still_fills_the_box_as_hhmm(logged):
+    """`<input type=time>` 收不下秒：库里那条带了秒，屏幕上也得折成 HH:MM。
+
+    折不好不是「不好看」而是静默丢数据——浏览器把认不出的 value 当成没填，
+    于是「打开看一眼」再按保存就成了一次清除窗口的提交。折算住在 `display.hhmm`。
+    """
+    ctx = logged.context
+    ctx.users.set_dnd(
+        _alice_id(logged), start=time(23, 0, 30), end=time(7, 30, 15), tz="Asia/Shanghai"
+    )
+    page = logged.client.get("/settings")
+    assert 'name="dnd_start" value="23:00"' in page.text
+    assert 'name="dnd_end" value="07:30"' in page.text
+    assert "23:00:30" not in page.text
 
 
 def test_dnd_rejects_a_zone_that_does_not_resolve(logged):
@@ -253,6 +328,32 @@ def test_an_empty_box_on_the_edit_page_changes_nothing(logged):
     assert ctx.channels_store.credentials(channel.id) == before
 
 
+_EMAIL_CONFIG = (
+    "host=smtp.example.com\nuser=me@example.com\npassword=an-auth-code\nto=me@example.com"
+)
+
+
+def test_edit_refuses_a_config_the_factory_does_not_accept(logged):
+    """改配置与新增走同一道闸：工厂先跑，跑不过就一个字都不落库。
+
+    新增那一条本来就过工厂（`NotifyService.add`），编辑过去绕过它——于是一个拼错的
+    `port` 会躺在库里，通道在选路时被静默跳过，人看到的是「配了却不发」。
+    """
+    ctx = logged.context
+    _add(logged, name="邮箱", kind="email", config=_EMAIL_CONFIG)
+    channel = _only(logged)
+    before = ctx.channels_store.credentials(channel.id)
+
+    resp = logged.client.post(
+        f"/settings/channels/{channel.id}/edit",
+        data={"csrf": logged.csrf, "config": "port=not-a-number"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+    assert "端口非法" in resp.text, "念的是工厂那句话，页面不自建第二套措辞"
+    assert ctx.channels_store.credentials(channel.id) == before, "被拒的一次写入一个字都不留"
+
+
 def test_the_edit_page_shows_keys_and_no_values(logged):
     """屏幕上只可能出现掩码视图：键名上屏（要让人认出哪一格配过），值一个都不上。
     `credentials()` 仍是明文唯一出口，页面上也没有「看一眼明文」那个开关。"""
@@ -337,6 +438,41 @@ def test_database_locked_is_503_not_404(logged, monkeypatch):
         ).status_code
         == 503
     )
+
+
+def test_probe_on_my_own_channel_hits_that_url_and_reports_back(logged, monkeypatch):
+    """接对了线那一句：按下去 → 建工厂 → 打到这条通道自己的 url → 结论回到这一屏。
+
+    网络换成替身（`requests.post`），其余全真走：探针不写 `notify_log`，但它会
+    `mark_ok`——那条通道在健康页上的状态确实变了，屏幕上要同时看得见。
+    """
+    ctx = logged.context
+    seen = _stub_network(monkeypatch)
+    _add(logged)
+    channel = _only(logged)
+
+    resp = _probe(logged, channel.id)
+    assert resp.status_code == 200
+    assert seen == ["https://example.invalid/hook"]
+    assert "探针：主群" in resp.text, "那一块要带着通道名字：报告里没有 name"
+    assert "sent" in resp.text
+    assert ctx.channels_store.show(channel.id).last_ok_at is not None
+
+
+def test_probe_is_rate_limited(logged, monkeypatch):
+    """探针与测试告警一样会真发到手机上，而且一次跑三趟带退避：它也该有一张卡。
+
+    窗口比测试告警短（30 秒）：排障时人要连着试几条，而连点依然是要挡的。
+    """
+    seen = _stub_network(monkeypatch)
+    _add(logged)
+    channel = _only(logged)
+
+    assert _probe(logged, channel.id).status_code == 200
+    second = _probe(logged, channel.id)
+    assert second.status_code == 429
+    assert "再等" in second.text
+    assert len(seen) == 1, "那张卡挡在发送之前：被拒的一次不该再打一次网络"
 
 
 def test_test_alert_is_recorded_and_rate_limited(logged):

@@ -11,6 +11,7 @@ from __future__ import annotations
 import hmac
 import logging
 import secrets
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -72,20 +73,27 @@ class LoginLimiter:
 
 
 class RateCard:
-    """固定间隔的令牌：try_take 返回 0 表示放行，否则返回要等的秒数。"""
+    """固定间隔的令牌：try_take 返回 0 表示放行，否则返回要等的秒数。
+
+    读—判—写在同一把锁里：端点跑在线程池上，两个标签页可能同时按同一个按钮。
+    少了这把锁，那句「每 5 分钟一条」会变成「大概每 5 分钟一条」——两次并发都读到
+    空，于是各放行一次，手机上就真多出一条告警。锁只护这张表本身，发送在锁外。
+    """
 
     def __init__(self, interval_s: int, *, now=time.monotonic) -> None:
         self.interval_s = interval_s
         self._now = now
         self._last: dict[str, float] = {}
+        self._lock = threading.Lock()
 
     def try_take(self, key: str) -> int:
-        now = self._now()
-        last = self._last.get(key)
-        if last is not None and now - last < self.interval_s:
-            return int(self.interval_s - (now - last)) + 1
-        self._last[key] = now
-        return 0
+        with self._lock:
+            now = self._now()
+            last = self._last.get(key)
+            if last is not None and now - last < self.interval_s:
+                return int(self.interval_s - (now - last)) + 1
+            self._last[key] = now
+            return 0
 
 
 def client_ip(request: Request) -> str:

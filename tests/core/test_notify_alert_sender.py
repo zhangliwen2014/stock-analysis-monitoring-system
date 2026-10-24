@@ -36,6 +36,7 @@ class _Stub:
         channel_ids=(),
         rule_id=None,
         account_id=None,
+        is_test=False,
     ) -> str:
         return "alert-1"
 
@@ -54,6 +55,7 @@ class _FakeNotify:
         channel_ids=(),
         rule_id=None,
         account_id=None,
+        is_test=False,
     ) -> DispatchResult:
         self.calls.append(
             {
@@ -62,6 +64,7 @@ class _FakeNotify:
                 "channel_ids": channel_ids,
                 "rule_id": rule_id,
                 "account_id": account_id,
+                "is_test": is_test,
             }
         )
         #: 那条 `DispatchResult` 里除了 id 还有每通道的 `DeliveryReport`：那些留在
@@ -104,6 +107,11 @@ def test_the_production_adapter_folds_the_result_into_its_id() -> None:
     assert list(call["channel_ids"]) == ["c-1", "c-2"]
     assert call["rule_id"] == "r-1" and call["account_id"] == "acc-1"
     assert call["message"] is not None
+    # 引擎只会按 `False` 走，而那一句也要真的递过去：适配器上少一个参数，
+    # 端口那张参数表就只是一份愿望
+    assert call["is_test"] is False
+    adapter.dispatch(message(), user_id="u-rule", is_test=True)
+    assert fake.calls[1]["is_test"] is True
 
 
 def test_the_production_adapter_answers_the_port() -> None:

@@ -221,14 +221,20 @@ class NotifyService:
         channel_ids: Sequence[str] = (),
         rule_id: str | None = None,
         account_id: str | None = None,
+        is_test: bool = False,
     ) -> DispatchResult:
-        """记录这条告警，然后把它送出去。**只写 `notify_log`，不碰 `alerts.status`**。"""
+        """记录这条告警，然后把它送出去。**只写 `notify_log`，不碰 `alerts.status`**。
+
+        `is_test` 一路交给 `record`（D131）：测试告警要能走完整条链，又不该被算进
+        `no_open_alert` 与健康积压。默认 False，所以调度那一条链一字不改。
+        """
         alert = self.record(
             message,
             user_id=user_id,
             channel_ids=channel_ids,
             rule_id=rule_id,
             account_id=account_id,
+            is_test=is_test,
         )
         return self.deliver_existing(alert.id)
 
@@ -257,6 +263,26 @@ class NotifyService:
         """
         self._build(kind, config)  # 未知 kind / 缺必填字段 → ValidationError，从这里抛出去
         return self.channels.create(user_id, kind, name, config)
+
+    def update_config(
+        self, channel_id: str, updates: Mapping[str, object], *, user_id: str | None = None
+    ) -> Channel:
+        """改配置也要先过工厂，与 `add` 那一道闸一字不差：**落库之前**。
+
+        绕过它会发生的事不是报错，是库里躺下一条永远发不出去的通道——一个拼错的 `port`
+        或缺一个必填的键，选路时工厂建不出实现，用户看到的是「配了却不发」（`add` 的
+        文档记的就是同一个后果）。所以这里拿合并后的明文（`credentials` 是明文唯一出口）
+        问一次工厂，跑不过就一个字都不写。
+
+        合并前先扔掉空值：那是 `ChannelRepo.update_config` 的合并语义（空值=保持不变，
+        编辑表单从不回显明文），问工厂的那一份必须**就是**要落库的那一份，否则
+        「这一格留空」会被当成「把 url 清空」拒掉，而仓库其实一个字都不会改。
+        """
+        node = self._require(channel_id, user_id=user_id)
+        given = {key: value for key, value in updates.items() if str(value) != ""}
+        merged = {**self.channels.credentials(node.id), **given}
+        self._build(node.kind, merged)  # 未知 kind / 缺必填字段 → ValidationError，从这里抛出去
+        return self.channels.update_config(node.id, updates)
 
     def list(self, user_id: str) -> list[Channel]:
         return self.channels.list_for(user_id)

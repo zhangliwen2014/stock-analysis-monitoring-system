@@ -14,7 +14,7 @@ from datetime import datetime
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import StorageError, ValidationError
-from sams.storage.crypto import Cipher, mask_config
+from sams.storage.crypto import MASK_PREFIX, Cipher, mask_config
 from sams.storage.db import Database
 from sams.storage.ids import new_id
 
@@ -193,8 +193,19 @@ class ChannelRepo:
         编辑表单不回显明文（掩码视图才上屏幕，§4.2 的唯一明文出口仍是 `credentials`），
         所以「没填的键」只能意味着保持不变——人看不见旧值，也就无法把它重打一遍。
         要删掉一个键，删掉通道重建：配置里没有哪个键值得为它设计一个删除协议。
+
+        `***` 开头的值在这里就被拒掉：那是 `mask_secret` 画在屏幕上的样子，不是凭据。
+        今天没有一屏会把掩码填进输入框，但只要哪天有人这么做了，`***` 就会被当成新值
+        覆盖掉库里那条真的 webhook，而屏幕上看着一切正常——在唯一那一次写入上拦，
+        比在每个调用方各自记得拦可靠。
         """
         node = self._require(channel_id)
+        for key, value in updates.items():
+            if str(value).startswith(MASK_PREFIX):
+                raise ValidationError(
+                    f"通道 {node.name} 的 {key} 收到的是一段掩码（以 {MASK_PREFIX} 开头）："
+                    "掩码是屏幕上给认得出用的，不是凭据，填回输入框会覆盖掉库里那一串"
+                )
         cleaned = {
             key.strip(): value
             for key, value in updates.items()

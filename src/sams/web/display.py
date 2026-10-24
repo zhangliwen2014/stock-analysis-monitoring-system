@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 from sams.core.quotes import CLOSED, DELAYED, LIVE, NO_DATA, STALE
@@ -70,6 +71,17 @@ def moment_label(value: datetime | None, tz: str | None = None, *, seconds: bool
     if tz and value.tzinfo is not None:
         value = value.astimezone(ZoneInfo(tz))
     return value.strftime("%m-%d %H:%M:%S" if seconds else "%m-%d %H:%M")
+
+
+def hhmm(value: dtime | None) -> str:
+    """墙钟时刻 → `<input type=time>` 收得下的写法（到分）。
+
+    `datetime.time` 没有时区，所以这里不涉及任何折算：它只管「屏幕上那一格该印什么」。
+    带秒的那一份控件认不出来，浏览器会当成没填——于是「打开看一眼」就成了一次清除
+    窗口的提交。`None` 交回空串而不是上面那几个 helper 用的 `—`：这一格是要回填进
+    表单的，`—` 会被浏览器拒收，而空串正是「此刻没有窗口」。
+    """
+    return "" if value is None else value.strftime("%H:%M")
 
 
 #: 告警状态的人话名字。键用 `repos/alerts.py` 那三个常量而不是字面量：状态改名时这里

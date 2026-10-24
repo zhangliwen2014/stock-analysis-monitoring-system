@@ -97,13 +97,17 @@ class QueuedAlertSender:
         channel_ids=(),
         rule_id=None,
         account_id=None,
+        is_test=False,
     ) -> str:
+        # `is_test` 只是把端口那一格接住：引擎只会按 False 走，而这里少收一个参数
+        # 就等于端口那张参数表骗人（`core/notify.py` 的 `AlertSender` 说了要逐字对齐）
         alert = self.notify.record(
             message,
             user_id=user_id,
             channel_ids=list(channel_ids),
             rule_id=rule_id,
             account_id=account_id,
+            is_test=is_test,
         )
         # 满了当场判负（`offer` 的默认超时就是 0）：求值线程多等一秒，同一轮里排在后面的
         # 市场全等它，而这一秒换不来任何东西——队列不会因为等满 1 秒就腾出位置

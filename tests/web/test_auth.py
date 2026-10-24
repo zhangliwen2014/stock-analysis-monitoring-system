@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import itertools
+import threading
 from datetime import UTC, datetime, timedelta
 
 from fastapi import Request
 from fastapi.testclient import TestClient
 
-from sams.web.auth import sign
+from sams.web.auth import RateCard, sign
 
 
 def _csrf(client) -> str:
@@ -99,3 +101,42 @@ def test_missing_pages_render_the_error_page(web_app):
     response = web_app.client.get("/definitely-not-here")
     assert response.status_code == 404
     assert "打不开这一页" in response.text
+
+
+def test_rate_card_holds_one_caller_at_a_time():
+    """读—判—写必须在同一把锁里：端点跑在线程池上，两个标签页可能同时按。
+
+    不加锁时这张卡是「大概每 5 分钟一条」：两次并发都读到空，于是各放行一次，
+    手机上就真多出一条告警。所以让第一个调用**停在卡里**（只有第一次读钟会卡住），
+    第二个必须等到第一个写完才拿得到钟——没上锁它就直接放行，测试当场就红。
+    """
+    inside = threading.Event()
+    release = threading.Event()
+    calls = itertools.count()
+
+    def stuck_once():
+        # 只有第一次读钟会停：停在卡里的那一个占着锁，别人进不来
+        if next(calls) == 0:
+            inside.set()
+            assert release.wait(5), "测试没有放行第一个调用"
+        return 1000.0
+
+    card = RateCard(300, now=stuck_once)
+    results: list[int] = []
+    second_done = threading.Event()
+
+    def take():
+        results.append(card.try_take("alice"))
+        second_done.set()
+
+    first = threading.Thread(target=take)
+    second = threading.Thread(target=take)
+    first.start()
+    assert inside.wait(5)
+    second.start()
+    assert not second_done.wait(0.2), "第二个调用没等第一个做完：try_take 不是原子的"
+    release.set()
+    first.join(5)
+    second.join(5)
+    # 第一个拿到令牌；第二个进来时看到的正是它刚落下的那个时间戳，只能等
+    assert results == [0, 301]

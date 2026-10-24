@@ -63,6 +63,10 @@ class WebState:
     #: /settings/test-alert 的每用户 5 分钟一张卡（spec §6.3）：进程内的计数，
     #: 重启就重置——这一条挡的是连点，不是攻击
     test_alerts: RateCard
+    #: /settings/channels/{id}/probe 的每用户 30 秒一张卡：探针也会真发到手机上，
+    #: 而且一次跑三趟带退避、就压在这条线程池线程上。窗口比测试告警短，因为排障时
+    #: 人要连着试几条（改完 url 立刻探一下），而连点照旧要挡
+    probes: RateCard
 
     def render(self, request: Request, name: str, *, status_code: int = 200, **ctx):
         from sams.web.auth import csrf_value
@@ -113,6 +117,7 @@ def create_app(
             window_s=core.settings.server.login_window_min * 60,
         ),
         test_alerts=RateCard(300),
+        probes=RateCard(30),
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
