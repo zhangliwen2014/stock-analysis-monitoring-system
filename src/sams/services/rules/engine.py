@@ -29,6 +29,7 @@ from sams.core.notify import AlertMessage, AlertSender
 from sams.core.quotes import Quote, local_day, source_label
 from sams.core.rules import RULE_KINDS, Verdict, escalates, is_intraday, template_for
 from sams.services.rules.anchor import move_prices
+from sams.services.rules.cache import CacheKey, SnapshotCache
 from sams.services.rules.filters import Gate, OpenAlert, run_filters
 from sams.services.rules.notes import Fx, constraint_lines, holding_pnl
 from sams.services.rules.snapshot import RuleData, Snapshot, Target, apply_quote
@@ -213,6 +214,7 @@ class RuleEngine:
         sender: AlertSender,
         settings: Settings,
         clock: Clock = SYSTEM_CLOCK,
+        cache: SnapshotCache | None = None,
     ) -> None:
         self.rules = rules
         self.alerts = alerts
@@ -222,6 +224,7 @@ class RuleEngine:
         self.bus = bus
         self.sender = sender
         self.settings = settings
+        self._cache = cache
         self.clock = clock
 
     # --- 出口 ---------------------------------------------------------------------------
@@ -338,6 +341,32 @@ class RuleEngine:
 
     # --- 一个对象 -----------------------------------------------------------------------
 
+    def _daily(
+        self,
+        rule: Rule,
+        target: Target,
+        *,
+        position: Position | None,
+        day: date,
+    ) -> Snapshot:
+        """日线读数的那一次 IO：盘中线程走缓存，收盘那一趟直读。"""
+        if self._cache is None:
+            return self.data.read(target, as_of=day, position=position)
+        key = CacheKey(
+            user_id=rule.user_id,
+            rule_id=rule.id,
+            market=target.market,
+            code=target.code,
+            account_id=target.account_id,
+            thesis_id=target.thesis_id,
+        )
+        got = self._cache.get(key, day=day)
+        if got is not None:
+            return got
+        snapshot = self.data.read(target, as_of=day, position=position)
+        self._cache.put(key, snapshot, day=day)
+        return snapshot
+
     def _one(
         self,
         rule: Rule,
@@ -376,7 +405,7 @@ class RuleEngine:
             return self._skipped(rule, target.market, target.code, _no_impl(rule.kind))
         built = template_for(rule.kind)
         try:
-            snapshot = self.data.read(target, as_of=day, position=position)
+            snapshot = self._daily(rule, target, position=position, day=day)
         except NotAdjustable as exc:
             # 「读不到这个对象」与「判不了」是同一类（`Skipped`），而不是整趟崩：
             # 只兜 `NotAdjustable` 这一种，不兜 `SamsError`——后者会把「取数链上有一个

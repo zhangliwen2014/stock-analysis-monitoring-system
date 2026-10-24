@@ -205,7 +205,7 @@ class Harness:
         #: `seed_hit` 默认挂在哪条规则上：`add()` 每建一条就把它改成那一条的 id
         self.added_id = "r-seed"
 
-    def engine(self, *, sender=None) -> RuleEngine:
+    def engine(self, *, sender=None, cache=None) -> RuleEngine:
         data = StubData(self.snapshot, self.held, self.thesis)
         data.read_raises = self.read_raises
         return RuleEngine(
@@ -218,6 +218,7 @@ class Harness:
             bus=self.bus,
             sender=sender or self.sender,
             settings=self.settings,
+            cache=cache,
         )
 
     def storing(self, *, raises: Exception | None = None) -> RuleEngine:
