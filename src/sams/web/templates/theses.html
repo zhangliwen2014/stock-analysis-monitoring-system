@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}论点{% endblock %}
+{% block content %}
+<h1>论点</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  {% if rows %}
+  <table>
+    <tr><th>标的</th><th>状态</th><th>风格</th><th>更新</th></tr>
+    {% for row in rows %}
+    <tr>
+      <td><a href="/theses/{{ row.id }}">{{ row.market }}/{{ row.code }}</a></td>
+      <td><a href="/theses/{{ row.id }}">{{ row.status }}</a></td>
+      <td>{{ row.style }}</td>
+      {# 这一列在 Python 里已经折到 display_tz 并排好：模板拿到的是字符串，不是 datetime #}
+      <td class="muted">{{ row.updated_at }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">还没有论点。</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>新建论点</h2>
+  <p class="muted">立论时系统会当场算一次估值，把算得出的那几列价位落进库里；
+    算不出的那一列不出现（补一个 0 就等于库里多一条没有式子 backing 的止损价）。</p>
+  <form method="post" action="/theses/create" class="panel">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>市场 <input name="market" value="A"></label>
+    <label>代码 <input name="code"></label>
+    <label>打分模板
+      {# 值来自 STYLE_NAMES（`ThesisService.add` 收的就是这批名字）：填一个不存在的名字，
+         拒回来的那句话会列出能用的，但下拉里本来就该只有能用的 #}
+      <select name="style">
+        {% for name in styles %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>一句话 <input name="note" placeholder="为什么看好它（写进时间线第一条）"></label>
+    <button type="submit">建论</button>
+  </form>
+</section>
+{% endblock %}

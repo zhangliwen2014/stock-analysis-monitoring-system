@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>{{ thesis.market }}/{{ thesis.code }} <span class="badge">{{ thesis.status }}</span></h1>
+  <p class="muted">
+    打分模板 {{ thesis.style }} · id {{ thesis.id }} ·
+    <a href="/symbol/{{ thesis.market }}/{{ thesis.code }}">这只票的现场</a>
+  </p>
+  {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  {% if steps %}
+  <form method="post" action="/theses/{{ thesis.id }}/advance" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {# 下拉里只有 `next_steps` 给的那几个档位：合法跳转表住在仓库，页面抄一份就会分叉 #}
+    <label>推进到
+      <select name="to">
+        {% for step in steps %}<option value="{{ step }}">{{ step }}</option>{% endfor %}
+      </select>
+    </label>
+    <input name="note" placeholder="为什么推进（写进时间线）">
+    <button type="submit">推进</button>
+  </form>
+  {% else %}
+  {# 终点状态没有下一步：给一个空的 <select> 只会让人-submit-后-读一句报错 #}
+  <p class="muted">这一条已经走完了（{{ thesis.status }} 没有下一步）。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  {# 这一句讲的是「这几列属于哪一次读数」：截至 X / 没有测量日（手填）/ 库里还没有价位，
+     措辞与服务层那两句话逐字一致，屏幕上不能长出第三种说法 #}
+  <h2>库里的那几列价位 <span class="muted">{{ levels_note }}</span></h2>
+  <table>
+    <tr><th>项</th><th class="num">库里那一次</th></tr>
+    {% for row in levels %}
+    <tr>
+      <td>{{ row.label }}</td>
+      {# money() 是 display.py 的 Jinja 全局：空位显示「—」而不是 0.00。赔率不是钱，
+         但同样是两位小数的一个数，借它的排法，不在模板里再写一种 #}
+      <td class="num">
+        {%- if row.kind == "range" and (row.low is not none or row.high is not none) -%}
+          {{ money(row.low) }} ~ {{ money(row.high) }}
+        {%- else -%}
+          {{ money(row.low) }}
+        {%- endif -%}
+      </td>
+    </tr>
+    {% endfor %}
+    {% if win_rate %}
+    <tr>
+      <td>胜率</td>
+      {# 那一列在 Python 里已从 0.55 折成「55.0%」：库里的口径是小数（D58） #}
+      <td class="num">{{ win_rate }}
+        {%- if win_rate_samples is not none %}
+          <span class="muted">（样本 {{ win_rate_samples }} 期）</span>
+        {%- endif -%}
+      </td>
+    </tr>
+    {% endif %}
+  </table>
+</section>
+
+<section class="card">
+  <h2>时间线</h2>
+  {% if events %}
+  <table>
+    <tr><th>时刻</th><th>从</th><th>到</th><th>记录</th></tr>
+    {% for event in events %}
+    <tr>
+      {# 时刻在 Python 里折成 UTC 并点名时区（`format_utc_moment`）：这条链跨几个月，
+         模板里 strftime 会把会话本地的那一次读数当成 UTC 那一次印出来 #}
+      <td class="muted">{{ event.at }}</td>
+      <td>{{ event.from }}</td>
+      <td>{{ event.to }}</td>
+      <td>{{ event.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">时间线是空的。</p>{% endif %}
+</section>
+{% endblock %}
