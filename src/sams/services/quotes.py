@@ -61,12 +61,17 @@ class QuoteBoard:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._quotes: dict[tuple[str, str], Quote] = {}
+        self._previous: dict[tuple[str, str], Quote] = {}
+        #: 来自 `seed()` 的键：那些是日线最后收盘，不是「上一轮」
+        self._seeded: set[tuple[str, str]] = set()
         self._marks: dict[str, _Mark] = {}
 
     def seed(self, quotes: Iterable[Quote]) -> None:
         with self._lock:
             for quote in quotes:
-                self._quotes[(quote.market, quote.code)] = quote
+                key = (quote.market, quote.code)
+                self._quotes[key] = quote
+                self._seeded.add(key)
 
     def update(
         self,
@@ -78,7 +83,17 @@ class QuoteBoard:
     ) -> None:
         with self._lock:
             for quote in quotes:
-                self._quotes[(quote.market, quote.code)] = quote
+                key = (quote.market, quote.code)
+                displaced = self._quotes.get(key)
+                # seed 灌的是日线最后收盘：把它当上一轮会让 9:30 的第一跳误判，
+                # 所以开局那一笔只顶替、不记
+                seeded = key in self._seeded
+                if displaced is not None and not seeded:
+                    # 被换下来的那一轮是「穿」的另一侧（§5.2）。fail/skip 不写它：
+                    # 那两处没有「新的一轮」这回事
+                    self._previous[key] = displaced
+                self._seeded.discard(key)
+                self._quotes[key] = quote
             mark = self._marks.setdefault(market, _Mark())
             mark.last_poll_at = now
             mark.last_error = error
@@ -109,6 +124,11 @@ class QuoteBoard:
     def get(self, market: str, code: str) -> Quote | None:
         with self._lock:
             return self._quotes.get((market, code))
+
+    def previous(self, market: str, code: str) -> Quote | None:
+        """上一轮报价（§5.2）：`price.cross_*` 的「上一根」。开局第一轮是 None。"""
+        with self._lock:
+            return self._previous.get((market, code))
 
     def snapshot(self) -> dict[str, MarketBoard]:
         with self._lock:
