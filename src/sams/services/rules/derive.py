@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from sams.core.rules import template_for
+from sams.core.version import VersionGate
 from sams.storage.repos.rules import Rule, RuleRepo
 from sams.storage.repos.theses import Thesis, ThesisRepo
 
@@ -171,9 +172,17 @@ class RuleDeriver:
     复制出 N 条同样的事实。
     """
 
-    def __init__(self, rules: RuleRepo, theses: ThesisRepo) -> None:
+    def __init__(
+        self,
+        rules: RuleRepo,
+        theses: ThesisRepo,
+        *,
+        versions: VersionGate | None = None,
+    ) -> None:
         self.rules = rules
         self.theses = theses
+        #: 盘中缓存的失效闸（§5.4）；可选，理由见 `RuleService.versions`
+        self.versions = versions
 
     def derive(
         self, user_id: str, thesis_id: str, *, account_id: str | None = None
@@ -208,6 +217,9 @@ class RuleDeriver:
                 )
             )
             have.add((item.kind, owner))
+        if created and self.versions is not None:
+            # 只有真建了规则才 bump：第二趟全是 already，库没变，不该把缓存全清
+            self.versions.bump("rules")
         return DeriveReport(
             thesis_id=thesis_id,
             created=tuple(created),

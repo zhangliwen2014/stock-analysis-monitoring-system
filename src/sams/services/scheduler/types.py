@@ -8,11 +8,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Protocol
 
 from sams.core.config import Settings
+from sams.core.version import VersionGate
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalSyncService
@@ -86,3 +87,7 @@ class JobDeps:
     rules: RuleEngine
     recheck: Rechecker
     users: UserRepo
+    #: 盘中缓存的失效闸：日线/公司行为写入后 bump，缓存整表清（§5.4）。
+    #: 默认自建一份，job 那一头永远敲得到；装配根（Task 15）会把盘中线程用的那一份
+    #: 传进来——两边各拿一份计数的话，盘后的 bump 清不掉盘中那份缓存
+    versions: VersionGate = field(default_factory=VersionGate)

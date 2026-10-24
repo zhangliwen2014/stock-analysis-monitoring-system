@@ -17,6 +17,7 @@ from sams.core import funds
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.config import Settings
 from sams.core.errors import StorageError, ValidationError
+from sams.core.version import VersionGate
 from sams.services.actors import resolve_actor
 from sams.storage.repos.ledger import Account, Order, Position, SimAccountRepo, SimOrderRepo
 from sams.storage.repos.theses import OBSERVING, PROPOSED, ThesisRepo
@@ -35,12 +36,22 @@ class LedgerService:
         theses: ThesisRepo,
         users: UserRepo,
         settings: Settings,
+        *,
+        versions: VersionGate | None = None,
     ) -> None:
         self.accounts = accounts
         self.orders = orders
         self.theses = theses
         self.users = users
         self.settings = settings
+        #: 盘中缓存的失效闸（§5.4）：成交与现金都读得到「现在有多少」。可选，
+        #: 理由见 `RuleService.versions`
+        self.versions = versions
+
+    def _bump(self) -> None:
+        """写面动过就 bump：盘中缓存整表失效（§5.4）。没接闸的构造点静默跳过。"""
+        if self.versions is not None:
+            self.versions.bump("ledger")
 
     def open_account(
         self,
@@ -52,7 +63,7 @@ class LedgerService:
         margin_enabled: bool = False,
     ) -> Account:
         user = resolve_actor(self.users, username)
-        return self.accounts.open(
+        account = self.accounts.open(
             user.id,
             name,
             broker=broker,
@@ -60,6 +71,8 @@ class LedgerService:
             margin_enabled=margin_enabled,
             report_currency=self.settings.report_currency,
         )
+        self._bump()
+        return account
 
     def deposit(
         self,
@@ -72,9 +85,11 @@ class LedgerService:
         actor_id: str,
     ) -> float:
         self._require_account(resolve_actor(self.users, username), account_id)
-        return self.accounts.adjust_cash(
+        balance = self.accounts.adjust_cash(
             account_id, currency, abs(amount), reason=reason, actor_id=actor_id
         )
+        self._bump()
+        return balance
 
     def withdraw(
         self,
@@ -87,9 +102,11 @@ class LedgerService:
         actor_id: str,
     ) -> float:
         self._require_account(resolve_actor(self.users, username), account_id)
-        return self.accounts.adjust_cash(
+        balance = self.accounts.adjust_cash(
             account_id, currency, -abs(amount), reason=reason, actor_id=actor_id
         )
+        self._bump()
+        return balance
 
     def buy(
         self,
@@ -153,7 +170,7 @@ class LedgerService:
         currency = funds.quote_currency(market, code, self.settings.markets)
         if thesis_id is not None:
             self._check_thesis(user, thesis_id)
-        return self.orders.record_fill(
+        order = self.orders.record_fill(
             account_id=account_id,
             user_id=user.id,
             market=market,
@@ -167,6 +184,8 @@ class LedgerService:
             fx_rate_ref=fx_rate_ref,
             ts=ts,
         )
+        self._bump()
+        return order
 
     def _require_account(self, user: User, account_id: str) -> Account:
         """这笔账是不是你的：仓库层的 `_require` 只查存在、不查归属。

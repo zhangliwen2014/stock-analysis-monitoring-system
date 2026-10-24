@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import StorageError, ValidationError
+from sams.core.version import VersionGate
 from sams.services.rules.derive import write_back
 from sams.services.rules.snapshot import RuleData
 from sams.storage.db import Database
@@ -68,6 +69,7 @@ class RuleService:
         db: Database,
         settings: Settings,
         clock: Clock = SYSTEM_CLOCK,
+        versions: VersionGate | None = None,
     ) -> None:
         self.rules = rules
         self.theses = theses
@@ -78,6 +80,14 @@ class RuleService:
         self.db = db
         self.settings = settings
         self.clock = clock
+        #: 盘中缓存的失效闸（§5.4）。可选：没有闸的构造点照旧跑，只是那边的缓存
+        #: 不会因这一改而重读
+        self.versions = versions
+
+    def _bump(self) -> None:
+        """写面动过就 bump：盘中缓存整表失效（§5.4）。没接闸的构造点静默跳过。"""
+        if self.versions is not None:
+            self.versions.bump("rules")
 
     # --- 写 -----------------------------------------------------------------------------
 
@@ -122,6 +132,7 @@ class RuleService:
             params_on=self.clock.today(),
             enabled=enabled,
         )
+        self._bump()
         return self.view(rule)
 
     def edit(
@@ -166,15 +177,20 @@ class RuleService:
                     now=self.clock.now_utc(),
                     **columns,
                 )
+        self._bump()
         return EditReport(rule=moved, written_back=columns, thesis_id=before.thesis_id)
 
     def set_enabled(self, user_id: str, rule_id: str, enabled: bool) -> RuleView:
         row = self._require(user_id, rule_id)
-        return self.view(self.rules.set_enabled(row.id, bool(enabled), user_id=user_id))
+        moved = self.rules.set_enabled(row.id, bool(enabled), user_id=user_id)
+        self._bump()
+        return self.view(moved)
 
     def remove(self, user_id: str, rule_id: str) -> bool:
         row = self._require(user_id, rule_id)
-        return self.rules.remove(row.id, user_id=user_id)
+        removed = self.rules.remove(row.id, user_id=user_id)
+        self._bump()
+        return removed
 
     # --- 读 -----------------------------------------------------------------------------
 

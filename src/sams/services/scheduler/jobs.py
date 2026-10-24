@@ -78,7 +78,10 @@ def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             return 0
         return deps.sync.sync_daily(market, code, start, ctx.as_of).written
 
-    return _collect(_units(ctx), one, "日线")
+    outcome = _collect(_units(ctx), one, "日线")
+    if outcome.rows_affected > 0:
+        deps.versions.bump("bars")
+    return outcome
 
 
 def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -92,7 +95,11 @@ def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             return 0
         return deps.corp_actions.sync_actions(market, code, HISTORY_START, ctx.as_of).written
 
-    return _collect(_units(ctx), one, "公司行为")
+    outcome = _collect(_units(ctx), one, "公司行为")
+    if outcome.rows_affected > 0:
+        # 公司行为改的是复权口径：缓存的日线读数同样作废
+        deps.versions.bump("bars")
+    return outcome
 
 
 def run_financials(deps: JobDeps, ctx: JobContext) -> JobOutcome:

@@ -29,6 +29,7 @@ from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
+from sams.core.version import VersionGate
 from sams.services.actors import resolve_actor
 from sams.services.valuation import STYLE_NAMES, ValuationRead, ValuationService
 from sams.storage.repos.ledger import SimOrderRepo
@@ -178,6 +179,7 @@ class ThesisService:
         settings: Settings,
         clock: Clock = SYSTEM_CLOCK,
         orders: SimOrderRepo | None = None,
+        versions: VersionGate | None = None,
     ) -> None:
         self.theses = theses
         self.users = users
@@ -189,6 +191,13 @@ class ThesisService:
         #: `test_the_container_always_wires_the_orders_repo`）：漏传不会报错，只会让
         #: 每一屏都说「没有成交」——那是把接线断了报成一条业务结论
         self.orders = orders
+        #: 盘中缓存的失效闸（§5.4）；可选，理由见 `RuleService.versions`
+        self.versions = versions
+
+    def _bump(self) -> None:
+        """写面动过就 bump：盘中缓存整表失效（§5.4）。没接闸的构造点静默跳过。"""
+        if self.versions is not None:
+            self.versions.bump("theses")
 
     # --- 写 --------------------------------------------------------------------------------
 
@@ -239,6 +248,7 @@ class ThesisService:
             levels_on=None if read is None else read.as_of,
             **levels,
         )
+        self._bump()
         return self._report(
             user.username,
             thesis,
@@ -253,9 +263,11 @@ class ThesisService:
     ) -> Thesis:
         """走一跳。跳转表与「建仓要先有价位」那条都在仓库层，这里只补上谁在走、何时走。"""
         user = self._actor(username)
-        return self.theses.advance(
+        moved = self.theses.advance(
             user.id, thesis_id, to, actor_id=user.id, now=self.clock.now_utc(), note=note
         )
+        self._bump()
+        return moved
 
     def revise(
         self,
@@ -294,6 +306,7 @@ class ThesisService:
             levels_on=None if read is None or not recomputed else read.as_of,
             **merged,
         )
+        self._bump()
         return self._report(
             user.username,
             thesis,
