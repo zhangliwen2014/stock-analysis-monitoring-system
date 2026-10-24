@@ -1,7 +1,7 @@
 """`price.cross_*` 的另一侧：日线还是前收盘，盘中是同一交易日的上一轮报价。
 
-「盘中不再退回前收盘」那一条是这一枚的核心：上一轮 10.05、线 10.04、现价 10.02
-在上一轮坐标里没穿过，退回昨收就会误报——报的是两轮之前的行情。
+「盘中不再退回前收盘」那一条是这一枚的核心：上一轮 10.05、线 10.04、现价 10.06，
+上一轮 10.05 已在线上方，退回前收盘 10.00 会凭空造出一次上穿。
 """
 
 from __future__ import annotations
@@ -40,12 +40,16 @@ def test_intraday_uses_the_previous_round_and_says_so():
 
 
 def test_intraday_does_not_fall_back_to_prev_close():
-    # cross_from=10.05、线 10.04、现价 10.02：上一轮坐标里没穿过。若退回 prev_close=10.00
-    # 就会误判成「上穿」——报的是两轮之前的行情
+    # 上一轮 10.05 已在线上方，退回前收盘 10.00 会凭空造出一次上穿。
+    # 正确：基准 10.05 → 10.05 <= 10.04 为假，不报；
+    # 错误（用 prev_close）：10.00 <= 10.04 < 10.06 为真，报
     ask = type(
         "Ask",
         (),
-        {"snapshot": snap(cross_from=10.05, prev_close=10.00), "params": {"price": 10.04}},
+        {
+            "snapshot": snap(price=10.06, cross_from=10.05, prev_close=10.00),
+            "params": {"price": 10.04},
+        },
     )()
     assert price_cross_above(ask).hit is None
 
