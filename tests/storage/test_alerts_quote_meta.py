@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
+from sams.core.notify import SYSTEM_MARKET
 from sams.datasource.registry import AdapterRegistry
 from sams.services.health import HealthService
 from sams.storage.repos.alerts import AlertRepo
@@ -73,5 +75,46 @@ def test_health_backlog_ignores_test_rows(db, settings):
     )
     repo = AlertRepo(db)
     row(repo)
-    row(repo, code="600519", is_test=True)
-    assert service.report().notify.unhandled == 1
+    # 测试行比真告警老三天、code 也不同：只漏掉 oldest 那条过滤的话，
+    # `unhandled_oldest` 就会变成这行更老的测试行，而不是 MOMENT
+    row(repo, code="600519", is_test=True, triggered_at=MOMENT - timedelta(days=3))
+    # /settings/test-alert 记的是 SYS 行（D131）：系统侧那两条查询也得挡住它，
+    # 否则点一次测试就常年显示「系统 1 个组件未处理」
+    row(repo, market=SYSTEM_MARKET, code="test", is_test=True)
+    notify = service.report().notify
+    assert notify.unhandled == 1
+    assert notify.unhandled_oldest == MOMENT
+    assert notify.unhandled_system == 0
+
+
+def test_health_report_works_without_is_test_column(db, settings):
+    repo = AlertRepo(db)
+    row(repo)
+    # DuckDB 不许在表上有索引时删列，先把 alerts 的索引摘掉；本用例只关心「列不在」
+    for name in db.query(
+        "SELECT index_name FROM duckdb_indexes() WHERE table_name = 'alerts'"
+    )["index_name"].to_list():
+        db.execute(f'DROP INDEX IF EXISTS "{name}"')
+    # 0018 的库没有这一列：健康页是「先看看这个库怎么了」的入口，不许在这里抛
+    db.execute("ALTER TABLE alerts DROP COLUMN is_test")
+    notify = HealthService(
+        db,
+        AdapterRegistry(adapters={}, market_sources={}, sleep=lambda _s: None),
+        CalendarRepo(db),
+        settings,
+    ).report().notify
+    assert notify.unhandled == 1
+    assert notify.unhandled_system == 0
+
+
+def test_malformed_quote_ts_does_not_break_read(db):
+    repo = AlertRepo(db)
+    created = row(repo, quote_ts=MOMENT)
+    payload = dict(repo.get(created.id).payload)
+    payload["quote_ts"] = "not-a-time"
+    db.execute(
+        "UPDATE alerts SET payload_json = ? WHERE id = ?",
+        [json.dumps(payload, ensure_ascii=False), created.id],
+    )
+    # 存坏的那一行不许让整张收件箱读不出来：解不开就当没存
+    assert repo.get(created.id).quote_ts is None
