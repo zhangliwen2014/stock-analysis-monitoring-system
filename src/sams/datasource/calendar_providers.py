@@ -7,6 +7,7 @@ A 股以 akshare 官方日历为权威（调休会临时多放）；港股/美�
 from __future__ import annotations
 
 import logging
+import threading
 from collections import Counter
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -16,6 +17,12 @@ from sams.core.errors import CalendarSourceError
 from sams.core.timeutil import CalendarDay, SessionWindow
 
 logger = logging.getLogger("sams.datasource.calendar")
+
+#: `tool_trade_date_hist_sina` 内部要造一个 V8 引擎（py_mini_racer）。那个引擎的地址池
+#: 不是线程安全的：两个线程同时初始化时它会 abort 整个进程（exit 133），而不是抛异常。
+#: 常驻进程里调度线程的 calendar 作业与盘中线程的惰性补齐会同时拉 A 股日历，所以这一次
+#: 外部调用必须串行——先后初始化没事，并发初始化才崩。
+_V8_INIT_LOCK = threading.Lock()
 
 CN_WINDOWS = (
     SessionWindow("am", "09:30", "11:30"),
@@ -38,7 +45,8 @@ class CnSinaProvider:
         try:
             import akshare as ak
 
-            frame = ak.tool_trade_date_hist_sina()
+            with _V8_INIT_LOCK:
+                frame = ak.tool_trade_date_hist_sina()
         except Exception as exc:  # noqa: BLE001 — 外部依赖失败要转成本域异常，不能裸抛
             raise CalendarSourceError(f"A 股日历拉取失败: {exc}") from exc
         column = "trade_date"

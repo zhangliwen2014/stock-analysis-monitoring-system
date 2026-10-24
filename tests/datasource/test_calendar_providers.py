@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import sys
+import threading
+import time
+import types
 from dataclasses import replace
 from datetime import UTC, date
 
+import pandas as pd
 import pytest
 
 from sams.core.config import MarketCfg, Settings
@@ -121,6 +126,41 @@ def test_cn_provider_declares_two_sessions_and_its_own_identity():
         "Asia/Shanghai",
         CN_WINDOWS,
     )
+
+
+def test_the_sina_call_is_serialised_across_threads(monkeypatch):
+    """`py_mini_racer` 的 V8 引擎并发初始化会 abort 整个进程（exit 133），不是抛异常；
+    常驻进程里调度线程的 calendar 作业与盘中线程的惰性补齐会同时拉 A 股日历。
+    这一次外部调用必须串行，否则 `sams serve` 起来十几秒就死。"""
+    inside = 0
+    peaks: list[int] = []
+    guard = threading.Lock()
+
+    def fake() -> pd.DataFrame:
+        nonlocal inside
+        with guard:
+            inside += 1
+            peaks.append(inside)
+        time.sleep(0.05)
+        with guard:
+            inside -= 1
+        return pd.DataFrame({"trade_date": [date(2026, 10, 9)]})
+
+    module = types.ModuleType("akshare")
+    module.tool_trade_date_hist_sina = fake
+    monkeypatch.setitem(sys.modules, "akshare", module)
+
+    provider = CnSinaProvider(tz="Asia/Shanghai")
+    threads = [
+        threading.Thread(target=provider.days_for_year, args=(2026,)) for _ in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert peaks and max(peaks) == 1, "并发进去就会撞上 V8 的双重初始化"
 
 
 @pytest.mark.live

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from dataclasses import replace
 
@@ -44,7 +45,23 @@ def _server_for(settings: Settings, args: argparse.Namespace) -> ServerCfg:
     return merged
 
 
+def _configure_logging() -> None:
+    """常驻进程的日志出口。
+
+    库里的服务用 `logger.info` 报启动与每日清理，而根记录器默认只放行 WARNING：
+    不在这里配置一次，`serve.log` 里就只剩 uvicorn 那几行，运维 grep 不到
+    「运行时已启动」「每日清理」（验收要它们）。已被别的 handler 接管时
+    `basicConfig` 自己不动手——嵌进别人的进程时不该再插一手。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+
 def start(settings: Settings, args: argparse.Namespace) -> int:
+    _configure_logging()
     try:
         server = _server_for(settings, args)
     except ValidationError as exc:

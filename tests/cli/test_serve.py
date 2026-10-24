@@ -6,6 +6,7 @@ uvicorn 在这一层换成记录参数的替身：真起一个 HTTP 服务属于
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -90,6 +91,20 @@ def test_start_prepares_then_starts_and_passes_single_worker_flags(
     out = capsys.readouterr().out
     assert "http://127.0.0.1:8765" in out
     assert "行情板已恢复 2 只票" in out
+
+
+def test_start_opens_the_info_channel_for_the_runtime_log(settings, started, monkeypatch):
+    """不配日志，`logger.info("运行时已启动")` 会被根记录器的 WARNING 门槛吞掉：
+    `serve.log` 里只剩 uvicorn 几行，验收要 grep 的启动与清理一行都没有。"""
+    root = logging.getLogger()
+    monkeypatch.setattr(root, "handlers", [])
+    monkeypatch.setattr(root, "level", logging.WARNING)
+
+    assert serve.start(settings, args()) == 0
+
+    assert root.level == logging.INFO
+    assert root.handlers, "至少要有往 stderr 写的一只手"
+    assert logging.getLogger("sams.services.runtime").isEnabledFor(logging.INFO)
 
 
 def test_tls_files_go_to_uvicorn_and_the_advertised_url_is_https(settings, started, capsys):
