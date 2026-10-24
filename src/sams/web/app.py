@@ -35,7 +35,7 @@ from sams.web.auth import (
 from sams.web.auth import router as auth_router
 from sams.web.context import ThreadContexts
 from sams.web.display import hms, money, pct, state_label
-from sams.web.pages import dashboard
+from sams.web.pages import dashboard, symbol
 
 _STATIC = Path(__file__).parent / "static"
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -111,6 +111,7 @@ def create_app(
 
     app.include_router(auth_router)
     app.include_router(dashboard.router)
+    app.include_router(symbol.router)
 
     def _login_redirect(_request: Request, _exc: LoginRequired) -> RedirectResponse:
         """会话失效要连 CSRF 与心跳一起抹掉：留任何一枚都是可用的半成品凭据。"""

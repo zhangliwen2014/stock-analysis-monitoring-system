@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}{{ market }}/{{ code }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>{{ symbol.get("name") or code }} <span class="muted">{{ market }}/{{ code }}</span></h1>
+  <p>
+    <strong class="num">{{ money(price) }}</strong>
+    <span class="{{ pct_class }}">{{ pct(quote_pct) }}</span>
+    <span class="badge">{{ state }}</span>
+    <span class="muted">{{ quote_at }}</span>
+  </p>
+  <div id="chart" style="width:100%;height:420px"
+       data-chart-url="/api/symbol/{{ market }}/{{ code }}/bars?days=180"></div>
+</section>
+
+<section class="card">
+  <h2>挂在这只票上的规则
+    <a class="muted" href="/rules/new?kind=stop.fixed&amp;target_type=symbol&amp;target_ref={{ market }}/{{ code }}">新建止损</a>
+  </h2>
+  {% if rules %}
+  <table>
+    <tr><th>名称</th><th>类型</th><th>级别</th><th>对象数</th><th>启用</th></tr>
+    {% for view in rules %}
+    <tr>
+      <td><a href="/rules/{{ view.rule.id }}/edit">{{ view.rule.name }}</a></td>
+      <td>{{ view.rule.kind }}</td>
+      <td>{{ view.rule.severity }}</td>
+      <td>{{ view.targets }}</td>
+      <td>{{ "是" if view.rule.enabled else "否" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">还没有规则挂在它身上。</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>论点 <a class="muted" href="/theses">全部</a></h2>
+  {% if theses %}
+  <ul>
+    {% for item in theses %}
+    <li>
+      <a href="/theses/{{ item.thesis.id }}">{{ item.thesis.status }}</a>
+      <span class="muted">{{ item.note or "" }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">还没有关于它的论点。</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>最近的告警 <a class="muted" href="/alerts?market={{ market }}">全部</a></h2>
+  {% if alerts %}
+  <table>
+    <tr><th>时刻</th><th>规则</th><th>档位</th><th>状态</th></tr>
+    {% for alert in alerts %}
+    <tr>
+      <td><a href="/alerts/{{ alert.id }}">{{ alert.triggered_at.strftime("%m-%d %H:%M") }}</a></td>
+      <td>{{ alert.rule_name }}</td>
+      <td>{{ alert.stage }}</td>
+      <td>{{ alert.status }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">最近没有告警。</p>{% endif %}
+</section>
+{% endblock %}
