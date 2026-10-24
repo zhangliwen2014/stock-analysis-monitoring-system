@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}自选{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>自选</h1>
+  {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  <form method="post" action="/watchlist/add" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <select name="market">
+      {% for code in markets %}<option value="{{ code }}">{{ code }}</option>{% endfor %}
+    </select>
+    <input name="code" placeholder="代码，如 600519 / 00700 / AAPL">
+    <input name="note" placeholder="备注（可空）">
+    <button type="submit">加入</button>
+  </form>
+  <div id="quote-board" hx-get="/api/partials/quotes" hx-trigger="every 10s" hx-swap="innerHTML">
+    {% include "partials/quotes.html" %}
+  </div>
+  {% if rows %}
+  <table>
+    <tr><th>市场</th><th>代码</th><th>备注</th><th></th></tr>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.market }}</td><td>{{ row.code }}</td><td>{{ row.note }}</td>
+      <td>
+        <form method="post" action="/watchlist/remove" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="market" value="{{ row.market }}">
+          <input type="hidden" name="code" value="{{ row.code }}">
+          <button type="submit">移除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</section>
+{% endblock %}

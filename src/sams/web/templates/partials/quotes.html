@@ -1,0 +1,21 @@
+{% if rows %}
+<table>
+  <tr>
+    <th>市场</th><th>代码</th><th>名称</th><th class="num">现价</th>
+    <th class="num">涨跌</th><th>状态</th><th>报价时刻</th>
+  </tr>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.market }}</td>
+    <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
+    <td>{{ row.name }}</td>
+    <td class="num">{{ money(row.price) }}</td>
+    <td class="num {{ row.pct_class }}">{{ pct(row.pct) }}</td>
+    <td>{{ row.state }}</td>
+    <td class="muted">{{ row.quote_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">自选还是空的。</p>
+{% endif %}

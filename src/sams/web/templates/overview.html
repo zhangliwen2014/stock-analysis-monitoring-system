@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}看板{% endblock %}
+{% block content %}
+{% if failed_channels %}
+<section class="card">
+  <h2>通知失败</h2>
+  {% for channel in failed_channels %}
+  <p class="flash-error">{{ channel.name }}：{{ channel.last_error }}</p>
+  {% endfor %}
+  <p class="muted">去 <a href="/settings/channels">设置 · 通道</a> 修复或停用。</p>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>市场</h2>
+  <div class="grid">
+    {% for market in markets %}
+    <div>
+      <strong>{{ market.name }}</strong>
+      <span class="badge">{{ "开市中" if market.open else "休市" }}</span>
+      <div class="muted">已抓 {{ market.count }} 只 · 最近 {{ market.poll_at or "—" }}</div>
+      {% if market.error %}<div class="flash-error">{{ market.error }}</div>{% endif %}
+      {% if market.skip %}<div class="muted">{{ market.skip }}</div>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>自选 <a class="muted" href="/watchlist">管理</a></h2>
+  <div id="quote-board" hx-get="/api/partials/quotes" hx-trigger="every 10s" hx-swap="innerHTML">
+    {% include "partials/quotes.html" %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>今日告警 <a class="muted" href="/alerts">{{ alerts_today }} 条</a></h2>
+</section>
+
+<section class="card">
+  <h2>模拟账户 <a class="muted" href="/portfolio">详情</a></h2>
+  {% if accounts %}
+  <table>
+    <tr><th>账户</th><th class="num">总市值</th><th class="num">总盈亏</th></tr>
+    {% for account in accounts %}
+    <tr>
+      <td>{{ account.name }}</td>
+      <td class="num">{{ money(account.total, account.currency) }}</td>
+      <td class="num {{ "up" if account.pnl > 0 else ("down" if account.pnl < 0 else "") }}">
+        {{ money(account.pnl) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">还没有账户。</p>{% endif %}
+</section>
+
+{% if checklist %}
+<section class="card">
+  <h2>第一次运行，从这里开始</h2>
+  <ul>
+    {% for text, href in checklist %}<li><a href="{{ href }}">{{ text }}</a></li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+{% endblock %}
