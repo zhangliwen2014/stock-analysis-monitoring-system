@@ -71,7 +71,13 @@ class SnapshotCache:
         return entry.snapshot
 
     def put(self, key: CacheKey, snapshot: Snapshot, *, day: date) -> None:
-        self._settle()
+        # 存之前对齐戳：bump 落在「读库」与「存库」之间时，这份读数是 bump 之前读的，
+        # 盖上新的戳就等于把它伪装成新的（`core/version.py` 的协议反过来写的那一型）
+        stamp = self._versions.snapshot()
+        if stamp != self._stamp:
+            self._entries.clear()
+            self._stamp = stamp
+            return
         self._entries[key] = _Entry(snapshot, day, self._monotonic())
 
     def _settle(self) -> None:

@@ -43,6 +43,20 @@ def test_any_version_bump_clears_everything(kind):
     assert got_cache.get(KEY, day=DAY) is None
 
 
+def test_a_bump_between_the_read_and_the_put_is_not_swallowed():
+    """读完才记快照的那一型：bump 落在「读」与「存」之间时，旧读数会被盖上新的戳。
+
+    `core/version.py` 的协议就是为它写的。后果不是报错，是接下来五分钟（TTL）里
+    盘中拿着 bump 之前的日线判规则，而闸上明明已经响过。
+    """
+    gate = VersionGate()
+    got_cache = SnapshotCache(gate, monotonic=lambda: 0.0)
+    assert got_cache.get(KEY, day=DAY) is None  # 引擎那一趟先 miss，再读库
+    gate.bump("bars")  # 读库与存库之间，写面动过
+    got_cache.put(KEY, "snap", day=DAY)
+    assert got_cache.get(KEY, day=DAY) is None, "这一份读数不该进表"
+
+
 def test_ttl_expires():
     # put 记下 0.0；第一取 0.0（岁数 0，命中）；第二取 301.0（岁数 > 300，过期）
     ticks = iter([0.0, 0.0, 301.0])
