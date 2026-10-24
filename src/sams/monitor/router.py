@@ -179,13 +179,19 @@ class NotifyService:
         alert = self.alerts.get(alert_id)
         if alert is None:
             raise StorageError(f"告警 {alert_id} 不存在：发送必须落在一条真实告警上")
+        # 收件人先查：人已不在就不该再为这条告警拼正文、跑一次可能很贵的上下文构建
+        user = self.users.get(alert.user_id)
+        if user is None:
+            reason = f"没有用户 {alert.user_id}：告警没有接收人就不能发"
+            # 这一条拒绝也要先落一行再抛（模块开头那条不变式对每条拒绝成立）；
+            # raise 保住是给下一个任务的队列用的：它要能区分「没有收件人」，
+            # 并且会对自己那一侧的失败另调 `abandon`
+            self.alerts.record(alert.id, None, NO_CHANNEL, error=reason, attempts=0)
+            raise ValidationError(reason)
         message = _message_from(alert)
         note = context_provider(alert) if context_provider is not None else ""
         if note:
             message = replace(message, body=f"{message.body}\n{note}")
-        user = self.users.get(alert.user_id)
-        if user is None:
-            raise ValidationError(f"没有用户 {alert.user_id}：告警没有接收人就不能发")
         dnd = self._dnd_note(user, message)
         if dnd:
             self.alerts.record(alert.id, None, SUPPRESSED, error=dnd, attempts=0)

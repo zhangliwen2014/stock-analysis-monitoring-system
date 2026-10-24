@@ -27,7 +27,7 @@ from sams.core.notify import (
 )
 from sams.monitor.router import NotifyService
 from sams.storage.crypto import cipher_for
-from sams.storage.repos.alerts import AlertRepo
+from sams.storage.repos.alerts import Alert, AlertRepo
 from sams.storage.repos.channels import Channel, ChannelRepo
 from sams.storage.repos.users import UserRepo
 
@@ -458,6 +458,30 @@ def test_record_then_deliver_sends_the_same_thing_as_dispatch(world):
     assert second.alert_id == alert.id
 
 
+def test_record_then_deliver_rebuilds_every_text_field(world):
+    """`_message_from` 的逐字段核对：对照物必须是**传进 `record` 的那条消息**，
+    不是第二次 `_message_from` 的结果——拿同一个函数和它自己比，把任何文本字段
+    抹成都空串也照样绿（上一版的比对就有这个毛病，正文、值、阈值全靠它蒙混）。
+    """
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    alert = world.notify.record(
+        msg(action_note="按计划处置", body="现金流覆盖分红两倍，跌到 0.4 也不减仓"),
+        user_id=user.id,
+    )
+    world.notify.deliver_existing(alert.id)
+    sent = world.made["wecom"].sent[-1]
+    assert sent.name == "中国神华"
+    assert sent.account_name == "主账户"
+    assert sent.rule_name == "PR 低"
+    assert sent.value_text == "PR=0.31"
+    assert sent.threshold_text == "PR≤0.4"
+    assert sent.action_note == "按计划处置"
+    assert sent.stage == "入池"
+    assert sent.body == "现金流覆盖分红两倍，跌到 0.4 也不减仓"
+    assert sent.alert_id == alert.id
+
+
 def test_quote_metadata_survives_the_trip_through_the_row(world):
     user = world.user()
     world.add(user.id, "wecom", "群 A")
@@ -503,3 +527,31 @@ def test_abandon_without_a_reason_is_refused(world):
 def test_deliver_existing_refuses_an_unknown_alert(world):
     with pytest.raises(StorageError):
         world.notify.deliver_existing("nope")
+
+
+def test_a_vanished_recipient_leaves_a_row_before_raising(world, db):
+    """收件人已不在时，`deliver_existing` 的拒绝也要先留下一行 `no_channel` 再抛：
+    只打在屏幕上的一句话在用户关掉终端之后就消失了，而「我那天为什么没收到」是
+    几周后才要问的那句（模块开头那条不变式对每一条拒绝成立，不只对压制）。
+
+    raise 本身要保住：下一个任务的队列要靠它区分「没有收件人」，并且它会对自己
+    那一侧的失败另调 `abandon`。查用户排在拼正文与建上下文**之前**：为一个已经不
+    在的人跑一次可能很贵的上下文构建，是白花的工作。
+    """
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    alert = world.notify.record(msg(), user_id=user.id)
+    db.execute("DELETE FROM users WHERE id = ?", [user.id])
+    built: list[str] = []
+
+    def build_context(a: Alert) -> str:
+        built.append(a.id)
+        return "当时的批注"
+
+    with pytest.raises(ValidationError, match="没有用户"):
+        world.notify.deliver_existing(alert.id, context_provider=build_context)
+    rows = world.alerts.deliveries(alert.id)
+    assert len(rows) == 1
+    assert rows[0].outcome == NO_CHANNEL
+    assert "接收人" in rows[0].error and "用户" in rows[0].error
+    assert built == []
