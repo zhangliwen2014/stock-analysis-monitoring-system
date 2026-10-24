@@ -440,8 +440,8 @@ def test_healthz_probes_never_touch_a_thread_context_connection(migrated):
 def test_a_failed_serve_build_closes_the_connections_it_opened(settings, monkeypatch):
     """半成品也要收干净：第二条连接建不起来时，第一条与 core 的连接必须关。
 
-    留着它们时，重跑 `sams serve` 会撞上自己——DuckDB 把同一个进程里没关的连接
-    当成另一个写者，而报错是「数据库正被另一个进程打开」，指不到真正的原因。
+    留着它们时，半成品的句柄会一直握着库文件——Windows 上还会挡住删除与改名，
+    而下一次启动的报错只会说「文件被占用」，指不到真正的原因。
     """
     real_context = bootstrap.build_context
     calls = {"n": 0}
@@ -466,3 +466,56 @@ def test_a_failed_serve_build_closes_the_connections_it_opened(settings, monkeyp
         bootstrap.build_serve(settings, adapters=stub_adapters())
 
     assert len(closed) == 2, "contexts[0] 与 core 各一条"
+
+
+def test_build_core_closes_its_own_connection_when_the_registry_fails(settings, monkeypatch):
+    """坏掉的数据源记录会让 `_registry` 抛：那条刚开的连接不能留在手里。"""
+    def boom(*args, **kwargs):
+        raise RuntimeError("坏掉的数据源记录")
+
+    closed: list[int] = []
+    real_close = Database.close
+
+    def record_close(self):
+        closed.append(id(self))
+        real_close(self)
+
+    monkeypatch.setattr(bootstrap, "_registry", boom)
+    monkeypatch.setattr(Database, "close", record_close)
+
+    with pytest.raises(RuntimeError, match="坏掉的数据源记录"):
+        bootstrap.build_core(settings)
+
+    assert len(closed) == 1
+
+
+def test_build_context_closes_only_the_connection_it_opened(migrated, monkeypatch):
+    """装配炸掉时，自己开的那条要关；调用方传进来的那条绝不能关。"""
+    core = bootstrap.build_core(migrated)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("装配炸了")
+
+    closed: list[int] = []
+    real_close = Database.close
+
+    def record_close(self):
+        closed.append(id(self))
+        real_close(self)
+
+    try:
+        monkeypatch.setattr(bootstrap, "_context_on", boom)
+        monkeypatch.setattr(Database, "close", record_close)
+
+        with pytest.raises(RuntimeError, match="装配炸了"):
+            bootstrap.build_context(core)
+        assert len(closed) == 1 and closed[0] != id(core.registry_db)
+
+        closed.clear()
+        own = Database.open(migrated.db_path)
+        with pytest.raises(RuntimeError, match="装配炸了"):
+            bootstrap.build_context(core, database=own)
+        assert closed == [], "传进来的连接归调用方"
+        own.close()
+    finally:
+        core.close()

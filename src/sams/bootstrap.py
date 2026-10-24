@@ -107,7 +107,7 @@ def attach_log_sink(bus: EventBus) -> None:
 class AppCore:
     """进程级共享件：后台线程与 HTTP 线程都拿这一份（D113）。
 
-    `registry_db` 只服务 registry 的源健康落库；在 serve（计划 14/15）里它不是任何
+    `registry_db` 只服务 registry 的源健康落库；在 `build_serve` 里它不是任何
     线程上下文的那条连接，而 `build_container` 让两者共用同一条连接，
     以保持 CLI「一个进程一条连接」的形状。
     """
@@ -119,7 +119,7 @@ class AppCore:
     registry: AdapterRegistry
     #: 手动请求队列：调度线程与 Web 共用，Web 的「立即同步」才落得到同一台调度器
     requests: RunRequestQueue
-    #: 行情板是进程级的一份：盘中线程写、`/healthz` 与 Web 读。
+    #: 行情板是进程级的一份：盘中线程写、`/healthz` 读（Web 页面在计划 3 接入后也读）。
     #: 每个上下文各造一块板时，页面看到的永远是自己那块空板
     board: QuoteBoard
     registry_db: Database
@@ -134,7 +134,7 @@ class AppCore:
 class ServiceContext:
     """一条线程的一整套仓库与服务：一条 DuckDB 连接，不跨线程（D113）。
 
-    每条上下文各造一台调度器，serve（计划 14/15）里只有调度线程会 `run_forever`；
+    每条上下文各造一台调度器，在 `build_serve` 里只有调度线程会 `run_forever`；
     请求队列来自 `AppCore.requests`，所以别的线程 `request_run` 入队的是同一批请求。
     """
 
@@ -215,7 +215,7 @@ class ServiceContext:
     intraday: IntradayMonitor
     task_runs: TaskRunRepo
     heartbeats: HeartbeatRepo
-    #: 保留策略（D116）：CLI、serve 的常驻维护与 admin 健康页（计划 14/15）共用这一份
+    #: 保留策略（D116）：CLI 与 serve 的常驻维护（以及计划 3 的 admin 健康页）共用这一份
     prune: PruneService
     #: 常驻调度器（spec §12）：`sams run start|once|jobs` 与健康页的 `[调度]` 读的是同一台
     scheduler: Scheduler
@@ -318,17 +318,24 @@ def build_core(
     """进程级共享件，一次进程只造一份。
 
     `database` 给进来时（`build_container` 就这么做）registry 的源健康与 CLI 的其余
-    仓库共用一条连接；不给就自己开一条，只给 registry 用。serve（计划 14/15）里
-    quote 与调度两条线程各开各的连接，不碰这一条。
+    仓库共用一条连接；不给就自己开一条，只给 registry 用。在 `build_serve` 里调度、
+    盘中、维护三条上下文各开各的连接，不碰这一条。自己开的那条在装配失败时自己关；
+    传进来的不碰。
     """
     cfg = settings or Settings.load()
     event_bus = bus or EventBus()
     attach_log_sink(event_bus)
     clock = clock or SYSTEM_CLOCK
     core_db = database or Database.open(cfg.db_path)
-    source_health = SourceHealthRepo(core_db)
-    data_sources = DataSourceRepo(core_db)
-    registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
+    try:
+        source_health = SourceHealthRepo(core_db)
+        data_sources = DataSourceRepo(core_db)
+        registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
+    except BaseException:
+        # 自己开的那条在装配失败时由自己关上：调用方拿不到引用，半成品的句柄会一直握着文件
+        if database is None:
+            core_db.close()
+        raise
     return AppCore(
         settings=cfg,
         clock=clock,
@@ -341,16 +348,15 @@ def build_core(
     )
 
 
-def build_context(
+def _context_on(
     core: AppCore,
     *,
-    database: Database | None = None,
-    providers: dict[str, CalendarProvider] | None = None,
-    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
+    database: Database,
+    providers: dict[str, CalendarProvider] | None,
+    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None,
 ) -> ServiceContext:
-    """一条线程的一整套仓库与服务。不传 `database` 时自己开一条（D113）。"""
+    """在给定连接上装一整套仓库与服务。连接的生命周期归调用方。"""
     cfg = core.settings
-    database = database or Database.open(cfg.db_path)
     clock = core.clock
     event_bus = core.bus
     registry = core.registry
@@ -589,6 +595,34 @@ def build_context(
     )
 
 
+def build_context(
+    core: AppCore,
+    *,
+    database: Database | None = None,
+    providers: dict[str, CalendarProvider] | None = None,
+    notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
+) -> ServiceContext:
+    """一条线程的一整套仓库与服务。不传 `database` 时自己开一条（D113）。
+
+    自己开的那一条在装配失败时由自己关上：调用方手里没有它的引用，
+    而半成品的句柄会一直握着库文件（Windows 上还会挡住删除）。
+    传进来的连接归调用方，失败时也不许关。
+    """
+    owned = database is None
+    database = database or Database.open(core.settings.db_path)
+    try:
+        return _context_on(
+            core,
+            database=database,
+            providers=providers,
+            notifier_factory=notifier_factory,
+        )
+    except BaseException:
+        if owned:
+            database.close()
+        raise
+
+
 def attach_system_alerter(context: ServiceContext) -> SystemAlerter:
     """把系统告警写进管理员收件箱；一个进程只挂一次。
 
@@ -719,12 +753,14 @@ def build_serve(
     """`sams serve` 的装配：一条进程级 core + 三条线程上下文 + 一个运行时。
 
     三个上下文依序造、依序记在 `opened` 里：造到第三个时炸掉，前两条也得关。
-    半成品留着连接时，重试会撞上自己的锁，而报错指的是「另一个进程」。
+    同一个进程里再开一条连接不会撞锁（DuckDB 共享实例），但半成品的句柄会一直
+    握着库文件——Windows 上还会挡住删除与改名。
     """
     cfg = settings or Settings.load()
-    core = build_core(cfg, clock=clock, bus=bus, adapters=adapters)
+    core: AppCore | None = None
     opened: list[ServiceContext] = []
     try:
+        core = build_core(cfg, clock=clock, bus=bus, adapters=adapters)
         for _ in range(3):
             opened.append(
                 build_context(
@@ -760,5 +796,6 @@ def build_serve(
     except BaseException:
         for context in opened:
             context.close()
-        core.close()
+        if core is not None:
+            core.close()
         raise

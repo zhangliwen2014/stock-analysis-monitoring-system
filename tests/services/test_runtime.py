@@ -210,3 +210,17 @@ def test_start_twice_is_refused(settings):
             runtime.start()
     finally:
         runtime.stop()
+
+
+def test_stop_tolerates_a_thread_that_never_started(settings):
+    """`start()` 在第二、三条线程上失败时，`stop()` 仍要能走完。
+
+    `serve` 的 finally 一定会调 `stop()`；那里再抛一次，原来的启动错误就被盖掉了，
+    而 `parts.close()` 也跟着跳过——泄漏的正是启动失败时最该收干净的那些连接。
+    """
+    runtime = make_runtime(settings)
+    runtime._threads = {"scheduler": threading.Thread(target=lambda: None)}
+
+    runtime.stop()
+
+    assert runtime.stop_event.is_set()

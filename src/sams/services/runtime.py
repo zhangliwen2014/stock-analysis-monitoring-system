@@ -115,7 +115,9 @@ class Runtime:
         }
         for name in ("scheduler", "intraday", "maintenance"):
             thread = self._threads.get(name)
-            if thread is None:
+            # `start()` 在第二、三条 `thread.start()` 上失败时，字典里会留下没起过的线程：
+            # join 一个没起过的线程会抛 RuntimeError，把真正的启动错误盖掉
+            if thread is None or thread.ident is None:
                 continue
             thread.join(timeout=timeouts[name])
             if thread.is_alive():
