@@ -161,6 +161,25 @@ def test_a_thread_that_never_exits_leaves_the_connections_open(
     assert "后台线程" in caplog.text
 
 
+def test_a_lan_listener_warns_about_the_plaintext_exposure(settings, started, caplog):
+    """spec §7：开了局域网就得在启动日志里说一声——听的地址与「没 TLS」。"""
+    lan = replace(settings, server=ServerCfg(host="0.0.0.0", allow_lan=True))
+
+    with caplog.at_level(logging.WARNING):
+        assert serve.start(lan, args()) == 0
+
+    assert "局域网" in caplog.text
+    assert "http://127.0.0.1:8765" in caplog.text
+    assert "未启用 TLS" in caplog.text
+
+
+def test_a_loopback_listener_does_not_warn_about_the_lan(settings, started, caplog):
+    with caplog.at_level(logging.WARNING):
+        assert serve.start(settings, args()) == 0
+
+    assert "局域网" not in caplog.text
+
+
 def test_a_refused_address_exits_1_without_opening_the_database(
     settings, monkeypatch, capsys
 ):

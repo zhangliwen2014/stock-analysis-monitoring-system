@@ -14,11 +14,11 @@ from sams.bootstrap import (
     build_core,
     build_serve,
 )
+from sams.core.errors import ValidationError
 from sams.core.events import EventBus, SystemAlarm
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
 from sams.storage.db import Database
-from sams.storage.migrate import apply_migrations
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.channels import ChannelRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
@@ -70,15 +70,6 @@ def test_log_sink_does_not_swallow_other_subscribers():
 
 
 # ---------- 数据源链的来源：库里有记录就不看配置文件 ----------
-
-
-@pytest.fixture
-def migrated(settings):
-    """建好并关闭：下面的用例各自重新打开这个文件库，模拟「两条命令两次进程」。"""
-    database = Database.open(settings.db_path)
-    apply_migrations(database)
-    database.close()
-    return settings
 
 
 def test_registry_chain_comes_from_the_database(migrated):
@@ -489,6 +480,27 @@ def test_build_core_closes_its_own_connection_when_the_registry_fails(settings, 
     assert len(closed) == 1
 
 
+def test_build_core_closes_its_own_connection_when_the_cipher_fails(migrated, monkeypatch):
+    """密钥配坏了也是装配失败：`cipher_for` 在 return 里求值时，那条连接就漏了。"""
+    def boom(*args, **kwargs):
+        raise ValidationError("secret_key 非法")
+
+    closed: list[int] = []
+    real_close = Database.close
+
+    def record_close(self):
+        closed.append(id(self))
+        real_close(self)
+
+    monkeypatch.setattr(bootstrap, "cipher_for", boom)
+    monkeypatch.setattr(Database, "close", record_close)
+
+    with pytest.raises(ValidationError, match="secret_key"):
+        bootstrap.build_core(migrated)
+
+    assert len(closed) == 1
+
+
 def test_build_context_closes_only_the_connection_it_opened(migrated, monkeypatch):
     """装配炸掉时，自己开的那条要关；调用方传进来的那条绝不能关。"""
     core = bootstrap.build_core(migrated)
@@ -519,6 +531,48 @@ def test_build_context_closes_only_the_connection_it_opened(migrated, monkeypatc
         own.close()
     finally:
         core.close()
+
+
+def test_build_container_closes_its_own_connection_when_assembly_fails(settings, monkeypatch):
+    """`build_container` 自己开的那条：后面三步任何一步炸了都要关。"""
+    def boom(*args, **kwargs):
+        raise RuntimeError("装配炸了")
+
+    closed: list[int] = []
+    real_close = Database.close
+
+    def record_close(self):
+        closed.append(id(self))
+        real_close(self)
+
+    monkeypatch.setattr(bootstrap, "build_core", boom)
+    monkeypatch.setattr(Database, "close", record_close)
+
+    with pytest.raises(RuntimeError, match="装配炸了"):
+        bootstrap.build_container(settings)
+
+    assert len(closed) == 1
+
+
+def test_build_container_never_closes_a_caller_connection(db, settings, monkeypatch):
+    """镜像 `test_build_context_closes_only_the_connection_it_opened`：传进来的不归这里关。"""
+    def boom(*args, **kwargs):
+        raise RuntimeError("装配炸了")
+
+    closed: list[int] = []
+    real_close = Database.close
+
+    def record_close(self):
+        closed.append(id(self))
+        real_close(self)
+
+    monkeypatch.setattr(bootstrap, "build_core", boom)
+    monkeypatch.setattr(Database, "close", record_close)
+
+    with pytest.raises(RuntimeError, match="装配炸了"):
+        bootstrap.build_container(settings, db=db)
+
+    assert closed == []
 
 
 def test_serve_parts_close_tries_every_step_and_reraises_the_first():

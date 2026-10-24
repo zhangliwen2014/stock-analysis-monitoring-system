@@ -331,6 +331,8 @@ def build_core(
         source_health = SourceHealthRepo(core_db)
         data_sources = DataSourceRepo(core_db)
         registry = _registry(cfg, data_sources, source_health, event_bus, clock, adapters)
+        # 密钥坏了也是装配失败：在 return 里求值时它会绕过下面那只 except，连接就漏了
+        cipher = cipher_for(cfg)
     except BaseException:
         # 自己开的那条在装配失败时由自己关上：调用方拿不到引用，半成品的句柄会一直握着文件
         if database is None:
@@ -340,7 +342,7 @@ def build_core(
         settings=cfg,
         clock=clock,
         bus=event_bus,
-        cipher=cipher_for(cfg),
+        cipher=cipher,
         registry=registry,
         requests=RunRequestQueue(),
         board=QuoteBoard(),
@@ -653,15 +655,22 @@ def build_container(
 ) -> Container:
     """CLI 的单一入口：core 与上下文共用一条连接，形状与 M3 完全一致。"""
     cfg = settings or Settings.load()
+    # 自己开的连接在装配失败时自己关：调用方拿不到它，半成品的句柄会一直握着库文件
+    owned = db is None
     database = db or Database.open(cfg.db_path)
-    core = build_core(cfg, clock=clock, bus=bus, database=database, adapters=adapters)
-    context = build_context(
-        core,
-        database=database,
-        providers=providers,
-        notifier_factory=notifier_factory,
-    )
-    attach_system_alerter(context)
+    try:
+        core = build_core(cfg, clock=clock, bus=bus, database=database, adapters=adapters)
+        context = build_context(
+            core,
+            database=database,
+            providers=providers,
+            notifier_factory=notifier_factory,
+        )
+        attach_system_alerter(context)
+    except BaseException:
+        if owned:
+            database.close()
+        raise
     return Container(
         **{field.name: getattr(context, field.name) for field in fields(context)}
     )

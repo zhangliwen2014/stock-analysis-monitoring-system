@@ -80,6 +80,11 @@ def start(settings: Settings, args: argparse.Namespace) -> int:
         print(f"SAMS 已启动：{advertised_url(server)}（Ctrl-C 停止，单 worker）")
         if restored:
             print(f"  行情板已恢复 {restored} 只票的最近报价")
+        if not server.is_loopback():
+            # spec §7：开门就要在日志里说清楚听在哪、有没有 TLS。用合并后的 server：
+            # 命令行 --host 覆盖出的监听地址也必须落进这句警告
+            plaintext = "" if server.tls_certfile else "（未启用 TLS：同网段可明文查看流量）"
+            logger.warning("已允许局域网访问：%s%s", advertised_url(server), plaintext)
         uvicorn.run(
             create_app(runtime),
             host=server.host,
