@@ -10,6 +10,8 @@
 
 * 编辑那一路，没填的那一格交出去的是 `None`（=不动），填了的那一格交的才是**整份**新值。
   为什么非得这样，写在 `rule_edit` 那个合并处（那也正是命令行 `rule edit` 的做法）。
+  而「没填」在页面上真的为空，靠的是编辑页的参数框空着起步、库里那份只当提示——
+  预填会让每一次保存都成了「把那些数又填了一遍」。
 * 冷却留空不等于 0。0 是「没有冷却」，那条规则命中一次就响一遍；空着说的是
   「按配置的来」，交给服务层的是 `None`（`add` 拿它落 `settings.cooldown_min`，
   `edit` 拿它表示这一项不动）。
@@ -78,8 +80,18 @@ def _values(data: dict[str, list[str]]) -> dict[str, str]:
     return values
 
 
+def _param_text(value: object) -> str:
+    """一个参数在提示里的写法。列表折回逗号串（`0.5,1.0`）：`str([0.5, 1.0])` 带着空格
+    和方括号，人照着它再敲一遍会被 `_as_tiers` 拒——提示得是表单自己读得懂的东西。"""
+    if isinstance(value, list):
+        return ",".join(str(piece) for piece in value)
+    return "" if value is None else str(value)
+
+
 def _stored_values(rule: Rule) -> dict[str, str]:
-    values = {
+    """编辑页预填的那几个单值字段。**参数不在里面**：为什么参数框空着起步，
+    写在 `rule_edit_page` 的那段注释里（`params_on` 与除权换算）。"""
+    return {
         "name": rule.name,
         "target_type": rule.target_type,
         "target_ref": rule.target_ref,
@@ -88,15 +100,11 @@ def _stored_values(rule: Rule) -> dict[str, str]:
         "account_id": rule.account_id or "",
         "thesis_id": rule.thesis_id or "",
     }
-    for key, value in rule.params.items():
-        if isinstance(value, list):
-            # 折回逗号串（`0.5,1.0`）：`str([0.5, 1.0])` 带着空格和方括号，
-            # 那一串交回 `_as_tiers` 会被它自己拒——表单读不懂自己写出去的东西
-            text = ",".join(str(piece) for piece in value)
-        else:
-            text = "" if value is None else str(value)
-        values[f"param_{key}"] = text
-    return values
+
+
+def _stored_hints(rule: Rule) -> dict[str, str]:
+    """库里那份参数：只当提示渲染（键是参数名），不落进任何一个输入框。"""
+    return {key: text for key, value in rule.params.items() if (text := _param_text(value))}
 
 
 def _mount(rule: Rule) -> str:
@@ -158,6 +166,7 @@ def _form_page(
     rule_id: str | None = None,
     bound: str | None = None,
     ticks: Sequence[str] = (),
+    hints: dict[str, str] | None = None,
 ):
     user = request.state.sams_user
     web = request.app.state.web
@@ -187,6 +196,7 @@ def _form_page(
         rule_id=rule_id,
         bound=bound,
         ticks=list(ticks),
+        hints=dict(hints or {}),
         **given,
     )
 
@@ -303,7 +313,13 @@ def rule_edit_page(request: Request, rule_id: str):
     return _form_page(
         request,
         template=template_for(rule.kind),
+        # 参数框一律空着起步，库里那份只当提示（`hints`）：预填会让「打开编辑页只为
+        # 改个名字」那一趟把每个框都填着旧数交回来——`touched` 就永远不为空，
+        # `params` 永远进 patch、`params_on` 永远盖成今天（`repos/rules.py` 的判据是
+        # 「交没交」），那条线于是在除权日免掉一次该做的搬家。留空 = 不动，
+        # 与级别、冷却那两格同一份合同；被拒的重渲染交回的是人刚敲的那份，不是这里。
         values=_stored_values(rule),
+        hints=_stored_hints(rule),
         # 四个键都给：库里少一个键（旧行）也只是没勾，不是把渲染交给巧合
         filters={key: bool(rule.filters.get(key)) for key in FILTER_KEYS},
         error=None,
@@ -334,6 +350,8 @@ def rule_edit(
         # `params_on` 盖不盖今天（`repos/rules.py`），而那是除权时要不要搬那条线的依据。
         # 所以没答过的那一格交 `None`，答过的那一格交完整的合并；判据是「表单交没交」，
         # 不是合出来的那份等不等：人把同一个数再敲一遍，说的还是「今天这里是这个数」。
+        # 这一判据要接得上人，靠的是编辑页的参数框空着起步（见 `rule_edit_page`）：
+        # 预填之下每个框都「交了」，这一规矩在真实路径上永远不为空。
         # 命令行 `rule edit` 合的就是这一份规矩（`cli/rule.py`）。
         touched = raw_params(template, data)
         params = {**dict(view.rule.params), **touched} if touched else None
@@ -353,10 +371,13 @@ def rule_edit(
     except DatabaseLocked:
         raise
     except SamsError as exc:
+        # 重渲染时框里交回的是人刚敲的那份（`_values`），库里那份仍只当提示（`hints`）：
+        # 提交过的原文与没碰过的预填是两件事
         return _form_page(
             request,
             template=template,
             values=values,
+            hints=_stored_hints(view.rule),
             filters=filters,
             error=str(exc),
             status=400,

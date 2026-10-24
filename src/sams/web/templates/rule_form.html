@@ -75,6 +75,11 @@
       </select>
       {% endif %}
       {% if spec.unit %}<span class="muted">{{ spec.unit }}</span>{% endif %}
+      {# 编辑页上参数框空着起步，库里那份只当提示出现在这一格旁边：预填等于替人把 #}
+      {# 每个框都「填了一遍」，每一次保存都会被当成重填了那些数、`params_on` 盖成今天 #}
+      {# （为什么要紧写在 `pages/rules.py` 的合并处——除权换算按它决定那条线搬不搬）。 #}
+      {# 新建那一屏没有 `hints`：留空是按模板默认值。 #}
+      {% if hints.get(spec.name) %}<span class="muted">当前：{{ hints[spec.name] }}（留空是不改这一项）</span>{% endif %}
     </label>
     {% endfor %}
     <label>级别

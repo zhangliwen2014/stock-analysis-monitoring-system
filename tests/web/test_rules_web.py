@@ -247,6 +247,38 @@ def test_a_price_retyped_is_todays_number(logged):
     assert shown.rule.params_on == logged.context.clock.now_utc().date()
 
 
+def test_renaming_via_the_form_does_not_restamp_the_params(logged):
+    """真正的用户路径：打开编辑页、改个名字、保存。浏览器会把每个参数框都提交一次——
+    框里若预填着库里那个数，`touched` 就永远不为空、`params` 永远进 patch、`params_on`
+    永远盖成今天（仓库的判据是「交没交」，`repos/rules.py`），止损线于是在除权日
+    不再搬。所以参数框空着起步：留空 = 不动，与级别、冷却那两格同一份合同。"""
+    rule_id = _add(logged, params={"price": 1500.0})
+    typed_on = date(2026, 3, 1)
+    _stamped_on(logged, rule_id, typed_on)
+    page = logged.client.get(f"/rules/{rule_id}/edit")
+    # 页面确实空着起步：预填哪天回来，这一条先红在这里
+    assert _echoed(page, "param_price") == ""
+    response = logged.client.post(
+        f"/rules/{rule_id}/edit",
+        data=_edit_rule_data(logged, name="只改个名", param_price=""),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    shown = logged.context.rule_service.show(_alice_id(logged), rule_id)
+    assert shown.rule.params["price"] == 1500.0
+    assert shown.rule.params_on == typed_on
+    # 反向也要真：敲进去一个数（哪怕是同一个）才该盖成今天。名字这趟也得改一下：
+    # 整份都没动时仓库的空改动闸先退回这一趟（`repos/rules.py`），那不是一次写
+    response = logged.client.post(
+        f"/rules/{rule_id}/edit",
+        data=_edit_rule_data(logged, name="敲了个数", param_price="1500"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    shown = logged.context.rule_service.show(_alice_id(logged), rule_id)
+    assert shown.rule.params_on == logged.context.clock.now_utc().date()
+
+
 def test_the_edit_page_pre_ticks_the_stored_channels(logged):
     """这一屏必须勾着库里那几条：不回填的框与压根没有那一格是两件事，
     而照着这一屏交一次的人不知道自己顺手清掉了什么。"""
@@ -382,8 +414,10 @@ def test_the_writes_are_behind_the_csrf_pair(logged):
 
 
 def test_the_edit_page_echoes_what_is_stored(logged):
-    """回填的是库里那一份：过滤开关的勾与 tiers 那个逗号串。
-    `str([0.5, 1.0])` 是 `[0.5, 1.0]`，交回 `_as_tiers` 会被拒——表单不能把自己写的东西读不懂。"""
+    """编辑页上「回填」参数的方式是提示，不是预填：逗号串 `0.5,1.0` 出现在那一格旁边
+    （`str([0.5, 1.0])` 带着空格和方括号，交回 `_as_tiers` 会被它自己拒），而输入框空着——
+    预填等于替人把每个框都「填了一遍」，每一次保存都会被说成重填了那些数。
+    过滤开关照旧勾着原样回填。"""
     account_id = _open_account(logged)
     rule_id = _add(
         logged, kind="tp.tiered", name="分批止盈", target_type="position", target_ref="*",
@@ -391,12 +425,14 @@ def test_the_edit_page_echoes_what_is_stored(logged):
     )
     page = logged.client.get(f"/rules/{rule_id}/edit")
     assert page.status_code == 200
-    assert 'value="0.5,1.0"' in page.text
+    assert "0.5,1.0" in page.text
+    assert "[0.5, 1.0]" not in page.text
+    assert 'value="0.5,1.0"' not in page.text
     assert 'name="filter_time_window" checked' in page.text
     assert 'name="filter_data_freshness" checked' not in page.text
-    # 照着这一屏交一次（只改名字）：那个开着的开关必须还开着。
-    # 表单数据是从上面那份渲染里读的，不是测试另写一遍常量：页面没回填的那个开关
-    # 会在这里被关掉， assertion 才会因为「页面没回填」而失败，而不是永远跟着测试自己的写法
+    # 照着这一屏交一次（只改名字，参数框照页面原样空着交）：开着的开关必须还开着，
+    # 库里那份 tiers 也还得是那份。表单数据是从渲染里读的，不是测试另写一遍常量：
+    # 页面回填错了（勾丢了、框变成预填）assertion 才会因「页面」而不是因「测试自己的写法」失败
     logged.client.post(
         f"/rules/{rule_id}/edit",
         data=_edit_rule_data(
@@ -407,6 +443,19 @@ def test_the_edit_page_echoes_what_is_stored(logged):
     shown = logged.context.rule_service.show(_alice_id(logged), rule_id)
     assert shown.rule.filters["time_window"] is True
     assert shown.rule.params["tiers"] == [0.5, 1.0]
+
+
+def test_no_param_box_is_prefilled_on_the_edit_page(logged):
+    """钉页面形状本身：输入框不带预填的 `value`，下拉不预选库里那个 choice——
+    将来谁把预填加回来，这一条当场红，而不是等到除权那天止损线没搬才发现。
+    库里那份以提示出现：看得见，不用重敲。"""
+    rule_id = _add(logged, kind="stop.ma", name="跌破周线", params={"basis": "daily_ma60"})
+    page = logged.client.get(f"/rules/{rule_id}/edit")
+    assert page.status_code == 200
+    # 存着的那一条不被预选：浏览器交出去的就不是「人没碰过的一格」
+    assert 'value="daily_ma60" selected' not in page.text
+    # 库里的选择以提示出现：看得见，不用重敲
+    assert "当前：daily_ma60" in page.text
 
 
 def test_edit_with_a_bad_number_rerenders_without_writing(logged):
