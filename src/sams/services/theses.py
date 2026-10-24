@@ -50,8 +50,9 @@ from sams.storage.repos.users import User, UserRepo
 STATUS_NAMES = STATUSES
 
 #: 对照表里的四栏：`key` 是给 `--json` 用的稳定标识，`label` 是屏幕上那个词，
-#: 后面那对是库里的列（单值的两列同名，区间那栏才是两列）
-_ROWS = (
+#: 后面那对是库里的列（单值的两列同名，区间那栏才是两列）。详情页也读这张表：
+#: 抄第二份就会分叉（见 `web/pages/theses.py`）
+LEVEL_ROWS = (
     ("entry", "买入区", ("entry_low", "entry_high")),
     ("stop", "止损", ("stop_price", "stop_price")),
     ("target", "目标", ("target_price", "target_price")),
@@ -59,10 +60,10 @@ _ROWS = (
 )
 
 
-#: 对照表实际读的那几列（`_ROWS` 的展开，去重）：判「库里到底有没有价位」要用它，
+#: 对照表实际读的那几列（`LEVEL_ROWS` 的展开，去重）：判「库里到底有没有价位」要用它，
 #: 不能用仓库那一张 `LEVEL_COLUMNS`——里面还挂着 M5 才回填的 `win_rate`，
 #: 那条有数而价位全空，会被读成「价位填过了」。
-_LEVEL_COLUMNS = tuple(dict.fromkeys(col for _, _, cols in _ROWS for col in cols))
+LEVEL_ROW_COLUMNS = tuple(dict.fromkeys(col for _, _, cols in LEVEL_ROWS for col in cols))
 
 
 def levels_from_plan(plan: Plan) -> dict:
@@ -132,7 +133,7 @@ class ThesisReport:
     @property
     def has_levels(self) -> bool:
         """库里到底有没有一列价位。没有的话，「库里那次」这个说法本身就不成立。"""
-        return any(getattr(self.thesis, column) is not None for column in _LEVEL_COLUMNS)
+        return any(getattr(self.thesis, column) is not None for column in LEVEL_ROW_COLUMNS)
 
     @property
     def stored_axis(self) -> str:
@@ -411,7 +412,7 @@ class ThesisService:
         plan = None if read is None else read.plan
         rows = tuple(
             _row(thesis, plan, key=key, label=label, columns=columns, unavailable=unavailable)
-            for key, label, columns in _ROWS
+            for key, label, columns in LEVEL_ROWS
         )
         fills = _fills(self.orders, thesis.id)
         return ThesisReport(
@@ -455,7 +456,7 @@ def _fmt(value: float | None) -> str:
 
 def _written(columns: dict) -> tuple[str, ...]:
     """这一次实际写了哪几栏（按屏幕上的顺序说，不按 kwargs 的哈希顺序）。"""
-    return tuple(label for _key, label, cols in _ROWS if any(c in columns for c in cols))
+    return tuple(label for _key, label, cols in LEVEL_ROWS if any(c in columns for c in cols))
 
 
 def _current(plan: Plan | None, key: str) -> tuple[tuple, str]:
@@ -528,7 +529,7 @@ def _measurement_note(thesis: Thesis, read: ValuationRead) -> str:
     拿它跟当前那次并排比差值，比的是「一个人填的数」与「一条式子算出的数」。
     """
     if thesis.levels_on is None:
-        if not any(getattr(thesis, column) is not None for column in _LEVEL_COLUMNS):
+        if not any(getattr(thesis, column) is not None for column in LEVEL_ROW_COLUMNS):
             return (
                 f"库里那一侧还没有价位（既不是某一次读数，也不是手填的数）；"
                 f"当前这次按 {read.as_of} 的库、ROE 口径 {read.fundamental.roe_basis} 算得出"

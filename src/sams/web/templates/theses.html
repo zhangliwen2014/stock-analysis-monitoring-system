@@ -27,7 +27,14 @@
     算不出的那一列不出现（补一个 0 就等于库里多一条没有式子 backing 的止损价）。</p>
   <form method="post" action="/theses/create" class="panel">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <label>市场 <input name="market" value="A"></label>
+    <label>市场
+      {# 下拉只给配置里那几个市场（与持仓页录成交同一做法）：自由输入框里一个手滑就是 400 #}
+      <select name="market">
+        {% for option in markets %}
+        <option value="{{ option }}"{% if loop.first %} selected{% endif %}>{{ option }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>代码 <input name="code"></label>
     <label>打分模板
       {# 值来自 STYLE_NAMES（`ThesisService.add` 收的就是这批名字）：填一个不存在的名字，

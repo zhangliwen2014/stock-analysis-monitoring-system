@@ -24,23 +24,13 @@ from fastapi.responses import RedirectResponse
 
 from sams.core.errors import DatabaseLocked, SamsError, StorageError, ValidationError
 from sams.core.timeutil import format_utc_moment
+from sams.services.theses import LEVEL_ROW_COLUMNS, LEVEL_ROWS
 from sams.services.valuation import STYLE_NAMES
 from sams.storage.repos.theses import Thesis
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import moment_label
 
 router = APIRouter()
-
-#: 详情那一屏摆的几列价位。标签与服务那张对照表同一批词（`services/theses.py` 的 `_ROWS`：
-#: 买入区/止损/目标/赔率），判「库里到底有没有价位」也算这几列——不含 `win_rate`：
-#: 那一列是 M5 回填的，有它而价位全空时被算成「价位填过了」就把一条空计划说成有计划
-_LEVEL_ROWS = (
-    ("买入区", ("entry_low", "entry_high")),
-    ("止损", ("stop_price",)),
-    ("目标", ("target_price",)),
-    ("赔率", ("reward_risk",)),
-)
-_LEVEL_COLUMNS = tuple(dict.fromkeys(col for _, cols in _LEVEL_ROWS for col in cols))
 
 
 def _require_own(ctx, user, thesis_id: str) -> Thesis:
@@ -84,19 +74,23 @@ def _list_page(request: Request, *, error: str | None = None, status: int = 200)
         # 下拉里的值就是 `ThesisService.add` 收得下的那批模板名。模板的中文名（价值型/趋势型）
         # 住在 analysis 层，web 不许 import 它（`tests/test_layering.py`），所以这里给的是名字本身
         styles=STYLE_NAMES,
+        # 市场下拉与持仓页录成交同一出处：只给配置里那几个，敲不出来的形态根本交不出来
+        markets=sorted(ctx.settings.markets),
         error=error,
     )
 
 
 def _levels(thesis: Thesis) -> list[dict]:
+    # 单值那几栏在 `LEVEL_ROWS` 里是同名两列（stop_price, stop_price），不是只有一列：
+    # 「区间」的判据是两列不同名，而不是列数为二
     return [
         {
             "label": label,
             "low": getattr(thesis, columns[0]),
-            "high": getattr(thesis, columns[1]) if len(columns) > 1 else None,
-            "kind": "range" if len(columns) > 1 else "one",
+            "high": getattr(thesis, columns[1]) if columns[1] != columns[0] else None,
+            "kind": "range" if columns[1] != columns[0] else "one",
         }
-        for label, columns in _LEVEL_ROWS
+        for _key, label, columns in LEVEL_ROWS
     ]
 
 
@@ -107,7 +101,7 @@ def _levels_note(thesis: Thesis) -> str:
     一句，改一处的措辞另一处就永远对不上。价位一列都没有时不能说「手填」——那是给用户
     安一个他没做过的动作，所以那种情况说的是「库里还没有价位」（`stored_axis` 的同一句话）。
     """
-    if not any(getattr(thesis, column) is not None for column in _LEVEL_COLUMNS):
+    if not any(getattr(thesis, column) is not None for column in LEVEL_ROW_COLUMNS):
         return "库里还没有价位"
     return f"截至 {thesis.levels_on}" if thesis.levels_on is not None else "没有测量日（手填）"
 
@@ -215,7 +209,7 @@ def thesis_advance(
             # 真正的闸在仓库，`advance` 走到那儿还会再拒一次
             raise ValidationError(
                 f"不能从 {thesis.status} 推进到 {to or '（空）'}："
-                f"合法的下一步是 {'/'.join(steps) or '（没有，这是终点）'}"
+                f"合法的下一步是 {'、'.join(steps) or '（没有，这是终点）'}"
             )
         ctx.theses.advance(user.username, thesis_id, to, note=note.strip() or None)
     except DatabaseLocked:

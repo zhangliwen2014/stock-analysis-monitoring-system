@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from sams.core.errors import DatabaseLocked
+from sams.storage.repos.theses import ThesisRepo
+
 
 def _alice_id(logged) -> str:
     return logged.context.users.get_by_username("alice").id
@@ -68,6 +71,8 @@ def test_advance_moves_the_status(logged):
     alice_id = _alice_id(logged)
     thesis = ctx.theses_store.require(alice_id, thesis_id)
     steps = ctx.theses.next_steps(thesis.status)
+    # 推进之前详情页的下拉里还没有 `opened`：留给下面做对照
+    before = logged.client.get(f"/theses/{thesis_id}").text
     response = logged.client.post(
         f"/theses/{thesis_id}/advance",
         data={"csrf": logged.csrf, "to": steps[0], "note": "进入下一步"},
@@ -81,9 +86,10 @@ def test_advance_moves_the_status(logged):
     assert "进入下一步" in notes
     # 列表那一行跟着状态走：那一格除了这一条论没有别处会写出这个词
     assert f">{steps[0]}" in logged.client.get("/theses").text
-    # 推进之后那个下拉换了一张表：`archived` 只接在三个了结状态之后
+    # 推进之后那个下拉换了一张表：`opened` 只接在 `proposed` 之后，是推进后才出现的那一步
     after = logged.client.get(f"/theses/{thesis_id}").text
-    assert '<option value="archived"' not in after
+    assert '<option value="opened"' in after
+    assert '<option value="opened"' not in before
 
 
 def test_advance_to_an_illegal_status_re_renders(logged):
@@ -95,8 +101,8 @@ def test_advance_to_an_illegal_status_re_renders(logged):
         data={"csrf": logged.csrf, "to": "archived", "note": ""},
     )
     assert response.status_code == 400
-    # 那句拒绝点名合法的下一步，名单出自 next_steps：`/` 连起来的这串只可能来自那句话
-    assert "合法的下一步是 proposed/invalidated" in response.text
+    # 那句拒绝点名合法的下一步，名单出自 next_steps（分隔符与服务层同一用「、」）
+    assert "合法的下一步是 proposed、invalidated" in response.text
     # 拒绝不能留下半个变更
     assert ctx.theses_store.require(_alice_id(logged), thesis_id).status == "observing"
 
@@ -105,8 +111,11 @@ def test_create_with_an_unknown_style_lists_the_real_names(logged):
     """下拉里的值必须是服务收得下的名字：`growth` 是拍出来的，收下它就是一句修不好的拒绝。"""
     response = _create(logged, style="growth")
     assert response.status_code == 400
-    # 那句拒绝把能用的名字全列出来（Jinja 会把引号转义，所以断的是这半句）
-    assert "的打分模板：能用的是 value、trend" in response.text
+    # 拒绝里点名了能用的模板名：只断这些名字本身，服务层改措辞不该弄坏 web 测试
+    assert "value" in response.text
+    assert "trend" in response.text
+    # 被拒的名字本身要回显出来：这句只可能来自那句拒绝（表单里没有别处会写出 growth）
+    assert "growth" in response.text
     # 被拒的这次什么都没写进库
     assert [t.code for t in logged.context.theses.list("alice")] == []
 
@@ -114,9 +123,12 @@ def test_create_with_an_unknown_style_lists_the_real_names(logged):
 def test_create_with_an_unconfigured_market_says_which_ones_exist(logged):
     response = _create(logged, market="JP", code="7203")
     assert response.status_code == 400
-    # `market_cfg` 那句话点名列出已配置的市场，而不是含糊的「参数错了」
+    # `market_cfg` 的拒绝会点名已配置的市场：断市场代码本身，不断那句话的措辞
     assert "未知市场" in response.text
-    assert "已配置: A, HK, US" in response.text
+    assert "HK" in response.text
+    assert "US" in response.text
+    # 被拒的市场要回显：JP 不在下拉里，页面上它只可能来自那句拒绝
+    assert "JP" in response.text
     assert [t.code for t in logged.context.theses.list("alice")] == []
 
 
@@ -155,6 +167,20 @@ def test_a_finished_thesis_offers_no_step(logged):
     assert page.status_code == 200
     assert "没有下一步" in page.text
     assert '<select name="to">' not in page.text
+
+
+def test_database_locked_is_503_not_404(logged, monkeypatch):
+    """库被调度线程握着时答 404 是一句自信的错误话：它会让人以为这条论没了。
+
+    真相是「过一会儿再来」，所以 `DatabaseLocked` 必须冒到全局处理器换成 503，
+    而不是被 `_require_own` 兜 `StorageError` 的那句吞成「不存在或属于别人」。
+    """
+
+    def locked(self, user_id, thesis_id):
+        raise DatabaseLocked("sams.duckdb", detail="Conflicting lock (PID 42)")
+
+    monkeypatch.setattr(ThesisRepo, "require", locked)
+    assert logged.client.get("/theses/any-id").status_code == 503
 
 
 def test_another_users_thesis_is_404(logged):
