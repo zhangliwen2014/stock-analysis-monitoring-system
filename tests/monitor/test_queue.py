@@ -21,20 +21,18 @@ from sams.monitor.queue import (
 
 
 class FakeNotify:
-    # 类级计数：alert_id 跨实例单调，对齐真实服务里 uuid 主键的唯一性
-    next_id = 1
-
     def __init__(self) -> None:
         self.recorded: list[AlertMessage] = []
         self.abandoned: list[tuple[str, str]] = []
         self.delivered: list[str] = []
+        self.next_id = 1
 
     def record(
         self, message, *, user_id, channel_ids=(), rule_id=None, account_id=None,
         is_test=False,
     ):
-        alert_id = f"a{FakeNotify.next_id}"
-        FakeNotify.next_id += 1
+        alert_id = f"a{self.next_id}"
+        self.next_id += 1
         self.recorded.append(message)
         return SimpleNamespace(id=alert_id)
 
@@ -87,7 +85,7 @@ def test_a_full_queue_abandons_instead_of_losing_the_alert():
     q.offer(AlertJob("occupied"))
     sender = QueuedAlertSender(notify, q)
     alert_id = sender.dispatch(msg(), user_id="u1")
-    assert alert_id == "a2"  # 引擎那一侧的账不因投递方式而不同
+    assert alert_id == "a1"  # 队列满了也照样给引擎一个 id：去重键与冷却那一侧的账不因投递方式而不同
     assert len(notify.abandoned) == 1
     assert "队列已满" in notify.abandoned[0][1]
     assert "重发" in notify.abandoned[0][1]
