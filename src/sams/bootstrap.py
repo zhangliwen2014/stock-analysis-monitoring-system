@@ -736,9 +736,22 @@ class ServeParts:
         return self.contexts[1].quotes.load_board()
 
     def close(self) -> None:
+        # 一条关不掉不该挡住其余三条：少关一条就是多泄漏一条，而第一条的异常
+        # 比最后一条更能说明「为什么开始收尾」
+        first: BaseException | None = None
         for context in self.contexts:
-            context.close()
-        self.core.close()
+            try:
+                context.close()
+            except BaseException as exc:
+                if first is None:
+                    first = exc
+        try:
+            self.core.close()
+        except BaseException as exc:
+            if first is None:
+                first = exc
+        if first is not None:
+            raise first
 
 
 def build_serve(

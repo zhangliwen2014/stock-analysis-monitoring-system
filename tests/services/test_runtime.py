@@ -9,6 +9,7 @@ import pytest
 from support import FrozenClock
 
 from sams.core.quotes import Quote
+from sams.services import runtime as runtime_module
 from sams.services.prune import PruneReport, PruneStep
 from sams.services.quotes import MarketBoard
 from sams.services.runtime import Runtime
@@ -221,6 +222,37 @@ def test_stop_tolerates_a_thread_that_never_started(settings):
     runtime = make_runtime(settings)
     runtime._threads = {"scheduler": threading.Thread(target=lambda: None)}
 
-    runtime.stop()
+    assert runtime.stop() is True, "一条线程都没起过时，没有什么还在跑"
 
     assert runtime.stop_event.is_set()
+
+
+class StubbornMonitor:
+    """卡在一次慢调用里的线程：故意不看 stop，要等用例放行才退出。"""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run_forever(self, *, stop, **_kwargs):
+        self.started.set()
+        while not self.release.wait(0.01):
+            pass
+        return 0
+
+
+def test_stop_reports_whether_every_thread_exited(settings, monkeypatch):
+    """返回值是给调用方的信号：False 时共享资源（库连接）不许关。"""
+    runtime = make_runtime(settings)
+    runtime.start()
+    assert runtime.stop() is True, "三条线程都按时退出"
+
+    monkeypatch.setattr(runtime_module, "WORKER_STOP_TIMEOUT_S", 0.05)
+    stubborn = StubbornMonitor()
+    stuck = make_runtime(settings, monitor=stubborn)
+    stuck.start()
+    assert stubborn.started.wait(2)
+    try:
+        assert stuck.stop() is False
+    finally:
+        stubborn.release.set()

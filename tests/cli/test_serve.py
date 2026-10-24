@@ -26,12 +26,14 @@ class FakeRuntime:
     def __init__(self):
         self.started = False
         self.stopped = False
+        self.clean = True
 
     def start(self):
         self.started = True
 
     def stop(self):
         self.stopped = True
+        return self.clean
 
 
 class FakeParts:
@@ -137,6 +139,26 @@ def test_a_crashed_server_still_stops_the_threads_and_closes(settings, monkeypat
         serve.start(settings, args())
 
     assert parts.runtime.stopped and parts.closed
+
+
+def test_a_thread_that_never_exits_leaves_the_connections_open(
+    settings, monkeypatch, caplog
+):
+    """活线程可能正握着库连接：从主线程关在它脚下是未定义行为。
+
+    进程紧接着就退出了，把连接交给操作系统回收比在活线程下手更安全。
+    """
+    parts = FakeParts()
+    parts.runtime.clean = False
+    monkeypatch.setattr(serve, "build_serve", lambda settings: parts)
+    monkeypatch.setattr(serve.uvicorn, "run", lambda app, **kwargs: None)
+
+    with caplog.at_level(logging.WARNING):
+        assert serve.start(settings, args()) == 0
+
+    assert parts.runtime.stopped
+    assert parts.closed is False, "线程还在跑，连接不许关"
+    assert "后台线程" in caplog.text
 
 
 def test_a_refused_address_exits_1_without_opening_the_database(

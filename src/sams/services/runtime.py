@@ -105,7 +105,12 @@ class Runtime:
             thread.start()
         logger.info("运行时已启动：%s", "、".join(self._threads))
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """逐个 join 线程，返回「它们是否都退出了」。
+
+        返回 False 时调用方不得关闭共享资源（库连接等）：那条线程可能正握着它们
+        执行，从另一条线程关掉等于在别人手里抽走桌子。
+        """
         self.stop_event.set()
         timeouts = {
             # 调度线程可能正卡在一个 job 里：等它收尾，但不等一个坏掉的实现
@@ -113,6 +118,7 @@ class Runtime:
             "intraday": WORKER_STOP_TIMEOUT_S,
             "maintenance": WORKER_STOP_TIMEOUT_S,
         }
+        clean = True
         for name in ("scheduler", "intraday", "maintenance"):
             thread = self._threads.get(name)
             # `start()` 在第二、三条 `thread.start()` 上失败时，字典里会留下没起过的线程：
@@ -121,9 +127,11 @@ class Runtime:
                 continue
             thread.join(timeout=timeouts[name])
             if thread.is_alive():
+                clean = False
                 logger.warning(
                     "%s 线程 %ss 内没有退出，继续停其余部分", name, timeouts[name]
                 )
+        return clean
 
     def next_maintenance_at(self, now: datetime) -> datetime:
         today = datetime.combine(now.date(), MAINTENANCE_AT, tzinfo=UTC)

@@ -20,6 +20,8 @@ from sams.core.config import ServerCfg, Settings
 from sams.core.errors import DatabaseLocked, SamsError, ValidationError
 from sams.web.app import create_app
 
+logger = logging.getLogger(__name__)
+
 
 def add_to(subparsers) -> None:
     # 不设 handler：`run()` 在造容器之前就分派到 `start(settings, args)`，
@@ -102,7 +104,13 @@ def start(settings: Settings, args: argparse.Namespace) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 1
     finally:
-        if runtime is not None:
-            runtime.stop()
+        clean = runtime.stop() if runtime is not None else True
         if parts is not None:
-            parts.close()
+            if clean:
+                parts.close()
+            else:
+                # 活线程可能正握着库连接执行；进程马上就要退出，交给操作系统回收
+                # 比在它脚下关连接安全（DuckDB 连接不保证跨线程 close 安全）
+                logger.warning(
+                    "仍有后台线程没有退出：连接留给进程退出时回收，不在活线程下关闭"
+                )

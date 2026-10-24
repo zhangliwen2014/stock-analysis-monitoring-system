@@ -519,3 +519,29 @@ def test_build_context_closes_only_the_connection_it_opened(migrated, monkeypatc
         own.close()
     finally:
         core.close()
+
+
+def test_serve_parts_close_tries_every_step_and_reraises_the_first():
+    """一条连接关不掉不该替另外三条做决定：少关一条就是多泄漏一条。"""
+    closed: list[str] = []
+
+    class Part:
+        def __init__(self, name: str, *, boom: bool = False) -> None:
+            self.name = name
+            self.boom = boom
+
+        def close(self) -> None:
+            closed.append(self.name)
+            if self.boom:
+                raise RuntimeError(f"{self.name} 关不掉")
+
+    parts = bootstrap.ServeParts(
+        core=Part("core"),
+        contexts=(Part("context-0", boom=True), Part("context-1"), Part("context-2")),
+        runtime=object(),
+    )
+
+    with pytest.raises(RuntimeError, match="context-0 关不掉"):
+        parts.close()
+
+    assert closed == ["context-0", "context-1", "context-2", "core"]
