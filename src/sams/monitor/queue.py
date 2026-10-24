@@ -2,7 +2,8 @@
 
 规则引擎那一侧只做两件快的事：告警落库、offer 进队列。网络重试、免打扰、路由
 全在通知线程里跑。队列满 ⇒ abandon：告警留在收件箱可以重发，而阻塞求值线程会让
-同一轮里排在后面的市场全等它。
+同一轮里排在后面的市场全等它。通知线程那一侧也一样逐单隔离：一条坏单（包括异常
+类型不在名单里的那种）只让它自己那一行写下为什么没发出去，不把线程和后面的队列带走。
 
 这一层只认识 core 与 storage：monitor 内部的分层红线（`tests/test_layering.py`）。
 """
@@ -102,7 +103,10 @@ class QueuedAlertSender:
             rule_id=rule_id,
             account_id=account_id,
         )
-        if self.queue.offer(AlertJob(alert.id)):
+        # timeout=0.0：满不满当场决定（`put` 收到 0 也是即时抛 Full，不是 ValueError）。
+        # 这里不用 `OFFER_TIMEOUT_S` 那个默认值——本模块唯一的调用方就是这一处，留着两个
+        # 「满」的口径只会被下一个人挑错那个：求值线程多等一秒，同一轮里排在后面的市场全等它
+        if self.queue.offer(AlertJob(alert.id), timeout=0.0):
             return alert.id
         self.notify.abandon(
             alert.id,
@@ -115,7 +119,8 @@ class QueuedAlertSender:
 
 
 class NotifyWorker:
-    """通知线程的主循环：取工作单 → 交给 NotifyService。停机后排水 ≤ DRAIN_S。"""
+    """通知线程的主循环：取工作单 → 交给 NotifyService。逐单隔离，没收到 stop 就一直消费；
+    停机后排水 ≤ DRAIN_S。"""
 
     def __init__(self, notify, queue: AlertQueue, *, drain_s: float = DRAIN_S) -> None:
         self.notify = notify
@@ -140,10 +145,32 @@ class NotifyWorker:
             except SamsError:
                 # 一条发不出去不该把线程带走：后面还有全市场的告警在排队
                 logger.exception("通知工作单 %r 失败", job)
+            except Exception as exc:  # noqa: BLE001 — 逐单隔离是这里的职责，异常类型不在名单里也一样
+                logger.exception("通知工作单 %r 出了预期外的错", job)
+                self._explain(job, exc)
             if deadline is not None and (
                 self.queue.empty() or time.monotonic() >= deadline
             ):
                 return
+
+    def _explain(self, job, exc: Exception) -> None:
+        """把预期外的失败写成一行弃单：这一层的不变式是每条拒绝都落库（`router` 模块开头），
+        否则用户那边只剩「我那天为什么没收到」，而栈追踪早就随终端一起关了。
+
+        `CallbackJob` 直接返回：系统告警从来不是收件箱里的一行，没有可弃的东西。
+        """
+        if not isinstance(job, AlertJob):
+            return
+        try:
+            self.notify.abandon(
+                job.alert_id,
+                reason=(
+                    f"通知线程处理这条告警时出了预期外的错："
+                    f"{type(exc).__name__}: {exc}（告警已落库，可在收件箱重发）"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — 弃单本身坏了也不能停在同一个坑里
+            logger.exception("给告警 %s 落弃单失败", job.alert_id)
 
 
 class SystemAlarmRelay:
@@ -158,4 +185,7 @@ class SystemAlarmRelay:
         bus.subscribe(SystemAlarm, self._on_alarm)
 
     def _on_alarm(self, event) -> None:
-        self._queue.offer(CallbackJob(self._handle, event))
+        if not self._queue.offer(CallbackJob(self._handle, event)):
+            # 队列满时只能说一句：系统告警不是库里的一行，没有可弃的东西，
+            # 而一句也不说就等于让故障静默消失（`router` 那条不变式在这里够不着）
+            logger.warning("通知队列已满，系统告警（组件 %s）被丢弃", event.component)
