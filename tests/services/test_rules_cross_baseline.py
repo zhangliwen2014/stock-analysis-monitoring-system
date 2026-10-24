@@ -74,3 +74,27 @@ def test_downward_cross_uses_the_same_origin():
     got = price_cross_below(ask)
     assert got.hit is not None
     assert got.hit.why.startswith("上一轮 10.05")
+
+
+def test_a_previous_round_sitting_exactly_on_the_line_counts_as_a_cross():
+    # 回踩确认：上一轮正好压在 10.00 上，这一跳 10.02 站上去，才算「穿」。
+    # 基准侧不带等号的话，贴着线起跳的那一次会被判成「早已穿过」，当天永不报。
+    ask = type(
+        "Ask",
+        (),
+        {"snapshot": snap(cross_from=10.00), "params": {"price": 10.0}},
+    )()
+    got = price_cross_above(ask)
+    assert got.hit is not None
+    assert got.hit.why.startswith("上一轮 10.00")
+
+
+def test_the_current_price_sitting_exactly_on_the_line_does_not_fire():
+    # 只碰到线不等于穿过：现价就停在 10.02 上，另一侧 9.95 算「到了」不算「穿过」。
+    # 现价侧带等号的话，价格贴着线磨的每一天都会重报一次。
+    ask = type(
+        "Ask",
+        (),
+        {"snapshot": snap(cross_from=9.95), "params": {"price": 10.02}},
+    )()
+    assert price_cross_above(ask).hit is None
