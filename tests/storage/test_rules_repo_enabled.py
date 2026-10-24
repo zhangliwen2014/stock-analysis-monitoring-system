@@ -24,8 +24,10 @@ def add(repo, user_id, name, *, enabled=True):
 
 def test_enabled_rules_across_users_in_a_stable_order(db):
     repo = RuleRepo(db)
-    a1 = add(repo, "u-a", "甲一")
+    # 插入次序刻意与 ORDER BY user_id, id 相反：u-b 先落地。若把 ORDER BY 去掉
+    # （或改成按插入/created_at 排），下面那条断言就会红
     b1 = add(repo, "u-b", "乙一")
+    a1 = add(repo, "u-a", "甲一")
     add(repo, "u-a", "甲停", enabled=False)
     b2 = add(repo, "u-b", "乙二")
     got = repo.list_enabled()
