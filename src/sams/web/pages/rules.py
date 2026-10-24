@@ -8,10 +8,8 @@
 
 两处与直觉相反的地方都在「没填」上：
 
-* 参数没填不等于不动。`RuleRepo.update` 收下的 `params` 是**整份替换**
-  （`patch.get("params", before.params)`），缺的键随后由 `validate_params` 按模板
-  **默认值**补上，而不是按库里那个值。所以编辑那一路必须从 `rule.params` 起头再盖，
-  过滤开关同理（少交一个键就是把它关掉）。
+* 编辑那一路，没填的那一格交出去的是 `None`（=不动），填了的那一格交的才是**整份**新值。
+  为什么非得这样，写在 `rule_edit` 那个合并处（那也正是命令行 `rule edit` 的做法）。
 * 冷却留空不等于 0。0 是「没有冷却」，那条规则命中一次就响一遍；空着说的是
   「按配置的来」，交给服务层的是 `None`（`add` 拿它落 `settings.cooldown_min`，
   `edit` 拿它表示这一项不动）。
@@ -22,6 +20,8 @@
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -50,6 +50,11 @@ _SCALARS = (
 #: 存不上的挂载对象：`_validate` 见 `portfolio` 就拒（组合级这一层还没有输入，U28），
 #: 而模板的 `targets` 里那五种是「形状」不是「能写」。给一个必然被拒的选项是坏掉的控件。
 _UNWRITABLE_TARGETS = ("portfolio",)
+
+#: 通道那一格渲染出来时插在里面的暗记（`rule_form.html` 那个 fieldset）。
+#: 保存那一路靠它分清两种「一个都没勾」：这一屏压根没有那一格（没人答过，交 `None`
+#: =不动），还是满屏的框被人全不勾（那是一句答案：改回默认路由）。
+_CHANNELS_OFFERED = "channels_offered"
 
 
 def _cooldown(raw: str) -> int | None:
@@ -152,17 +157,26 @@ def _form_page(
     status: int,
     rule_id: str | None = None,
     bound: str | None = None,
+    ticks: Sequence[str] = (),
 ):
     user = request.state.sams_user
     web = request.app.state.web
     ctx = web.contexts.current()
+    # 模板不收的那一格连名单都不读：`stop.fixed` 那一屏既不要账户也不要论，
+    # 那两次查询读回来没人看
+    given: dict[str, object] = {
+        # 通道这一份每次都要读：有没有那一格由它判（见 `_CHANNELS_OFFERED`）
+        "channels": ctx.channels_store.list_for(user.id),
+    }
+    if template.needs_position:
+        given["accounts"] = ctx.sim_accounts.list_for(user.id)
+    if template.needs_thesis:
+        given["theses"] = ctx.theses.list(user.username)
     return web.render(
         request,
         "rule_form.html",
         status_code=status,
-        title=f"规则 {template.kind}",
         template=template,
-        kinds=RULE_KINDS,
         # 名单从契约来，不从模板里那份硬编码来
         targets=[item for item in template.targets if item not in _UNWRITABLE_TARGETS],
         filter_keys=FILTER_KEYS,
@@ -172,9 +186,8 @@ def _form_page(
         error=error,
         rule_id=rule_id,
         bound=bound,
-        channels=ctx.channels_store.list_for(user.id),
-        accounts=ctx.sim_accounts.list_for(user.id),
-        theses=ctx.theses.list(user.username),
+        ticks=list(ticks),
+        **given,
     )
 
 
@@ -237,6 +250,13 @@ def rule_create(
         template = template_for(kind)
     except SamsError as exc:
         return _picker_page(request, values=values, error=str(exc), status=400)
+    target_type = one(data, "target_type").strip()
+    target_ref = one(data, "target_ref").strip()
+    thesis_id = one(data, "thesis_id") or None
+    if target_type == "thesis" and thesis_id:
+        # 挂在论上时，下拉里选中的那一条就是挂载对象：`_validate` 在归一之前先按形状查
+        # `target_ref`，要人再把那串 uuid 敲进引用框等于让这个下拉只剩一种用法——产 400
+        target_ref = thesis_id
     try:
         ctx.rule_service.add(
             user.id,
@@ -244,13 +264,13 @@ def rule_create(
             name=one(data, "name"),
             # 引用原样交出去（只 strip）：`rules.target_ref` 存的就是人敲的那串，
             # 归一发生在求值时的 `snapshot.expand`——这里再排一遍会留下两套规则（见 symbol.py）
-            target_type=one(data, "target_type").strip(),
-            target_ref=one(data, "target_ref").strip(),
+            target_type=target_type,
+            target_ref=target_ref,
             # 只交填了的那几项：缺的由 `validate_params` 补默认值，必填的那一个由它拒
             params=raw_params(template, data),
             filters=filters,
             account_id=one(data, "account_id") or None,
-            thesis_id=one(data, "thesis_id") or None,
+            thesis_id=thesis_id,
             # 空选择 = 不指定 = 模板自己那个级别，不是空串进仓库
             severity=one(data, "severity") or None,
             channel_ids=many(data, "channel_ids"),
@@ -263,7 +283,13 @@ def rule_create(
         # 业务拒绝（少了必填参数、别人的账户、野过滤器）留在这里说：表单还在屏上，
         # 改那一格就能重交，而 error.html 给的是一屏没有表单的话
         return _form_page(
-            request, template=template, values=values, filters=filters, error=str(exc), status=400
+            request,
+            template=template,
+            values=values,
+            filters=filters,
+            error=str(exc),
+            status=400,
+            ticks=many(data, "channel_ids"),
         )
     return RedirectResponse("/rules", status_code=303)
 
@@ -284,6 +310,7 @@ def rule_edit_page(request: Request, rule_id: str):
         status=200,
         rule_id=rule_id,
         bound=_mount(rule),
+        ticks=rule.channel_ids,
     )
 
 
@@ -301,17 +328,26 @@ def rule_edit(
     values = _values(data)
     filters = filter_flags(data)
     try:
-        # 从库里那一份起头，只盖表单真填了的几项：`update` 是整份替换，
-        # 没盖到的键会被模板默认值填掉（那才是「改个名字顺手把止损线搬回默认价」）
-        params = {**dict(view.rule.params), **raw_params(template, data)}
+        # 整包替换就写在这一处：`RuleRepo.update` 只把**不是 `None`** 的 kwarg 当成一次写，
+        # 交了的那个键则是整份生效——缺的键由 `validate_params` 按模板默认值补，而不是按
+        # 库里那一份（少交一个就是「把止损线搬回默认价」）。`params` 在不在 `patch` 里还决定
+        # `params_on` 盖不盖今天（`repos/rules.py`），而那是除权时要不要搬那条线的依据。
+        # 所以没答过的那一格交 `None`，答过的那一格交完整的合并；判据是「表单交没交」，
+        # 不是合出来的那份等不等：人把同一个数再敲一遍，说的还是「今天这里是这个数」。
+        # 命令行 `rule edit` 合的就是这一份规矩（`cli/rule.py`）。
+        touched = raw_params(template, data)
+        params = {**dict(view.rule.params), **touched} if touched else None
+        # 没渲染过那一格 = 没人答过 = 不动；渲染了而一个不勾 = 一句答案 = 改回默认路由
+        channels = many(data, "channel_ids") if _CHANNELS_OFFERED in data else None
         ctx.rule_service.edit(
             user.id,
             rule_id,
             name=one(data, "name"),
             params=params,
+            # 四个开关每次都整套交出：那一张表永远渲染，没勾的那个就是「关掉」这句答案
             filters=filters,
             severity=one(data, "severity") or None,
-            channel_ids=many(data, "channel_ids"),
+            channel_ids=channels,
             cooldown_min=_cooldown(one(data, "cooldown_min")),
         )
     except DatabaseLocked:
@@ -326,6 +362,7 @@ def rule_edit(
             status=400,
             rule_id=rule_id,
             bound=_mount(view.rule),
+            ticks=many(data, "channel_ids"),
         )
     return RedirectResponse("/rules", status_code=303)
 

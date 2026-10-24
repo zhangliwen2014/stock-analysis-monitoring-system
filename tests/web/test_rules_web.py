@@ -7,6 +7,9 @@
 
 from __future__ import annotations
 
+import re
+from datetime import date
+
 import pytest
 
 from sams.core.errors import DatabaseLocked
@@ -20,6 +23,32 @@ def _alice_id(logged) -> str:
 def _open_account(logged, name="测试户") -> str:
     """持仓类规则必须挂账户（`_validate` 那道门），去重键里也有它。"""
     return logged.context.ledger.open_account("alice", name).id
+
+
+def _desktop(logged, name="桌面"):
+    """一条本机桌面通道：`desktop` 没有要配的字段，直接进仓库。"""
+    return logged.context.channels_store.create(_alice_id(logged), "desktop", name, {})
+
+
+def _stamped_on(logged, rule_id: str, on: date) -> None:
+    """把「那几个数是哪天填的」挪到过去：今天的时钟再盖一次，屏幕上看得见。"""
+    logged.context.db.execute("UPDATE rules SET params_on = ? WHERE id = ?", [on, rule_id])
+
+
+def _checked_filters(page) -> dict[str, str]:
+    """这一屏上勾着的开关，读成表单数据。
+
+    测试自己手写一遍开关，验的只是「我写了什么」；照着渲染出来的东西交一次，
+    页面没回填的那一格才会露出来。
+    """
+    return {name: "on" for name in re.findall(r'name="(filter_[a-z_]+)" checked', page.text)}
+
+
+def _echoed(page, field: str) -> str:
+    """这一屏某个输入框里的那个值（同上：读页面，不读测试自己写的常量）。"""
+    found = re.search(rf'name="{field}"[^>]*value="([^"]*)"', page.text)
+    assert found is not None, page.text
+    return found.group(1)
 
 
 def _add(logged, **overrides) -> str:
@@ -154,8 +183,7 @@ def test_a_non_numeric_cooldown_is_refused_by_name(logged):
 
 
 def test_edit_keeps_the_params_the_form_did_not_touch(logged):
-    """service 的 `update` 是整份替换（`patch.get("params", before.params)`），缺的键由
-    模板**默认值**补上而不是旧值：编辑必须自己从库里那一份起头盖。"""
+    """只改名字：库里那份参数得原样留着，一个键都不被默认值顶掉（合并那一段写在端点里）。"""
     account_id = _open_account(logged)
     rule_id = _add(
         logged, kind="stop.time", name="拿住太久", target_type="position", target_ref="*",
@@ -187,6 +215,162 @@ def test_edit_moves_the_line_and_bumps(logged):
     assert shown.rule.name == "新止损"
 
 
+def test_a_name_only_edit_leaves_the_param_date_alone(logged):
+    """`params_on` 是「那几个数哪天填的」，除权换算按它决定止损线搬不搬。
+    改个名字不该把它说成今天——那等于给这条线免掉一次该做的搬家。"""
+    rule_id = _add(logged, params={"price": 1500.0})
+    typed_on = date(2026, 3, 1)
+    _stamped_on(logged, rule_id, typed_on)
+    response = logged.client.post(
+        f"/rules/{rule_id}/edit", data=_edit_rule_data(logged, name="换个名"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    shown = logged.context.rule_service.show(_alice_id(logged), rule_id)
+    assert shown.rule.params_on == typed_on
+    # 没填的那一格也不是 0：留空是不改，不是把冷却抹掉
+    assert shown.rule.cooldown_min == 30
+
+
+def test_a_price_retyped_is_todays_number(logged):
+    """反过来也得诚实：人把同一个数再敲一遍，说的就是「今天这里是这个数」（仓库那句注释）。
+    判据是这一趟有没有把 `params` 交出去，不是合并后的那一份等不等。"""
+    rule_id = _add(logged, params={"price": 1500.0})
+    _stamped_on(logged, rule_id, date(2026, 3, 1))
+    response = logged.client.post(
+        f"/rules/{rule_id}/edit", data=_edit_rule_data(logged, param_price="1500"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    shown = logged.context.rule_service.show(_alice_id(logged), rule_id)
+    assert shown.rule.params["price"] == 1500.0
+    assert shown.rule.params_on == logged.context.clock.now_utc().date()
+
+
+def test_the_edit_page_pre_ticks_the_stored_channels(logged):
+    """这一屏必须勾着库里那几条：不回填的框与压根没有那一格是两件事，
+    而照着这一屏交一次的人不知道自己顺手清掉了什么。"""
+    node = _desktop(logged)
+    rule_id = _add(logged, channel_ids=[node.id])
+    page = logged.client.get(f"/rules/{rule_id}/edit")
+    assert page.status_code == 200
+    assert f'name="channel_ids" value="{node.id}" checked' in page.text
+
+
+def test_an_edit_that_never_saw_the_channel_boxes_keeps_them(logged):
+    """这一屏压根没渲染那一格（表单里那个 `channels_offered` 不在），空名单就不是用户的答案：
+    改个名字不该把一条已经指名发到某通道的规则挪回默认路由。"""
+    node = _desktop(logged)
+    rule_id = _add(logged, channel_ids=[node.id])
+    response = logged.client.post(
+        f"/rules/{rule_id}/edit", data=_edit_rule_data(logged, name="茅台止损改"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    shown = logged.context.rule_service.show(_alice_id(logged), rule_id)
+    assert shown.rule.channel_ids == [node.id]
+
+
+def test_the_channel_boxes_survive_a_rejected_edit(logged):
+    """被拒后重新渲染时勾着的还是用户刚勾的那几条：清掉它们等于替他把路由改了，
+    而他这一趟压根只是想改个价。"""
+    node = _desktop(logged)
+    rule_id = _add(logged, channel_ids=[node.id])
+    response = logged.client.post(
+        f"/rules/{rule_id}/edit",
+        data=_edit_rule_data(
+            logged, channels_offered="1", channel_ids=node.id, param_price="一千四"
+        ),
+    )
+    assert response.status_code == 400
+    assert f'name="channel_ids" value="{node.id}" checked' in response.text
+
+
+def test_unticking_every_channel_offered_is_a_real_answer(logged):
+    """那一格渲染出来了而用户全不勾：那是「改回默认路由」，这一趟就得真的清掉。"""
+    node = _desktop(logged)
+    rule_id = _add(logged, channel_ids=[node.id])
+    response = logged.client.post(
+        f"/rules/{rule_id}/edit", data=_edit_rule_data(logged, channels_offered="1"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert logged.context.rule_service.show(_alice_id(logged), rule_id).rule.channel_ids == []
+
+
+def test_a_disabled_channel_stays_visible_and_marked(logged):
+    """已经存着的通道停用后仍要出现在这一屏（不显示就等于顺手把它清掉），
+    但它勾不上——`_require_channels` 永远拒它，所以这一格得自己把话说明白。"""
+    _desktop(logged, "兜底那条")
+    muted = _desktop(logged, "静音那条")
+    rule_id = _add(logged, channel_ids=[muted.id])
+    logged.context.channels_store.set_enabled(muted.id, False)
+    page = logged.client.get(f"/rules/{rule_id}/edit")
+    assert page.status_code == 200
+    assert "（已停用）" in page.text
+    assert f'name="channel_ids" value="{muted.id}" checked' in page.text
+
+
+def test_a_thesis_picked_from_the_dropdown_creates_the_rule(logged):
+    """`target_type=thesis` 时下拉里那条就是挂载对象：要人另外把 uuid 敲进引用框
+    （而填 `A/600519` 那种人话还会被形状闸拒）等于这个下拉只能产出一屏 400。"""
+    thesis_id = logged.context.theses.add("alice", "A", "600519", note="高端酒").thesis.id
+    response = logged.client.post(
+        "/rules/new",
+        data=_new_rule_data(
+            logged, kind="thesis.drift", name="周复检掉档", target_type="thesis",
+            target_ref="", thesis_id=thesis_id, param_price="",
+        ),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    rule = logged.context.rule_service.list(_alice_id(logged))[0].rule
+    assert rule.target_type == "thesis"
+    assert rule.target_ref == thesis_id
+    assert rule.thesis_id == thesis_id
+
+
+def test_an_untouched_choice_leaves_the_value_to_the_template(logged):
+    """下拉里没有一个「没填」的选项时，浏览器交的是 `choices[0]`：用户没碰过的那一项
+    会被说成他显式选过。`basis` 的默认恰好也是 `choices[0]`，所以钉的是存进去的那一份。"""
+    page = logged.client.get("/rules/new?kind=stop.ma")
+    assert page.status_code == 200
+    assert 'name="param_basis"' in page.text
+    response = logged.client.post(
+        "/rules/new",
+        data=_new_rule_data(logged, kind="stop.ma", name="跌破周线", param_price="",
+                            param_basis=""),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    rule = logged.context.rule_service.list(_alice_id(logged))[0].rule
+    assert rule.params == {"basis": "weekly_ma20"}
+
+
+def test_blank_means_unchanged_on_edit_and_default_on_create(logged):
+    """同一句「留空」在两张屏上说的是两件事：新建时按配置的来，编辑时是不动这一项。
+    措辞跟着 `rule_id` 分头走，否则编辑那一屏上这句话会把人骗去清空一个他不想动的数。"""
+    rule_id = _add(logged)
+    edit = logged.client.get(f"/rules/{rule_id}/edit")
+    assert "留空是不改这一项" in edit.text
+    assert "留空是按配置的默认值" not in edit.text
+    fresh = logged.client.get("/rules/new?kind=stop.fixed")
+    assert "留空是按配置的默认值" in fresh.text
+    assert "模板默认" in fresh.text
+    assert "不改这一项" not in fresh.text
+
+
+def test_the_form_does_not_read_rosters_the_template_has_no_box_for(logged, monkeypatch):
+    """名单按那一格在不在读：`stop.fixed` 这一屏既没有账户框也没有论的下拉，
+    那两次读回来没人看（每开一次表单白问两趟库）。"""
+    def refused(*args, **kwargs):
+        raise AssertionError("这一屏没有那一格，不该读这份名单")
+
+    monkeypatch.setattr(type(logged.context.sim_accounts), "list_for", refused)
+    monkeypatch.setattr(type(logged.context.theses), "list", refused)
+    assert logged.client.get("/rules/new?kind=stop.fixed").status_code == 200
+
+
 def test_the_writes_are_behind_the_csrf_pair(logged):
     """三个写操作都还带着 `csrf_protect`：表单原文那份依赖与它是同一次 body 解析，
     谁也没把谁挤掉（挤掉了就是三条能被人拿页面替别人改规则的口子）。"""
@@ -210,10 +394,14 @@ def test_the_edit_page_echoes_what_is_stored(logged):
     assert 'value="0.5,1.0"' in page.text
     assert 'name="filter_time_window" checked' in page.text
     assert 'name="filter_data_freshness" checked' not in page.text
-    # 照着这一屏交一次（只改名字）：那个开着的开关必须还开着——回填没勾，保存就把它关了
+    # 照着这一屏交一次（只改名字）：那个开着的开关必须还开着。
+    # 表单数据是从上面那份渲染里读的，不是测试另写一遍常量：页面没回填的那个开关
+    # 会在这里被关掉， assertion 才会因为「页面没回填」而失败，而不是永远跟着测试自己的写法
     logged.client.post(
         f"/rules/{rule_id}/edit",
-        data=_edit_rule_data(logged, filter_time_window="on", param_tiers="0.5,1.0"),
+        data=_edit_rule_data(
+            logged, **_checked_filters(page), param_tiers=_echoed(page, "param_tiers")
+        ),
         follow_redirects=False,
     )
     shown = logged.context.rule_service.show(_alice_id(logged), rule_id)

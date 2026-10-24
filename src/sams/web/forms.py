@@ -1,9 +1,10 @@
 """表单字段的读法。这一层只认表单，不认参数校验。
 
-参数的默认值、上下界、枚举与分档串全归 `core.rules.validate_params`：CLI 与仓库念的都是
-它那几句话，页面在这里再排一遍数字与边界只会得到两套会分叉的措辞。所以这层只把
+参数的默认值、上下界、枚举与分档串全归 `core.rules.validate_params`：CLI 与页面念的都是
+它那几句话，这里再排一遍数字与边界只会得到两套会分叉的措辞。所以这层只把
 `param_*` 那几个输入框的**原文**交出去——填了的那几项进校验，没填的一项都不出现：
-出现就等于替用户显式承认了那个值（编辑那条路径要拿它盖在旧值上，见 `pages/rules.py`）。
+出现就等于替用户显式承认了那个值。编辑那一路怎么拿这份去盖库里那一份，
+写在 `pages/rules.py` 的合并处。
 
 字段名与契约对齐：`param_<name>`、`filter_<key>`、`channel_ids`（多选）。
 """
@@ -38,7 +39,10 @@ def many(data: dict[str, list[str]], key: str) -> list[str]:
 
 
 def checked(data: dict[str, list[str]], key: str) -> bool:
-    return key in data and data[key][0] not in ("", "0", "false")
+    """复选框的合同只有一条：勾了这个键就在，没勾就不在。值是什么不看——
+    浏览器交的是 `on`，而把 `"0"`/`"false"` 读成「没勾」是给一种不存在的写法留位子，
+    顺带还会把一个真叫 `false` 的值读成关。"""
+    return key in data
 
 
 def raw_params(template: Template, data: dict[str, list[str]]) -> dict[str, str]:

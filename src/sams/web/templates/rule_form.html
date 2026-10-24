@@ -65,6 +65,10 @@
              placeholder="{{ spec.default }}">
       {% else %}
       <select name="param_{{ spec.name }}">
+        {# 空选项说的是「这一格我没碰」：没有它，浏览器交的是 `choices[0]`，
+           一个用户没动过的枚举会被说成他显式选过（新建时该由模板默认值说话，
+           编辑时该由库里那一份说话，两者都不是这一格的答案） #}
+        <option value="">{{ "（不改这一项）" if rule_id else "（不填）" }}</option>
         {% for choice in spec.choices %}
         <option value="{{ choice }}"{% if values.get("param_" + spec.name) == choice %} selected{% endif %}>{{ choice }}</option>
         {% endfor %}
@@ -75,8 +79,9 @@
     {% endfor %}
     <label>级别
       <select name="severity">
-        {# 空选择交给服务层落模板自己那个级别：空串进仓库是一句没人认得的级别 #}
-        <option value="">（模板默认：{{ template.severity }}）</option>
+        {# 空选择交给服务层落模板自己那个级别：空串进仓库是一句没人认得的级别。
+           编辑那一路这句话是假的（空 = 不动这一项），所以措辞按 `rule_id` 分头说 #}
+        <option value="">{{ "（不改这一项）" if rule_id else "（模板默认：" + template.severity + "）" }}</option>
         {% for level in severities %}
         <option value="{{ level }}"{% if values.get("severity") == level %} selected{% endif %}>{{ level }}</option>
         {% endfor %}
@@ -84,7 +89,7 @@
     </label>
     <label>冷却（分钟）
       <input name="cooldown_min" type="number" step="1" value="{{ values.get("cooldown_min", "") }}"
-             placeholder="留空是按配置的默认值">
+             placeholder="{{ "留空是不改这一项" if rule_id else "留空是按配置的默认值" }}">
     </label>
     <fieldset>
       <legend>过滤开关</legend>
@@ -98,9 +103,11 @@
     {% if channels %}
     <fieldset>
       <legend>发到哪些通道（不选走默认路由）</legend>
+      {# 暗记：保存那一路靠它分清「这一屏压根没有那一格」与「满屏的框一个都没勾」 #}
+      <input type="hidden" name="channels_offered" value="1">
       {% for channel in channels %}
       <label class="inline">
-        <input type="checkbox" name="channel_ids" value="{{ channel.id }}"> {{ channel.name }}（{{ channel.kind }}）
+        <input type="checkbox" name="channel_ids" value="{{ channel.id }}"{% if channel.id in ticks %} checked{% endif %}> {{ channel.name }}（{{ channel.kind }}）{% if not channel.enabled %}（已停用）{% endif %}
       </label>
       {% endfor %}
     </fieldset>
