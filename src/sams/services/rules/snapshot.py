@@ -12,9 +12,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -22,6 +23,7 @@ from sams.analysis.indicators import metrics
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.config import Settings
 from sams.core.errors import ValidationError
+from sams.core.quotes import Quote, cross_baseline, local_day
 from sams.services._fold import before_last, fold, fold_to_price_basis, high_water, last
 from sams.services.analysis import AnalysisService, SeriesRead
 from sams.services.valuation import ValuationService
@@ -41,6 +43,10 @@ DAILY_LOOKBACK_DAYS = 400
 
 #: 持仓不足这么多根日 K 时，「持仓期最高价」没有意义（第一根就是最高价，回撤恒为 0）。
 TRAILING_MIN_BARS = 3
+
+#: `RuleData.read` 与 `apply_quote` 共用的一句话：这一趟没有可判价格的读数。
+#: 收成常量是因为「盖完报价之后它必须消失」——`apply_quote` 靠字面匹配把它挑出去
+NO_PRICE_MISSING = "没有过闸的现价：这一趟不判任何价格类条件"
 
 #: MA60 要哪一列：`indicators=("ma",)` 产出 ma5/ma10/ma20/ma60/ma120/ma250
 _MA_COLUMN = "ma60"
@@ -123,6 +129,9 @@ class Snapshot:
     target_on: date | None = None
     #: 这一趟搬了哪几个数（每个都带它跨了哪些除权日，见 `anchor.Moved`）
     moved: tuple[Moved, ...] = ()
+    #: 「穿」的另一侧价：盘中来自上一轮报价（§5.2），日线一趟永远是 None。
+    #: 放在快照上而不是参数上传：模板签名（`Ask`）不必为此改
+    cross_from: float | None = None
 
 
 class RuleData:
@@ -238,7 +247,7 @@ class RuleData:
         account = self._account(target)
         missing: list[str] = []
         if valuation.price is None:
-            missing.append("没有过闸的现价：这一趟不判任何价格类条件")
+            missing.append(NO_PRICE_MISSING)
         atr = _atr(daily, valuation.price, missing)
         # 那两条线上的数与它的日期必须出自同一次分支判断（见 `_stop` / `_target`）
         stop_line, stop_on = _stop(thesis, valuation)
@@ -413,3 +422,35 @@ def _holding_days(position: Position | None, as_of: date) -> int | None:
     if position is None or position.open_ts is None:
         return None
     return max(0, (as_of - position.open_ts.date()).days)
+
+
+def apply_quote(
+    snapshot: Snapshot, *, quote: Quote, previous: Quote | None, zone: ZoneInfo | None
+) -> Snapshot:
+    """把这一轮的实时报价盖到日线上（§5.2）。纯函数：原快照不动，返回新的一份。
+
+    只有报价**给了**的字段才盖（`open`/`prev_close` 缺了就保留日线的值）；`holding_high`
+    取日线与报价高点的较大者，日线没有持仓高点时仍是 None——盘中冒出一个当天高点
+    不能替历史最高价作数。`price_age_days=0` 是「这一趟的价就是现在」的声明。
+    """
+    day = local_day(quote.ts, zone) if zone is not None else quote.ts.date()
+    missing = tuple(line for line in snapshot.missing if line != NO_PRICE_MISSING)
+    holding_high = snapshot.holding_high
+    if holding_high is not None:
+        holding_high = max(
+            holding_high, quote.high if quote.high is not None else quote.price
+        )
+    return replace(
+        snapshot,
+        price=quote.price,
+        price_on=day,
+        price_age_days=0,
+        day_open=quote.open if quote.open is not None else snapshot.day_open,
+        prev_close=quote.prev_close if quote.prev_close is not None else snapshot.prev_close,
+        holding_high=holding_high,
+        cross_from=(
+            cross_baseline(quote, previous, zone=zone) if zone is not None else None
+        ),
+        missing=missing,
+    )
+
