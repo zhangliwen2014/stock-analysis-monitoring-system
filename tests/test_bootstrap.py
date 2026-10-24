@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+import threading
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
+import polars as pl
 import pytest
 from support import FrozenClock, StubAdapter, sample_bars
 
@@ -16,8 +19,12 @@ from sams.bootstrap import (
 )
 from sams.core.errors import ValidationError
 from sams.core.events import EventBus, SystemAlarm
+from sams.core.quotes import Quote
+from sams.monitor.queue import QueuedAlertSender
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
+from sams.services.intraday import MarketPoll
+from sams.services.quotes import QuotePollResult
 from sams.storage.db import Database
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.channels import ChannelRepo
@@ -359,26 +366,61 @@ def test_attaching_the_log_sink_twice_still_logs_each_alarm_once(caplog):
     assert caplog.text.count("hello") == 1
 
 
-def test_serve_builds_three_contexts_on_one_core(migrated):
-    """三条线程各一条连接（D113），但板子、桶与请求队列是同一份。
+def test_serve_builds_four_contexts_on_one_core(migrated):
+    """四条线程各一条连接（D113），但板子、桶与请求队列是同一份。
 
     板子不是同一个对象时，盘中线程写的那一份 Web 永远看不到；请求队列同理，
     Web 的「立即同步」会入到一个没人读的队列里。
     """
     parts = build_serve(migrated, adapters=stub_adapters())
     try:
-        assert len(parts.contexts) == 3
-        assert len({id(context.db) for context in parts.contexts}) == 3
-        assert all(context.registry is parts.core.registry for context in parts.contexts)
-        assert all(context.bus is parts.core.bus for context in parts.contexts)
-        assert all(
-            context.scheduler.requests is parts.core.requests
-            for context in parts.contexts
-        )
-        assert parts.contexts[1].quotes.board is parts.core.board
-        assert parts.contexts[1].intraday.quotes is parts.contexts[1].quotes
-        assert parts.runtime.board is parts.core.board
-        assert parts.runtime.monitor is parts.contexts[1].intraday
+        core, contexts, runtime = parts.core, parts.contexts, parts.runtime
+        assert len(contexts) == 4
+        assert len({id(ctx.db) for ctx in contexts}) == 4
+        assert contexts[0].registry is contexts[1].registry
+        assert contexts[0].bus is contexts[1].bus
+        assert contexts[0].scheduler.requests is contexts[1].scheduler.requests
+        assert contexts[1].quotes.board is core.board
+        assert contexts[1].intraday.quotes is contexts[1].quotes
+        assert contexts[1].intraday.on_poll is not None
+        assert contexts[0].intraday.on_poll is None
+        assert runtime.board is core.board
+        assert runtime.monitor is contexts[1].intraday
+        assert runtime.worker is not None
+    finally:
+        parts.close()
+
+
+def test_only_the_intraday_context_sends_through_the_queue(migrated):
+    """只有盘中那条走队列：调度线程的告警照旧直发（§5.5）。
+
+    两条都入队时，`serve` 的停机顺序一变，调度侧的告警就排在没人读的队列里。
+    """
+    parts = build_serve(migrated, adapters=stub_adapters())
+    try:
+        scheduler_ctx, intraday_ctx, notify_ctx, maintenance_ctx = parts.contexts
+        assert isinstance(intraday_ctx.rule_engine.sender, QueuedAlertSender)
+        assert not isinstance(scheduler_ctx.rule_engine.sender, QueuedAlertSender)
+    finally:
+        parts.close()
+
+
+def test_every_context_shares_the_core_version_gate(migrated):
+    """写面的 bump 与盘中缓存的读闸必须是同一份闸，否则 §5.4 整条链是装饰。
+
+    每份上下文各造一个 `VersionGate` 时，调度线程写的日线 bump 在自己那份上响，
+    盘中线程那份永远不动——症状不是报错，是盘中拿着昨天的复权价判今天的规则。
+    """
+    parts = build_serve(migrated, adapters=stub_adapters())
+    try:
+        for context in parts.contexts:
+            assert context.rule_service.versions is parts.core.versions
+            assert context.rule_deriver.versions is parts.core.versions
+            assert context.theses.versions is parts.core.versions
+            assert context.ledger.versions is parts.core.versions
+        # job 的 deps 不在 Scheduler 上露出来，它是每个 JobSpec 那个 partial 的第一个实参
+        deps = parts.contexts[0].scheduler.jobs[0].run.args[0]
+        assert deps.versions is parts.core.versions
     finally:
         parts.close()
 
@@ -599,3 +641,98 @@ def test_serve_parts_close_tries_every_step_and_reraises_the_first():
         parts.close()
 
     assert closed == ["context-0", "context-1", "context-2", "core"]
+
+
+def test_an_intraday_hit_flows_from_the_board_to_the_queue(migrated):
+    """全链一趟：板 → 时段/宇宙闸 → 引擎 → 队列 → 通知线程 → 收件箱。
+
+    每一段单独都有用例，串起来这段没人跑过：`on_poll` 没接进 `IntradayMonitor`、
+    队列没接到 `NotifyWorker`、或者 `prepare()` 的迁移少了一列，都在这一枚里现形。
+    """
+    parts = build_serve(migrated, adapters=stub_adapters())
+    try:
+        parts.prepare()
+        core = parts.core
+        intraday_ctx = parts.contexts[1]
+        notify_ctx = parts.contexts[2]
+
+        user = intraday_ctx.users.create("trader", "correct-horse-battery")
+        intraday_ctx.rules_store.create(
+            user.id,
+            kind="stop.fixed",
+            name="跌破 10 元",
+            target_type="symbol",
+            target_ref="A/601088",
+            params={"price": 10.0},
+        )
+
+        # 「今天」跟着报价的市场本地日走（引擎读日线就按它）：机器时区若是 UTC，
+        # date.today() 与上海日可能差一天，日线就会落在 as_of 之外
+        moment = datetime.now(UTC)
+        today = moment.astimezone(ZoneInfo("Asia/Shanghai")).date()
+        bars = pl.DataFrame(
+            {
+                "market": ["A"] * 3,
+                "code": ["601088"] * 3,
+                "date": [today - timedelta(days=2), today - timedelta(days=1), today],
+                "open": [10.6, 10.5, 10.05],
+                "high": [10.8, 10.6, 10.1],
+                "low": [10.2, 10.1, 9.9],
+                "close": [10.5, 10.4, 9.9],
+                "volume": [1e6] * 3,
+                "amount": [1e7] * 3,
+                "source": ["tencent"] * 3,
+            }
+        )
+        intraday_ctx.rule_data.bars.upsert(bars)
+        # 复权口径要有人确认过：裸价区间没有覆盖确认时 `AnalysisService` 直接拒读
+        # （那句「0 行既可能是没分红，也可能是没查过」），盘中这一趟就什么都判不出
+        intraday_ctx.corp_actions_coverage.record(
+            "A",
+            "601088",
+            covered_from=today - timedelta(days=2),
+            covered_to=today,
+            full_history=True,
+            src="tencent",
+        )
+
+        quote = Quote(
+            market="A",
+            code="601088",
+            ts=moment - timedelta(seconds=5),
+            price=9.4,
+            open=9.8,
+            prev_close=10.2,
+            source="tencent",
+        )
+        core.board.update("A", (quote,), now=moment)
+
+        # 直接灌一轮结果：poll_once 的时段/宇宙闸在 Task 10 之前的用例里盖过了
+        got = intraday_ctx.intraday.on_poll(
+            (
+                MarketPoll(
+                    "A",
+                    result=QuotePollResult(
+                        quotes=(quote,), skipped=(), errors=(), sources=()
+                    ),
+                ),
+            )
+        )
+        assert got.hits == 1
+        assert core.alerts_queue.qsize() == 1
+
+        rows = intraday_ctx.alerts_store.list_for(user.id)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.stage == "urgent"  # 开 9.8 < 线 10 ≤ 昨收 10.2：跳空破位
+        assert row.intraday is True
+        assert "报价" in row.payload["extra"]["body"]
+
+        stop = threading.Event()
+        stop.set()
+        parts.runtime.worker.run(stop=stop)  # 同步排水：工作单全部跑完
+        assert core.alerts_queue.empty()
+        deliveries = notify_ctx.alerts_store.deliveries(row.id)
+        assert deliveries and deliveries[0].outcome == "no_channel"  # 没配通道，落了账
+    finally:
+        parts.close()

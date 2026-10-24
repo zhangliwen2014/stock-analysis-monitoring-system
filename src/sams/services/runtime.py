@@ -1,7 +1,8 @@
 """常驻进程的线程生命周期与 `/healthz` 的读数（spec §2.1/§2.3）。
 
-`Runtime` 不认识组装根：它拿到的是已经装好的调度器、盘中节拍器、清理服务与行情板。
-「谁负责接线」因此只有 `bootstrap` 一处，而这一层可以在测试里用四个假对象跑起来。
+`Runtime` 不认识组装根：它拿到的是已经装好的调度器、盘中节拍器、队列的消费者、
+清理服务与行情板。
+「谁负责接线」因此只有 `bootstrap` 一处，而这一层可以在测试里用几组假对象跑起来。
 
 线程都是守护线程：主线程退出时它们不该把进程钉住。`stop()` 仍然逐个 join——
 守护只保证「不阻止退出」，不保证「退出前把这一轮收干净」。
@@ -39,6 +40,12 @@ class _DbProbe(Protocol):
     def scalar(self, sql: str) -> Any: ...
 
 
+class _Worker(Protocol):
+    """通知线程的形状（结构化）：`NotifyWorker` 与测试替身各长各的。"""
+
+    def run(self, *, stop: threading.Event) -> None: ...
+
+
 def _iso(value: datetime | None) -> str | None:
     return None if value is None else value.isoformat()
 
@@ -52,6 +59,7 @@ class Runtime:
         schedule_reading: Callable[[], ScheduleData],
         monitor: IntradayMonitor,
         prune: PruneService,
+        worker: _Worker | None = None,
         board: QuoteBoard | None = None,
         database: _DbProbe | None = None,
         clock: Clock = SYSTEM_CLOCK,
@@ -65,6 +73,8 @@ class Runtime:
         self.schedule_reading = schedule_reading
         self.monitor = monitor
         self.prune = prune
+        #: 通知线程的消费者：不传就没有第四条线程（CLI 与只跑三条的测试照旧）
+        self.worker = worker
         self.board = board
         #: `/healthz` 用一条只回答「读得到吗」的探针；不传就不报这一项
         self.database = database
@@ -101,6 +111,13 @@ class Runtime:
                 daemon=True,
             ),
         }
+        if self.worker is not None:
+            self._threads["notify"] = threading.Thread(
+                target=self.worker.run,
+                kwargs={"stop": self.stop_event},
+                name="sams-notify",
+                daemon=True,
+            )
         for thread in self._threads.values():
             thread.start()
         logger.info("运行时已启动：%s", "、".join(self._threads))
@@ -116,12 +133,15 @@ class Runtime:
             # 调度线程可能正卡在一个 job 里：等它收尾，但不等一个坏掉的实现
             "scheduler": float(self.settings.scheduler_tick_s) + 30.0,
             "intraday": WORKER_STOP_TIMEOUT_S,
+            "notify": WORKER_STOP_TIMEOUT_S,
             "maintenance": WORKER_STOP_TIMEOUT_S,
         }
         clean = True
-        for name in ("scheduler", "intraday", "maintenance"):
+        # notify 排在 intraday 之后、maintenance 之前：先停产出告警的线程，
+        # 再排空队列，最后才轮到维护
+        for name in ("scheduler", "intraday", "notify", "maintenance"):
             thread = self._threads.get(name)
-            # `start()` 在第二、三条 `thread.start()` 上失败时，字典里会留下没起过的线程：
+            # `start()` 在后面某条 `thread.start()` 上失败时，字典里会留下没起过的线程：
             # join 一个没起过的线程会抛 RuntimeError，把真正的启动错误盖掉
             if thread is None or thread.ident is None:
                 continue

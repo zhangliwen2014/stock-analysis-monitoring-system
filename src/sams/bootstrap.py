@@ -17,11 +17,18 @@ from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.notify import AlertMessage
+from sams.core.version import VersionGate
 from sams.datasource.base import BarAdapter
 from sams.datasource.calendar_providers import default_providers
 from sams.datasource.registry import AdapterRegistry
 from sams.datasource.sources import build as build_source
 from sams.monitor.notifiers import Notifier, build_notifier_factory
+from sams.monitor.queue import (
+    AlertQueue,
+    NotifyWorker,
+    QueuedAlertSender,
+    SystemAlarmRelay,
+)
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
 from sams.services.analysis import AnalysisService
@@ -35,8 +42,10 @@ from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
 from sams.services.prune import PruneService
 from sams.services.quotes import QuoteBoard, QuoteService
+from sams.services.rules.cache import SnapshotCache
 from sams.services.rules.derive import RuleDeriver
 from sams.services.rules.engine import RuleEngine
+from sams.services.rules.intraday import IntradayEvaluator
 from sams.services.rules.maintenance import RuleService
 from sams.services.rules.recheck import Rechecker
 from sams.services.rules.snapshot import RuleData
@@ -122,6 +131,11 @@ class AppCore:
     #: 行情板是进程级的一份：盘中线程写、`/healthz` 读（Web 页面在计划 3 接入后也读）。
     #: 每个上下文各造一块板时，页面看到的永远是自己那块空板
     board: QuoteBoard
+    #: 缓存失效的闸：四条线程的写面与盘中那份缓存读的是同一份，各造一份时
+    #: bump 响在自己那份上，缓存那头永远不动（§5.4）
+    versions: VersionGate
+    #: 告警队列：盘中线程 offer、通知线程取——四条线程里只有它横跨三条
+    alerts_queue: AlertQueue
     registry_db: Database
 
     def close(self) -> None:
@@ -346,6 +360,8 @@ def build_core(
         registry=registry,
         requests=RunRequestQueue(),
         board=QuoteBoard(),
+        versions=VersionGate(),
+        alerts_queue=AlertQueue(),
         registry_db=core_db,
     )
 
@@ -356,13 +372,20 @@ def _context_on(
     database: Database,
     providers: dict[str, CalendarProvider] | None,
     notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None,
+    queue: AlertQueue | None = None,
+    cache: SnapshotCache | None = None,
 ) -> ServiceContext:
-    """在给定连接上装一整套仓库与服务。连接的生命周期归调用方。"""
+    """在给定连接上装一整套仓库与服务。连接的生命周期归调用方。
+
+    `queue` 与 `cache` 只有盘中那一份上下文传：传了 queue 就改走「落库 + 入队」，
+    投递交给通知线程；传了 cache 就让引擎每轮只读一次日线（§5.4）。
+    """
     cfg = core.settings
     clock = core.clock
     event_bus = core.bus
     registry = core.registry
     cipher = core.cipher
+    versions = core.versions
     bars = BarRepo(database)
     symbols = SymbolRepo(database)
     calendar_store = CalendarRepo(database)
@@ -399,7 +422,9 @@ def _context_on(
     )
     sim_accounts = SimAccountRepo(database)
     sim_orders = SimOrderRepo(database, sim_accounts, markets=cfg.markets, symbols=symbols)
-    ledger = LedgerService(sim_accounts, sim_orders, theses_store, users, cfg)
+    ledger = LedgerService(
+        sim_accounts, sim_orders, theses_store, users, cfg, versions=versions
+    )
     fx_store = FxRepo(database)
     portfolio = PortfolioService(sim_accounts, sim_orders, bars, fx_store, users, clock=clock)
     channels_store = ChannelRepo(database, cipher=cipher, clock=clock)
@@ -427,7 +452,9 @@ def _context_on(
     )
     # 规则告警与系统告警共用这一个 sender：DND、通道选择、`notify_log` 那一行都住在
     # `NotifyService` 那一头，一个组装根里留两条发送路径，迟早一条带上这些而另一条不带
-    sender = _NotifyAlertSender(notify)
+    sender = (
+        QueuedAlertSender(notify, queue) if queue is not None else _NotifyAlertSender(notify)
+    )
     rule_engine = RuleEngine(
         rules=rules_store,
         alerts=alerts_store,
@@ -438,6 +465,7 @@ def _context_on(
         sender=sender,
         settings=cfg,
         clock=clock,
+        cache=cache,
     )
     # 三个规则服务排在最后：它们吃的就是上面那些已经装好的仓库与取数处，
     # 而 `RuleService` 要的是 `rule_data`（notes 里那句「展开成零个对象」由它算）
@@ -451,8 +479,9 @@ def _context_on(
         db=database,
         settings=cfg,
         clock=clock,
+        versions=versions,
     )
-    rule_deriver = RuleDeriver(rules_store, theses_store)
+    rule_deriver = RuleDeriver(rules_store, theses_store, versions=versions)
     rule_rechecker = Rechecker(
         theses=theses_store, data=rule_data, bus=event_bus, clock=clock
     )
@@ -478,7 +507,14 @@ def _context_on(
         data=rule_data,
         settings=cfg,
     )
-    intraday = IntradayMonitor(cfg, quotes, calendar, universe_builder, clock=clock)
+    on_poll = (
+        None
+        if queue is None
+        else IntradayEvaluator(rules_store, rule_engine, core.board).after_poll
+    )
+    intraday = IntradayMonitor(
+        cfg, quotes, calendar, universe_builder, clock=clock, on_poll=on_poll
+    )
     task_runs = TaskRunRepo(database, clock=clock)
     heartbeats = HeartbeatRepo(database, clock=clock)
     prune = PruneService(
@@ -499,6 +535,7 @@ def _context_on(
         rules=rule_engine,
         recheck=rule_rechecker,
         users=users,
+        versions=versions,
     )
     scheduler = Scheduler(
         cfg,
@@ -554,7 +591,15 @@ def _context_on(
         valuation=valuation,
         # `settings` 是那个「已知市场」的出处：一个没配的市场立不出 thesis，
         # 因为那条链上每一栏都读不到数（D84）
-        theses=ThesisService(theses_store, users, valuation, cfg, clock=clock, orders=sim_orders),
+        theses=ThesisService(
+            theses_store,
+            users,
+            valuation,
+            cfg,
+            clock=clock,
+            orders=sim_orders,
+            versions=versions,
+        ),
         ledger=ledger,
         portfolio=portfolio,
         sim_accounts=sim_accounts,
@@ -603,12 +648,16 @@ def build_context(
     database: Database | None = None,
     providers: dict[str, CalendarProvider] | None = None,
     notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
+    queue: AlertQueue | None = None,
+    cache: SnapshotCache | None = None,
 ) -> ServiceContext:
     """一条线程的一整套仓库与服务。不传 `database` 时自己开一条（D113）。
 
     自己开的那一条在装配失败时由自己关上：调用方手里没有它的引用，
     而半成品的句柄会一直握着库文件（Windows 上还会挡住删除）。
     传进来的连接归调用方，失败时也不许关。
+
+    `queue` 与 `cache` 透传给 `_context_on`：只有盘中那一份上下文传。
     """
     owned = database is None
     database = database or Database.open(core.settings.db_path)
@@ -618,6 +667,8 @@ def build_context(
             database=database,
             providers=providers,
             notifier_factory=notifier_factory,
+            queue=queue,
+            cache=cache,
         )
     except BaseException:
         if owned:
@@ -629,8 +680,8 @@ def attach_system_alerter(context: ServiceContext) -> SystemAlerter:
     """把系统告警写进管理员收件箱；一个进程只挂一次。
 
     `build_context` 不挂：`serve` 里每条线程一个上下文，各挂一次会让同一条系统告警
-    变成 N 条管理员告警。CLI 在 `build_container` 末尾挂；`serve` 在通知队列接入后
-    由 `Runtime` 挂一次（计划 2）。
+    变成 N 条管理员告警。CLI 在 `build_container` 末尾挂；`serve` 那条挂在 `build_serve`：
+    经 `SystemAlarmRelay` 只入队，处理在通知线程（计划 2）。
     """
     alerter = SystemAlerter(
         alerts=context.alerts_store,
@@ -729,14 +780,15 @@ class FreshScheduleProbe:
 
 @dataclass
 class ServeParts:
-    """`sams serve` 的三条线程上下文与那一个 `Runtime`。
+    """`sams serve` 的四条线程上下文与那一个 `Runtime`。
 
-    `contexts` 的顺序就是创建顺序：调度线程、盘中线程、维护线程。维护那一份只被
-    用来建 `PruneService`（它的连接随后归维护线程独占），三份都不是「主上下文」。
+    `contexts` 的顺序就是创建顺序：调度线程、盘中线程、通知线程、维护线程。维护
+    那一份只被用来建 `PruneService`（它的连接随后归维护线程独占），四份都不是
+    「主上下文」；通知线程的 notify 仓库由 `NotifyWorker` 持有。
     """
 
     core: AppCore
-    contexts: tuple[ServiceContext, ServiceContext, ServiceContext]
+    contexts: tuple[ServiceContext, ServiceContext, ServiceContext, ServiceContext]
     runtime: Runtime
 
     def prepare(self) -> int:
@@ -772,24 +824,29 @@ def build_serve(
     providers: dict[str, CalendarProvider] | None = None,
     notifier_factory: Callable[[str, Mapping[str, object]], Notifier] | None = None,
 ) -> ServeParts:
-    """`sams serve` 的装配：一条进程级 core + 三条线程上下文 + 一个运行时。
+    """`sams serve` 的装配：一条进程级 core + 四条线程上下文 + 一个运行时。
 
-    三个上下文依序造、依序记在 `opened` 里：造到第三个时炸掉，前两条也得关。
+    四个上下文依序造、依序记在 `opened` 里：造到第四个时炸掉，前面几条也得关。
     同一个进程里再开一条连接不会撞锁（DuckDB 共享实例），但半成品的句柄会一直
     握着库文件——Windows 上还会挡住删除与改名。
     """
     cfg = settings or Settings.load()
-    core: AppCore | None = None
+    core = build_core(cfg, clock=clock, bus=bus, adapters=adapters)
     opened: list[ServiceContext] = []
     try:
-        core = build_core(cfg, clock=clock, bus=bus, adapters=adapters)
-        for _ in range(3):
+        for index in range(4):
+            intraday = index == 1
             opened.append(
                 build_context(
-                    core, providers=providers, notifier_factory=notifier_factory
+                    core,
+                    providers=providers,
+                    notifier_factory=notifier_factory,
+                    # 只有盘中那一份走队列与缓存：其余三份照旧直发（§5.5）
+                    queue=core.alerts_queue if intraday else None,
+                    cache=SnapshotCache(core.versions) if intraday else None,
                 )
             )
-        scheduler_ctx, intraday_ctx, maintenance_ctx = opened
+        scheduler_ctx, intraday_ctx, notify_ctx, maintenance_ctx = opened
         prune = PruneService(
             maintenance_ctx.db,
             quotes=maintenance_ctx.quotes_store,
@@ -797,6 +854,7 @@ def build_serve(
             heartbeats=maintenance_ctx.heartbeats,
             clock=core.clock,
         )
+        worker = NotifyWorker(notify_ctx.notify, core.alerts_queue)
         runtime = Runtime(
             cfg,
             scheduler=scheduler_ctx.scheduler,
@@ -806,18 +864,29 @@ def build_serve(
             ),
             monitor=intraday_ctx.intraday,
             prune=prune,
+            worker=worker,
             board=core.board,
             database=FreshDbProbe(cfg),
             clock=core.clock,
         )
+        # 系统告警也走队列：relay 把 `SystemAlarm` 折成工作单，`alerter.handle`
+        # 在通知线程里跑。**只挂 relay 这一次**——`alerter.attach(bus)` 会把 handle
+        # 直接订阅到发布线程上，两个都挂的话同一条系统告警会变成两条
+        alerter = SystemAlerter(
+            alerts=notify_ctx.alerts_store,
+            users=notify_ctx.users,
+            sender=QueuedAlertSender(notify_ctx.notify, core.alerts_queue),
+            settings=cfg,
+            clock=core.clock,
+        )
+        SystemAlarmRelay(core.alerts_queue, alerter.handle).attach(core.bus)
         return ServeParts(
             core=core,
-            contexts=(scheduler_ctx, intraday_ctx, maintenance_ctx),
+            contexts=(scheduler_ctx, intraday_ctx, notify_ctx, maintenance_ctx),
             runtime=runtime,
         )
     except BaseException:
         for context in opened:
             context.close()
-        if core is not None:
-            core.close()
+        core.close()
         raise

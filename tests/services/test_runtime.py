@@ -48,6 +48,19 @@ class FakeMonitor:
         return 0
 
 
+class FakeWorker:
+    """通知线程的替身：形状照 `_Worker` 协议，记录起止。"""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+
+    def run(self, *, stop):
+        self.started.set()
+        stop.wait(5)
+        self.stopped.set()
+
+
 class FakePrune:
     def __init__(self) -> None:
         self.called = threading.Event()
@@ -84,6 +97,7 @@ def make_runtime(
     schedule_reading=None,
     monitor=None,
     prune=None,
+    worker=None,
     board=None,
     database=None,
     clock=None,
@@ -95,6 +109,7 @@ def make_runtime(
         schedule_reading=schedule_reading or engine.schedule_data,
         monitor=monitor or FakeMonitor(),
         prune=prune or FakePrune(),
+        worker=worker,
         board=board if board is not None else FakeBoard(),
         database=database,
         clock=clock or FrozenClock(NOW),
@@ -186,21 +201,35 @@ def test_run_maintenance_passes_dry_run_and_reports_the_total(settings):
     assert prune.calls == 1 and report.dry_run is True and report.total == 3
 
 
-def test_start_runs_three_threads_and_stop_joins_them(settings):
+def test_start_runs_four_threads_and_stop_joins_them(settings):
     scheduler = FakeScheduler()
     monitor = FakeMonitor()
     prune = FakePrune()
-    runtime = make_runtime(settings, scheduler=scheduler, monitor=monitor, prune=prune)
+    worker = FakeWorker()
+    runtime = make_runtime(
+        settings, scheduler=scheduler, monitor=monitor, prune=prune, worker=worker
+    )
 
     runtime.start()
     assert scheduler.started.wait(2) and monitor.started.wait(2)
     assert prune.called.wait(2), "维护线程启动即清一次"
-    assert set(runtime.threads) == {"scheduler", "intraday", "maintenance"}
+    assert set(runtime.threads) == {"scheduler", "intraday", "notify", "maintenance"}
 
     runtime.stop()
     assert scheduler.stopped.wait(2) and monitor.stopped.wait(2)
+    assert worker.started.is_set() and worker.stopped.is_set()
     assert not any(thread.is_alive() for thread in runtime.threads.values())
     runtime.stop()  # 幂等：停机流程被重复调用不该抛
+
+
+def test_without_a_worker_there_is_no_notify_thread(settings):
+    """没接队列的装配（CLI、只跑三条的老用例）不该凭空多一条空转线程。"""
+    runtime = make_runtime(settings)
+    runtime.start()
+    try:
+        assert "notify" not in runtime.threads
+    finally:
+        runtime.stop()
 
 
 def test_start_twice_is_refused(settings):
@@ -214,7 +243,7 @@ def test_start_twice_is_refused(settings):
 
 
 def test_stop_tolerates_a_thread_that_never_started(settings):
-    """`start()` 在第二、三条线程上失败时，`stop()` 仍要能走完。
+    """`start()` 在后面某条线程上失败时，`stop()` 仍要能走完。
 
     `serve` 的 finally 一定会调 `stop()`；那里再抛一次，原来的启动错误就被盖掉了，
     而 `parts.close()` 也跟着跳过——泄漏的正是启动失败时最该收干净的那些连接。
