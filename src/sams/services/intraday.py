@@ -7,7 +7,8 @@
 2. 构建这一轮的对象全集（自选 ∪ 持仓 ∪ 规则目标 ∪ 在跟观点）；
 3. 调 `QuoteService.poll`。取价、降级、落库、告警都在那一层。
 
-**不在这里评估规则**：那一层吃 `QuotePollResult`，由装配决定它跟不跟在这个循环后面。
+**不在这里评估规则**：那一层吃 `QuotePollResult`，由装配决定它跟不跟在这个循环后面——
+这道缝落实为 `IntradayMonitor` 的 `on_poll` 构造参数，本层依旧不认识规则。
 也不 import 调度器：`UniverseBuilder` 只需要一个 `build()` → `.codes()` 的形状，
 把整个调度器拖进来会让「盘中」依赖「盘后」的内部。
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -59,6 +61,7 @@ class IntradayMonitor:
         clock: Clock = SYSTEM_CLOCK,
         sleep: Sleeper = time.sleep,
         interval_s: float | None = None,
+        on_poll: Callable[[tuple[MarketPoll, ...]], object] | None = None,
     ) -> None:
         self.settings = settings
         self.quotes = quotes
@@ -67,6 +70,8 @@ class IntradayMonitor:
         self.clock = clock
         self.sleep = sleep
         self.interval_s = interval_s if interval_s is not None else settings.polling_interval_s
+        # 这一层不认识规则——挂钩是装配注进来的；它坏了不许拖垮取价。
+        self.on_poll = on_poll
 
     def poll_once(self, *, now: datetime | None = None) -> tuple[MarketPoll, ...]:
         moment = now or self.clock.now_utc()
@@ -93,6 +98,12 @@ class IntradayMonitor:
                 outcomes.append(MarketPoll(market, error=str(exc)))
                 continue
             outcomes.append(MarketPoll(market, result=result))
+        if self.on_poll is not None:
+            try:
+                self.on_poll(tuple(outcomes))
+            except SamsError:
+                # 求值失败不回收这轮行情：板子上的价照常更新，下一轮还会再判
+                logger.exception("盘中规则评估这一轮失败")
         return tuple(outcomes)
 
     def run_forever(
