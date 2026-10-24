@@ -1,0 +1,42 @@
+/* 一套足够看的默认样式：卡片、表格、表单、横幅。没有动画与字体定制——先能用。 */
+:root { --line: #d8d8de; --muted: #6b6b76; --danger: #b42318; --ok: #067647; }
+* { box-sizing: border-box; }
+body { font: 15px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+       margin: 0; color: #1c1c22; background: #f6f6f8; }
+a { color: inherit; }
+.topbar { display: flex; align-items: center; gap: 16px; padding: 10px 20px;
+          background: #14141a; color: #f4f4f6; }
+.topbar a { text-decoration: none; opacity: 0.85; }
+.topbar a:hover { opacity: 1; }
+.brand { font-weight: 700; letter-spacing: 1px; }
+.nav-links { display: flex; gap: 14px; flex: 1; flex-wrap: wrap; }
+.inline-form { display: flex; gap: 8px; align-items: center; margin: 0; }
+main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+.card { background: #fff; border: 1px solid var(--line); border-radius: 8px;
+        padding: 16px; margin-bottom: 16px; }
+.narrow { max-width: 420px; margin: 48px auto; }
+h1 { font-size: 20px; margin: 0 0 12px; }
+h2 { font-size: 16px; margin: 0 0 10px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 500; font-size: 13px; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.up { color: var(--danger); }   /* 红涨 */
+.down { color: var(--ok); }     /* 绿跌 */
+.muted { color: var(--muted); }
+.flash-error { color: var(--danger); background: #fee4e2; border: 1px solid #fda29b;
+               border-radius: 6px; padding: 8px 12px; }
+.flash-ok { color: var(--ok); background: #d1fadf; border: 1px solid #75e0a7;
+            border-radius: 6px; padding: 8px 12px; }
+label { display: block; margin: 10px 0; }
+input, select, textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--line);
+                          border-radius: 6px; width: 100%; max-width: 420px; }
+.inline-form input { width: auto; }
+button { font: inherit; padding: 6px 14px; border: 1px solid var(--line);
+         border-radius: 6px; background: #fff; cursor: pointer; }
+button:hover { background: #f0f0f3; }
+form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+             margin: 12px 0; background: #fafafc; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px;
+         border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
