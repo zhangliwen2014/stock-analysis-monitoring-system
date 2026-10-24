@@ -9,6 +9,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from sams.core.quotes import CLOSED, DELAYED, LIVE, NO_DATA, STALE
+from sams.storage.repos.alerts import DISMISSED, HANDLED, NEW
 
 _STATE_LABEL = {
     LIVE: "实时",
@@ -54,15 +55,27 @@ def hms(moment: datetime | None, tz: str | None = None) -> str:
     return moment.strftime("%H:%M:%S")
 
 
-def moment_label(value: datetime | None, tz: str | None = None) -> str:
+def moment_label(value: datetime | None, tz: str | None = None, *, seconds: bool = False) -> str:
     """告警那一列的时刻：`%m-%d %H:%M`，折算口径与 `hms` 一致。
 
     `TIMESTAMPTZ` 回读在本库不稳定（`format_utc_moment` 的文档记的就是这件事）：同
     一屏上行情那行已经折到 `display_tz`，告警若在模板里直接 `strftime`，两个时刻属于
     两个时区而屏幕上看不出来——交易员会按错的那一个去回放。naive 值不猜它的时区。
+
+    `seconds` 是给投递记录那张表的：同一条告警的三次尝试只差几秒，只到分钟会把它们
+    印成一模一样的一列，看不出哪一次失败。
     """
     if value is None:
         return "—"
     if tz and value.tzinfo is not None:
         value = value.astimezone(ZoneInfo(tz))
-    return value.strftime("%m-%d %H:%M")
+    return value.strftime("%m-%d %H:%M:%S" if seconds else "%m-%d %H:%M")
+
+
+#: 告警状态的人话名字。键用 `repos/alerts.py` 那三个常量而不是字面量：状态改名时这里
+#: 跟着编译不过或留下一个没人再写得出的旧标签，而字面量只会安静地一直走 `get` 的兜底分支。
+ALERT_STATUS_LABELS = {NEW: "未处理", HANDLED: "已处理", DISMISSED: "已驳回"}
+
+
+def alert_status(value: str) -> str:
+    return ALERT_STATUS_LABELS.get(value, value)

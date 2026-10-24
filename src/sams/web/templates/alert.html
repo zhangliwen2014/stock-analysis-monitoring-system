@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>{{ alert.market }}/{{ alert.code }}
+    {% if alert.symbol_name %}<span class="muted">{{ alert.symbol_name }}</span>{% endif %}
+  </h1>
+  {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  {# 状态名走 display 那个全局（表是 `repos/alerts.py` 的三个常量）：模板不自己翻译状态 #}
+  <p>
+    <span class="badge">{{ alert.severity }}</span>
+    {{ alert_status(alert.status) }} ·
+    {# 时刻在 Python 里折到 display_tz 并排成字符串：模板拿到的一律不是 datetime #}
+    <span class="muted">{{ triggered_at }}</span>
+    {% if alert.is_test %}<span class="badge">测试</span>{% endif %}
+  </p>
+  <table>
+    <tr><th>项</th><th>内容</th></tr>
+    <tr><td>规则</td><td>{{ alert.rule_name or "—" }}</td></tr>
+    {# 现值/阈值/建议动作在 payload 里，不是列（措辞改版不动表），取的工作在端点里做完了 #}
+    <tr><td>现值 / 阈值</td><td class="num">{{ value_text }} / {{ threshold_text }}</td></tr>
+    <tr><td>建议动作</td><td>{{ action_note or "—" }}</td></tr>
+    <tr><td>阶段</td><td>{{ alert.stage or "—" }}</td></tr>
+    <tr><td>正文</td><td>{{ body or "—" }}</td></tr>
+    {% if alert.handled_at %}
+    <tr><td>处理时刻</td><td class="muted">{{ handled_at }}</td></tr>
+    <tr><td>处理备注</td><td>{{ alert.handle_note or "—" }}</td></tr>
+    {% endif %}
+    {% if alert.dismiss_reason %}
+    <tr><td>驳回原因</td><td>{{ alert.dismiss_reason }}</td></tr>
+    {% endif %}
+  </table>
+</section>
+
+{% if can_act %}
+<section class="card">
+  <h2>处理</h2>
+  <form method="post" action="/alerts/{{ alert.id }}/acted" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input name="note" placeholder="备注（可空）：打算怎么处理">
+    <button type="submit">标记已处理</button>
+  </form>
+  <form method="post" action="/alerts/{{ alert.id }}/dismiss" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input name="reason" placeholder="驳回原因（必填）：为什么说它是假信号">
+    <button type="submit">驳回</button>
+  </form>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>投递记录</h2>
+  {% if dispatch %}
+  <p>本次重发：</p>
+  <ul>
+    {% for item in dispatch.deliveries %}
+    <li>{{ item.kind or "—" }} → {{ item.outcome }}
+      {%- if item.error %}（{{ item.error }}）{% endif %}</li>
+    {% else %}
+    <li class="muted">本次重发一条投递都没记下</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <table>
+    <tr><th>时刻</th><th>通道</th><th>结果</th><th class="num">次数</th><th>说明</th></tr>
+    {% for row in deliveries %}
+    <tr>
+      {# 那一列到秒为止：同一条告警的三次尝试只差几秒，只到分钟会印成一模一样的一列 #}
+      <td class="muted">{{ row.at }}</td>
+      <td>{{ row.channel_id or "—" }}</td>
+      <td>{{ row.outcome }}</td>
+      <td class="num">{{ row.attempts }}</td>
+      <td>{{ row.error or "—" }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">没有投递记录。</td></tr>
+    {% endfor %}
+  </table>
+  <p class="muted">重发按<b>此刻</b>的通道与免打扰状态再走一遍选路，正文从库里重建；
+    它只动投递记录，不动这条告警按成了什么。</p>
+  <form method="post" action="/alerts/{{ alert.id }}/resend" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">再发一次</button>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}告警{% endblock %}
+{% block content %}
+<h1>告警</h1>
+
+<form method="get" action="/alerts" class="panel grid">
+  <label>状态
+    {# 名单来自 STATUS_CHOICES（仓库那三个状态 + 全部）：检查与下拉同一份，不会各漂一边 #}
+    <select name="status">
+      {% for value, label in status_choices %}
+      <option value="{{ value }}"{% if chosen.status == value %} selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>档位
+    {# 三个档位从 core 的 SEVERITIES 来：页面不带第二份词汇表 #}
+    <select name="severity">
+      <option value="">全部档位</option>
+      {% for level in severities %}
+      <option value="{{ level }}"{% if chosen.severity == level %} selected{% endif %}>{{ level }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>市场
+    {# 下拉而不是输入框：库里那一列只有归一后的键，自由输入一个 `a` 筛出来是空的 #}
+    <select name="market">
+      <option value="">全部市场</option>
+      {% for option in markets %}
+      <option value="{{ option }}"{% if chosen.market == option %} selected{% endif %}>{{ option }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>起（含） <input type="date" name="since" value="{{ chosen.since }}"></label>
+  {# until 含那一天整天：窗口按 display_tz 切，与下面那一列时刻同一口径 #}
+  <label>止（含） <input type="date" name="until" value="{{ chosen.until }}"></label>
+  <button type="submit">筛选</button>
+</form>
+
+{% for (market, code), rows in groups.items() %}
+<section class="card">
+  <h2>{{ market }}/{{ code }}{% if rows[0].symbol_name %}
+    <span class="muted">{{ rows[0].symbol_name }}</span>{% endif %}</h2>
+  <table>
+    <tr><th>时刻</th><th>档位</th><th>规则</th><th>现值 / 阈值</th><th>状态</th><th></th></tr>
+    {% for row in rows %}
+    <tr>
+      {# 时刻在 Python 里已折到 display_tz：模板拿到的是字符串，不是 datetime #}
+      <td class="muted">{{ row.at }}</td>
+      <td><span class="badge">{{ row.severity }}</span></td>
+      <td>{{ row.rule_name or "—" }}</td>
+      <td class="num">{{ row.value_text }} / {{ row.threshold_text }}</td>
+      <td>{{ alert_status(row.status) }}</td>
+      <td><a href="/alerts/{{ row.id }}">详情</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% else %}
+<p class="muted">没有命中的告警。</p>
+{% endfor %}
+
+<p class="muted">
+  第 {{ page }} 页
+  {# 链接在 Python 里拼好并 urlencode：值里出现 `&` 或空格也不会把链接弄断 #}
+  {% if prev_url %}<a href="{{ prev_url }}">上一页</a>{% endif %}
+  {% if next_url %}<a href="{{ next_url }}">下一页</a>{% endif %}
+</p>
+{% endblock %}

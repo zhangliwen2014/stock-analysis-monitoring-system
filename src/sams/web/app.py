@@ -34,8 +34,8 @@ from sams.web.auth import (
 )
 from sams.web.auth import router as auth_router
 from sams.web.context import ThreadContexts
-from sams.web.display import hms, money, pct, state_label
-from sams.web.pages import dashboard, portfolio, rules, symbol, theses
+from sams.web.display import alert_status, hms, money, pct, state_label
+from sams.web.pages import alerts, dashboard, portfolio, rules, symbol, theses
 
 _STATIC = Path(__file__).parent / "static"
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -44,7 +44,9 @@ _TEMPLATES = Path(__file__).parent / "templates"
 def _templates() -> Jinja2Templates:
     """显示函数注册成 Jinja 全局：数字怎么排、状态叫什么，模板里不该各写一份。"""
     templates = Jinja2Templates(directory=str(_TEMPLATES))
-    templates.env.globals.update(money=money, pct=pct, hms=hms, state_label=state_label)
+    templates.env.globals.update(
+        money=money, pct=pct, hms=hms, state_label=state_label, alert_status=alert_status
+    )
     return templates
 
 
@@ -110,6 +112,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
     app.include_router(auth_router)
+    app.include_router(alerts.router)
     app.include_router(dashboard.router)
     app.include_router(portfolio.router)
     app.include_router(rules.router)
