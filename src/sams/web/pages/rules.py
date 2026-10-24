@@ -1,0 +1,346 @@
+"""规则：列表、契约驱动的表单、启停。
+
+表单形状只有一个出处：参数按 `Param.shape` 那三种排、过滤开关按 `FILTER_KEYS` 排、
+可选的挂载对象按 `Template.targets` 排。加一种参数模板不用改这层，也不用改模板。
+校验也不在这里第二遍：`validate_params` 与 `validate_filters` 是 CLI 和仓库共用的那一对，
+页面只交原文（`web/forms.py`），被拒时念的就是它们那几句话——两处各写一套措辞，
+迟早会分叉成「命令行说能存、页面说不行」。
+
+两处与直觉相反的地方都在「没填」上：
+
+* 参数没填不等于不动。`RuleRepo.update` 收下的 `params` 是**整份替换**
+  （`patch.get("params", before.params)`），缺的键随后由 `validate_params` 按模板
+  **默认值**补上，而不是按库里那个值。所以编辑那一路必须从 `rule.params` 起头再盖，
+  过滤开关同理（少交一个键就是把它关掉）。
+* 冷却留空不等于 0。0 是「没有冷却」，那条规则命中一次就响一遍；空着说的是
+  「按配置的来」，交给服务层的是 `None`（`add` 拿它落 `settings.cooldown_min`，
+  `edit` 拿它表示这一项不动）。
+
+启停只有 `set_enabled` 一个出口（服务层没有 toggle/pause），页面上的「翻转」读的是
+当前那一行。版本 bump 全在服务层发生，这层不碰闸。仓库调用全在端点体内走
+`web.contexts.current()`（D113）。
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse
+
+from sams.core.errors import DatabaseLocked, SamsError, StorageError, ValidationError
+from sams.core.notify import SEVERITIES
+from sams.core.rules import FILTER_KEYS, RULE_KINDS, Template, template_for
+from sams.storage.repos.rules import Rule
+from sams.web.auth import csrf_protect, require_user
+from sams.web.forms import filter_flags, form_data, many, one, param_fields, raw_params
+
+router = APIRouter()
+
+#: 表单原文的依赖，提到模块级一份：lint 不许在参数默认值里调用 `Depends`，
+#: 而 FastAPI 认的就是这个对象本身，不认调用写法。
+#: 它与 `csrf_protect` 读到的是同一份 body：Starlette 缓存 `request.form()`，
+#: 那个依赖先解析一遍，这里取回的是同一份，不存在解析两次或把 body 读空。
+_form_body = Depends(form_data)
+
+#: 表单里那几个单值字段（`param_*` 与它们同一条路，见 `_values`）
+_SCALARS = (
+    "name", "target_type", "target_ref", "severity", "cooldown_min",
+    "account_id", "thesis_id",
+)
+
+#: 存不上的挂载对象：`_validate` 见 `portfolio` 就拒（组合级这一层还没有输入，U28），
+#: 而模板的 `targets` 里那五种是「形状」不是「能写」。给一个必然被拒的选项是坏掉的控件。
+_UNWRITABLE_TARGETS = ("portfolio",)
+
+
+def _cooldown(raw: str) -> int | None:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        # `int("一千")` 抛的是 ValueError，不是 SamsError：不自己折一下就越过兜底，
+        # 换回一屏 500（而用户手里那张表单明明只是这一格填错了）
+        raise ValidationError(
+            f"冷却（分钟）要的是整数分钟，收到 {text!r}（留空是按配置的默认值）"
+        ) from exc
+
+
+def _values(data: dict[str, list[str]]) -> dict[str, str]:
+    """被拒之后要原样回到输入框里的东西：单值字段 + 全部 `param_*`。"""
+    values = {key: one(data, key) for key in _SCALARS}
+    values.update(param_fields(data))
+    return values
+
+
+def _stored_values(rule: Rule) -> dict[str, str]:
+    values = {
+        "name": rule.name,
+        "target_type": rule.target_type,
+        "target_ref": rule.target_ref,
+        "severity": rule.severity,
+        "cooldown_min": str(rule.cooldown_min),
+        "account_id": rule.account_id or "",
+        "thesis_id": rule.thesis_id or "",
+    }
+    for key, value in rule.params.items():
+        if isinstance(value, list):
+            # 折回逗号串（`0.5,1.0`）：`str([0.5, 1.0])` 带着空格和方括号，
+            # 那一串交回 `_as_tiers` 会被它自己拒——表单读不懂自己写出去的东西
+            text = ",".join(str(piece) for piece in value)
+        else:
+            text = "" if value is None else str(value)
+        values[f"param_{key}"] = text
+    return values
+
+
+def _mount(rule: Rule) -> str:
+    """编辑页那一行「挂在哪里」。
+
+    是文字而不是下拉：`RuleService.edit` 与 `RuleRepo.update` 都不收 `account_id`
+    与 `thesis_id`（合并那一段永远取旧值），换成两个改不动的框等于请用户填一个
+    存不下去的选择。要换挂载对象就回列表另建一条。
+    """
+    parts = [f"{rule.target_type}:{rule.target_ref}"]
+    if rule.account_id:
+        parts.append(f"账户 {rule.account_id}")
+    if rule.thesis_id:
+        parts.append(f"论 {rule.thesis_id}")
+    return "｜".join(parts)
+
+
+def _list_page(request: Request, *, error: str | None = None, status: int = 200):
+    user = request.state.sams_user
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    return web.render(
+        request,
+        "rules.html",
+        status_code=status,
+        title="规则",
+        # 走服务层而不是仓库那份：`targets` 与 `notes` 说的是「这条规则现在响不响」，
+        # 覆盖 0 个对象是一条静默的规则，而这一屏是唯一能看见它的地方
+        views=ctx.rule_service.list(user.id),
+        error=error,
+    )
+
+
+def _picker_page(
+    request: Request, *, values: dict[str, str], error: str | None = None, status: int = 200
+):
+    return request.app.state.web.render(
+        request,
+        "rule_form.html",
+        status_code=status,
+        title="规则",
+        template=None,
+        kinds=RULE_KINDS,
+        values=values,
+        filters={},
+        error=error,
+        rule_id=None,
+    )
+
+
+def _form_page(
+    request: Request,
+    *,
+    template: Template,
+    values: dict[str, str],
+    filters: dict[str, bool],
+    error: str | None,
+    status: int,
+    rule_id: str | None = None,
+    bound: str | None = None,
+):
+    user = request.state.sams_user
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    return web.render(
+        request,
+        "rule_form.html",
+        status_code=status,
+        title=f"规则 {template.kind}",
+        template=template,
+        kinds=RULE_KINDS,
+        # 名单从契约来，不从模板里那份硬编码来
+        targets=[item for item in template.targets if item not in _UNWRITABLE_TARGETS],
+        filter_keys=FILTER_KEYS,
+        severities=SEVERITIES,
+        values=values,
+        filters=filters,
+        error=error,
+        rule_id=rule_id,
+        bound=bound,
+        channels=ctx.channels_store.list_for(user.id),
+        accounts=ctx.sim_accounts.list_for(user.id),
+        theses=ctx.theses.list(user.username),
+    )
+
+
+def _own_view(ctx, user, rule_id: str):
+    """不存在与不是你的都是 404：服务层那句 `StorageError` 本来就不区分这两种。
+
+    但 `DatabaseLocked` 也是 `StorageError` 的子类（`core/errors.py`）：库被调度线程握着的
+    时候答「这条规则不存在」是一句自信的错误话——它会让人去重建一条本来就还在的规则。
+    """
+    try:
+        return ctx.rule_service.show(user.id, rule_id)
+    except DatabaseLocked:
+        raise
+    except StorageError:
+        raise HTTPException(status_code=404) from None
+
+
+@router.get("/rules")
+def rules_page(request: Request):
+    require_user(request)
+    return _list_page(request)
+
+
+@router.get("/rules/new")
+def rule_new_page(
+    request: Request, kind: str = "", target_type: str = "symbol", target_ref: str = ""
+):
+    require_user(request)
+    values = {"target_type": target_type, "target_ref": target_ref}
+    if not kind:
+        return _picker_page(request, values=values)
+    try:
+        template = template_for(kind)
+    except SamsError as exc:
+        # 拿着一个错链接的人要的是「一共有哪几种」，而不是一屏拒绝：名单就在这句话里
+        return _picker_page(request, values=values, error=str(exc), status=400)
+    return _form_page(
+        request,
+        template=template,
+        values=values,
+        # 新建那张表一个开关都不预勾：core 的默认是不降噪（一条静默的规则比一条吵的难查）
+        filters={},
+        error=None,
+        status=200,
+    )
+
+
+@router.post("/rules/new")
+def rule_create(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    kind = one(data, "kind")
+    values = _values(data)
+    filters = filter_flags(data)
+    try:
+        template = template_for(kind)
+    except SamsError as exc:
+        return _picker_page(request, values=values, error=str(exc), status=400)
+    try:
+        ctx.rule_service.add(
+            user.id,
+            kind=kind,
+            name=one(data, "name"),
+            # 引用原样交出去（只 strip）：`rules.target_ref` 存的就是人敲的那串，
+            # 归一发生在求值时的 `snapshot.expand`——这里再排一遍会留下两套规则（见 symbol.py）
+            target_type=one(data, "target_type").strip(),
+            target_ref=one(data, "target_ref").strip(),
+            # 只交填了的那几项：缺的由 `validate_params` 补默认值，必填的那一个由它拒
+            params=raw_params(template, data),
+            filters=filters,
+            account_id=one(data, "account_id") or None,
+            thesis_id=one(data, "thesis_id") or None,
+            # 空选择 = 不指定 = 模板自己那个级别，不是空串进仓库
+            severity=one(data, "severity") or None,
+            channel_ids=many(data, "channel_ids"),
+            cooldown_min=_cooldown(one(data, "cooldown_min")),
+        )
+    except DatabaseLocked:
+        # 库被调度线程握着：那是「过一会儿再建」，不是「你填错了」，交给全局 handler 答 503
+        raise
+    except SamsError as exc:
+        # 业务拒绝（少了必填参数、别人的账户、野过滤器）留在这里说：表单还在屏上，
+        # 改那一格就能重交，而 error.html 给的是一屏没有表单的话
+        return _form_page(
+            request, template=template, values=values, filters=filters, error=str(exc), status=400
+        )
+    return RedirectResponse("/rules", status_code=303)
+
+
+@router.get("/rules/{rule_id}/edit")
+def rule_edit_page(request: Request, rule_id: str):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    view = _own_view(ctx, user, rule_id)
+    rule = view.rule
+    return _form_page(
+        request,
+        template=template_for(rule.kind),
+        values=_stored_values(rule),
+        # 四个键都给：库里少一个键（旧行）也只是没勾，不是把渲染交给巧合
+        filters={key: bool(rule.filters.get(key)) for key in FILTER_KEYS},
+        error=None,
+        status=200,
+        rule_id=rule_id,
+        bound=_mount(rule),
+    )
+
+
+@router.post("/rules/{rule_id}/edit")
+def rule_edit(
+    request: Request,
+    rule_id: str,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    view = _own_view(ctx, user, rule_id)
+    template = template_for(view.rule.kind)
+    values = _values(data)
+    filters = filter_flags(data)
+    try:
+        # 从库里那一份起头，只盖表单真填了的几项：`update` 是整份替换，
+        # 没盖到的键会被模板默认值填掉（那才是「改个名字顺手把止损线搬回默认价」）
+        params = {**dict(view.rule.params), **raw_params(template, data)}
+        ctx.rule_service.edit(
+            user.id,
+            rule_id,
+            name=one(data, "name"),
+            params=params,
+            filters=filters,
+            severity=one(data, "severity") or None,
+            channel_ids=many(data, "channel_ids"),
+            cooldown_min=_cooldown(one(data, "cooldown_min")),
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _form_page(
+            request,
+            template=template,
+            values=values,
+            filters=filters,
+            error=str(exc),
+            status=400,
+            rule_id=rule_id,
+            bound=_mount(view.rule),
+        )
+    return RedirectResponse("/rules", status_code=303)
+
+
+@router.post("/rules/{rule_id}/toggle")
+def rule_toggle(request: Request, rule_id: str, _csrf: None = Depends(csrf_protect)):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    view = _own_view(ctx, user, rule_id)
+    try:
+        # 服务层只有 `set_enabled`，没有 toggle：翻转读的是刚取出来的那一行
+        ctx.rule_service.set_enabled(user.id, rule_id, not view.rule.enabled)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        # 这个按钮长在列表上，话就得回到列表说（重新渲染表单会把用户从哪来的都改掉）
+        return _list_page(request, status=400, error=str(exc))
+    return RedirectResponse("/rules", status_code=303)

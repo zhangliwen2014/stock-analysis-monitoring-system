@@ -11,6 +11,7 @@ a { color: inherit; }
 .brand { font-weight: 700; letter-spacing: 1px; }
 .nav-links { display: flex; gap: 14px; flex: 1; flex-wrap: wrap; }
 .inline-form { display: flex; gap: 8px; align-items: center; margin: 0; }
+.inline { display: inline; }   /* 复选框那一排：label 默认是块级，一格一个开关会排成一列 */
 main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
 .card { background: #fff; border: 1px solid var(--line); border-radius: 8px;
         padding: 16px; margin-bottom: 16px; }

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}规则{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>规则 <a class="muted" href="/rules/new">新建</a></h1>
+  {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  {% if views %}
+  <table>
+    <tr><th>名称</th><th>类型</th><th>对象</th><th>级别</th><th>覆盖</th><th>启用</th><th></th></tr>
+    {% for view in views %}
+    <tr>
+      <td><a href="/rules/{{ view.rule.id }}/edit">{{ view.rule.name }}</a></td>
+      <td class="muted">{{ view.rule.kind }}</td>
+      <td class="muted">{{ view.rule.target_type }}:{{ view.rule.target_ref }}</td>
+      <td>{{ view.rule.severity }}</td>
+      <td>{{ view.targets }}</td>
+      <td>{{ "是" if view.rule.enabled else "否" }}</td>
+      <td>
+        <form method="post" action="/rules/{{ view.rule.id }}/toggle" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">{{ "停用" if view.rule.enabled else "启用" }}</button>
+        </form>
+      </td>
+    </tr>
+    {% if view.notes %}
+    {# 覆盖 0 个对象的规则看着是「启用」而一条都不响：这一行是它唯一的出声处 #}
+    <tr><td colspan="7" class="muted">{% for note in view.notes %}{{ note }}{% if not loop.last %}；{% endif %}{% endfor %}</td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">还没有规则。</p>{% endif %}
+</section>
+{% endblock %}

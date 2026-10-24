@@ -35,7 +35,7 @@ from sams.web.auth import (
 from sams.web.auth import router as auth_router
 from sams.web.context import ThreadContexts
 from sams.web.display import hms, money, pct, state_label
-from sams.web.pages import dashboard, portfolio, symbol, theses
+from sams.web.pages import dashboard, portfolio, rules, symbol, theses
 
 _STATIC = Path(__file__).parent / "static"
 _TEMPLATES = Path(__file__).parent / "templates"
@@ -112,6 +112,7 @@ def create_app(
     app.include_router(auth_router)
     app.include_router(dashboard.router)
     app.include_router(portfolio.router)
+    app.include_router(rules.router)
     app.include_router(symbol.router)
     app.include_router(theses.router)
 
