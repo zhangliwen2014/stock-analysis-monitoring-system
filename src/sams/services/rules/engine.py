@@ -27,7 +27,7 @@ from sams.core.errors import NotAdjustable, SamsError, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage, AlertSender
 from sams.core.quotes import Quote, local_day, source_label
-from sams.core.rules import Verdict, escalates, is_intraday, template_for
+from sams.core.rules import RULE_KINDS, Verdict, escalates, is_intraday, template_for
 from sams.services.rules.anchor import move_prices
 from sams.services.rules.filters import Gate, OpenAlert, run_filters
 from sams.services.rules.notes import Fx, constraint_lines, holding_pnl
@@ -251,6 +251,11 @@ class RuleEngine:
             # 不给默认空板：一个忘传的 None 会让整趟「一只票都没报价」悄悄变绿，
             # 那是装配错误，不是业务结论
             raise ValidationError("盘中一趟必须带行情板：quotes 是这一次求值的现价出处")
+        if quotes is not None and not intraday:
+            # 两个参数是一对的：只给板不给 intraday，收盘那一趟会被新鲜度闸悄悄改写
+            raise ValidationError(
+                "quotes 只在盘中那一趟用：要么连 intraday=True 一起给，要么都不给"
+            )
         if market is not None:
             market = canonical_market(market)
         raised: list[Raised] = []
@@ -312,13 +317,19 @@ class RuleEngine:
         要的显然是「这条如果开着会判出什么」，回一句空列表最没用。
 
         盘中那一趟走另一扇门（§5.3）：跨全部用户的启用规则里挑出 intraday 的那半，
-        再按用户切——名单来自 `is_intraday`，不是这里再抄一份。
+        再按用户切——名单来自 `is_intraday` 读模板旗标，不是这里再抄一份旗标；
+        名单外的 kind 不滤掉（理由见分支里那句注释）。
         """
         if intraday:
+            # 名单只按**认识的** kind 的模板旗标滤：`is_intraday` 对名单外的 kind 是抛
+            # KeyError（`TEMPLATES` 是唯一出处），拿它当筛子就等于让库里躺着的一条野行
+            # 把整趟拖崩。野行留在名单里交给 `_one`——那里 `TABLE.get` 查不到会给一句
+            # skipped（与收盘那一趟同一个取向：那种行不该把整趟拖崩）。
             return [
                 rule
                 for rule in self.rules.list_enabled()
-                if rule.user_id == user_id and is_intraday(rule.kind)
+                if rule.user_id == user_id
+                and (rule.kind not in RULE_KINDS or is_intraday(rule.kind))
             ]
         listed = self.rules.list_for(user_id, enabled_only=rule_id is None)
         if rule_id is None:
