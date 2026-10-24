@@ -22,7 +22,6 @@ from sams.core.events import EventBus, SystemAlarm
 logger = logging.getLogger("sams.monitor.queue")
 
 DEFAULT_QUEUE_SIZE = 1000
-OFFER_TIMEOUT_S = 1.0
 GET_TIMEOUT_S = 0.5
 #: 停机后还愿意等多久把剩下的发完。超时没发完的留在队列里：进程退出不该为一杯牛奶等牛
 DRAIN_S = 10.0
@@ -59,7 +58,10 @@ class AlertQueue:
     def maxsize(self) -> int:
         return self._queue.maxsize
 
-    def offer(self, item, *, timeout: float = OFFER_TIMEOUT_S) -> bool:
+    def offer(self, item, *, timeout: float = 0.0) -> bool:
+        # 默认不等：两个调用方（`QueuedAlertSender.dispatch` 与 `SystemAlarmRelay`）都跑在
+        # 别人也要用这条线程的场合，满了就当场 False 让调用方决定怎么交代，等 1 秒等于把
+        # 求值线程与发布线程各拖住 1 秒，而那条 docstring 里答应的是「满 ⇒ abandon」
         try:
             self._queue.put(item, timeout=timeout)
         except queue_mod.Full:
@@ -103,11 +105,9 @@ class QueuedAlertSender:
             rule_id=rule_id,
             account_id=account_id,
         )
-        # timeout=0.0：满不满当场决定（`put` 收到 0 也是即时抛 Full，不是 ValueError）。
-        # 这一处是模块里唯一显式传 0.0 的调用方，也是唯一被要求「一秒都不许等」的那一个：
-        # 求值线程多等一秒，同一轮里排在后面的市场全等它。`SystemAlarmRelay` 仍吃
-        # `OFFER_TIMEOUT_S` 那个默认值 —— 收紧它不属这次的活，别把它误当成本处的同伴读
-        if self.queue.offer(AlertJob(alert.id), timeout=0.0):
+        # 满了当场判负（`offer` 的默认超时就是 0）：求值线程多等一秒，同一轮里排在后面的
+        # 市场全等它，而这一秒换不来任何东西——队列不会因为等满 1 秒就腾出位置
+        if self.queue.offer(AlertJob(alert.id)):
             return alert.id
         self.notify.abandon(
             alert.id,
