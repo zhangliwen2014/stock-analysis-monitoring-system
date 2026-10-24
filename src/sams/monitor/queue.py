@@ -104,8 +104,9 @@ class QueuedAlertSender:
             account_id=account_id,
         )
         # timeout=0.0：满不满当场决定（`put` 收到 0 也是即时抛 Full，不是 ValueError）。
-        # 这里不用 `OFFER_TIMEOUT_S` 那个默认值——本模块唯一的调用方就是这一处，留着两个
-        # 「满」的口径只会被下一个人挑错那个：求值线程多等一秒，同一轮里排在后面的市场全等它
+        # 这一处是模块里唯一显式传 0.0 的调用方，也是唯一被要求「一秒都不许等」的那一个：
+        # 求值线程多等一秒，同一轮里排在后面的市场全等它。`SystemAlarmRelay` 仍吃
+        # `OFFER_TIMEOUT_S` 那个默认值 —— 收紧它不属这次的活，别把它误当成本处的同伴读
         if self.queue.offer(AlertJob(alert.id), timeout=0.0):
             return alert.id
         self.notify.abandon(
