@@ -52,8 +52,11 @@ def test_the_quote_fields_win_and_the_day_follows_the_market():
 
 
 def test_fields_the_source_did_not_give_keep_the_daily_value():
-    got = apply_quote(snap(), quote=quote(open=None, prev_close=None), previous=None, zone=ZONE)
-    assert got.day_open is None  # 日线本来就没有当日开盘
+    # 日线这一列要真给一个值：断言 None 只能证明「谁都没写」，证明不了「没被盖掉」
+    got = apply_quote(
+        snap(day_open=37.5), quote=quote(open=None, prev_close=None), previous=None, zone=ZONE
+    )
+    assert got.day_open == 37.5
     assert got.prev_close == 40.0
 
 
@@ -63,9 +66,32 @@ def test_holding_high_extends_but_never_invents():
     assert apply_quote(no_line, quote=quote(), previous=None, zone=ZONE).holding_high is None
 
 
+def test_a_new_intraday_high_raises_the_line():
+    # 上面那条的报价高点低于日线高点，一次都走不到「抬高」这一支：回撤判据正靠它
+    got = apply_quote(snap(holding_high=38.0), quote=quote(high=39.1), previous=None, zone=ZONE)
+    assert got.holding_high == 39.1
+
+
+def test_a_quote_without_a_high_uses_its_price():
+    # 没有高点时退回现价而不是保留旧线：盘中创了新高却没报高点，线不跟着抬就是假回撤
+    got = apply_quote(snap(holding_high=38.0), quote=quote(high=None), previous=None, zone=ZONE)
+    assert got.holding_high == 38.2
+
+
 def test_the_no_price_note_is_stripped_once_a_quote_arrives():
     got = apply_quote(snap(), quote=quote(), previous=None, zone=ZONE)
     assert got.missing == ()
+
+
+def test_other_missing_lines_survive_the_price_note_being_stripped():
+    # 挑句子是按字面匹配那句现价说明，挑宽了就会把别的缺数一起吞掉
+    got = apply_quote(
+        snap(missing=(NO_PRICE_MISSING, "持仓不足三根日 K")),
+        quote=quote(),
+        previous=None,
+        zone=ZONE,
+    )
+    assert got.missing == ("持仓不足三根日 K",)
 
 
 def test_cross_from_comes_from_the_previous_round_of_the_same_day():
