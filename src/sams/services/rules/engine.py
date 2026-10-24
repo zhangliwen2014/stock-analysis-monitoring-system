@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_market
@@ -24,11 +26,12 @@ from sams.core.config import Settings
 from sams.core.errors import NotAdjustable, SamsError, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage, AlertSender
-from sams.core.rules import Verdict, escalates, template_for
+from sams.core.quotes import Quote, local_day, source_label
+from sams.core.rules import Verdict, escalates, is_intraday, template_for
 from sams.services.rules.anchor import move_prices
 from sams.services.rules.filters import Gate, OpenAlert, run_filters
 from sams.services.rules.notes import Fx, constraint_lines, holding_pnl
-from sams.services.rules.snapshot import RuleData, Snapshot, Target
+from sams.services.rules.snapshot import RuleData, Snapshot, Target, apply_quote
 from sams.services.rules.templates import TABLE, Ask
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.fx import FxRepo
@@ -38,6 +41,18 @@ from sams.storage.repos.rules import Rule, RuleRepo
 #: 往回找「最近一个已开市的日子」最多找这么多天。20 天盖住春节与国庆两段连休，
 #: 再长就该由日历与健康页说话，而不是让引擎拿一个猜出来的日子去判停牌。
 SESSION_LOOKBACK_DAYS = 20
+
+
+class QuoteView(Protocol):
+    """盘中一趟向引擎开口的两个问题：这只票现在什么价，上一轮是什么价。
+
+    `QuoteBoard` 天然长成这个形状；替身与它同构（`support_rules.StubQuotes`）。
+    """
+
+    def get(self, market: str, code: str) -> Quote | None: ...
+
+    def previous(self, market: str, code: str) -> Quote | None: ...
+
 
 #: 逐个 kind 的那几句：家族说不出「复核」与「清仓」的差别
 ACTIONS: dict[str, str] = {
@@ -56,6 +71,20 @@ _FAMILY = {
 }
 
 DEFAULT_ACTION = "按这条规则处置"
+
+
+def _quote_line(quote: Quote, zone: ZoneInfo | None) -> str:
+    """正文第二行（D120/D134）：报价的时刻与来源，市场本地时区，秒级。
+
+    「延迟未标注」也要写：没标注不等于保证实时，写出来用户才知道该信几分。
+    """
+    shown = quote.ts if zone is None else quote.ts.astimezone(zone)
+    parts = [f"报价 {shown:%H:%M:%S}", source_label(quote.source)]
+    if quote.delayed is True:
+        parts.append("延迟")
+    elif quote.delayed is None:
+        parts.append("延迟未标注")
+    return " · ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -205,6 +234,8 @@ class RuleEngine:
         market: str | None = None,
         dry_run: bool = False,
         rule_id: str | None = None,
+        intraday: bool = False,
+        quotes: QuoteView | None = None,
     ) -> RunReport:
         """一趟同步求值。调度器的 `rules` job 按市场跑（传 `market`），CLI 那一趟不传，
         而本函数不知道自己被调了几次——一次还是三个市场，是调用方的事。
@@ -216,6 +247,10 @@ class RuleEngine:
         """
         now = self.clock.now_utc()
         day = as_of if as_of is not None else self.clock.today()
+        if intraday and quotes is None:
+            # 不给默认空板：一个忘传的 None 会让整趟「一只票都没报价」悄悄变绿，
+            # 那是装配错误，不是业务结论
+            raise ValidationError("盘中一趟必须带行情板：quotes 是这一次求值的现价出处")
         if market is not None:
             market = canonical_market(market)
         raised: list[Raised] = []
@@ -224,7 +259,7 @@ class RuleEngine:
         blocked: list[Blocked] = []
         quiet = 0
         cache = _Cache()
-        selected = self._select(user_id, rule_id)
+        selected = self._select(user_id, rule_id, intraday=intraday)
         for rule in selected:
             try:
                 targets = self.data.expand(rule)
@@ -248,6 +283,7 @@ class RuleEngine:
                     now=now,
                     dry_run=dry_run,
                     cache=cache,
+                    quotes=quotes,
                 )
                 if isinstance(fate, Raised):
                     raised.append(fate)
@@ -269,9 +305,21 @@ class RuleEngine:
             quiet=quiet,
         )
 
-    def _select(self, user_id: str, rule_id: str | None) -> list[Rule]:
+    def _select(
+        self, user_id: str, rule_id: str | None, *, intraday: bool = False
+    ) -> list[Rule]:
         """点名一条规则时绕过 `enabled`：用户刚停用一条又 `--rule` 点它，
-        要的显然是「这条如果开着会判出什么」，回一句空列表最没用。"""
+        要的显然是「这条如果开着会判出什么」，回一句空列表最没用。
+
+        盘中那一趟走另一扇门（§5.3）：跨全部用户的启用规则里挑出 intraday 的那半，
+        再按用户切——名单来自 `is_intraday`，不是这里再抄一份。
+        """
+        if intraday:
+            return [
+                rule
+                for rule in self.rules.list_enabled()
+                if rule.user_id == user_id and is_intraday(rule.kind)
+            ]
         listed = self.rules.list_for(user_id, enabled_only=rule_id is None)
         if rule_id is None:
             return listed
@@ -289,7 +337,24 @@ class RuleEngine:
         now: datetime,
         dry_run: bool,
         cache: _Cache,
+        quotes: QuoteView | None = None,
     ) -> Raised | Suppressed | Skipped | None:
+        quote: Quote | None = None
+        zone: ZoneInfo | None = None
+        if quotes is not None:
+            quote = quotes.get(target.market, target.code)
+            if quote is None:
+                # 没报价不判（§5.3）：连「stale」都谈不上——这只票今天压根没被问过价
+                return self._skipped(
+                    rule, target.market, target.code,
+                    "盘中还没有这只票的报价：这一趟不判",
+                )
+            stale = self._stale_note(quote)
+            if stale:
+                return self._skipped(rule, target.market, target.code, stale)
+            # 日线读到报价说自己是哪天：US 的收盘在北京是次日凌晨
+            zone = self._zone(target.market)
+            day = local_day(quote.ts, zone) if zone is not None else quote.ts.date()
         # 这道检查排在 `template_for` 之前：kind 的名单有两份（`TEMPLATES` 在 `core/rules.py`、
         # `TABLE` 在这里），野 kind 原本会先在 `template_for` 那里抛出去——抛出去就是整趟崩，
         # 而这里的取向是「库里已经躺着的那种行不该把整趟拖崩」（与 `NotAdjustable`
@@ -307,6 +372,13 @@ class RuleEngine:
             # 真 bug」也折成屏幕上的一句 skipped，而那一趟看起来是成功的。
             return self._skipped(
                 rule, target.market, target.code, f"读不到这个对象：{exc}"
+            )
+        if quote is not None:
+            snapshot = apply_quote(
+                snapshot,
+                quote=quote,
+                previous=quotes.previous(target.market, target.code),
+                zone=zone,
             )
         placed = move_prices(rule, built, snapshot)
         if placed.blocked:
@@ -337,7 +409,7 @@ class RuleEngine:
         if dry_run:
             return self._raised("", rule, snapshot, verdict, now)
         try:
-            return self._dispatch(rule, snapshot, verdict, built, now)
+            return self._dispatch(rule, snapshot, verdict, built, now, quote=quote)
         except SamsError as exc:
             # 端口后面是 `NotifyService.dispatch`：它会抛 `StorageError`（库写不进）与
             # `ValidationError`（用户不存在），两者都在 `SamsError` 底下。兜住它们意味着
@@ -406,15 +478,30 @@ class RuleEngine:
             ),
         )
 
-    def _local_day(self, market: str, now: datetime) -> date | None:
+    def _zone(self, market: str) -> ZoneInfo | None:
         try:
             # 走 `MarketCfg.zone()` 而不是自己 `ZoneInfo(...)`：坏时区名抛的是
             # `ZoneInfoNotFoundError`（`KeyError` 的子类），这一支只接 `ValidationError`——
             # 那一头已经把两种错转译好了，配置写错不该崩整趟。
-            zone = self.settings.market_cfg(market).zone()
+            return self.settings.market_cfg(market).zone()
         except ValidationError:
             return None
-        return now.astimezone(zone).date()
+
+    def _stale_note(self, quote: Quote) -> str:
+        """盘中那一道新鲜度闸（§5.2）：陈旧的报价宁可跳过，也不能拿来判止损。"""
+        if quote.is_stale:
+            return "报价源把这一笔标成了不可信（stale）：这一趟不判"
+        age = (self.clock.now_utc() - quote.ts).total_seconds()
+        if age > self.settings.quote_stale_s:
+            return (
+                f"报价距今 {int(age)} 秒，超过上限 {self.settings.quote_stale_s} 秒："
+                "这一趟不判"
+            )
+        return ""
+
+    def _local_day(self, market: str, now: datetime) -> date | None:
+        zone = self._zone(market)
+        return None if zone is None else local_day(now, zone)
 
     def _sessions(self, market: str, day: date, cache: _Cache) -> tuple:
         key = (market, day)
@@ -469,9 +556,10 @@ class RuleEngine:
     # --- 投递 ---------------------------------------------------------------------------
 
     def _dispatch(
-        self, rule: Rule, snapshot: Snapshot, verdict: Verdict, built, now: datetime
+        self, rule: Rule, snapshot: Snapshot, verdict: Verdict, built, now: datetime,
+        *, quote: Quote | None = None,
     ) -> Raised:
-        message = self._message(rule, snapshot, verdict, built, now)
+        message = self._message(rule, snapshot, verdict, built, now, quote=quote)
         alert_id = self.sender.dispatch(
             message,
             user_id=rule.user_id,
@@ -554,7 +642,8 @@ class RuleEngine:
         )
 
     def _message(
-        self, rule: Rule, snapshot: Snapshot, verdict: Verdict, built, now: datetime
+        self, rule: Rule, snapshot: Snapshot, verdict: Verdict, built, now: datetime,
+        *, quote: Quote | None = None,
     ) -> AlertMessage:
         return AlertMessage(
             market=snapshot.market,
@@ -568,10 +657,16 @@ class RuleEngine:
             threshold_text=verdict.threshold_text,
             action_note=action_for(rule.kind, rule.name),
             stage=verdict.stage,
-            body=self._body(rule, built, snapshot, verdict),
+            body=self._body(rule, built, snapshot, verdict, quote=quote),
+            intraday=quote is not None,
+            quote_ts=quote.ts if quote is not None else None,
+            quote_source=quote.source if quote is not None else None,
         )
 
-    def _body(self, rule: Rule, built, snapshot: Snapshot, verdict: Verdict) -> str:
+    def _body(
+        self, rule: Rule, built, snapshot: Snapshot, verdict: Verdict,
+        *, quote: Quote | None = None,
+    ) -> str:
         """正文的四摞，顺序就是读的顺序：线在哪 → 这笔现在什么样 → 今天能不能执行 → 缺什么。
 
         「能不能执行」放在盈亏之后（§10.2 要求每条告警都带）：先让人知道这笔亏多少，
@@ -580,8 +675,12 @@ class RuleEngine:
         「换算」紧跟判据：那一行说的是上一行用的那个数从哪儿来。放到盈亏之后，人是先读到
         结论、再读到出处，而出处那一句是要改变结论的（那条线其实比看上去低）。没搬的时候
         这里为空——不写「无除权」，那是一句没有人要的噪音。
+
+        盘中那一趟的第二行是报价出处（D120）：几点的价、哪个源、延迟标没标。
         """
         lines = [f"{built.label}：{verdict.why}" if verdict.why else built.label]
+        if quote is not None:
+            lines.append(_quote_line(quote, self._zone(snapshot.market)))
         lines.extend(move.line for move in snapshot.moved)
         pnl = holding_pnl(snapshot, fx=self._fx(snapshot))
         if pnl:

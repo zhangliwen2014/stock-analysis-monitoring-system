@@ -123,6 +123,8 @@ class StubData:
         self.thesis = thesis
         #: 装上它，`read` 就抛：一条挂了错代码的规则不该把整趟拖崩
         self.read_raises: Exception | None = None
+        #: 记下每次日线读数落在哪天：盘中那一趟的日期应当跟着报价走（§5.3）
+        self.as_of_seen: list[date] = []
 
     def expand(self, rule) -> list[Target]:
         # 真实 `RuleData.expand` 对「持仓类却没有账户」抛：去重键含 account_id，缺了它
@@ -141,9 +143,26 @@ class StubData:
         return self.thesis
 
     def read(self, target: Target, *, as_of: date, position=None) -> Snapshot:
+        self.as_of_seen.append(as_of)
         if self.read_raises is not None:
             raise self.read_raises
         return self.snapshot
+
+
+class StubQuotes:
+    """QuoteBoard 的替身：引擎只问 `get` 与 `previous`（§5.3 的 `QuoteView`）。"""
+
+    def __init__(self, current=None, previous=None) -> None:
+        self.current = dict(current or {})
+        self.previous_map = dict(previous or {})
+        self.gets: list[tuple[str, str]] = []
+
+    def get(self, market, code):
+        self.gets.append((market, code))
+        return self.current.get((market, code))
+
+    def previous(self, market, code):
+        return self.previous_map.get((market, code))
 
 
 def snap(**over) -> Snapshot:
