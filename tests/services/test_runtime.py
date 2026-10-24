@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from support import FrozenClock
 
+from sams.core.errors import SamsError
 from sams.core.quotes import Quote
 from sams.services import runtime as runtime_module
 from sams.services.prune import PruneReport, PruneStep
@@ -285,3 +287,68 @@ def test_stop_reports_whether_every_thread_exited(settings, monkeypatch):
         assert stuck.stop() is False
     finally:
         stubborn.release.set()
+
+
+def test_request_prune_refuses_a_second_run_while_one_is_running(settings):
+    release = threading.Event()
+    started = threading.Event()
+
+    class SlowPrune:
+        def run(self, *, dry_run=False):
+            started.set()
+            release.wait(timeout=5)
+            return PruneReport(dry_run=dry_run, steps=(PruneStep("quotes_snapshot", 3),))
+
+    runtime = make_runtime(settings, prune=SlowPrune())
+    assert runtime.request_prune() is True
+    assert started.wait(timeout=5) is True
+    assert runtime.request_prune() is False
+    release.set()
+    deadline = datetime.now(UTC) + timedelta(seconds=5)
+    while runtime.last_prune_at is None and datetime.now(UTC) < deadline:
+        time.sleep(0.01)
+    assert runtime.last_prune == "1 步、合计 3 行"
+    assert runtime.last_prune_error is None
+
+
+def test_a_failing_manual_prune_lands_in_last_prune_error(settings):
+    class BadPrune:
+        def run(self, *, dry_run=False):
+            raise SamsError("库被锁住了")
+
+    runtime = make_runtime(settings, prune=BadPrune())
+    assert runtime.request_prune() is True
+    deadline = datetime.now(UTC) + timedelta(seconds=5)
+    while runtime.last_prune_at is None and datetime.now(UTC) < deadline:
+        time.sleep(0.01)
+    assert "库被锁住了" in runtime.last_prune_error
+
+
+def test_stop_waits_for_an_in_flight_manual_prune(settings, monkeypatch):
+    """`request_prune` 起的线程也在 `stop()` 的 join 名单里。
+
+    `serve` 的 finally 只认那个返回值：False 就不关库连接。少 join 这一条，
+    一次手动清理会跑在已经关掉的 DuckDB 连接上——从坐着的人手里抽走桌子，
+    而炸出来的是另一条线程里一句看不出原因的错。
+    """
+    release = threading.Event()
+    started = threading.Event()
+
+    class SlowPrune:
+        def run(self, *, dry_run=False):
+            started.set()
+            release.wait(timeout=5)
+            return PruneReport(dry_run=dry_run, steps=(PruneStep("quotes_snapshot", 3),))
+
+    runtime = make_runtime(settings, prune=SlowPrune())
+    assert runtime.request_prune() is True
+    assert started.wait(timeout=5) is True
+    monkeypatch.setattr(runtime_module, "WORKER_STOP_TIMEOUT_S", 0.05)
+    try:
+        assert runtime.stop() is False, "清理还没收手时不许关共享资源"
+    finally:
+        release.set()
+    deadline = datetime.now(UTC) + timedelta(seconds=5)
+    while runtime.last_prune_at is None and datetime.now(UTC) < deadline:
+        time.sleep(0.01)
+    assert runtime.stop() is True

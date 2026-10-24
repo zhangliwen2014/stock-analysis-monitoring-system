@@ -83,6 +83,15 @@ class Runtime:
         self.stop_event = threading.Event()
         self._threads: dict[str, threading.Thread] = {}
         self._started_at: datetime | None = None
+        self._prune_lock = threading.Lock()
+        self._prune_running = False
+        #: 手动清理那条线程：不进 `_threads`（那里装的是 `start()` 起一次的服务线程，
+        #: 别处按四条断言），但 `stop()` 照样要 join 它——理由写在 `stop()` 的文档里
+        self._prune_thread: threading.Thread | None = None
+        #: 手动清理的结果三件套：HTTP 线程只读属性，不碰库（D113）
+        self.last_prune: str | None = None
+        self.last_prune_at: datetime | None = None
+        self.last_prune_error: str | None = None
 
     @property
     def threads(self) -> dict[str, threading.Thread]:
@@ -127,6 +136,10 @@ class Runtime:
 
         返回 False 时调用方不得关闭共享资源（库连接等）：那条线程可能正握着它们
         执行，从另一条线程关掉等于在别人手里抽走桌子。
+
+        手动清理那条线程不在 `_threads` 里（那里装的是 `start()` 起一次的服务线程），
+        但它照样握着库连接，所以照样 join：`sams serve` 停机时一次写了一半的清理
+        不能被关在脚下的连接继续跑。
         """
         self.stop_event.set()
         timeouts = {
@@ -151,6 +164,16 @@ class Runtime:
                 logger.warning(
                     "%s 线程 %ss 内没有退出，继续停其余部分", name, timeouts[name]
                 )
+        # 手动清理（`request_prune` 起的）不在服务线程那一批里，但它同样握着库连接：
+        # 少了这一 join，停机时那次写了一半的清理就跑在已经被关掉的连接上
+        prune_thread = self._prune_thread
+        if prune_thread is not None and prune_thread.ident is not None:
+            prune_thread.join(timeout=WORKER_STOP_TIMEOUT_S)
+            if prune_thread.is_alive():
+                clean = False
+                logger.warning(
+                    "手动清理线程 %ss 内没有退出：这次停机不算干净", WORKER_STOP_TIMEOUT_S
+                )
         return clean
 
     def next_maintenance_at(self, now: datetime) -> datetime:
@@ -166,6 +189,36 @@ class Runtime:
             report.total,
         )
         return report
+
+    def request_prune(self) -> bool:
+        """管理员手动触发的每日清理；已经在跑时返回 False：不排队、不开第二把枪。
+
+        DuckDB 单写：清理线程与调度线程抢库锁会互相等，把「正在跑」挡在入口
+        比让两条线程在锁上排队好。
+        """
+        with self._prune_lock:
+            if self._prune_running:
+                return False
+            self._prune_running = True
+            thread = threading.Thread(
+                target=self._prune_once, name="sams-prune-manual", daemon=True
+            )
+            # 句柄在起线程之前就存下：`stop()` 可能在这条线程刚起、还没写属性时来 join
+            self._prune_thread = thread
+        thread.start()
+        return True
+
+    def _prune_once(self) -> None:
+        try:
+            report = self.run_maintenance()
+            self.last_prune = f"{len(report.steps)} 步、合计 {report.total} 行"
+            self.last_prune_error = None
+        except Exception as exc:  # 失败要留在页面上，不是炸掉后台线程
+            self.last_prune_error = str(exc)
+        finally:
+            self.last_prune_at = self.clock.now_utc()
+            with self._prune_lock:
+                self._prune_running = False
 
     def healthz(self) -> dict[str, Any]:
         now = self.clock.now_utc()
