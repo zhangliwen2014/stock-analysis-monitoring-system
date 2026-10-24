@@ -321,6 +321,12 @@ class SimOrderRepo:
                 raise ValidationError(f"{label} 必须是有限小数，收到 {value!r}")
         if qty <= 0:
             raise ValidationError("qty 必须大于 0：清仓请用 sell 而不是 buy 0")
+        if price <= 0:
+            raise ValidationError(
+                "价格 必须大于 0：负价格是一笔「买它还倒找钱」的买入——现金反而变多，"
+                "而成本基础会落到零以下，此后这一行的每一笔 price_pnl 都看着正常而其实是错数。"
+                "要记退款或调整，那是现金动作（sams ledger cash），不是一笔成交"
+            )
         if fee < 0:
             raise ValidationError("手续费不能为负：负手续费等于把成本做低")
         market = canonical_market(market)

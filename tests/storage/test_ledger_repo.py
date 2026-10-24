@@ -256,6 +256,18 @@ def test_a_negative_fee_is_refused(accounts: SimAccountRepo, fills: SimOrderRepo
         _fill(fills, account_id, "buy", fee=-5.0)
 
 
+def test_a_negative_price_is_refused(accounts: SimAccountRepo, fills: SimOrderRepo) -> None:
+    """负价格是一笔「买它还倒找钱」的成交：毛额是负的，现金反而变多，
+    而 `blended_cost` 会存下一个看着完全正常的负均价——此后这一行每一笔 `price_pnl`
+    都是错数，且没有哪一层会觉得不对。退款/调整是现金动作，走 `sams ledger cash`。
+    """
+    account_id = _funded(accounts)
+    with pytest.raises(ValidationError, match="价格 必须大于 0"):
+        _fill(fills, account_id, "buy", price=-1500.0)
+    assert fills.order_rows(account_id) == 0
+    assert accounts.cash_balances(account_id)["CNY"] == pytest.approx(100_000.0)
+
+
 def test_orders_can_be_listed_by_thesis(
     accounts: SimAccountRepo, fills: SimOrderRepo
 ) -> None:

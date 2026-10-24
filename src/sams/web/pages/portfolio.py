@@ -16,6 +16,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import RedirectResponse
 
+from sams.bootstrap import ServiceContext
 from sams.core.errors import DatabaseLocked, SamsError, ValidationError
 from sams.web.auth import csrf_protect, require_user
 
@@ -29,20 +30,27 @@ def _number(raw: str, label: str) -> float:
         raise ValidationError(f"{label} 要是数字，收到 {raw!r}") from exc
 
 
-def _account_view(ctx, username: str, account) -> dict:
-    """一个账户的一屏：汇总 + 逐行持仓。键只留模板要读的那些。"""
+def _account_view(ctx: ServiceContext, username: str, account) -> dict:
+    """一个账户的一屏：汇总 + 逐行持仓。键只留模板要读的那些。
+
+    两个「合计」不在一个空间：上面那个 `total` 是**现金 + 持仓市值**（账户合计），
+    每一行持仓带的 `pnl_report` 是**市值 − 成本**（这一行的盈亏）。列名写清「盈亏小计」，
+    否则读的人会以为那一列相加就是顶上那个数。
+    """
     summary = ctx.portfolio.summary(username, account.id)
     positions = [
         {
             "market": row.market,
             "code": row.code,
-            # 这三列在标的币种里，与下面那三列报告币种里的数不是一个空间
+            # 成本、现价、价格盈亏这三列在标的币种里；后面那一列盈亏小计在报告币种里，
+            # 中间隔着一个换汇段，两列永远不能相加出上面那个合计
             "currency": row.currency,
-            "qty": row.qty,
+            # 股数是「多少股」不是「多少钱」：100.0 排在带币种的列里会被当成一个金额
+            "qty": f"{row.qty:g}",
             "avg_cost": row.avg_cost,
             "last_price": row.last_price,
             "price_pnl": row.price_pnl,
-            "total": row.total_report,
+            "pnl_report": row.total_report,
             "convertible": row.convertible,
             "note": row.unavailable_note,
         }
@@ -76,6 +84,9 @@ def _portfolio_page(request: Request, *, error: str | None = None, status: int =
         "portfolio.html",
         status_code=status,
         title="持仓",
+        # 市场只能是配置里那几个（同自选页那个下拉）：写一个没配的市场，推不出标的币种，
+        # 拒回来的那句话讲的是币种而不是「你市场填错了」
+        markets=sorted(ctx.settings.markets),
         accounts=accounts,
         theses=theses,
         error=error,
@@ -105,6 +116,17 @@ def ledger_fill(
     web = request.app.state.web
     ctx = web.contexts.current()
     try:
+        if not account_id.strip():
+            # 名下没有账户时那个 <select> 只能交上来一个空 id：交给 `_require_account`
+            # 会得到「账户  不存在或不属于用户 …」——空 id 混进一句讲别的账户的话。
+            # 这一步真正要做的是开户与注资，两句都是可执行的命令（§5.4 规则 4）
+            raise ValidationError(
+                f"还没有账户可记账：先 `sams ledger account add --user {user.username} "
+                f"--name 主账户` 开一个，再按你打算买入的币种注资 "
+                f"`sams ledger cash --user {user.username} --account 开户给出的那个 id "
+                f"--currency CNY --amount 100000 --reason 起始资金`"
+                f"（账户里没有那种币的现金就买不了，§5.4 规则 4）"
+            )
         quantity = _number(qty, "数量")
         trade_price = _number(price, "价格")
         trade_fee = _number(fee, "费用") if fee.strip() else 0.0
@@ -120,13 +142,9 @@ def ledger_fill(
         # 市场与代码不在这里归一：`_fill` 自己归一并自己推币种，页面重复一遍
         # 只会得到两套规则
         if side == "buy":
-            ctx.ledger.buy(
-                account_id, user.username, market.strip().upper(), code.strip(), **kwargs
-            )
+            ctx.ledger.buy(account_id, user.username, market, code, **kwargs)
         elif side == "sell":
-            ctx.ledger.sell(
-                account_id, user.username, market.strip().upper(), code.strip(), **kwargs
-            )
+            ctx.ledger.sell(account_id, user.username, market, code, **kwargs)
         else:
             raise ValidationError("方向只能是 buy 或 sell")
     except DatabaseLocked:

@@ -23,8 +23,10 @@
   {% endif %}
   <table>
     <tr>
-      <th>市场</th><th>代码</th><th class="num">数量</th><th class="num">成本</th>
-      <th class="num">现价</th><th class="num">价格盈亏</th><th class="num">小计</th><th>备注</th>
+      <th>市场</th><th>代码</th><th class="num">数量（股）</th><th class="num">成本</th>
+      <th class="num">现价</th><th class="num">价格盈亏</th>
+      {# 这一列是「市值−成本」，与顶上那个合计（现金+持仓市值）不在一个空间，别按列相加 #}
+      <th class="num">盈亏小计（{{ account.currency }}）</th><th>备注</th>
     </tr>
     {% for row in account.positions %}
     <tr>
@@ -35,7 +37,7 @@
       <td class="num">{{ money(row.last_price, row.currency) }}</td>
       <td class="num">{{ money(row.price_pnl, row.currency) }}</td>
       {# 不可换算那一行不给 0.00：它没进上面那个合计，显示成零会让读数的人以为两只币种的数混在了一列 #}
-      <td class="num">{{ money(row.total, account.currency) if row.convertible else "不计入" }}</td>
+      <td class="num">{{ money(row.pnl_report, account.currency) if row.convertible else "不计入" }}</td>
       <td class="muted">{{ row.note or "" }}</td>
     </tr>
     {% endfor %}
@@ -43,7 +45,13 @@
 </section>
 {% endfor %}
 {% else %}
-<section class="card"><p class="muted">还没有账户：用 `sams ledger account-add` 开一个，或直接在下面录入第一笔。</p></section>
+<section class="card">
+  <p class="muted">还没有账户：先开一个
+    <code>sams ledger account add --user {{ user.username }} --name 主账户</code>，
+    再按你打算买入的币种注资
+    <code>sams ledger cash --user {{ user.username }} --account 开户给出的那个 id --currency CNY --amount 100000 --reason 起始资金</code>。
+    账户里没有那种币的现金就买不了（§5.4 规则 4），所以下面那张录入表现在还记不了账。</p>
+</section>
 {% endif %}
 
 <section class="card">
@@ -58,7 +66,13 @@
     <label>方向
       <select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select>
     </label>
-    <label>市场 <input name="market" value="A"></label>
+    <label>市场
+      <select name="market">
+        {% for code in markets %}
+        <option value="{{ code }}"{% if loop.first %} selected{% endif %}>{{ code }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>代码 <input name="code"></label>
     <label>数量 <input name="qty" type="number" step="any"></label>
     <label>价格 <input name="price" type="number" step="any"></label>
