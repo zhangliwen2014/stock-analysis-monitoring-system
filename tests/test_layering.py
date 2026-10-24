@@ -41,9 +41,9 @@ ALLOWED: dict[str, set[str]] = {
     "cli": {"core", "services", "web"},
 }
 
-#: 组装根不受限（它的工作就是认识所有实现），但只有 cli 可以引用它取依赖
+#: 组装根不受限（它的工作就是认识所有实现），但只有 cli 与 web 可以引用它取依赖
 ASSEMBLY = "bootstrap"
-ASSEMBLY_CONSUMERS = {"cli"}
+ASSEMBLY_CONSUMERS = {"cli", "web"}
 
 
 def _resolved(name: str, level: int, module_parts: tuple[str, ...]) -> str:

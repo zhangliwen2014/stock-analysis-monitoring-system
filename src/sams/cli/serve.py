@@ -19,6 +19,7 @@ from sams.cli.common import EXIT_LOCKED, advertised_url
 from sams.core.config import ServerCfg, Settings
 from sams.core.errors import DatabaseLocked, SamsError, ValidationError
 from sams.web.app import create_app
+from sams.web.context import ThreadContexts
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,9 @@ def start(settings: Settings, args: argparse.Namespace) -> int:
             # 命令行 --host 覆盖出的监听地址也必须落进这句警告
             plaintext = "" if server.tls_certfile else "（未启用 TLS：同网段可明文查看流量）"
             logger.warning("已允许局域网访问：%s%s", advertised_url(server), plaintext)
+        contexts = ThreadContexts(parts.core)
         uvicorn.run(
-            create_app(runtime),
+            create_app(runtime, core=parts.core, contexts=contexts),
             host=server.host,
             port=server.port,
             workers=1,

@@ -42,6 +42,9 @@ class FakeParts:
         self.loaded = loaded
         self.prepared = False
         self.closed = False
+        # `start()` 现在要把 core 顺手交给 ThreadContexts：替身得镜像真 ServeParts
+        # 的字段，否则接线测试炸的是替身的 AttributeError 而不是被测的接线
+        self.core = SimpleNamespace()
 
     def prepare(self):
         self.prepared = True
