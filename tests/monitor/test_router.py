@@ -15,7 +15,7 @@ from datetime import UTC, datetime, time
 
 import pytest
 
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError, ValidationError
 from sams.core.events import EventBus, NotifyFailed
 from sams.core.notify import (
     FAILED,
@@ -441,3 +441,65 @@ def test_local_status_reports_both_local_channels(world):
     status = world.service(lambda kind, config: SpyNotifier(kind), env=env).local_status()
     assert set(status) == {"desktop", "voice"}
     assert "远程" in status["desktop"] and "远程" in status["voice"]
+
+
+# ---------------------------------------------------------------- 两步发送（§5.5）
+
+
+def test_record_then_deliver_sends_the_same_thing_as_dispatch(world):
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    direct = world.notify.dispatch(msg(), user_id=user.id)
+    alert = world.notify.record(msg(), user_id=user.id)
+    again = world.notify.deliver_existing(alert.id)
+    assert [d.outcome for d in again.deliveries] == [d.outcome for d in direct.deliveries]
+    first, second = world.made["wecom"].sent[-2:]
+    assert second.body == first.body
+    assert second.alert_id == alert.id
+
+
+def test_quote_metadata_survives_the_trip_through_the_row(world):
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    moment = datetime.now(UTC)
+    alert = world.notify.record(
+        msg(intraday=True, quote_ts=moment, quote_source="tencent"), user_id=user.id
+    )
+    row = world.alerts.get(alert.id)
+    assert row.intraday is True and row.quote_source == "tencent"
+    world.notify.deliver_existing(alert.id)
+    sent = world.made["wecom"].sent[-1]
+    assert sent.intraday is True
+    assert sent.quote_ts == moment
+    assert sent.quote_source == "tencent"
+
+
+def test_a_context_provider_extends_the_body(world):
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    alert = world.notify.record(msg(), user_id=user.id)
+    world.notify.deliver_existing(
+        alert.id, context_provider=lambda a: "当时你写过：这条线是神华的坑"
+    )
+    assert world.made["wecom"].sent[-1].body.endswith("当时你写过：这条线是神华的坑")
+
+
+def test_abandon_writes_why_it_never_went_out(world):
+    user = world.user()
+    alert = world.notify.record(msg(), user_id=user.id)
+    world.notify.abandon(alert.id, reason="通知队列已满：发送被丢弃")
+    delivery = world.alerts.deliveries(alert.id)[0]
+    assert delivery.outcome == "no_channel"
+    assert "队列已满" in delivery.error
+
+
+def test_abandon_without_a_reason_is_refused(world):
+    user = world.user()
+    alert = world.notify.record(msg(), user_id=user.id)
+    with pytest.raises(ValidationError):
+        world.notify.abandon(alert.id, reason="  ")
+
+
+def test_deliver_existing_refuses_an_unknown_alert(world):
+    with pytest.raises(StorageError):
+        world.notify.deliver_existing("nope")

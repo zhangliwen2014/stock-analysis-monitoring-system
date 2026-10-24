@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
-from sams.core.errors import SamsError, ValidationError
+from sams.core.errors import SamsError, StorageError, ValidationError
 from sams.core.events import EventBus, NotifyFailed
 from sams.core.notify import (
     FAILED,
@@ -33,7 +33,7 @@ from sams.core.notify import (
 from sams.core.retry import Sleeper, backoff_delays
 from sams.monitor.env import DESKTOP, VOICE, LocalEnv
 from sams.monitor.notifiers import Notifier, build_notifier_factory, probe_message
-from sams.storage.repos.alerts import AlertRepo
+from sams.storage.repos.alerts import Alert, AlertRepo
 from sams.storage.repos.channels import Channel, ChannelRepo
 from sams.storage.repos.users import User, UserRepo
 
@@ -41,6 +41,28 @@ logger = logging.getLogger("sams.monitor.router")
 
 #: 免打扰的屏幕上那句措辞（要包含「免打扰」四个字：§11 的说明与用例都引用它）
 DND_WORD = "免打扰"
+
+
+def _message_from(alert: Alert) -> AlertMessage:
+    """从库里那一行重建要发的话：发送可以发生在写入之后很久（队列、重发）。"""
+    return AlertMessage(
+        market=alert.market,
+        code=alert.code,
+        severity=alert.severity,
+        triggered_at=alert.triggered_at,
+        name=alert.symbol_name,
+        account_name=alert.account_name,
+        rule_name=alert.rule_name,
+        value_text=str(alert.payload.get("value_text") or ""),
+        threshold_text=str(alert.payload.get("threshold_text") or ""),
+        action_note=str(alert.payload.get("action_note") or ""),
+        stage=alert.stage,
+        body=str((alert.payload.get("extra") or {}).get("body") or ""),
+        alert_id=alert.id,
+        intraday=alert.intraday,
+        quote_ts=alert.quote_ts,
+        quote_source=alert.quote_source,
+    )
 
 
 @dataclass(frozen=True)
@@ -105,7 +127,7 @@ class NotifyService:
         self.attempts = max(1, int(attempts))
         self.env = env
 
-    def dispatch(
+    def record(
         self,
         message: AlertMessage,
         *,
@@ -113,12 +135,17 @@ class NotifyService:
         channel_ids: Sequence[str] = (),
         rule_id: str | None = None,
         account_id: str | None = None,
-    ) -> DispatchResult:
-        """记录这条告警，然后把它送出去。**只写 `notify_log`，不碰 `alerts.status`**。"""
+        is_test: bool = False,
+    ) -> Alert:
+        """只落库，不发送：发送在 `deliver_existing`，两者之间可以隔着一条队列。
+
+        `is_test` 是 `/settings/test-alert` 那条链的标记（D131）：测试告警不进
+        `no_open_alert` 与健康积压，收件箱里带「测试」徽标。
+        """
         user = self.users.get(user_id)
         if user is None:
             raise ValidationError(f"没有用户 {user_id}：告警没有接收人就不能发")
-        alert = self.alerts.create(
+        return self.alerts.create(
             user_id,
             rule_id=rule_id,
             rule_name=message.rule_name,
@@ -135,21 +162,69 @@ class NotifyService:
             triggered_at=message.triggered_at,
             channel_ids=list(channel_ids),
             extra={"body": message.body},
+            is_test=is_test,
+            intraday=message.intraday,
+            quote_ts=message.quote_ts,
+            quote_source=message.quote_source,
         )
-        # 发出去的那一份带着真实 id：库里那一行才是这条告警的身份
-        message = replace(message, alert_id=alert.id)
-        note = self._dnd_note(user, message)
+
+    def deliver_existing(
+        self, alert_id: str, *, context_provider: Callable[[Alert], str] | None = None
+    ) -> DispatchResult:
+        """把库里已有的一条告警走完路由与投递。正文从库里重建，不信任内存里的对象。
+
+        `context_provider` 是 M4-B 的缝：把「这条论当时的批注」接在正文后面，
+        队列这一侧不需要知道上下文长什么样。
+        """
+        alert = self.alerts.get(alert_id)
+        if alert is None:
+            raise StorageError(f"告警 {alert_id} 不存在：发送必须落在一条真实告警上")
+        message = _message_from(alert)
+        note = context_provider(alert) if context_provider is not None else ""
         if note:
-            # 压制发生在选路之前：没有「本来要发给谁」这件事被决定，那一行也就没有通道
-            self.alerts.record(alert.id, None, SUPPRESSED, error=note, attempts=0)
-            return DispatchResult(alert.id, (DeliveryReport("", None, SUPPRESSED, note, 0),))
-        targets, refusal = self._route(user, message.severity, list(channel_ids))
+            message = replace(message, body=f"{message.body}\n{note}")
+        user = self.users.get(alert.user_id)
+        if user is None:
+            raise ValidationError(f"没有用户 {alert.user_id}：告警没有接收人就不能发")
+        dnd = self._dnd_note(user, message)
+        if dnd:
+            self.alerts.record(alert.id, None, SUPPRESSED, error=dnd, attempts=0)
+            return DispatchResult(alert.id, (DeliveryReport("", None, SUPPRESSED, dnd, 0),))
+        targets, refusal = self._route(user, message.severity, list(alert.channel_ids))
         if not targets:
             self.alerts.record(alert.id, None, NO_CHANNEL, error=refusal, attempts=0)
             return DispatchResult(alert.id, (DeliveryReport("", None, NO_CHANNEL, refusal, 0),))
         return DispatchResult(
             alert.id, tuple(self._deliver(alert.id, message, node) for node in targets)
         )
+
+    def abandon(self, alert_id: str, *, reason: str) -> None:
+        """宣告放弃：这条告警不再会发了，但那一行留在收件箱里可以重发。"""
+        text = (reason or "").strip()
+        if not text:
+            raise ValidationError(
+                "abandon 必须带原因：那一句话在屏幕上的「为什么没发出去」要能指到一件事"
+            )
+        self.alerts.record(alert_id, None, NO_CHANNEL, error=text, attempts=0)
+
+    def dispatch(
+        self,
+        message: AlertMessage,
+        *,
+        user_id: str,
+        channel_ids: Sequence[str] = (),
+        rule_id: str | None = None,
+        account_id: str | None = None,
+    ) -> DispatchResult:
+        """记录这条告警，然后把它送出去。**只写 `notify_log`，不碰 `alerts.status`**。"""
+        alert = self.record(
+            message,
+            user_id=user_id,
+            channel_ids=channel_ids,
+            rule_id=rule_id,
+            account_id=account_id,
+        )
+        return self.deliver_existing(alert.id)
 
     def probe(self, channel_id: str, *, user_id: str | None = None) -> DeliveryReport:
         """探针 = 发一条 weak 的合成消息（`notifiers` 模块开头那句话）。
