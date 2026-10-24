@@ -24,7 +24,7 @@ MARKET_ZONES: dict[str, ZoneInfo] = {
 LIVE, DELAYED, CLOSED, STALE, NO_DATA = "live", "delayed", "closed", "stale", "no_data"
 
 #: 注册名 → 屏幕上的名字。认识的说人话，不认识的显示注册名本身
-SOURCE_LABELS = {"tencent": "腾讯", "sina_quote": "新浪"}
+SOURCE_LABELS: dict[str, str] = {"tencent": "腾讯", "sina_quote": "新浪"}
 
 
 def source_label(name: str | None) -> str:
@@ -72,7 +72,13 @@ class Quote:
 
 
 def local_day(ts: datetime, zone: ZoneInfo) -> date:
-    """报价时刻在市场本地是哪一天。US 的收盘在北京是次日凌晨，日子必须按市场算。"""
+    """报价时刻在市场本地是哪一天。US 的收盘在北京是次日凌晨，日子必须按市场算。
+
+    naive 时刻在这里是**拒绝**而不是按本机时区猜：那会让同一份数据在两台机器上
+    落进不同的日子（`Quote` 与 `quote_state` 同样拒收 naive）。
+    """
+    if ts.tzinfo is None:
+        raise ValidationError("local_day 需要带时区的时刻")
     return ts.astimezone(zone).date()
 
 
