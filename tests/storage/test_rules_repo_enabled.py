@@ -44,9 +44,22 @@ def test_a_disabled_rule_never_shows_up(db):
     assert [r.name for r in repo.list_enabled()] == ["开着"]
 
 
-def test_rules_from_other_tables_are_not_leaked(db):
-    # `set_enabled` 之后回读的形状必须和 `list_enabled` 同源：都是 `_to_rule`
+def test_list_enabled_returns_the_full_rule_shape(db):
+    # 读回来的必须是 `create` 返回的那整份形状（两边都走 `_to_rule`），不是几个列名
     repo = RuleRepo(db)
     rule = add(repo, "u-a", "一条")
     got = repo.list_enabled()[0]
     assert got.id == rule.id and got.kind == "stop.fixed" and got.enabled is True
+
+
+def test_an_empty_table_returns_nothing(db):
+    assert RuleRepo(db).list_enabled() == []
+
+
+def test_a_user_whose_only_rule_is_disabled_is_absent(db):
+    repo = RuleRepo(db)
+    add(repo, "u-a", "开着")
+    add(repo, "u-b", "停着", enabled=False)
+    got = repo.list_enabled()
+    assert [r.name for r in got] == ["开着"]
+    assert all(r.user_id != "u-b" for r in got)

@@ -463,7 +463,8 @@ class RuleRepo:
         """所有用户的启用规则（§5.3 盘中那一趟的入口）。
 
         与 `list_for` 差在两维：跨全部用户、只 `enabled = TRUE`。次序按 user 再 id：
-        盘中一趟按用户逐个求值，读进来就聚好，调用方不必再排。
+        盘中一趟按用户逐个求值，读进来就聚好，调用方不必再排。注意同一个用户内是按 rule id
+        （uuid hex）排的，不是创建次序——`list_for` 用的才是 `created_at`。
         """
         rows = self.db.query(
             f"SELECT {_COLUMNS} FROM rules WHERE enabled = TRUE ORDER BY user_id, id"
