@@ -160,6 +160,29 @@ def test_remove_drops_the_default_flag_with_it(repo, seeded_user):
     assert repo.show(a.id) is None
 
 
+def test_list_all_spans_users_so_the_admin_page_is_not_self_only(repo, seeded_user, other_user):
+    """管理页的「通道总览」列的是所有人的通道（§4.2：admin 只见启用状态与最近错误）。
+
+    只有 `list_for` 的话，管理员那一屏读回来的是他自己那几条，而「谁的通道最近失败了、
+    谁压根没配」正是他唯一能替别人处理的那件事。按 user_id 排是必须的：几十条散着列，
+    读不出哪几条属于同一个人（默认仍排在这个人的第一条，与 `list_for` 同一口径）。
+    """
+    create(repo, seeded_user, name="主群")
+    create(repo, seeded_user, name="副群")
+    create(repo, other_user, name="别人的群")
+
+    rows = repo.list_all()
+    assert [row.user_id for row in rows] == sorted([seeded_user, seeded_user, other_user])
+    assert rows[0].is_default, "默认要排在这个人的第一条：兜底走哪条是第一眼要看的东西"
+    # 跨用户读的仍是掩码视图：明文只在 `credentials()` 那一处
+    assert all(row.config["url"].startswith(MASK_PREFIX) for row in rows)
+    assert all("abc123456789" not in row.config["url"] for row in rows)
+
+
+def test_list_all_is_empty_before_the_first_channel(repo):
+    assert repo.list_all() == []
+
+
 def test_scope_is_the_owner(repo, seeded_user, other_user):
     a = create(repo, seeded_user)
     assert repo.list_for(other_user) == []

@@ -140,6 +140,19 @@ class ChannelRepo:
         sql += " ORDER BY is_default DESC, name"
         return [self._to_channel(row) for row in self.db.query(sql, params).to_dicts()]
 
+    def list_all(self) -> list[Channel]:
+        """跨用户列出所有通道：只有管理页的「通道总览」用（spec §4.2）。
+
+        这一处是 `list_for` 去掉用户过滤，不是另一套读法：`Channel.config` 按构造
+        永远是掩码视图（明文在 `config_encrypted` 里，只有 `credentials()` 解得开），
+        所以「跨用户读」与「漏出别人的 webhook token」是两件事，少了这条注释下一个人
+        会把两者混为一谈而给这个方法加解密。
+        先按 user_id 排：几十条散着列不出「哪几条属于同一个人」，而同一个人的默认
+        排在前头（与 `list_for` 同一口径），运维时看的就是那一条。
+        """
+        sql = f"SELECT {_COLUMNS} FROM channels ORDER BY user_id, is_default DESC, name"
+        return [self._to_channel(row) for row in self.db.query(sql).to_dicts()]
+
     def by_kind(self, user_id: str, kind: str) -> list[Channel]:
         return [row for row in self.list_for(user_id, kinds=[_require_kind(kind)]) if row.enabled]
 
