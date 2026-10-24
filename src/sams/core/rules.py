@@ -90,6 +90,9 @@ class Template:
     #: 的后果」：拿它做判断 ⇒ 整条不判，只用于显示 ⇒ 屏幕上注明那一列可能偏高。
     #: 与 `needs_position` 不是一件事：`stop.thesis_drift` 要账户，看的是打分掉档
     judged: frozenset[str] = frozenset()
+    #: 盘中轮询里判（§5.1）。放模板上而不是引擎里的名单：新 kind 想进盘中，
+    #: 在声明处说了才算
+    intraday: bool = False
 
     def money_params(self) -> tuple[Param, ...]:
         """声明为「元」的那几个参数——只有它们是价，需要按除权搬（§10.2）。
@@ -121,37 +124,40 @@ TEMPLATES: dict[str, Template] = {
         "stop.fixed", "跌破绝对价即报",
         (_number("price", "止损价", required=True, minimum=0.0, unit="元"),),
         severity="strong", stages=True, targets=("symbol", "watchlist", "thesis", "position"),
+        intraday=True,
     ),
     "stop.pct": Template(
         "stop.pct", "成本下浮 x%",
         (_number("pct", "回撤比例", required=True, minimum=0.0, maximum=0.9),),
         severity="strong", stages=True, needs_position=True,
         judged=frozenset({"avg_cost"}),
-        targets=("position", "thesis"),
+        targets=("position", "thesis"), intraday=True,
     ),
     "stop.trailing": Template(
         "stop.trailing", "持仓期最高价回撤 x%",
         (_number("pct", "回撤比例", required=True, minimum=0.0, maximum=0.9),),
         severity="strong", stages=True, needs_position=True, targets=("position", "thesis"),
+        intraday=True,
     ),
     "stop.atr": Template(
         "stop.atr", "成本 − 倍数×ATR14",
         (_number("multiple", "ATR 倍数", default=2.0, minimum=0.1, maximum=10.0, unit="倍"),),
         severity="strong", stages=True, needs_position=True,
         judged=frozenset({"avg_cost"}),
-        targets=("position", "thesis"),
+        targets=("position", "thesis"), intraday=True,
     ),
     "stop.ma": Template(
         "stop.ma", "跌破均线",
         (_choice("basis", "哪条线", ("weekly_ma20", "daily_ma60"), "weekly_ma20"),),
         severity="strong", stages=True, targets=("symbol", "watchlist", "position", "thesis"),
+        intraday=True,
     ),
     "stop.breakeven": Template(
         "stop.breakeven", "浮盈超 x% 后把线抬到成本",
         (_number("trigger_pct", "触发浮盈", required=True, minimum=0.01, maximum=2.0),),
         severity="strong", stages=True, needs_position=True,
         judged=frozenset({"avg_cost"}),
-        targets=("position", "thesis"),
+        targets=("position", "thesis"), intraday=True,
     ),
     "stop.time": Template(
         "stop.time", "持仓 N 天未达预期 → 复核",
@@ -173,17 +179,17 @@ TEMPLATES: dict[str, Template] = {
                default="0.5,1.0"),),
         severity="mid", stages=True, needs_position=True,
         judged=frozenset({"avg_cost", "target_price"}),
-        targets=("position", "thesis"),
+        targets=("position", "thesis"), intraday=True,
     ),
     "price.cross_below": Template(
         "price.cross_below", "下穿指定价",
         (_number("price", "价位", required=True, minimum=0.0, unit="元"),),
-        severity="mid", stages=False,
+        severity="mid", stages=False, intraday=True,
     ),
     "price.cross_above": Template(
         "price.cross_above", "上穿指定价",
         (_number("price", "价位", required=True, minimum=0.0, unit="元"),),
-        severity="mid", stages=False,
+        severity="mid", stages=False, intraday=True,
     ),
     "thesis.odds_below": Template(
         "thesis.odds_below", "赔率跌破阈值",
@@ -215,6 +221,12 @@ def template_for(kind: str) -> Template:
             f"未知规则类型 kind={kind!r}：只有 {', '.join(RULE_KINDS)}。"
             "名单的唯一出处是 `core/rules.py`，加一种就是在这里加一行"
         ) from None
+
+
+def is_intraday(kind: str) -> bool:
+    """这个 kind 是否在盘中轮询里判（§5.1）。kind 必须在 `TEMPLATES` 里：
+    野 kind 在 `template_for` 也会被拒，这里同样让它炸 KeyError 而不是悄悄 False。"""
+    return TEMPLATES[kind].intraday
 
 
 def _as_number(param: Param, raw: object) -> float:
