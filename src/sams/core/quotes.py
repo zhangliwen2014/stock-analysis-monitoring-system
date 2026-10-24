@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from sams.core.errors import ValidationError
@@ -22,6 +22,16 @@ MARKET_ZONES: dict[str, ZoneInfo] = {
 }
 
 LIVE, DELAYED, CLOSED, STALE, NO_DATA = "live", "delayed", "closed", "stale", "no_data"
+
+#: 注册名 → 屏幕上的名字。认识的说人话，不认识的显示注册名本身
+SOURCE_LABELS = {"tencent": "腾讯", "sina_quote": "新浪"}
+
+
+def source_label(name: str | None) -> str:
+    """告警正文那一段「· 腾讯」。空名是「未知源」，不是空串——那一行总得有个出处。"""
+    if not name:
+        return "未知源"
+    return SOURCE_LABELS.get(name, name)
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,24 @@ class Quote:
 
     def marked_stale(self) -> Quote:
         return replace(self, is_stale=True)
+
+
+def local_day(ts: datetime, zone: ZoneInfo) -> date:
+    """报价时刻在市场本地是哪一天。US 的收盘在北京是次日凌晨，日子必须按市场算。"""
+    return ts.astimezone(zone).date()
+
+
+def cross_baseline(current: Quote, previous: Quote | None, *, zone: ZoneInfo) -> float | None:
+    """「穿」的另一侧价（§5.2）：**同一个市场本地日**的上一轮报价才有资格当「上一根」。
+
+    跨了日（或根本没有上一轮）返回 None：`price.cross_*` 会落到「前收盘」那一侧，
+    而不是拿昨天下午的价冒充今天的第一跳。
+    """
+    if previous is None:
+        return None
+    if local_day(previous.ts, zone) != local_day(current.ts, zone):
+        return None
+    return previous.price
 
 
 @dataclass(frozen=True)
