@@ -4,7 +4,7 @@
 <section class="card">
   <h1>{{ symbol.get("name") or code }} <span class="muted">{{ market }}/{{ code }}</span></h1>
   <p>
-    <strong class="num">{{ money(price) }}</strong>
+    <strong class="num">{{ money(price, symbol.get("currency")) }}</strong>
     <span class="{{ pct_class }}">{{ pct(quote_pct) }}</span>
     <span class="badge">{{ state }}</span>
     <span class="muted">{{ quote_at }}</span>
@@ -19,14 +19,13 @@
   </h2>
   {% if rules %}
   <table>
-    <tr><th>名称</th><th>类型</th><th>级别</th><th>对象数</th><th>启用</th></tr>
-    {% for view in rules %}
+    <tr><th>名称</th><th>类型</th><th>级别</th><th>启用</th></tr>
+    {% for rule in rules %}
     <tr>
-      <td><a href="/rules/{{ view.rule.id }}/edit">{{ view.rule.name }}</a></td>
-      <td>{{ view.rule.kind }}</td>
-      <td>{{ view.rule.severity }}</td>
-      <td>{{ view.targets }}</td>
-      <td>{{ "是" if view.rule.enabled else "否" }}</td>
+      <td><a href="/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
+      <td>{{ rule.kind }}</td>
+      <td>{{ rule.severity }}</td>
+      <td>{{ "是" if rule.enabled else "否" }}</td>
     </tr>
     {% endfor %}
   </table>
@@ -54,7 +53,7 @@
     <tr><th>时刻</th><th>规则</th><th>档位</th><th>状态</th></tr>
     {% for alert in alerts %}
     <tr>
-      <td><a href="/alerts/{{ alert.id }}">{{ alert.triggered_at.strftime("%m-%d %H:%M") }}</a></td>
+      <td><a href="/alerts/{{ alert.id }}">{{ alert.at }}</a></td>
       <td>{{ alert.rule_name }}</td>
       <td>{{ alert.stage }}</td>
       <td>{{ alert.status }}</td>

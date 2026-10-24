@@ -20,12 +20,14 @@
         }
         chart.setOption({
           tooltip: { trigger: "axis" },
-          legend: { data: ["收盘", "MA20", "MA60"] },
+          // 三条线同一个基：接口给的 close_hfq 与算在 close_hfq 上的 MA20/MA60。
+          // 画裸 close 会让一次分红把两条均线永久顶在价格线上方，看上去像涨不回去
+          legend: { data: ["收盘（后复权）", "MA20", "MA60"] },
           xAxis: { type: "category", data: payload.dates },
           yAxis: { type: "value", scale: true },
           dataZoom: [{ type: "inside" }],
           series: [
-            { name: "收盘", type: "line", data: payload.close, showSymbol: false },
+            { name: "收盘（后复权）", type: "line", data: payload.close_hfq, showSymbol: false },
             { name: "MA20", type: "line", data: payload.ma20, showSymbol: false },
             { name: "MA60", type: "line", data: payload.ma60, showSymbol: false },
           ],

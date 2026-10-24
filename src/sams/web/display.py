@@ -52,3 +52,17 @@ def hms(moment: datetime | None, tz: str | None = None) -> str:
     if tz and moment.tzinfo is not None:
         moment = moment.astimezone(ZoneInfo(tz))
     return moment.strftime("%H:%M:%S")
+
+
+def moment_label(value: datetime | None, tz: str | None = None) -> str:
+    """告警那一列的时刻：`%m-%d %H:%M`，折算口径与 `hms` 一致。
+
+    `TIMESTAMPTZ` 回读在本库不稳定（`format_utc_moment` 的文档记的就是这件事）：同
+    一屏上行情那行已经折到 `display_tz`，告警若在模板里直接 `strftime`，两个时刻属于
+    两个时区而屏幕上看不出来——交易员会按错的那一个去回放。naive 值不猜它的时区。
+    """
+    if value is None:
+        return "—"
+    if tz and value.tzinfo is not None:
+        value = value.astimezone(ZoneInfo(tz))
+    return value.strftime("%m-%d %H:%M")
