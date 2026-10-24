@@ -293,6 +293,70 @@ def test_a_failing_source_still_reports_what_it_skipped(db):
     assert result.sources == ("s",)
 
 
+def test_a_source_that_answers_with_only_parse_errors_is_a_failure(db):
+    """应答了但每一行都读不懂：不是「停牌跳过」，而是上游格式变了（要人看）。"""
+    alarms: list[SystemAlarm] = []
+    bus = EventBus()
+    bus.subscribe(SystemAlarm, alarms.append)
+    primary = StubQuoteAdapter("p", batch_for)
+    service, board = make_service(db, {"p": primary}, bus=bus)
+    service.poll("A", ["600519"], now=T0)
+
+    primary.behaviour = lambda market, codes: QuoteBatch((), (), ("600519: 字段不足（3 个）",))
+    broken = T1 + timedelta(seconds=QUOTE_OUTAGE_ALARM_S)
+    service.poll("A", ["600519"], now=T1)
+
+    view = board.snapshot()["A"]
+    assert view.last_error == "600519: 字段不足（3 个）"
+    assert view.skip_reason is None, "读不懂不是跳过：skip_reason 会把故障说成休市"
+    assert view.quotes["600519"].is_stale is True
+    record = QuoteHealthRepo(db).load()["p"]
+    assert record.ok is False
+    assert record.last_error == "600519: 字段不足（3 个）"
+    assert record.consecutive_failures == 1
+    assert record.last_ok_at == T0, "它确实答过一次成功，那次失败不该被改写成也失败"
+
+    service.poll("A", ["600519"], now=broken)
+    assert len(alarms) == 1 and alarms[0].component == "quote.A"
+
+
+def test_an_answer_with_some_skips_and_some_errors_stays_a_skip(db):
+    """有一只是源明确没有的：整轮不是「全读不懂」，不开始事故钟。"""
+    alarms: list[SystemAlarm] = []
+    bus = EventBus()
+    bus.subscribe(SystemAlarm, alarms.append)
+    primary = StubQuoteAdapter("p", batch_for)
+    service, board = make_service(db, {"p": primary}, bus=bus)
+    service.poll("A", ["600519"], now=T0)
+
+    primary.behaviour = lambda market, codes: QuoteBatch(
+        (), ("600519",), ("000001: 字段不足（3 个）",)
+    )
+    late = T0 + timedelta(seconds=QUOTE_OUTAGE_ALARM_S)
+    service.poll("A", ["600519"], now=late)
+    service.poll("A", ["600519"], now=late + timedelta(seconds=60))
+
+    view = board.snapshot()["A"]
+    assert view.skip_reason is not None and view.last_error is None
+    record = QuoteHealthRepo(db).load()["p"]
+    assert record.ok is True and record.consecutive_failures == 0
+    assert alarms == []
+
+
+def test_an_empty_answer_without_skips_is_a_failure(db):
+    primary = StubQuoteAdapter("p", lambda market, codes: QuoteBatch((), (), ()))
+    service, board = make_service(db, {"p": primary})
+
+    result = service.poll("A", ["600519"], now=T0)
+
+    assert result.sources == ("p",), "它答了，只是答得没有内容：sources 仍算它"
+    view = board.snapshot()["A"]
+    assert view.last_error == "源应答但没有任何可用的报价"
+    assert view.skip_reason is None
+    record = QuoteHealthRepo(db).load()["p"]
+    assert record.ok is False and record.consecutive_failures == 1
+
+
 def test_each_batch_acquires_from_the_bucket(db):
     class CountingBucket:
         def __init__(self):

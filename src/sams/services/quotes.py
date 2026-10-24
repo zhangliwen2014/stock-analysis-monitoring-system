@@ -212,6 +212,10 @@ class QuoteService:
         errors: list[str] = []
         degraded: list[str] = []
         answered: list[str] = []
+        #: 首个应答源自己那一次答复：健康判定只看它，不被前面失败源留下的串遮住
+        answered_quotes: tuple[Quote, ...] = ()
+        answered_skipped: tuple[str, ...] = ()
+        answered_errors: tuple[str, ...] = ()
         remaining = list(wanted)
         for name in chain:
             if not remaining:
@@ -219,13 +223,17 @@ class QuoteService:
             adapter = self.registry.adapter(name)
             attempt = self._attempt(name, adapter, market, remaining)
             if attempt.failure is None:
-                self._record_source(name, adapter, ok=True, error=None, moment=moment)
                 collected.extend(attempt.quotes)
                 skipped.extend(attempt.skipped)
                 errors.extend(attempt.errors)
                 answered.append(name)
+                answered_quotes = attempt.quotes
+                answered_skipped = attempt.skipped
+                answered_errors = attempt.errors
                 # 这个源回答了（哪怕只回了一部分）：跳过的代码下一轮再试，
-                # 换成下一个源等于替用户猜「另一家更可能有这只票」
+                # 换成下一个源等于替用户猜「另一家更可能有这只票」。
+                # 还没回答成什么、答得有没有用，要等这里读完再记：一个源只记一次，
+                # 先记成功再改记失败会留下一个假的 last_ok_at
                 break
             collected.extend(attempt.quotes)
             skipped.extend(attempt.skipped)
@@ -237,18 +245,44 @@ class QuoteService:
             remaining = [code for code in remaining if code not in got]
 
         summary = "；".join(degraded) or None
+        usable = bool(answered_quotes or answered_skipped)
+        #: 应答了却交不出报价时的那一句；普通失败（没有源回答）留空
+        answer_error: str | None = None
+        if answered:
+            name = answered[0]
+            if not usable:
+                answer_error = (
+                    answered_errors[0] if answered_errors else "源应答但没有任何可用的报价"
+                )
+            self._record_source(
+                name,
+                self.registry.adapter(name),
+                ok=usable,
+                error=answer_error,
+                moment=moment,
+            )
         if collected:
             self._persist(market, collected, moment)
             self.board.update(market, collected, now=moment, error=summary)
             self._note_outage(market, moment, got=True)
-        elif answered:
-            # 源应答了但一只价都没给（比如整单停牌）：这不是取价失败——不标 stale，
-            # 也不开始「三分钟无报价」的事故钟；跳过原因留在板上解释「为什么没有新报价」
+        elif answered_skipped:
+            # 源明确说了「这批里有些票我没有」（整单停牌是同一形状）：这不是取价失败——
+            # 不标 stale，也不开始「三分钟无报价」的事故钟；跳过原因留在板上解释
+            # 「为什么没有新报价」。判据只看应答源自己的 skipped：前面失败源留下的
+            # 跳过名单不该把「答了但一行都读不懂」也说成停牌
             detail = summary or "；".join(errors) or "源应答但未返回报价"
             self.board.skip(market, detail, now=moment)
             self._note_outage(market, moment, got=True)
         else:
-            self.board.fail(market, summary or f"{market} 本轮没有取得任何报价", now=moment)
+            # 没有报价、也没有明确的跳过：源坏了，或者应答里每一行都读不懂（上游格式变了）。
+            # 两种都要走事故钟，值班的人才知道该看哪里
+            detail = (
+                summary
+                or answer_error
+                or "；".join(errors)
+                or f"{market} 本轮没有取得任何报价"
+            )
+            self.board.fail(market, detail, now=moment)
             self._note_outage(market, moment, got=False)
 
         if self.bus is not None:
