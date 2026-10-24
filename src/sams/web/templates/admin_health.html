@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}健康{% endblock %}
+{% block content %}
+<h1>健康</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+{# 这一屏没有一张 `<img>`：所有读数都是文本（T-4），留一份截图等于留一份会外泄的资产。
+   时刻全部在 `pages/admin.py` 里折到 display_tz 才到这里，模板不碰 datetime。 #}
+<section class="card">
+  <h2>运行时</h2>
+  <table>
+    <tr><th>项</th><th>读数</th></tr>
+    <tr>
+      <td>状态</td>
+      <td>{{ healthz.status }}（v{{ healthz.version }}，运行 {{ healthz.uptime_s }}s）</td>
+    </tr>
+    <tr><td>数据库</td><td>{{ "ok" if healthz.db.ok else db_note }}</td></tr>
+    <tr><td>调度</td><td>{{ scheduler_note }}</td></tr>
+    {% for market in intraday %}
+    <tr>
+      <td>盘中 · {{ market.market }}</td>
+      <td>
+        {{ market.poll_at }} · {{ market.source }} · {{ market.age }}
+        {# 报过错的那一次不许看着是健康的 #}
+        {% if market.note %}<span class="flash-error">{{ market.note }}</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    <tr>
+      <td>本机通知</td>
+      <td>
+        {% for kind, reason in local_status.items() %}
+        <span class="badge">{{ kind }}={{ reason or "可用" }}</span>
+        {% endfor %}
+      </td>
+    </tr>
+  </table>
+</section>
+
+<section class="card">
+  <h2>立即同步</h2>
+  <p class="muted">把一个市场的同步请求排进下一拍（调度线程在跑的时候才消费）。</p>
+  <form method="post" action="/admin/sync" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <select name="market">
+      {% for market in markets %}<option value="{{ market }}">{{ market }}</option>{% endfor %}
+    </select>
+    <button type="submit">排队</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>每日清理</h2>
+  <p class="muted">
+    最近一次：{{ prune_summary or "还没跑过" }}
+    {% if prune_at %}（{{ prune_at }}）{% endif %}
+  </p>
+  {% if prune_error %}<p class="flash-error">上一次失败：{{ prune_error }}</p>{% endif %}
+  <p class="muted">清理不排队：已经在跑的时候按下去只会告诉你「正在跑」。</p>
+  <form method="post" action="/admin/prune" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="inline"><input type="checkbox" name="confirm" value="yes"> 我确认现在跑清理</label>
+    <button type="submit">触发</button>
+  </form>
+</section>
+{% endblock %}

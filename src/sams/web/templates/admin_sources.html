@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}数据源{% endblock %}
+{% block content %}
+<h1>数据源</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+{% if probe %}
+<section class="card">
+  <h2>探针：{{ probe.name }} · {{ probe.market }} · {{ probe.code }}</h2>
+  <p>{{ probe.verdict }}{% if probe.seconds %}（{{ probe.seconds }}s）{% endif %}</p>
+  <p class="muted">绕开降级链只打这一个源：全链跑通不代表每个源都好。</p>
+</section>
+{% endif %}
+
+<table>
+  <tr><th>名字</th><th>实现</th><th>状态</th><th>备注</th><th>操作</th></tr>
+  {% for source in sources %}
+  <tr>
+    <td>{{ source.name }}</td>
+    <td class="muted">{{ source.kind }}</td>
+    <td>{{ "启用" if source.enabled else "停用" }}</td>
+    <td>{{ source.note or "—" }}</td>
+    <td class="row-actions">
+      {# 隐藏 input 带的是「要变成什么」：这一格永远在表单里，端点读值而不是读键在不在 #}
+      <form method="post" action="/admin/sources/set_enabled" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="name" value="{{ source.name }}">
+        <input type="hidden" name="enabled" value="{{ "0" if source.enabled else "1" }}">
+        <button type="submit">{{ "停用" if source.enabled else "启用" }}</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">库里还没有数据源：先用命令行加一个（sams source add）</td></tr>
+  {% endfor %}
+</table>
+
+<section class="card">
+  <h2>单独试一个源</h2>
+  <p class="muted">区间空着就是最近 5 天。源不在市场链上会被拒，那句话照抄在页面上。</p>
+  <form method="post" action="/admin/sources/probe" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <select name="name">
+      {% for source in sources %}<option value="{{ source.name }}">{{ source.name }}</option>{% endfor %}
+    </select>
+    <select name="market">
+      {% for market in markets %}<option value="{{ market }}">{{ market }}</option>{% endfor %}
+    </select>
+    <input type="text" name="code" placeholder="代码" required>
+    <input type="date" name="start">
+    <input type="date" name="end">
+    <button type="submit">试跑</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>降级链（只含启用中的源）</h2>
+  <ul>
+    {% for market, names in chains.items() %}
+    <li>{{ market }}：{{ names | join(" → ") }}</li>
+    {% else %}
+    <li class="muted">还没有路由</li>
+    {% endfor %}
+  </ul>
+</section>
+{% endblock %}

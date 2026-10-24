@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}用户{% endblock %}
+{% block content %}
+<h1>用户</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+{# 「显示名」那一列已经是折好的名字：空显示名退回登录名，折在 `pages/admin.py` 的 `_names` #}
+<table>
+  <tr>
+    <th>用户名</th><th>显示名</th><th>角色</th><th>状态</th><th>活跃会话</th><th>操作</th>
+  </tr>
+  {% for user, name, sessions, is_active in rows %}
+  <tr>
+    <td>{{ user.username }}</td>
+    <td>{{ name }}</td>
+    <td>{{ "admin" if user.is_admin else "user" }}</td>
+    <td>{{ "启用" if is_active else "停用" }}</td>
+    <td>{{ sessions }}</td>
+    <td class="row-actions">
+      {% if is_active %}
+      <form method="post" action="/admin/users/{{ user.id }}/disable" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit">停用</button>
+      </form>
+      {% else %}
+      <form method="post" action="/admin/users/{{ user.id }}/enable" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit">启用</button>
+      </form>
+      {% endif %}
+      {# 隐藏 input 带的是「要变成什么」，端点读的是值：`checked()` 只看键在不在，
+         而这一格永远在表单里，用它读就等于每一次都读到「升为 admin」 #}
+      <form method="post" action="/admin/users/{{ user.id }}/set_admin" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="is_admin" value="{{ "0" if user.is_admin else "1" }}">
+        <button type="submit">{{ "降为普通" if user.is_admin else "升为 admin" }}</button>
+      </form>
+      <form method="post" action="/admin/users/{{ user.id }}/reset_password" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="password" name="password" placeholder="新密码（至少 12 位）" required>
+        <button type="submit">重置密码</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+<section class="card">
+  <h2>新建用户</h2>
+  <form method="post" action="/admin/users/create" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="text" name="username" placeholder="用户名（小写）" required>
+    <input type="password" name="password" placeholder="密码（至少 12 位）" required>
+    <label class="inline"><input type="checkbox" name="is_admin" value="1"> admin</label>
+    <button type="submit">创建</button>
+  </form>
+  <p class="muted">停用与重置密码都会吊销那个人全部会话：还开着的那几个标签页要重新登录。</p>
+</section>
+{% endblock %}
