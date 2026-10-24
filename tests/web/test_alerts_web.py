@@ -6,10 +6,11 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sams.core.errors import DatabaseLocked, ValidationError
-from sams.core.notify import MID, NO_CHANNEL
+from sams.core.notify import MID, NO_CHANNEL, SYSTEM_MARKET
 from sams.monitor.router import NotifyService
 from sams.storage.repos.alerts import DISMISSED, HANDLED, NEW
 from sams.web.display import moment_label
+from sams.web.pages.alerts import GROUP_SPLIT_NOTE, MARKET_SYSTEM_LABEL
 
 
 def _seed(ctx, *, user_id, market="A", code="600519", severity=MID, **overrides):
@@ -250,3 +251,134 @@ def test_inbox_pages(logged):
     with_filter = logged.client.get("/alerts", params={"page": 2, "market": "A"})
     assert with_filter.status_code == 200
     assert "market=A" in with_filter.text
+
+
+def test_inbox_can_filter_to_system_alerts_and_the_select_shows_it(logged):
+    """`SYS` 必须是下拉里的一档：系统告警与真告警同表，只靠 `market = 'SYS'` 分开
+    （`AlertRepo.has_system_alert`），筛不出来等于这一类告警在收件箱里没有入口；
+    而手改 `?market=SYS` 时选中的那个 option 必须真在名单里，否则页面一边说
+    「全部市场」一边只列 SYS。"""
+    ctx = logged.context
+    user = _alice(ctx)
+    _seed(ctx, user_id=user.id)
+    _seed(ctx, user_id=user.id, market=SYSTEM_MARKET, code="scheduler", rule_name=None)
+
+    page = logged.client.get("/alerts", params={"market": SYSTEM_MARKET})
+    assert page.status_code == 200
+    assert "scheduler" in page.text and "600519" not in page.text
+    assert f'<option value="{SYSTEM_MARKET}" selected>{MARKET_SYSTEM_LABEL}</option>' in page.text
+    # 不筛时它也得在名单里躺着（否则这一档只有手改 URL 的人能用）
+    assert f'<option value="{SYSTEM_MARKET}">' in logged.client.get("/alerts").text
+
+
+def test_inbox_rejects_an_unknown_market_and_names_the_allowed_ones(logged):
+    """填错的市场要答 400，跟档位同一口径：`?market=xyz` 折成 `XYZ` 后筛出空列表，
+    那一屏会对着一堆确实存在的告警说「没有命中的告警」——那句话是假的。"""
+    ctx = logged.context
+    _seed(ctx, user_id=_alice(ctx).id)
+
+    response = logged.client.get("/alerts", params={"market": "xyz"})
+    assert response.status_code == 400
+    allowed = "、".join([*sorted(ctx.settings.markets), SYSTEM_MARKET])
+    assert f"只有 {allowed}" in response.text
+    assert "XYZ" in response.text
+
+
+def test_inbox_rejects_a_page_that_is_not_a_number(logged):
+    """页码不是数字是敲错了，不是偏好：静默折回第 1 页会让人以为是筛选变了，
+    而这一页的其它输入都是这么答的。"""
+    response = logged.client.get("/alerts", params={"page": "two"})
+    assert response.status_code == 400
+    assert "页码要的是整数" in response.text and "two" in response.text
+
+
+def test_inbox_rejects_a_page_below_one(logged):
+    response = logged.client.get("/alerts", params={"page": "0"})
+    assert response.status_code == 400
+    assert "页码从 1 开始" in response.text
+
+
+def test_inbox_a_page_past_the_end_says_so_and_keeps_the_prev_link(logged):
+    """越界的那一页不能说「没有命中的告警」：51 条确实命中，只是不在这个页码上。"""
+    ctx = logged.context
+    user = _alice(ctx)
+    now = datetime.now(UTC)
+    for index in range(51):
+        _seed(
+            ctx,
+            user_id=user.id,
+            code=f"6{index:05d}",
+            triggered_at=now - timedelta(minutes=50 - index),
+        )
+
+    past = logged.client.get("/alerts", params={"page": 999})
+    assert past.status_code == 200
+    assert "没有命中的告警" not in past.text
+    assert "这一页没有内容" in past.text
+    # 上一页还得能点回去，否则人只能改 URL
+    assert "上一页" in past.text
+
+
+def test_inbox_says_a_group_can_be_split_only_when_the_filter_is_paginated(logged):
+    """分组是按页各算一次的：同一标的的告警可能在两页里各出现一次标题，
+    这句话只在真的分页时说出来，不分页的那一屏不该有噪音。"""
+    ctx = logged.context
+    user = _alice(ctx)
+    _seed(ctx, user_id=user.id, code="000001", triggered_at=datetime.now(UTC))
+    single = logged.client.get("/alerts")
+    assert single.status_code == 200
+    assert GROUP_SPLIT_NOTE not in single.text
+
+    now = datetime.now(UTC)
+    for index in range(51):
+        _seed(
+            ctx,
+            user_id=user.id,
+            code=f"6{index:05d}",
+            triggered_at=now - timedelta(minutes=50 - index),
+        )
+
+    first = logged.client.get("/alerts")
+    assert first.status_code == 200
+    assert GROUP_SPLIT_NOTE in first.text
+
+
+def test_inbox_marks_a_test_alert_in_the_row(logged):
+    """`monitor/router.py` 那句「收件箱里带『测试』徽标」说的是列表：
+    只有详情页有徽标的话，/settings/test-alert 那条（D131）在列表里和真告警长得一样。"""
+    ctx = logged.context
+    user = _alice(ctx)
+    _seed(ctx, user_id=user.id, is_test=True)
+    _seed(ctx, user_id=user.id, code="000001")
+
+    page = logged.client.get("/alerts")
+    assert page.status_code == 200
+    # 恰好一个：测试那一条有、真告警那一条没有
+    assert page.text.count(">测试<") == 1
+
+
+def test_detail_says_a_resend_can_double_send(logged):
+    """重发不走队列、不抢租约、也不去重（`deliver_existing`），而队列那一侧只有
+    `qsize`/`empty`，认不出「这一条还在不在队里」：这句话只能写在按钮旁边。"""
+    ctx = logged.context
+    alert = _seed(ctx, user_id=_alice(ctx).id)
+
+    page = logged.client.get(f"/alerts/{alert.id}")
+    assert page.status_code == 200
+    assert "再发一次" in page.text
+    assert "会被再发一次" in page.text
+
+
+def test_dismiss_400_refills_what_was_typed(logged):
+    """被拒的重渲染要把人刚敲的那份交回框里（同 `pages/rules.py`）：清掉它等于让人
+    从零再敲一遍。今天真会拒的那一句是空原因，所以交的是「敲了空格、被 strip 成空」——
+    它同时钉住交回的是**原文**而不是折过的那份（折过的话这里会是空串）。"""
+    ctx = logged.context
+    alert = _seed(ctx, user_id=_alice(ctx).id)
+
+    resp = logged.client.post(
+        f"/alerts/{alert.id}/dismiss", data={"csrf": logged.csrf, "reason": "   "}
+    )
+    assert resp.status_code == 400
+    assert "驳回必须写原因" in resp.text
+    assert 'value="   "' in resp.text

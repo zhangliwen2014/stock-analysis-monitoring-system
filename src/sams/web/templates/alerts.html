@@ -22,11 +22,12 @@
     </select>
   </label>
   <label>市场
-    {# 下拉而不是输入框：库里那一列只有归一后的键，自由输入一个 `a` 筛出来是空的 #}
+    {# 下拉而不是输入框：库里那一列只有归一后的键，自由输入一个 `a` 筛出来是空的。
+       名单（含 `SYS` 那一档）与那道检查读的是同一份，见 pages/alerts.py 的 _market_choices #}
     <select name="market">
       <option value="">全部市场</option>
-      {% for option in markets %}
-      <option value="{{ option }}"{% if chosen.market == option %} selected{% endif %}>{{ option }}</option>
+      {% for value, label in markets %}
+      <option value="{{ value }}"{% if chosen.market == value %} selected{% endif %}>{{ label }}</option>
       {% endfor %}
     </select>
   </label>
@@ -40,6 +41,8 @@
 <section class="card">
   <h2>{{ market }}/{{ code }}{% if rows[0].symbol_name %}
     <span class="muted">{{ rows[0].symbol_name }}</span>{% endif %}</h2>
+  {# 分组是页内各算一次的：真分页时这一组可能被拆开，这句话只在那一屏出现 #}
+  {% if group_note %}<p class="muted">{{ group_note }}</p>{% endif %}
   <table>
     <tr><th>时刻</th><th>档位</th><th>规则</th><th>现值 / 阈值</th><th>状态</th><th></th></tr>
     {% for row in rows %}
@@ -47,7 +50,9 @@
       {# 时刻在 Python 里已折到 display_tz：模板拿到的是字符串，不是 datetime #}
       <td class="muted">{{ row.at }}</td>
       <td><span class="badge">{{ row.severity }}</span></td>
-      <td>{{ row.rule_name or "—" }}</td>
+      <td>{{ row.rule_name or "—" }}
+        {# 测试告警（D131）在列表里也要认得出来：不然它和真告警长得一样 #}
+        {% if row.is_test %}<span class="badge">测试</span>{% endif %}</td>
       <td class="num">{{ row.value_text }} / {{ row.threshold_text }}</td>
       <td>{{ alert_status(row.status) }}</td>
       <td><a href="/alerts/{{ row.id }}">详情</a></td>
@@ -56,7 +61,8 @@
   </table>
 </section>
 {% else %}
-<p class="muted">没有命中的告警。</p>
+{# 这句话在 Python 里按页码选：越界的那一页说「没有命中的告警」是假话（见 PAGE_EMPTY_NOTE） #}
+<p class="muted">{{ empty_note }}</p>
 {% endfor %}
 
 <p class="muted">

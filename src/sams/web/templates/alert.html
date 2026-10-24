@@ -42,7 +42,8 @@
   </form>
   <form method="post" action="/alerts/{{ alert.id }}/dismiss" class="panel inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <input name="reason" placeholder="驳回原因（必填）：为什么说它是假信号">
+    {# 被拒时框里交回的是人刚敲的那份（`pages/alerts.py` 的 `reason`）：清掉它等于让人重敲一遍 #}
+    <input name="reason" value="{{ reason }}" placeholder="驳回原因（必填）：为什么说它是假信号">
     <button type="submit">驳回</button>
   </form>
 </section>
@@ -78,6 +79,10 @@
   </table>
   <p class="muted">重发按<b>此刻</b>的通道与免打扰状态再走一遍选路，正文从库里重建；
     它只动投递记录，不动这条告警按成了什么。</p>
+  {# 队列那一侧只交出 `qsize`/`empty`（`monitor/queue.py`），认不出「这一条还在不在队里」，
+     而 `deliver_existing` 不读队列、不抢租约、不去重：这句话只能写在按钮旁边 #}
+  <p class="muted">重发在网页线程里当场跑，不走那条通知队列：这条告警要是还在队列里排着，
+    它会被再发一次。</p>
   <form method="post" action="/alerts/{{ alert.id }}/resend" class="panel inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit">再发一次</button>
