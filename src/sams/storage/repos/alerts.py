@@ -185,16 +185,55 @@ class AlertRepo:
         )
         return self._to_alert(rows.to_dicts()[0]) if rows.height else None
 
-    def list_for(self, user_id: str, *, status: str | None = None, limit: int = 50) -> list[Alert]:
+    def list_for(
+        self,
+        user_id: str,
+        *,
+        status: str | None = None,
+        severity: str | None = None,
+        market: str | None = None,
+        code: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        rule_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Alert]:
+        """收件箱的筛选。条件全部 AND；`since/until` 作用于 `triggered_at`，
+        带时区才收（`_moment` 统一转 UTC）。
+
+        `until` 是**开区间**：收件箱按天翻页时「到今天 00:00」若含端点，
+        零点那一条会在两页里各出现一次。
+        """
         if status is not None and status not in STATUS:
             raise ValidationError(f"未知状态 {status!r}：只有 {list(STATUS)}")
-        sql = f"SELECT {_ALERT_COLUMNS} FROM alerts WHERE user_id = ?"
+        clauses = ["user_id = ?"]
         params: list[object] = [user_id]
         if status:
-            sql += " AND status = ?"
+            clauses.append("status = ?")
             params.append(status)
-        sql += " ORDER BY triggered_at DESC, id DESC LIMIT ?"
-        params.append(int(limit))
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        if market:
+            clauses.append("market = ?")
+            params.append(market)
+        if code:
+            clauses.append("code = ?")
+            params.append(code)
+        if rule_id:
+            clauses.append("rule_id = ?")
+            params.append(rule_id)
+        if since is not None:
+            clauses.append("triggered_at >= ?")
+            params.append(_moment(since))
+        if until is not None:
+            clauses.append("triggered_at < ?")
+            params.append(_moment(until))
+        sql = f"SELECT {_ALERT_COLUMNS} FROM alerts WHERE {' AND '.join(clauses)}"
+        # id 作第二排序键：同一秒命中两条时，只有 LIMIT/OFFSET 的分页会跳页
+        sql += " ORDER BY triggered_at DESC, id DESC LIMIT ? OFFSET ?"
+        params += [int(limit), int(offset)]
         return [self._to_alert(row) for row in self.db.query(sql, params).to_dicts()]
 
     def latest_for(

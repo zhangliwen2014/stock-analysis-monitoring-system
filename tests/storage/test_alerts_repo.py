@@ -168,6 +168,38 @@ def test_list_for_filters_by_status(repo, seeded_user):
     assert handled.status == "handled"
 
 
+def test_list_for_filters_by_severity_market_code_and_window(db):
+    """收件箱的筛选：条件全部 AND，`since/until` 走 `triggered_at`。
+
+    `limit/offset` 也要在这一个用例里成对出现——分页的错通常是「第二页重复第一页」，
+    只测 limit 测不出来。
+    """
+    repo = AlertRepo(db)
+    early = datetime(2026, 10, 20, 1, 0, tzinfo=UTC)
+    late = datetime(2026, 10, 22, 1, 0, tzinfo=UTC)
+    mid = datetime(2026, 10, 21, 0, 0, tzinfo=UTC)
+    kw = dict(
+        rule_id="r1", rule_name="止损", account_id=None, account_name="",
+        symbol_name="贵州茅台", stage="hit", value_text="1500",
+        threshold_text="1550", action_note="减半",
+    )
+    repo.create("u1", market="A", code="600519", severity="strong", triggered_at=early, **kw)
+    repo.create("u1", market="HK", code="00700", severity="mid", triggered_at=late,
+                rule_id="r2", rule_name="目标价", account_id=None, account_name="",
+                symbol_name="腾讯", stage="pre", value_text="380", threshold_text="400",
+                action_note="观察")
+
+    assert [a.code for a in repo.list_for("u1")] == ["00700", "600519"]
+    assert [a.code for a in repo.list_for("u1", severity="strong")] == ["600519"]
+    assert [a.code for a in repo.list_for("u1", market="HK")] == ["00700"]
+    assert [a.code for a in repo.list_for("u1", code="600519")] == ["600519"]
+    assert [a.code for a in repo.list_for("u1", since=mid)] == ["00700"]
+    assert [a.code for a in repo.list_for("u1", until=mid)] == ["600519"]
+    assert [a.code for a in repo.list_for("u1", rule_id="r2")] == ["00700"]
+    assert repo.list_for("u1", limit=1, offset=1)[0].code == "600519"
+    assert repo.list_for("u2") == []
+
+
 def test_set_status_rejects_an_unknown_one(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
     with pytest.raises(ValidationError, match="状态"):
