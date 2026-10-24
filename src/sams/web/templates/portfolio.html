@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}持仓{% endblock %}
+{% block content %}
+<h1>模拟账户</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+{% if accounts %}
+{% for account in accounts %}
+<section class="card">
+  <h2>{{ account.name }}
+    <span class="muted">合计 {{ money(account.total, account.currency) }} · 截至 {{ account.as_of }}</span>
+  </h2>
+  <table>
+    <tr><th class="num">价格盈亏</th><th class="num">换汇盈亏</th><th class="num">已实现</th></tr>
+    <tr>
+      <td class="num">{{ money(account.price_pnl, account.currency) }}</td>
+      <td class="num">{{ money(account.fx_pnl, account.currency) }}</td>
+      <td class="num">{{ money(account.realized, account.currency) }}</td>
+    </tr>
+  </table>
+  {% if account.notes %}
+  <ul class="muted">{% for note in account.notes %}<li>{{ note }}</li>{% endfor %}</ul>
+  {% endif %}
+  <table>
+    <tr>
+      <th>市场</th><th>代码</th><th class="num">数量</th><th class="num">成本</th>
+      <th class="num">现价</th><th class="num">价格盈亏</th><th class="num">小计</th><th>备注</th>
+    </tr>
+    {% for row in account.positions %}
+    <tr>
+      <td>{{ row.market }}</td>
+      <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
+      <td class="num">{{ row.qty }}</td>
+      <td class="num">{{ money(row.avg_cost, row.currency) }}</td>
+      <td class="num">{{ money(row.last_price, row.currency) }}</td>
+      <td class="num">{{ money(row.price_pnl, row.currency) }}</td>
+      {# 不可换算那一行不给 0.00：它没进上面那个合计，显示成零会让读数的人以为两只币种的数混在了一列 #}
+      <td class="num">{{ money(row.total, account.currency) if row.convertible else "不计入" }}</td>
+      <td class="muted">{{ row.note or "" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endfor %}
+{% else %}
+<section class="card"><p class="muted">还没有账户：用 `sams ledger account-add` 开一个，或直接在下面录入第一笔。</p></section>
+{% endif %}
+
+<section class="card">
+  <h2>录入成交</h2>
+  <form method="post" action="/ledger/fill" class="panel">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>账户
+      <select name="account_id">
+        {% for account in accounts %}<option value="{{ account.id }}">{{ account.name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>方向
+      <select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select>
+    </label>
+    <label>市场 <input name="market" value="A"></label>
+    <label>代码 <input name="code"></label>
+    <label>数量 <input name="qty" type="number" step="any"></label>
+    <label>价格 <input name="price" type="number" step="any"></label>
+    <label>费用 <input name="fee" type="number" step="any" value="0"></label>
+    <label>关联论点（可空）
+      <select name="thesis_id">
+        <option value=""></option>
+        {% for thesis in theses %}<option value="{{ thesis.id }}">{{ thesis.id }} · {{ thesis.status }}</option>{% endfor %}
+      </select>
+    </label>
+    <button type="submit">记账</button>
+  </form>
+</section>
+{% endblock %}
