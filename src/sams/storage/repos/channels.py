@@ -187,6 +187,29 @@ class ChannelRepo:
             )
             self.db.execute("UPDATE channels SET is_default = TRUE WHERE id = ?", [channel_id])
 
+    def update_config(self, channel_id: str, updates: Mapping[str, str]) -> Channel:
+        """合并写配置：给出的非空值覆盖旧值，空值=保持不变。
+
+        编辑表单不回显明文（掩码视图才上屏幕，§4.2 的唯一明文出口仍是 `credentials`），
+        所以「没填的键」只能意味着保持不变——人看不见旧值，也就无法把它重打一遍。
+        要删掉一个键，删掉通道重建：配置里没有哪个键值得为它设计一个删除协议。
+        """
+        node = self._require(channel_id)
+        cleaned = {
+            key.strip(): value
+            for key, value in updates.items()
+            if key.strip() and value != ""
+        }
+        merged = self.credentials(node.id)
+        merged.update(cleaned)
+        self.db.execute(
+            "UPDATE channels SET config_encrypted = ? WHERE id = ?",
+            [self.cipher.encrypt(merged), node.id],
+        )
+        moved = self.show(node.id)
+        assert moved is not None  # 同一条连接刚写完
+        return moved
+
     def remove(self, channel_id: str) -> None:
         node = self._require(channel_id)
         with self.db.transaction():

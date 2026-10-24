@@ -227,3 +227,32 @@ def test_channel_is_a_frozen_value_object(repo, seeded_user):
     assert isinstance(a, Channel)
     with pytest.raises(AttributeError):
         a.name = "改名"
+
+
+def test_update_config_merges_and_keeps_the_blank_keys(repo, seeded_user):
+    """空值=不动那一键：编辑表单从不回显明文（掩码视图才上屏幕），所以「没填」
+    只能意味着保持不变——`credentials` 仍是明文的唯一出口。"""
+    channel = create(repo, seeded_user, token="old-token-value")
+
+    updated = repo.update_config(channel.id, {"url": "https://new.example/hook", "token": ""})
+
+    assert repo.credentials(channel.id) == {
+        "url": "https://new.example/hook",
+        "token": "old-token-value",
+    }
+    # 读回来的还是掩码视图：合并写不把明文带回调用方
+    assert updated.user_id == seeded_user
+    assert "https://new.example/hook" not in updated.config["url"]
+
+
+def test_update_config_can_add_a_key_and_refuses_an_unknown_channel(repo, seeded_user):
+    channel = create(repo, seeded_user)
+    updated = repo.update_config(channel.id, {"at_all": "someone@example.com"})
+    assert repo.credentials(channel.id) == {
+        "url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc123456789",
+        "at_all": "someone@example.com",
+    }
+    assert updated.name == "主群"
+
+    with pytest.raises(StorageError, match="不存在"):
+        repo.update_config("nope", {"url": "https://x"})

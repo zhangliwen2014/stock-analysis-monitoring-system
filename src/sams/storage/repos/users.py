@@ -17,8 +17,13 @@ MIN_PASSWORD_LEN = 12
 _USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{2,31}$")
 BCRYPT_MAX_BYTES = 72
 ACTIVE, DISABLED = "active", "disabled"
+#: 屏幕上那一列的宽度上限：比 `channels.name` 那一条同数，两处不同会长出两种折行
+_DISPLAY_NAME_MAX_CHARS = 40
 #: 三条读路径共用的列名串。少一列不会报错，只会让那一条路径上的 DND 永远读到 None
-_COLUMNS = "id, username, is_admin, status, created_at, last_login_at, dnd_start, dnd_end, dnd_tz"
+_COLUMNS = (
+    "id, username, is_admin, status, created_at, last_login_at,"
+    " dnd_start, dnd_end, dnd_tz, display_name"
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,8 @@ class User:
     dnd_start: time | None = None
     dnd_end: time | None = None
     dnd_tz: str | None = None
+    #: 页面上的称呼；空串=没设置（登录名才是凭据，显示名只是礼貌）
+    display_name: str = ""
 
 
 def _validate_username(username: str) -> str:
@@ -157,6 +164,15 @@ class UserRepo:
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         self.db.execute("UPDATE users SET is_admin = ? WHERE id = ?", [bool(is_admin), user_id])
 
+    def set_display_name(self, user_id: str, value: str) -> None:
+        """空串是「没设置」而不是「删掉这一列」：库里那一列可以为 NULL，读回来是空串。"""
+        name = (value or "").strip()
+        if len(name) > _DISPLAY_NAME_MAX_CHARS:
+            raise ValidationError(
+                f"显示名请控制在 {_DISPLAY_NAME_MAX_CHARS} 字以内（收到 {len(name)}）"
+            )
+        self.db.execute("UPDATE users SET display_name = ? WHERE id = ?", [name, user_id])
+
     def set_dnd(
         self, user_id: str, *, start: time | None, end: time | None, tz: str | None
     ) -> None:
@@ -196,4 +212,5 @@ def _to_user(rows, index: int = 0) -> User:
         dnd_start=rows["dnd_start"][index],
         dnd_end=rows["dnd_end"][index],
         dnd_tz=rows["dnd_tz"][index],
+        display_name=str(rows["display_name"][index] or ""),
     )

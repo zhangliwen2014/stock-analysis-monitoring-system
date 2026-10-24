@@ -103,3 +103,32 @@ def test_password_longer_than_utf8_limit_is_rejected_not_truncated(users):
     """中文口令按 UTF-8 字节数计，超过 72 字节必须报错。"""
     with pytest.raises(ValidationError, match="72"):
         users.create("zhangsan", "密码" * 40)
+
+
+def test_display_name_is_empty_until_set(users):
+    """空串=没设置：`username` 是登录凭据，显示名只是礼貌（0019 那一列的头注）。"""
+    user = users.create("zhangsan", PASSWORD)
+    assert users.get(user.id).display_name == ""
+
+
+def test_set_display_name_strips_and_validates(users):
+    user = users.create("zhangsan", PASSWORD)
+
+    users.set_display_name(user.id, "  卡罗尔  ")
+    assert users.get(user.id).display_name == "卡罗尔"
+
+    users.set_display_name(user.id, "")
+    assert users.get(user.id).display_name == ""
+
+    with pytest.raises(ValidationError, match="40"):
+        users.set_display_name(user.id, "x" * 41)
+
+
+def test_display_name_is_read_on_every_path(users):
+    """三条读路径共用 `_COLUMNS`：少一列不会报错，只会让那一条路径上的显示名永远空着。"""
+    user = users.create("zhangsan", PASSWORD)
+    users.set_display_name(user.id, "卡罗尔")
+    assert users.get(user.id).display_name == "卡罗尔"
+    assert users.get_by_username("zhangsan").display_name == "卡罗尔"
+    assert [row.display_name for row in users.list_users()] == ["卡罗尔"]
+    assert users.authenticate("zhangsan", PASSWORD).display_name == "卡罗尔"

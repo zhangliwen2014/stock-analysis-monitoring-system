@@ -70,6 +70,19 @@ class SessionRepo:
         )
         return flipped.height
 
+    def revoke_others(self, user_id: str, *, keep: str) -> int:
+        """吊销该用户其余未吊销的会话，只留 `keep`（明文 token）。
+
+        改密码的语义是「别的设备下线，当前这台留着」：`revoke_all` 做不到后半句。
+        """
+        flipped = self.db.query(
+            "UPDATE user_sessions SET revoked_at = ? "
+            "WHERE user_id = ? AND revoked_at IS NULL AND token_hash <> ? "
+            "RETURNING token_hash",
+            [self.clock.now_utc(), user_id, _hash(keep)],
+        )
+        return flipped.height
+
     def active_count(self, user_id: str) -> int:
         """与 verify 同一套时间判断：全部用注入时钟，否则「有效」在两处会给出不同答案。"""
         now = self.clock.now_utc()

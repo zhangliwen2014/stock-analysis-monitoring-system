@@ -76,3 +76,24 @@ def test_expiry_follows_the_injected_clock(db, user_id):
 
     clock.advance(days=2)
     assert repo.verify(token) is None
+
+
+def test_revoke_others_keeps_only_the_given_token(repo, user_id):
+    """改密码的语义是「别的设备下线，当前这台留着」：`revoke_all` 做不到后半句。"""
+    keep = repo.issue(user_id)
+    other = repo.issue(user_id)
+    third = repo.issue(user_id)
+
+    assert repo.verify(keep) == user_id
+    assert repo.revoke_others(user_id, keep=keep) == 2
+    assert repo.verify(keep) == user_id
+    assert repo.verify(other) is None
+    assert repo.verify(third) is None
+    assert repo.active_count(user_id) == 1
+
+
+def test_revoke_others_leaves_the_current_token_reusable(repo, user_id):
+    """留着的那一枚之后还能用，所以重复调用不会把自己踢下线。"""
+    keep = repo.issue(user_id)
+    assert repo.revoke_others(user_id, keep=keep) == 0
+    assert repo.verify(keep) == user_id
