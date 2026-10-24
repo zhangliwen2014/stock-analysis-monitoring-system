@@ -78,13 +78,19 @@ def test_health_backlog_ignores_test_rows(db, settings):
     # 测试行比真告警老三天、code 也不同：只漏掉 oldest 那条过滤的话，
     # `unhandled_oldest` 就会变成这行更老的测试行，而不是 MOMENT
     row(repo, code="600519", is_test=True, triggered_at=MOMENT - timedelta(days=3))
+    # 真的系统告警（组件名与测试行不同，distinct code 才是 1）：它同时保证
+    # system_unhandled 非零，那条 oldest 查询才会真的执行
+    row(repo, market=SYSTEM_MARKET, code="quote_source")
     # /settings/test-alert 记的是 SYS 行（D131）：系统侧那两条查询也得挡住它，
-    # 否则点一次测试就常年显示「系统 1 个组件未处理」
-    row(repo, market=SYSTEM_MARKET, code="test", is_test=True)
+    # 否则点一次测试就常年显示「系统 1 个组件未处理」。故意比真系统行老三天：
+    # 只漏掉 oldest 过滤的话，最早一条会变成它而不是真系统告警的 MOMENT
+    row(repo, market=SYSTEM_MARKET, code="test", is_test=True,
+        triggered_at=MOMENT - timedelta(days=3))
     notify = service.report().notify
     assert notify.unhandled == 1
     assert notify.unhandled_oldest == MOMENT
-    assert notify.unhandled_system == 0
+    assert notify.unhandled_system == 1
+    assert notify.unhandled_system_oldest == MOMENT
 
 
 def test_health_report_works_without_is_test_column(db, settings):
