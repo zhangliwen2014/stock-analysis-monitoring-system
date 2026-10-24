@@ -126,7 +126,11 @@ class QuoteBoard:
             return self._quotes.get((market, code))
 
     def previous(self, market: str, code: str) -> Quote | None:
-        """上一轮报价（§5.2）：`price.cross_*` 的「上一根」。开局第一轮是 None。"""
+        """上一轮报价（§5.2）：`price.cross_*` 的「上一根」。
+
+        开局第一轮是 None（灌板灌进来的日线收盘不算一轮）。跨了交易日的上一轮
+        仍会返回——「是不是同一交易日」由 `cross_baseline` 判，不在这里丢。
+        """
         with self._lock:
             return self._previous.get((market, code))
 

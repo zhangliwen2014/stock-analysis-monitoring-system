@@ -56,3 +56,21 @@ def test_previous_is_keyed_by_market_and_code():
     assert board.previous("A", "601088").price == 9.4
     assert board.previous("HK", "00700").price == 199.0
     assert board.previous("HK", "09988") is None
+
+
+def test_the_round_after_the_seeded_one_becomes_previous():
+    # 灌板后的第一轮还不是「上一轮」；从第二轮起才记——`_seeded` 必须在这一轮被摘掉
+    board = QuoteBoard()
+    board.seed((quote(9.95),))
+    board.update("A", (quote(9.50),), now=NOW)
+    board.update("A", (quote(9.40),), now=NOW)
+    previous = board.previous("A", "601088")
+    assert previous is not None and previous.price == 9.50
+
+
+def test_each_round_replaces_the_previous_one():
+    board = QuoteBoard()
+    board.update("A", (quote(9.50),), now=NOW)
+    board.update("A", (quote(9.40),), now=NOW)
+    board.update("A", (quote(9.30),), now=NOW)
+    assert board.previous("A", "601088").price == 9.40
