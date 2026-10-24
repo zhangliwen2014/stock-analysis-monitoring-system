@@ -89,6 +89,11 @@ class AlertMessage:
     #: 一个手写的串会变成「屏幕上有个 id，按它查不到任何东西」。
     #: 通道模板里若要用它（M4 的深链就是），拿到的一定是真实那一个。
     alert_id: str = ""
+    #: 盘中三件套（D120）：这一条是盘中判的、报价是哪一刻、出自哪个源。
+    #: 放在消息上而不是事后查库：通知线程拿到的是重建出来的那份，别让它再回头查
+    intraday: bool = False
+    quote_ts: datetime | None = None
+    quote_source: str | None = None
 
     def __post_init__(self) -> None:
         if self.severity not in SEVERITIES:

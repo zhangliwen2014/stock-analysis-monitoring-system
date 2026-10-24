@@ -394,9 +394,12 @@ class HealthService:
         status = self.local_status() if self.local_status is not None else {}
         # 用户积压排除 `market='SYS'`：系统告警在每个管理员名下各有一行副本，
         # 混进来的话「2 个组件、2 个管理员」会显示成「未处理 4 条」
+        # 测试告警（D131）不算「没人看」：/settings/test-alert 发的那条
+        # 不该让未处理计数常年 +1。系统侧那两条查询不动——SYS 行永远不会是测试行
         unhandled = int(
             self.db.scalar(
-                "SELECT count(*) FROM alerts WHERE status = 'new' AND market <> ?",
+                "SELECT count(*) FROM alerts WHERE status = 'new' AND market <> ?"
+                " AND coalesce(is_test, FALSE) = FALSE",
                 [SYSTEM_MARKET],
             )
             or 0
@@ -404,7 +407,8 @@ class HealthService:
         oldest = (
             self.db.scalar(
                 "SELECT min(triggered_at) FROM alerts"
-                " WHERE status = 'new' AND market <> ?",
+                " WHERE status = 'new' AND market <> ?"
+                " AND coalesce(is_test, FALSE) = FALSE",
                 [SYSTEM_MARKET],
             )
             if unhandled

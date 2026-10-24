@@ -28,7 +28,7 @@ _ERROR_MAX_CHARS = 400
 
 _ALERT_COLUMNS = (
     "id, user_id, rule_id, account_id, market, code, stage, triggered_at,"
-    " status, payload_json, severity, handled_at, handle_note, dismiss_reason"
+    " status, payload_json, severity, handled_at, handle_note, dismiss_reason, is_test"
 )
 
 
@@ -38,6 +38,17 @@ def _moment(value: datetime) -> datetime:
     if value.tzinfo is None:
         raise ValidationError("告警时刻必须带时区（例如 2026-10-20T22:00+08:00）")
     return value.astimezone(UTC)
+
+
+def _parse_ts(raw: object) -> datetime | None:
+    """payload 里存的 ISO 时刻。存坏了的那一行不能让整个收件箱读不出来。"""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw))
+    except ValueError:
+        logger.warning("payload 里的 quote_ts 读不懂：%r", raw)
+        return None
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,12 @@ class Alert:
     symbol_name: str = ""
     severity: str = "mid"
     channel_ids: list[str] = field(default_factory=list)
+    #: `alerts.is_test` 那一列（0019）：测试告警不进 no_open_alert 与健康积压（D131）
+    is_test: bool = False
+    #: 这三个来自 payload（D120）：要显示与回放的事实，不占列——占列的话措辞改版又要动表
+    intraday: bool = False
+    quote_ts: datetime | None = None
+    quote_source: str | None = None
 
 
 class AlertRepo:
@@ -101,6 +118,10 @@ class AlertRepo:
         triggered_at: datetime,
         channel_ids: Sequence[str] = (),
         extra: Mapping[str, object] | None = None,
+        is_test: bool = False,
+        intraday: bool = False,
+        quote_ts: datetime | None = None,
+        quote_source: str | None = None,
     ) -> Alert:
         if severity not in SEVERITIES:
             raise ValidationError(
@@ -119,13 +140,17 @@ class AlertRepo:
             "action_note": action_note,
             "channel_ids": list(channel_ids),
             "extra": dict(extra or {}),
+            "is_test": bool(is_test),
+            "intraday": bool(intraday),
+            "quote_ts": None if quote_ts is None else _moment(quote_ts).isoformat(),
+            "quote_source": quote_source,
         }
         alert_id = new_id()
         self.db.execute(
             "INSERT INTO alerts"
             " (id, user_id, rule_id, account_id, market, code, stage, triggered_at,"
-            " status, payload_json, severity)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)",
+            " status, payload_json, severity, is_test)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)",
             [
                 alert_id,
                 user_id,
@@ -137,6 +162,7 @@ class AlertRepo:
                 moment,
                 json.dumps(payload, ensure_ascii=False),
                 severity,
+                bool(is_test),
             ],
         )
         created = self.get(alert_id)
@@ -206,10 +232,12 @@ class AlertRepo:
         提醒」，把账户算进去的话，A 账户里那条未处理的止损会挡不住 B 账户的第二条推送，
         用户收到两条内容一样、只有账户名不同的告警。
         与 `latest_for` 的分工也在这里：那一头管冷却（同键同账户），这一头管刷屏（同票同人）。
+        测试告警（D131）不进来：/settings/test-alert 发的那条不该把真告警挡一整天。
         """
         rows = self.db.query(
             f"SELECT {_ALERT_COLUMNS} FROM alerts"
             " WHERE user_id = ? AND market = ? AND code = ? AND status = 'new'"
+            " AND coalesce(is_test, FALSE) = FALSE"
             " ORDER BY triggered_at DESC, id DESC LIMIT 1",
             [user_id, market, code],
         )
@@ -371,4 +399,10 @@ class AlertRepo:
             #: 两者不一致时以列为准，因为列是 0015 之后新写的、payload 是老数据里搬来的
             severity=str(row["severity"] or payload.get("severity") or "mid"),
             channel_ids=list(payload.get("channel_ids") or []),
+            is_test=bool(row["is_test"]),
+            intraday=bool(payload.get("intraday") or False),
+            quote_ts=_parse_ts(payload.get("quote_ts")),
+            quote_source=(
+                str(payload["quote_source"]) if payload.get("quote_source") else None
+            ),
         )
