@@ -103,9 +103,15 @@ def top_rule_ratios(
     排名与门槛在同一个函数里算：页面各算各的会让一条规则同时进「前五」和
     「样本不足」——门槛是排名自己的事，不是渲染的事。并列时触发多者优先，
     再按 rule_id 定序（测试要能断言顺序，不能靠 dict 的插入序）。
+
+    `rule_id` 为 NULL 的行（SYS 系统告警，见 `monitor/queue.py` 与
+    `services/scheduler/alarms.py` 的入库路径）分组前就跳过：聚成名为「None」的
+    「规则」进排名、再链到 `/rules/None/edit`，是拿系统告警伪造规则质量。
     """
     by_rule: dict[str, list[Mapping[str, Any]]] = {}
     for row in rows:
+        if row["rule_id"] is None:
+            continue
         by_rule.setdefault(str(row["rule_id"]), []).append(row)
     ratios = []
     for rule_id, group in by_rule.items():

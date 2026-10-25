@@ -41,6 +41,9 @@ def _bounds(now_local: datetime, window: str) -> tuple[datetime, datetime]:
 
     「近 7 天」含今天：起点是今天减 6 天的零点。减 7 会让每天零点那一秒在相邻窗口里
     各出现一次——与 `list_for` 开区间同一个理由，反着成立。
+
+    display_tz 按无 DST 的墙钟日理解（生产用 Asia/Shanghai）：若配成 DST 时区，
+    `replace(hour=0)` 加整天会在春秋切换日漂一小时——这是已接受的限制，不改算法。
     """
     midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     if window == "week":
@@ -122,17 +125,20 @@ def review_page(request: Request, window: str = Query("7d")):
         }
         for row in ctx.alerts_store.list_overdue(user.id, now=now_utc, limit=OVERDUE_LIMIT)
     ]
-    handled_rows = [
-        {
-            "id": row["id"],
-            "at": moment_label(row["triggered_at"], tz),
-            "rule_name": str(row["rule_name"] or ""),
-            "label": _ref_of(row)[0],
-            "url": _ref_of(row)[1],
-        }
-        for row in rows
-        if row["status"] == HANDLED
-    ]
+    handled_rows = []
+    for row in rows:
+        if row["status"] != HANDLED:
+            continue
+        label, url = _ref_of(row)
+        handled_rows.append(
+            {
+                "id": row["id"],
+                "at": moment_label(row["triggered_at"], tz),
+                "rule_name": str(row["rule_name"] or ""),
+                "label": label,
+                "url": url,
+            }
+        )
     note_rows = [
         {
             "id": note.id,

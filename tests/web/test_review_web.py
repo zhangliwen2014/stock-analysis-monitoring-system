@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from fastapi.testclient import TestClient
 from support import FrozenClock
 
-from sams.storage.repos.alerts import HANDLED
+from sams.storage.repos.alerts import ACKNOWLEDGED, HANDLED
 
 
 def _seed(ctx, *, user_id, market="A", code="600519", **overrides):
@@ -62,7 +62,7 @@ def test_unknown_window_is_answered_with_the_allowed_list(logged):
 
 
 def test_week_window_starts_this_monday_by_display_tz(make_app):
-    """冻结时钟装在「北京周日 09:00」：本周一 00:00 起算，上周六那条不该在。
+    """冻结时钟装在「北京周日 09:00」：本周一 00:00 起算，上周日那条不该在。
 
     冻结点取「真实当下之后的下一个周日 01:00 UTC」而不是写死 2026-10-25：
     空闲心跳 `_active_ok` 拿真实墙钟比对（auth.py），写死的过去时刻让这条测试
@@ -78,7 +78,7 @@ def test_week_window_starts_this_monday_by_display_tz(make_app):
     ctx = web.contexts.current()
     ctx.users.create("alice", "correct-horse-battery", is_admin=True)
     uid = ctx.users.get_by_username("alice").id
-    _seed(ctx, user_id=uid, triggered_at=frozen - timedelta(days=7))  # 上周六
+    _seed(ctx, user_id=uid, triggered_at=frozen - timedelta(days=7))  # 上周日
     _seed(ctx, user_id=uid, triggered_at=frozen - timedelta(days=6))  # 本周一 09:00
     with TestClient(web.app) as client:
         resp = client.post(
@@ -91,16 +91,38 @@ def test_week_window_starts_this_monday_by_display_tz(make_app):
         assert _number(page, "window-total") == 1
 
 
-def test_seven_day_window_includes_the_sixth_midnight(logged):
-    """「近 7 天」含今天：起点是 6 天前的零点，那一秒那一条要在；再早一分钟不在。"""
-    ctx = logged.context
+def test_seven_day_window_includes_the_sixth_midnight(make_app):
+    """「近 7 天」含今天：起点是 6 天前的零点，那一秒那一条要在；再早一分钟不在。
+
+    冻结时钟（同 week 测试）：页面与种子各读一次时钟的话，跨本地零点时两个
+    「6 天前的零点」会漂移，断言撞运气。冻结点取真实墙钟之后的 09:00 UTC——
+    换成北京时间是傍晚，离本地午夜最远。
+    """
+    now = datetime.now(UTC)
+    frozen = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    if frozen <= now:
+        # 兜底：空闲心跳拿真实墙钟比对会话（auth.py），冻结点必须严格在未来，
+        # 否则登录后的会话校验会先于窗口断言失败——再推一周保证它总在将来。
+        frozen += timedelta(days=7)
+    web = make_app(clock=FrozenClock(frozen))
+    ctx = web.contexts.current()
+    ctx.users.create("alice", "correct-horse-battery", is_admin=True)
+    uid = ctx.users.get_by_username("alice").id
     tz = ZoneInfo(ctx.settings.server.display_tz)
-    now_local = datetime.now(tz)
-    sixth = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=6)
-    _seed(ctx, user_id=_alice(ctx).id, triggered_at=sixth + timedelta(minutes=1))
-    _seed(ctx, user_id=_alice(ctx).id, triggered_at=sixth - timedelta(minutes=1))
-    page = logged.client.get("/review")
-    assert _number(page, "window-total") == 1
+    sixth = frozen.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=6
+    )
+    _seed(ctx, user_id=uid, triggered_at=sixth + timedelta(minutes=1))
+    _seed(ctx, user_id=uid, triggered_at=sixth - timedelta(minutes=1))
+    with TestClient(web.app) as client:
+        resp = client.post(
+            "/login",
+            data={"username": "alice", "password": "correct-horse-battery"},
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+        page = client.get("/review")
+        assert _number(page, "window-total") == 1
 
 
 def test_overdue_lists_old_not_fresh_and_the_top_number_is_full(logged):
@@ -136,7 +158,9 @@ def test_quick_ack_button_closes_in_place(logged):
         f"/alerts/{alert.id}/ack", data={"csrf": logged.csrf}, follow_redirects=False
     )
     assert resp.status_code == 303
-    assert "已读" in logged.client.get("/review").text  # 已读仍算未处理，仍在这份清单里（D124）
+    assert ctx.alerts_store.get(alert.id).status == ACKNOWLEDGED  # 行为直接从库里断言
+    # 已读仍算未处理，仍在清单里（D124）
+    assert f"/alerts/{alert.id}" in logged.client.get("/review").text
 
 
 def test_rule_ratio_top_rows_and_thin_single_column(logged):

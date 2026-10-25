@@ -115,6 +115,17 @@ def test_rule_ratio_ranks_and_thin_split():
     assert thin[0].triggered == MIN_RULE_SAMPLES - 1
 
 
+def test_null_rule_rows_stay_out_of_the_ranking():
+    """SYS 系统告警（`rule_id` 为 NULL）不进排名：聚成名为「None」的「规则」
+    再链到 `/rules/None/edit` 是幽灵链接——它既不是规则，也没有可编辑的页。
+    入库路径见 `monitor/queue.py` 与 `services/scheduler/alarms.py`（rule_id=None）。
+    """
+    rows = [_row(id=f"s{i}", rule_id=None, rule_name="SYS") for i in range(5)]
+    rows.append(_row(id="r1-1", rule_id="r1", status="dismissed", dismiss_code="expected"))
+    ranked, thin = top_rule_ratios(rows)
+    assert [x.rule_id for x in ranked + thin] == ["r1"]
+
+
 def test_ranking_is_capped_at_five():
     rows = [
         _row(id=f"{rule}-{index}", rule_id=rule, status="dismissed", dismiss_code="expected")
