@@ -52,7 +52,8 @@
       <td><span class="badge">{{ row.severity }}</span></td>
       <td>{{ row.rule_name or "—" }}
         {# 测试告警（D131）在列表里也要认得出来：不然它和真告警长得一样 #}
-        {% if row.is_test %}<span class="badge">测试</span>{% endif %}</td>
+        {% if row.is_test %}<span class="badge">测试</span>{% endif %}
+        {% if row.deferred %}<span class="badge">稍后至 {{ row.deferred }}</span>{% endif %}</td>
       <td class="num">{{ row.value_text }} / {{ row.threshold_text }}</td>
       <td>{{ alert_status(row.status) }}</td>
       <td><a href="/alerts/{{ row.id }}">详情</a></td>

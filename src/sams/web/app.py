@@ -35,7 +35,15 @@ from sams.web.auth import (
 )
 from sams.web.auth import router as auth_router
 from sams.web.context import ThreadContexts
-from sams.web.display import alert_status, hms, money, pct, state_label
+from sams.web.display import (
+    action_label,
+    alert_status,
+    dismiss_label,
+    hms,
+    money,
+    pct,
+    state_label,
+)
 from sams.web.pages import (
     admin,
     alerts,
@@ -56,7 +64,13 @@ def _templates() -> Jinja2Templates:
     """显示函数注册成 Jinja 全局：数字怎么排、状态叫什么，模板里不该各写一份。"""
     templates = Jinja2Templates(directory=str(_TEMPLATES))
     templates.env.globals.update(
-        money=money, pct=pct, hms=hms, state_label=state_label, alert_status=alert_status
+        money=money,
+        pct=pct,
+        hms=hms,
+        state_label=state_label,
+        alert_status=alert_status,
+        action_label=action_label,
+        dismiss_label=dismiss_label,
     )
     return templates
 

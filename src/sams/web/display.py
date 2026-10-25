@@ -96,3 +96,42 @@ ALERT_STATUS_LABELS = {
 
 def alert_status(value: str) -> str:
     return ALERT_STATUS_LABELS.get(value, value)
+
+
+#: 处置动作与忽略原因的中文名：与 `repos/alerts.py` 的 `ACTION_KINDS`/`DISMISS_CODES`
+#: 一一对应。新增一档忘配表时，屏幕上出现的是原键名而不是空白——漏配看得见
+ACTION_LABELS = {
+    "trade": "成交",
+    "thesis": "关联观点",
+    "rule": "调整规则",
+    "watch": "加入自选",
+    "other": "其他处置",
+}
+DISMISS_LABELS = {
+    "misreport": "误报",
+    "expected": "符合预期",
+    "data_issue": "数据问题",
+    "not_applicable": "不适用",
+    "duplicate": "重复提醒",
+    "other": "其他",
+}
+#: `alert_events.action` 那一列的读法（D138：五个动作各写一行）
+EVENT_ACTION_LABELS = {
+    "ack": "已读",
+    "act": "处置",
+    "dismiss": "忽略",
+    "defer": "稍后",
+    "undo": "撤销",
+}
+
+
+def action_label(value: str | None) -> str:
+    if not value:
+        return "—"
+    return ACTION_LABELS.get(value, value)
+
+
+def dismiss_label(value: str | None) -> str:
+    if not value:
+        return "—"
+    return DISMISS_LABELS.get(value, value)

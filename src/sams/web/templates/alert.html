@@ -6,48 +6,152 @@
     {% if alert.symbol_name %}<span class="muted">{{ alert.symbol_name }}</span>{% endif %}
   </h1>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
-  {# 状态名走 display 那个全局（表是 `repos/alerts.py` 的三个常量）：模板不自己翻译状态 #}
   <p>
     <span class="badge">{{ alert.severity }}</span>
     {{ alert_status(alert.status) }} ·
     {# 时刻在 Python 里折到 display_tz 并排成字符串：模板拿到的一律不是 datetime #}
     <span class="muted">{{ triggered_at }}</span>
     {% if alert.is_test %}<span class="badge">测试</span>{% endif %}
+    {% if intraday %}<span class="badge">盘中</span>{% endif %}
+    {% if deferred %}<span class="badge">你让它稍后提醒：稍后至 {{ deferred }}</span>{% endif %}
   </p>
   <table>
     <tr><th>项</th><th>内容</th></tr>
     <tr><td>规则</td><td>{{ alert.rule_name or "—" }}</td></tr>
+    <tr><td>账户</td><td>{{ alert.account_name or "—" }}</td></tr>
     {# 现值/阈值/建议动作在 payload 里，不是列（措辞改版不动表），取的工作在端点里做完了 #}
     <tr><td>现值 / 阈值</td><td class="num">{{ value_text }} / {{ threshold_text }}</td></tr>
     <tr><td>建议动作</td><td>{{ action_note or "—" }}</td></tr>
     <tr><td>阶段</td><td>{{ alert.stage or "—" }}</td></tr>
     <tr><td>正文</td><td>{{ body or "—" }}</td></tr>
-    {% if alert.handled_at %}
-    <tr><td>处理时刻</td><td class="muted">{{ handled_at }}</td></tr>
-    <tr><td>处理备注</td><td>{{ alert.handle_note or "—" }}</td></tr>
+    {% if quote_source %}<tr><td>报价来源</td><td class="muted">{{ quote_source }}</td></tr>{% endif %}
+    {% if terminal %}
+    <tr><td>处置动作</td><td>{{ action_kind_text }}
+      {% if action_ref_url %}<a href="{{ action_ref_url }}">{{ alert.action_ref }}</a>
+      {% elif alert.action_ref %}<span class="muted">{{ alert.action_ref }}</span>{% endif %}
+    </td></tr>
+    <tr><td>说明</td><td>{{ alert.handle_note or "—" }}</td></tr>
+    <tr><td>关上时刻</td><td class="muted">{{ handled_at }}</td></tr>
     {% endif %}
-    {% if alert.dismiss_reason %}
-    <tr><td>驳回原因</td><td>{{ alert.dismiss_reason }}</td></tr>
+    {% if alert.dismiss_code %}
+    <tr><td>忽略原因</td><td>{{ dismiss_code_text }}：{{ alert.dismiss_reason or "（未填）" }}</td></tr>
+    <tr><td></td><td class="muted">这条原因会进入本周忽略率。</td></tr>
     {% endif %}
   </table>
+  {% if can_undo %}
+  <form method="post" action="/alerts/{{ alert.id }}/undo" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    {# 窗口外这个按钮根本不渲染（`can_undo` 读 UNDO_WINDOW）：让人按下去吃 409 是拿拒绝当交互 #}
+    <button type="submit">撤销（终态 5 分钟内）</button>
+  </form>
+  {% endif %}
 </section>
 
 {% if can_act %}
 <section class="card">
-  <h2>处理</h2>
-  <form method="post" action="/alerts/{{ alert.id }}/acted" class="panel inline-form">
+  <h2>闭环</h2>
+  {% if can_ack %}
+  <form method="post" action="/alerts/{{ alert.id }}/ack" class="inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    <input name="note" placeholder="备注（可空）：打算怎么处理">
-    <button type="submit">标记已处理</button>
+    <button type="submit">已读</button>
   </form>
-  <form method="post" action="/alerts/{{ alert.id }}/dismiss" class="panel inline-form">
+  {% endif %}
+  <form method="post" action="/alerts/{{ alert.id }}/defer" class="inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
-    {# 被拒时框里交回的是人刚敲的那份（`pages/alerts.py` 的 `reason`）：清掉它等于让人重敲一遍 #}
-    <input name="reason" value="{{ reason }}" placeholder="驳回原因（必填）：为什么说它是假信号">
-    <button type="submit">驳回</button>
+    <label>稍后 <select name="until">
+      {% for value, label in defer_choices %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+    </select></label>
+    <button type="submit">让它稍后提醒</button>
   </form>
+
+  <details {% if draft.action_kind %}open{% endif %}>
+    <summary>处置——做了什么（动作五选一，能指到实物的必须指到）</summary>
+    <form method="post" action="/alerts/{{ alert.id }}/acted">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>动作 <select name="action_kind">
+        <option value="">选择动作…</option>
+        {% for value, label in action_kinds %}
+        <option value="{{ value }}" {% if draft.action_kind == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select></label>
+      <label>说明 <input name="note" value="{{ draft.note }}"
+             placeholder="其他处置必填一句；其余可空"></label>
+      {% if related_theses %}
+      <label>关联的观点 <select name="thesis_ref">
+        {% for t in related_theses %}<option value="{{ t.id }}">{{ t.label }}</option>{% endfor %}
+      </select></label>
+      {% else %}<p class="muted">这只票还没有你的观点。</p>{% endif %}
+      {% if rules %}
+      <label>关联的规则 <select name="rule_ref">
+        {% for r in rules %}<option value="{{ r.id }}">{{ r.label }}</option>{% endfor %}
+      </select></label>
+      {% endif %}
+      <div class="closure-trade">
+        <p class="muted">录一笔成交（成交与闭环同一条事务；标的取自这条告警）：</p>
+        <label>账户 <select name="account_id">
+          {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+        </select></label>
+        <label>方向 <select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
+        <label>数量 <input name="qty" size="6" value="{{ draft.qty }}"></label>
+        <label>价格 <input name="price" size="8" value="{{ draft.price }}"></label>
+        <label>费用 <input name="fee" size="6" value="{{ draft.fee }}"></label>
+        <label>成交时间 <input type="datetime-local" name="ts">（空 = 此刻）</label>
+      </div>
+      {# §6.3：T+1/整手/涨跌停只警告不拦截——模拟账本常在补记真实成交，这句话得静态挂着 #}
+      <p class="muted">A 股 T+1、整手、涨跌停：这里不做拦截，照实记。</p>
+      <label><input type="checkbox" name="sync_annotation" value="on">
+        同时写一条标的批注（预填这条告警与我的结论）</label>
+      <button type="submit">记为已处置</button>
+    </form>
+  </details>
+
+  <details {% if reason %}open{% endif %}>
+    <summary>忽略——为什么不处理</summary>
+    <form method="post" action="/alerts/{{ alert.id }}/dismiss">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label>原因码 <select name="code">
+        <option value="">选择原因…</option>
+        {% for value, label in dismiss_codes %}
+        <option value="{{ value }}" {% if draft.code == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select></label>
+      <label>说明 <input name="reason" value="{{ reason }}"
+             placeholder="误报/其他必填一句；其余可空"></label>
+      <label><input type="checkbox" name="sync_annotation" value="on">
+        同时写一条标的批注（预填这条告警与我的原因）</label>
+      <button type="submit">驳回</button>
+      <p class="muted">这条原因会进入本周忽略率。忽略率只统计「驳回」，稍后不算。</p>
+    </form>
+  </details>
 </section>
 {% endif %}
+
+<section class="card">
+  <h2>上下文</h2>
+  {# 与推送同一源的批注：嵌的就是那枚 fragment，不为详情另写一条读批注的路（§6.3） #}
+  <div hx-get="/api/partials/annotations?target_type=symbol&target_ref={{ alert.market }}:{{ alert.code }}"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">批注加载中…</p>
+  </div>
+  <p class="muted">最近一笔成交请看 <a href="/portfolio">持仓与流水</a>。</p>
+</section>
+
+<section class="card">
+  <h2>动作历史</h2>
+  <table>
+    <tr><th>时刻</th><th>动作</th><th>状态</th><th>说明</th></tr>
+    {% for row in events %}
+    <tr>
+      <td class="muted">{{ row.at }}</td>
+      <td>{{ row.action }}</td>
+      <td>{{ row.from }} → {{ row.to }}</td>
+      <td>{{ row.note or "—" }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="muted">还没有动作：这条还挂着。</td></tr>
+    {% endfor %}
+  </table>
+</section>
 
 <section class="card">
   <h2>投递记录</h2>

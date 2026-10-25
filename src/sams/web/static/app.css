@@ -57,3 +57,6 @@ form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
 .md-preview { border: 1px dashed var(--line, #bbb); padding: 8px; margin-top: 8px; }
 .ann-imgs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; align-items: center; }
 .ann-imgs img { max-height: 120px; max-width: 160px; border-radius: 6px; }
+
+.closure-trade { border-left: 3px solid var(--line, #ddd); padding-left: 10px; margin: 8px 0; }
+.card details summary { cursor: pointer; margin: 6px 0; }

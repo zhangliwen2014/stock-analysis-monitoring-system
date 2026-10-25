@@ -131,7 +131,7 @@ def test_acted_marks_handled_and_leaves_default_inbox(logged):
 
     resp = logged.client.post(
         f"/alerts/{alert.id}/acted",
-        data={"csrf": logged.csrf, "note": "已减仓"},
+        data={"csrf": logged.csrf, "action_kind": "other", "note": "已减仓"},
         follow_redirects=False,
     )
     assert resp.status_code == 303
@@ -147,19 +147,19 @@ def test_acted_marks_handled_and_leaves_default_inbox(logged):
     assert "止损线" in logged.client.get("/alerts", params={"status": "all"}).text
 
 
-def test_dismiss_requires_reason_then_records_it(logged):
+def test_dismiss_requires_code_then_records_it(logged):
     ctx = logged.context
     alert = _seed(ctx, user_id=_alice(ctx).id)
 
     blank = logged.client.post(f"/alerts/{alert.id}/dismiss", data={"csrf": logged.csrf})
     assert blank.status_code == 400
-    # 那句话长在表单旁边（驳回原因这一格旁边），而不是一屏 error.html
-    assert "驳回必须写原因" in blank.text
+    # 那句话长在表单旁边（原因码下拉旁边），而不是一屏 error.html
+    assert "忽略必须先选原因码" in blank.text
     assert ctx.alerts_store.get(alert.id).status == NEW
 
     ok = logged.client.post(
         f"/alerts/{alert.id}/dismiss",
-        data={"csrf": logged.csrf, "reason": "假信号：还没碰到止损线"},
+        data={"csrf": logged.csrf, "code": "expected", "reason": "假信号：还没碰到止损线"},
         follow_redirects=False,
     )
     assert ok.status_code == 303
@@ -377,8 +377,9 @@ def test_dismiss_400_refills_what_was_typed(logged):
     alert = _seed(ctx, user_id=_alice(ctx).id)
 
     resp = logged.client.post(
-        f"/alerts/{alert.id}/dismiss", data={"csrf": logged.csrf, "reason": "   "}
+        f"/alerts/{alert.id}/dismiss",
+        data={"csrf": logged.csrf, "code": "other", "reason": "   "},
     )
     assert resp.status_code == 400
-    assert "驳回必须写原因" in resp.text
+    assert "other 必须写一句说明" in resp.text
     assert 'value="   "' in resp.text
