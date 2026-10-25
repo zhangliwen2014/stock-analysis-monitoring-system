@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
+from sams.core.errors import ValidationError
 from sams.core.notify import (
     CONTEXT_HEADER,
     CONTEXT_MAX_ITEMS,
@@ -115,8 +118,41 @@ def test_a_tight_budget_drops_from_the_back():
     budget = len(full.encode()) - len("· …第三条内容".encode()) + 1
     text, ids, dropped = format_annotation_context(items, budget_bytes=budget)
     assert "第三条" not in text
-    assert ids[-1] != "c" if len(ids) > 1 else "c" not in ids
-    assert dropped >= 1
+    assert ids == ("a", "b")
+    assert dropped == 1
+
+
+def test_budget_drops_keep_the_pinned_one():
+    """剪的是尾部（最新但非置顶），不是名额：置顶的旧批注不能在预算里最先出局。"""
+    pinned_old = item(
+        "pinned-old",
+        pinned=True,
+        body="置顶的那条很长很长" + "长" * 30,
+        created=datetime(2026, 10, 1, tzinfo=UTC),
+    )
+    fresh_a = item("fresh-a", body="甲", created=datetime(2026, 10, 22, tzinfo=UTC))
+    fresh_b = item("fresh-b", body="乙", created=datetime(2026, 10, 23, tzinfo=UTC))
+    full, _, _ = format_annotation_context((pinned_old, fresh_a, fresh_b))
+    budget = len(full.encode()) - len("· 10-22 14:03 我 甲".encode())
+    text, ids, dropped = format_annotation_context(
+        (pinned_old, fresh_a, fresh_b), budget_bytes=budget
+    )
+    assert ids[0] == "pinned-old"
+    assert "甲" not in text  # 出局的是尾部（次新的 fresh-a），不是置顶的那条
+    assert "乙" in text
+    assert dropped == 1
+
+
+def test_a_naive_created_at_is_refused_at_construction():
+    """naive 与 aware 混比崩在排序的 `TypeError` 上，那条告警会整块无声降级：闸立在构造。"""
+    with pytest.raises(ValidationError, match="时区"):
+        AnnotationContext(
+            annotation_id="a",
+            created_at=datetime(2026, 10, 22, 6, 3),
+            moment_label="10-22 14:03",
+            author_label="我",
+            body_text="正文",
+        )
 
 
 def test_a_budget_that_cannot_fit_the_first_item_drops_the_whole_block():
