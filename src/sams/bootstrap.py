@@ -32,7 +32,9 @@ from sams.monitor.queue import (
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
 from sams.services.analysis import AnalysisService
+from sams.services.annotation_prune import AnnotationPruner
 from sams.services.annotations import AnnotationService
+from sams.services.attachments import attachments_root
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
@@ -69,6 +71,7 @@ from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
+from sams.storage.repos.attachments import AttachmentRepo
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.channels import ChannelRepo
@@ -542,6 +545,13 @@ def _context_on(
         quotes=quotes_store,
         task_runs=task_runs,
         heartbeats=heartbeats,
+        annotations=AnnotationPruner(
+            database,
+            annotations_store,
+            AttachmentRepo(database, clock=clock),
+            root=attachments_root(cfg),
+            clock=clock,
+        ),
         clock=clock,
     )
     deps = JobDeps(

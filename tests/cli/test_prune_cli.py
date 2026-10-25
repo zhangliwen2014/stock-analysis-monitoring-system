@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -156,6 +157,42 @@ def test_prune_deletes_and_writes_one_row_per_step(config_path, capsys):
 )
 def test_zero_retention_is_a_usage_error(config_path, flag):
     """敲错开关是用法错误（退出 2），不是「这次没删东西」（退出 0）。"""
+    with pytest.raises(SystemExit) as exc:
+        cli.run(["db", "prune", flag, "0"])
+    assert exc.value.code == 2
+
+
+def add_orphan_file(config_path):
+    root = config_path.parent / "attachments" / "u1" / "2026" / "01"
+    root.mkdir(parents=True)
+    path = root / "orphan.png"
+    path.write_bytes(b"1234567")
+    old = (datetime.now(UTC) - timedelta(days=31)).timestamp()
+    os.utime(path, (old, old))
+    return path
+
+
+def test_prune_reports_and_collects_orphan_attachments(config_path, capsys):
+    assert cli.run(["db", "migrate"]) == 0
+    capsys.readouterr()
+    path = add_orphan_file(config_path)
+
+    assert cli.run(["db", "prune", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "attachments_orphan: 将删除 1 行" in out
+    assert "文件: 将删除 1 个（7 字节）" in out
+    assert path.exists()
+
+    assert cli.run(["db", "prune"]) == 0
+    out = capsys.readouterr().out
+    assert "attachments_orphan: 删除 1 行" in out
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "flag", ["--annotations-purged-days", "--attachments-orphan-days"]
+)
+def test_annotation_retention_is_a_positive_int(config_path, flag):
     with pytest.raises(SystemExit) as exc:
         cli.run(["db", "prune", flag, "0"])
     assert exc.value.code == 2

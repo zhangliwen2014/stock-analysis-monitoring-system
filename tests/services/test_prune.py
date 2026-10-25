@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, date, datetime, time, timedelta
 
 import pytest
@@ -142,3 +143,65 @@ def test_a_failing_step_rolls_back_the_earlier_deletes(db, monkeypatch):
     assert db.row_count("quotes_snapshot") == 10
     assert db.row_count("task_runs") == 3
     assert db.row_count("scheduler_heartbeats") == 5
+
+
+def test_annotation_steps_appear_only_when_they_have_something_to_do(tmp_path, db):
+    """零行不占一步：旧库没有批注时，`sams db prune` 的输出与今天一模一样。"""
+    from sams.services.annotation_prune import AnnotationPruner
+    from sams.storage.repos.annotations import AnnotationRepo
+    from sams.storage.repos.attachments import AttachmentRepo
+
+    clock = FrozenClock(NOW)
+    pruner = AnnotationPruner(
+        db,
+        AnnotationRepo(db, clock=clock),
+        AttachmentRepo(db, clock=clock),
+        root=tmp_path / "attachments",
+        clock=clock,
+    )
+    service = PruneService(
+        db,
+        quotes=QuoteRepo(db),
+        task_runs=TaskRunRepo(db, clock=clock),
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        annotations=pruner,
+        clock=clock,
+    )
+    seed_quotes(db)
+    report = service.run(quotes_sessions=5, task_runs_days=90, heartbeats_keep=2)
+    assert "annotations_purged" not in [step.name for step in report.steps]
+    assert report.files == 0
+
+
+def test_dry_run_reports_files_without_deleting_them(tmp_path, db):
+    from sams.services.annotation_prune import AnnotationPruner
+    from sams.storage.repos.annotations import AnnotationRepo
+    from sams.storage.repos.attachments import AttachmentRepo
+
+    clock = FrozenClock(NOW)
+    old = tmp_path / "attachments" / "u1" / "2026" / "01" / "orphan.png"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"12345")
+    stamp = (NOW - timedelta(days=31)).timestamp()
+    os.utime(old, (stamp, stamp))
+    pruner = AnnotationPruner(
+        db,
+        AnnotationRepo(db, clock=clock),
+        AttachmentRepo(db, clock=clock),
+        root=tmp_path / "attachments",
+        clock=clock,
+    )
+    service = PruneService(
+        db,
+        quotes=QuoteRepo(db),
+        task_runs=TaskRunRepo(db, clock=clock),
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        annotations=pruner,
+        clock=clock,
+    )
+    report = service.run(
+        quotes_sessions=5, task_runs_days=90, heartbeats_keep=2, dry_run=True
+    )
+    assert report.files == 1
+    assert report.file_bytes == 5
+    assert old.exists()

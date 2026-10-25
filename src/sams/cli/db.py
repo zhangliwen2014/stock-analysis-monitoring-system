@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 from sams.cli.common import group
+from sams.services.annotation_prune import ORPHAN_DAYS, PURGED_DAYS
 from sams.services.prune import KEEP_HEARTBEATS, KEEP_QUOTE_SESSIONS, KEEP_TASK_RUN_DAYS
 
 
@@ -52,6 +53,20 @@ def add_to(subparsers) -> None:
         metavar="N",
         help=f"调度心跳只留最近 N 条（默认 {KEEP_HEARTBEATS}）",
     )
+    parser.add_argument(
+        "--annotations-purged-days",
+        type=_positive,
+        default=PURGED_DAYS,
+        metavar="N",
+        help=f"软删满 N 天的批注硬清除（默认 {PURGED_DAYS}）",
+    )
+    parser.add_argument(
+        "--attachments-orphan-days",
+        type=_positive,
+        default=ORPHAN_DAYS,
+        metavar="N",
+        help=f"没有对应批注行的附件文件，超过 N 天未变动的回收（默认 {ORPHAN_DAYS}）",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只打印将删行数，不动库")
     parser.set_defaults(handler=prune)
 
@@ -80,10 +95,14 @@ def prune(container, args) -> int:
         quotes_sessions=args.quotes_sessions,
         task_runs_days=args.task_runs_days,
         heartbeats_keep=args.heartbeats_keep,
+        annotations_purged_days=args.annotations_purged_days,
+        attachments_orphan_days=args.attachments_orphan_days,
         dry_run=args.dry_run,
     )
     verb = "将删除" if report.dry_run else "删除"
     for step in report.steps:
         print(f"{step.name}: {verb} {step.rows} 行")
+    if report.files or report.file_bytes:
+        print(f"文件: {verb} {report.files} 个（{report.file_bytes} 字节）")
     print(f"{'预计' if report.dry_run else '合计'}: {report.total} 行")
     return 0
