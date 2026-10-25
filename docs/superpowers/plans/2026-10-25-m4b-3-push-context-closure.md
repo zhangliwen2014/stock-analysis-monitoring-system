@@ -117,7 +117,7 @@ def test_the_body_is_hard_capped_at_one_twenty_chars():
     """`plain_text` 已经把批注压到 120，格式化这一层再挡一次：provider 给的是
     `body_md` 原文也不能让一行炸开——推送里一行就是一行。"""
     line = annotation_context_line(item("a", body="字" * 200))
-    assert len(line.split(" ", 2)[2]) == 120
+    assert len(line.split(" ", 4)[4]) == 120
     assert line.endswith("…")
 
 
@@ -127,15 +127,21 @@ def test_empty_items_render_no_header():
 
 
 def test_dedupe_by_id_keeps_the_first_occurrence():
-    text, ids, _ = format_annotation_context((item("a"), item("a", body="后写的"), item("b")))
+    text, ids, dropped = format_annotation_context(
+        (item("a"), item("a", body="后写的"), item("b"))
+    )
     assert ids == ("a", "b")
     assert "渠道库存见底" in text
+    # 跨源合并会把同一条批注交两次：那不是「被剪掉」，dropped 不许把它计进审计
+    assert dropped == 0
 
 
 def test_pinned_first_then_newest():
-    old_pinned = item("pinned-old", pinned=True, when="10-01 09:00")
-    fresh = item("fresh", when="10-22 09:00")
-    old = item("plain-old", when="10-02 09:00")
+    old_pinned = item(
+        "pinned-old", pinned=True, when="10-01 09:00", created=datetime(2026, 10, 1, tzinfo=UTC)
+    )
+    fresh = item("fresh", when="10-22 09:00", created=datetime(2026, 10, 22, tzinfo=UTC))
+    old = item("plain-old", when="10-02 09:00", created=datetime(2026, 10, 2, tzinfo=UTC))
     _, ids, _ = format_annotation_context((old, fresh, old_pinned))
     assert ids == ("pinned-old", "fresh", "plain-old")
 
@@ -156,7 +162,11 @@ def test_budget_none_is_no_budget():
 
 def test_a_tight_budget_drops_from_the_back():
     """尾部是「最新但非置顶」的那几条：先剪它们，置顶的优先级才不是空话。"""
-    items = (item("a", body="第一" + "条" * 20), item("b", body="第二条内容"), item("c", body="第三条内容"))
+    items = (
+        item("a", body="第一" + "条" * 20),
+        item("b", body="第二条内容"),
+        item("c", body="第三条内容"),
+    )
     full, _, _ = format_annotation_context(items)
     budget = len(full.encode()) - len("· …第三条内容".encode()) + 1
     text, ids, dropped = format_annotation_context(items, budget_bytes=budget)
@@ -261,14 +271,17 @@ def format_annotation_context(
     *,
     budget_bytes: int | None = None,
 ) -> tuple[str, tuple[str, ...], int]:
-    """渲染上下文块，返回（文本、实际带入的 id、被预算剪掉的条数）。
+    """渲染上下文块，返回（文本、实际带入的 id、去重后没进这一块的条数）。
 
     `budget_bytes` 是「这个通道的正文还剩多少字节」：超预算从**尾部**剪（尾部是
     最新但非置顶的那几条）；连第一条都放不下就整块不发而不是截半行（§7.2）。
     预算为 `None`（`budget_bytes is None`）表示不剪——Web 详情页那种「与推送同源」
     的展示要的是完整 3 条。
+    `dropped` 按**去重后**的候选计：跨源合并（标的 + 观点）会交出同一条批注两次，
+    那不是「被剪掉」——把它计进审计，是在谎报这个通道装不下。
     """
     chosen = _select_annotation_context(items)
+    unique = len({entry.annotation_id for entry in items})
     if not chosen:
         return "", (), 0
     lines = [CONTEXT_HEADER] + [annotation_context_line(entry) for entry in chosen]
@@ -281,10 +294,10 @@ def format_annotation_context(
     kept = len(lines) - 1
     if budget_bytes is not None and len("\n".join(lines).encode()) > budget_bytes:
         # 剪到只剩「题头 + 第一条」仍放不下：题头自己也不发了
-        return "", (), len(chosen)
+        return "", (), unique
     text = "\n".join(lines)
     ids = tuple(entry.annotation_id for entry in chosen[:kept])
-    return text, ids, len(chosen) - kept
+    return text, ids, unique - kept
 ```
 
 - [ ] **Step 4: 跑测试确认通过**

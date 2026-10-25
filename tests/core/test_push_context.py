@@ -71,9 +71,13 @@ def test_empty_items_render_no_header():
 
 
 def test_dedupe_by_id_keeps_the_first_occurrence():
-    text, ids, _ = format_annotation_context((item("a"), item("a", body="后写的"), item("b")))
+    text, ids, dropped = format_annotation_context(
+        (item("a"), item("a", body="后写的"), item("b"))
+    )
     assert ids == ("a", "b")
     assert "渠道库存见底" in text
+    # 跨源合并会把同一条批注交两次：那不是「被剪掉」，dropped 不许把它计进审计
+    assert dropped == 0
 
 
 def test_pinned_first_then_newest():

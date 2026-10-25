@@ -235,14 +235,17 @@ def format_annotation_context(
     *,
     budget_bytes: int | None = None,
 ) -> tuple[str, tuple[str, ...], int]:
-    """渲染上下文块，返回（文本、实际带入的 id、被预算剪掉的条数）。
+    """渲染上下文块，返回（文本、实际带入的 id、去重后没进这一块的条数）。
 
     `budget_bytes` 是「这个通道的正文还剩多少字节」：超预算从**尾部**剪（尾部是
     最新但非置顶的那几条）；连第一条都放不下就整块不发而不是截半行（§7.2）。
     预算为 `None`（`budget_bytes is None`）表示不剪——Web 详情页那种「与推送同源」
     的展示要的是完整 3 条。
+    `dropped` 按**去重后**的候选计：跨源合并（标的 + 观点）会交出同一条批注两次，
+    那不是「被剪掉」——把它计进审计，是在谎报这个通道装不下。
     """
     chosen = _select_annotation_context(items)
+    unique = len({entry.annotation_id for entry in items})
     if not chosen:
         return "", (), 0
     lines = [CONTEXT_HEADER] + [annotation_context_line(entry) for entry in chosen]
@@ -255,10 +258,10 @@ def format_annotation_context(
     kept = len(lines) - 1
     if budget_bytes is not None and len("\n".join(lines).encode()) > budget_bytes:
         # 剪到只剩「题头 + 第一条」仍放不下：题头自己也不发了
-        return "", (), len(items)
+        return "", (), unique
     text = "\n".join(lines)
     ids = tuple(entry.annotation_id for entry in chosen[:kept])
-    return text, ids, len(items) - kept
+    return text, ids, unique - kept
 
 
 @runtime_checkable
