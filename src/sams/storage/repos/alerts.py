@@ -348,12 +348,17 @@ class AlertRepo:
         *,
         error: str = "",
         attempts: int = 1,
+        context: Mapping[str, object] | None = None,
     ) -> None:
         """一次投递尝试的结果。
 
         `channel_id=None` 只允许配 `suppressed`/`no_channel`。这条约束写在 Python 而不是
         DDL：DuckDB 的 CHECK 报错到屏幕上只剩一个约束名，而这一句要能说清
         「为什么压制没有通道」——压制的意思是「还没有选到通道就停了」。
+
+        `context` 是这一次发送实际带入的推送上下文（D126）：原样存成 JSON，
+        仓库层不校验它的形状——形状是 `router` 的装配事实，校验两份就有两个口径。
+        `None` 写 NULL：那与「上下文是空列表」是两个答案（见 `PushContext` 的分工）。
         """
         if outcome not in OUTCOMES:
             raise ValidationError(f"未知投递结果 outcome={outcome!r}：只有 {list(OUTCOMES)}")
@@ -371,8 +376,9 @@ class AlertRepo:
         if attempts < 0:
             raise ValidationError(f"attempts 不能为负（收到 {attempts}）")
         self.db.execute(
-            "INSERT INTO notify_log (id, alert_id, channel_id, ts, attempt, outcome, error)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO notify_log"
+            " (id, alert_id, channel_id, ts, attempt, outcome, error, context_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 new_id(),
                 alert_id,
@@ -381,6 +387,7 @@ class AlertRepo:
                 int(attempts),
                 outcome,
                 (error or "").strip()[:_ERROR_MAX_CHARS],
+                None if context is None else json.dumps(context, ensure_ascii=False),
             ],
         )
 
