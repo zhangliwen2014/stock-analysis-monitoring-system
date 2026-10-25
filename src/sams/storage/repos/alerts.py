@@ -13,10 +13,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.errors import StorageError, ValidationError
+from sams.core.errors import Conflict, StorageError, ValidationError
 from sams.core.notify import FAILED, NO_CHANNEL, OUTCOMES, SENT, SEVERITIES, SYSTEM_MARKET
 from sams.storage.db import Database
 from sams.storage.ids import new_id
+from sams.storage.repos.alert_events import AlertEventRepo
 
 logger = logging.getLogger("sams.storage.alerts")
 
@@ -124,6 +125,9 @@ class AlertRepo:
     def __init__(self, db: Database, *, clock: Clock = SYSTEM_CLOCK) -> None:
         self.db = db
         self.clock = clock
+        # 动作历史用同一个 `db` 与同一个时钟：状态列与历史行必须在同一个事务里落，
+        # 否则一次已读会留下「列变了、历史里没有」或反过来的那一半
+        self.events = AlertEventRepo(db, clock=clock)
 
     def create(
         self,
@@ -398,6 +402,47 @@ class AlertRepo:
             )
             for row in rows.to_dicts()
         ]
+
+    def acknowledge(self, alert_id: str, *, user_id: str) -> Alert:
+        """「看到了」。重复调用是幂等的：手机连点两下不该多出一条历史。"""
+        row = self._owned(alert_id, user_id)
+        if row.status == ACKNOWLEDGED:
+            return row
+        if row.status != NEW:
+            raise Conflict(
+                f"告警 {alert_id} 已经是 {row.status}，不能再标已读：已读只是中间态，"
+                "关上它请走处置或忽略"
+            )
+        moment = self.clock.now_utc()
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE alerts SET status = ?, acknowledged_at = ? WHERE id = ?",
+                [ACKNOWLEDGED, moment, alert_id],
+            )
+            self.events.add(
+                alert_id,
+                user_id=user_id,
+                action="ack",
+                from_status=NEW,
+                to_status=ACKNOWLEDGED,
+            )
+        return self._reload(alert_id)
+
+    def _owned(self, alert_id: str, user_id: str) -> Alert:
+        row = self.get(alert_id)
+        if row is None:
+            raise StorageError(f"告警 {alert_id} 不存在（动作必须落在一条真实告警上）")
+        if row.user_id != user_id:
+            raise StorageError(
+                f"告警 {alert_id} 不属于 {user_id}：那是发给另一个人的，"
+                "代他按下去的每一个动作都会改写他的收件箱"
+            )
+        return row
+
+    def _reload(self, alert_id: str) -> Alert:
+        row = self.get(alert_id)
+        assert row is not None  # 刚写完，同一条连接里一定读得回来
+        return row
 
     def set_status(
         self, alert_id: str, status: str, *, user_id: str, note: str = ""

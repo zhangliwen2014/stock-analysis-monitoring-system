@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from support import FrozenClock
 
-from sams.core.errors import StorageError, ValidationError
+from sams.core.errors import Conflict, StorageError, ValidationError
 from sams.core.notify import FAILED, NO_CHANNEL, SENT, SUPPRESSED
 from sams.storage.repos.alerts import (
     ACKNOWLEDGED,
@@ -564,3 +564,36 @@ def test_list_for_accepts_the_new_status(repo, seeded_user, db):
     assert [row.id for row in repo.list_for(seeded_user, status=ACKNOWLEDGED)] == [alert.id]
 
 
+
+
+def test_acknowledge_marks_it_read_without_closing_it(repo, seeded_user, clock):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    moved = repo.acknowledge(alert.id, user_id=seeded_user)
+    assert moved.status == ACKNOWLEDGED
+    assert moved.acknowledged_at == clock.moment
+    assert moved.handled_at is None
+    assert [e.action for e in repo.events.list_for(alert.id)] == ["ack"]
+
+
+def test_acknowledge_is_idempotent(repo, seeded_user, clock):
+    """手机连点两下不该留下两条「已读」事件。"""
+    alert = repo.create(seeded_user, **CREATE_KW)
+    first = repo.acknowledge(alert.id, user_id=seeded_user)
+    clock.advance(seconds=9)
+    second = repo.acknowledge(alert.id, user_id=seeded_user)
+    assert second.acknowledged_at == first.acknowledged_at
+    assert len(repo.events.list_for(alert.id)) == 1
+
+
+def test_acknowledge_refuses_a_closed_alert(repo, seeded_user):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="已挂单")
+    with pytest.raises(Conflict, match="已"):
+        repo.acknowledge(alert.id, user_id=seeded_user)
+
+
+def test_an_acknowledged_alert_still_blocks_a_second_fire(repo, seeded_user):
+    """已读不等于已处置：同票第二条规则不该因为点了一下「已读」就重新开火。"""
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.acknowledge(alert.id, user_id=seeded_user)
+    assert repo.latest_open(seeded_user, "A", "601088").id == alert.id

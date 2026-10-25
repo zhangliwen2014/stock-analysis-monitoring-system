@@ -617,7 +617,9 @@ def make_alerts(container, statuses):
             # 每条往前推一天：那一列「最早的一条」要有新旧可分
             triggered_at=datetime.now(UTC) - timedelta(days=index),
         )
-        if status != "new":
+        if status == "acknowledged":
+            container.alerts_store.acknowledge(alert.id, user_id=user.id)
+        elif status != "new":
             container.alerts_store.set_status(
                 alert.id, status, user_id=user.id, note="测试"
             )
@@ -625,10 +627,10 @@ def make_alerts(container, statuses):
     return made
 
 
-def test_unhandled_counts_only_the_ones_nobody_has_looked_at(db, settings):
-    """`new` 才是积压：handled/dismissed 已经在人的清单上销掉了，再数一遍就是虚报。"""
+def test_unhandled_counts_read_but_unfinished_alerts(db, settings):
+    """已读也算积压：点一下「已读」不说明这件事有人管了（M4-B §8.1）。"""
     container = make_container(db, settings)
-    make_alerts(container, ["new", "new", "handled", "dismissed"])
+    make_alerts(container, ["new", "acknowledged", "handled", "dismissed"])
 
     report = container.health.report()
     assert report.notify.unhandled == 2
