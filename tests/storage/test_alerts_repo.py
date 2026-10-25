@@ -893,10 +893,14 @@ def test_undo_after_five_minutes_is_refused(repo, seeded_user, clock):
         repo.undo(alert.id, user_id=seeded_user)
 
 
-def test_undo_refuses_when_a_legacy_close_is_newer_than_the_recorded_action(repo, seeded_user):
-    """新入口已读之后，旧入口 set_status 关了它：最新事件仍是那条 ack，
-    不能拿更早的 act 猜上一态。"""
+def test_undo_refuses_when_a_legacy_close_is_newer_than_the_recorded_action(
+    repo, seeded_user
+):
+    """处置过、撤销过、又已读，然后旧入口关了它：最新事件是 ack，
+    不能拿更早那条 act 的 from_status 猜上一态（旧实现会回退到 new）。"""
     alert = repo.create(seeded_user, **CREATE_KW)
+    repo.act(alert.id, user_id=seeded_user, action_kind="watch", note="先处置")
+    repo.undo(alert.id, user_id=seeded_user)
     repo.acknowledge(alert.id, user_id=seeded_user)
     repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="旧入口")
     with pytest.raises(Conflict, match="动作记录"):
