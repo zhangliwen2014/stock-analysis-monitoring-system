@@ -395,8 +395,29 @@ def test_thesis_panel_hides_visibility(logged):
         params={"target_type": "rule", "target_ref": rule.id},
     )
     assert page.status_code == 200
-    assert 'name="visibility"' not in page.text
+    # 只认 select：非 symbol 的行里有 `<input type="hidden" name="visibility">`，
+    # 断言整个 name 会把「没有选择器」和「有控件」混为一谈
+    assert '<select name="visibility">' not in page.text
     assert "仅自己" in page.text
+
+
+def test_rejected_draft_keeps_team_visibility_selected(logged):
+    """被拒草稿重渲染不能悄悄改可见范围：选了「团队可见」、因超大附件被 400 拒掉，
+    选择器还得停在 team——否则用户照着原样重提，笔记就存成私有了。"""
+    big = b"\x89PNG\r\n\x1a\n" + b"x" * (5 * 1024 * 1024 + 1)
+    resp = logged.client.post(
+        "/annotations",
+        data={
+            "csrf": logged.csrf,
+            "target_type": "symbol",
+            "target_ref": "A:600519",
+            "body_md": "给团队",
+            "visibility": "team",
+        },
+        files=[("files", ("big.png", big, "image/png"))],
+    )
+    assert resp.status_code == 400
+    assert 'value="team" selected' in resp.text
 
 
 def test_create_team_flips_badge(logged):

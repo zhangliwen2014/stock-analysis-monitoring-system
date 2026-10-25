@@ -19,8 +19,10 @@
     <div class="ann-editor-row">
       <label>可见范围
         <select name="visibility">
-          <option value="private">仅自己</option>
-          <option value="team">团队可见</option>
+          {# 被拒草稿重渲染要保住用户选的可见范围：不回填的话，选了「团队可见」、
+             被尺寸闸弹回、原样重提——笔记会悄悄存成私有。`draft` 与正文同一口径（None 时视为私有）。 #}
+          <option value="private"{% if draft and draft.get("visibility") == "private" %} selected{% endif %}>仅自己</option>
+          <option value="team"{% if draft and draft.get("visibility") == "team" %} selected{% endif %}>团队可见</option>
         </select>
       </label>
       {% if not team_sharing %}<span class="muted">团队共享当前已关闭，选「团队可见」会被退回</span>{% endif %}
