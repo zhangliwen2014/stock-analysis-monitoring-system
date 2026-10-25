@@ -32,6 +32,7 @@ from sams.monitor.queue import (
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
 from sams.services.analysis import AnalysisService
+from sams.services.annotations import AnnotationService
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
@@ -67,6 +68,7 @@ from sams.storage.crypto import Cipher, cipher_for
 from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.alerts import AlertRepo
+from sams.storage.repos.annotations import AnnotationRepo
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.channels import ChannelRepo
@@ -202,6 +204,10 @@ class ServiceContext:
     sim_ledger: SimOrderRepo
     channels_store: ChannelRepo
     alerts_store: AlertRepo
+    #: 批注仓库：`annotations` 那个名字留给服务（与 `theses_store`/`rules_store` 同一命名法）
+    annotations_store: AnnotationRepo
+    #: 批注用例：五类目标的归属校验在这里，仓库只认「这一行是不是你的」
+    annotations: AnnotationService
     #: 通道凭据的加密器：CLI 要能在不碰 `storage.services.*` 的情况下掩码
     cipher: Cipher
     #: 发送路由（spec §11）
@@ -487,6 +493,18 @@ def _context_on(
     rule_rechecker = Rechecker(
         theses=theses_store, data=rule_data, bus=event_bus, clock=clock
     )
+    annotations_store = AnnotationRepo(database, clock=clock)
+    annotations = AnnotationService(
+        annotations_store,
+        users,
+        symbols,
+        theses_store,
+        rules_store,
+        alerts_store,
+        sim_accounts,
+        sim_orders,
+        cfg,
+    )
 
     # 下面四个同步服务与 `UniverseBuilder` 原本就地造在 `return Container(...)` 的参数里。
     # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
@@ -608,6 +626,8 @@ def _context_on(
         sim_ledger=sim_orders,
         channels_store=channels_store,
         alerts_store=alerts_store,
+        annotations_store=annotations_store,
+        annotations=annotations,
         rules_store=rules_store,
         rule_data=rule_data,
         rule_engine=rule_engine,

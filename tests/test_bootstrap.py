@@ -763,3 +763,15 @@ def test_an_intraday_hit_flows_from_the_board_to_the_queue(migrated):
         assert deliveries and deliveries[0].outcome == "no_channel"  # 没配通道，落了账
     finally:
         parts.close()
+
+
+def test_container_wires_annotations(container):
+    """批注仓库与服务必须进同一条线程上下文（D113）：Web 线程不能借用别人的连接。"""
+    built, _ = container
+    user = built.users.create("writer", "correct-horse-battery")
+    made = built.annotations.create(
+        user.id, target_type="symbol", target_ref="A:600519", body_md="先看图"
+    )
+    assert built.annotations_store.get(made.id) is not None
+    rows = built.annotations.list_target(user.id, "symbol", "A:600519")
+    assert [row.id for row in rows] == [made.id]
