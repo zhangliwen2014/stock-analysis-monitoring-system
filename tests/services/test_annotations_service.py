@@ -17,6 +17,7 @@ from sams.core.errors import Conflict, NotFound, ValidationError
 from sams.services.annotations import AnnotationService, normalize_tags
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
+from sams.storage.repos.app_settings import AppSettingsRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -40,6 +41,7 @@ def world(db, settings):
     alerts = AlertRepo(db, clock=clock)
     accounts = SimAccountRepo(db)
     orders = SimOrderRepo(db, accounts, markets=settings.markets, symbols=symbols)
+    app_settings = AppSettingsRepo(db, clock=clock)
     service = AnnotationService(
         AnnotationRepo(db, clock=clock),
         users,
@@ -50,6 +52,7 @@ def world(db, settings):
         accounts,
         orders,
         settings,
+        app_settings,
     )
     return SimpleNamespace(
         clock=clock,
@@ -61,7 +64,9 @@ def world(db, settings):
         alerts=alerts,
         accounts=accounts,
         orders=orders,
+        app_settings=app_settings,
         service=service,
+        annotations=service,
     )
 
 
@@ -311,3 +316,56 @@ def test_list_recent_forwards_the_window(world):
     )
     got = world.service.list_recent(world.user.id, since=NOW + timedelta(days=1))
     assert [row.id for row in got] == [recent.id]
+
+
+# --- 团队可见写路径（B2：§4.2/D121/D127）---------------------------------------------------
+
+
+def test_team_write_needs_the_policy_on(world):
+    """D127：off 时新写 team 被拒——话要说清是谁关的开关管不着这条草稿能存。"""
+    world.app_settings.set("annotations.team_sharing", "off")
+    with pytest.raises(ValidationError, match="团队共享当前已关闭"):
+        world.annotations.create(
+            world.user.id, target_type="symbol", target_ref="A:600519",
+            body_md="共享草稿", visibility="team",
+        )
+
+
+def test_team_write_on_symbol_flips_visibility(world):
+    made = world.annotations.create(
+        world.user.id, target_type="symbol", target_ref="A:600519",
+        body_md="给团队看", visibility="team",
+    )
+    assert made.visibility == "team"
+
+
+def test_team_on_non_symbol_still_refused(world):
+    # make_thesis 返回的是 Thesis 对象，取 ref 照本文件其它 thesis 用例：.id
+    ref = make_thesis(world).id
+    with pytest.raises(ValidationError, match="只对 symbol 生效"):
+        world.annotations.create(
+            world.user.id, target_type="thesis", target_ref=ref,
+            body_md="绕过 UI 也写不进去", visibility="team",
+        )
+
+
+def test_edit_flip_to_team_refused_when_off(world):
+    made = world.annotations.create(
+        world.user.id, target_type="symbol", target_ref="A:600519", body_md="先私有"
+    )
+    world.app_settings.set("annotations.team_sharing", "off")
+    with pytest.raises(ValidationError, match="团队共享当前已关闭"):
+        world.annotations.edit(world.user.id, made.id, body_md="先私有", visibility="team")
+
+
+def test_edit_may_keep_existing_team_row_when_off(world):
+    """关策略不拦「保持原样」：§4.2 说既有 team 行只是对非作者隐藏，不是不能碰。"""
+    made = world.annotations.create(
+        world.user.id, target_type="symbol", target_ref="A:600519",
+        body_md="先共享", visibility="team",
+    )
+    world.app_settings.set("annotations.team_sharing", "off")
+    kept = world.annotations.edit(
+        world.user.id, made.id, body_md="改一个字", visibility="team"
+    )
+    assert kept.visibility == "team"

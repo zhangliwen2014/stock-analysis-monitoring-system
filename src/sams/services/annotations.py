@@ -1,7 +1,8 @@
 """批注用例（M4-B §4）：目标归属、标签、正文上限与读取可见性。
 
-B1 只开私有批注：`team` 的两列已经在 schema 里，但写入口不给它开口子——UI 没开的
-开关比一个能写进去却没人看得见的值诚实。B2 接入策略后由同一个服务放宽写入口。
+写入口已放宽到 team（B2）：闸在 `_gate_team`——策略关时**新写** team 被拒，
+保持既有 team 不变不拦（§4.2 说既有行只是对非作者隐藏，不是不能碰）；
+非 symbol 的 team 由仓库那条 `_reject_team_on_non_symbol` 拒掉（D121），这里不重复造。
 
 目标归属在这里问各自的仓库（thesis/rule/alert/order），因为仓库只认「这一行是不是
 你的」。目标不存在与不属于当前用户统一 `NotFound`：两种回答都告诉探测者同一件事。
@@ -23,10 +24,12 @@ from sams.storage.repos.annotations import (
     RULE,
     SYMBOL,
     TARGET_TYPES,
+    TEAM,
     THESIS,
     Annotation,
     AnnotationRepo,
 )
+from sams.storage.repos.app_settings import AppSettingsRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -75,6 +78,7 @@ class AnnotationService:
         accounts: SimAccountRepo,
         orders: SimOrderRepo,
         settings: Settings,
+        app_settings: AppSettingsRepo,
     ) -> None:
         self.annotations = annotations
         self.users = users
@@ -85,6 +89,8 @@ class AnnotationService:
         self.accounts = accounts
         self.orders = orders
         self.settings = settings
+        # 必填而不是默认 None：漏接线要在启动就炸，而不是第一次写 team 时才炸
+        self.app_settings = app_settings
 
     # --- 写 -----------------------------------------------------------------------------
 
@@ -96,11 +102,13 @@ class AnnotationService:
         target_ref: str,
         body_md: str,
         tags: str | Sequence[str] | None = (),
+        visibility: str = PRIVATE,
     ) -> Annotation:
         if self.users.get(user_id) is None:
             raise ValidationError(f"用户 {user_id} 不存在：批注必须有一个作者")
         ref = self._normalize_ref(target_type, target_ref)
         label = self._target_label(user_id, target_type, ref)
+        self._gate_team(visibility, target_type)
         return self.annotations.create(
             user_id,
             target_type=target_type,
@@ -108,7 +116,7 @@ class AnnotationService:
             target_label=label,
             body_md=self._body(body_md),
             tags=normalize_tags(tags),
-            visibility=PRIVATE,
+            visibility=visibility,
         )
 
     def edit(
@@ -119,16 +127,22 @@ class AnnotationService:
         body_md: str,
         tags: str | Sequence[str] | None = (),
         expected_updated_at=None,
+        visibility: str | None = None,
     ) -> Annotation:
         made = self.annotations.get(annotation_id)
         if made is None or made.user_id != user_id:
             raise NotFound(f"批注 {annotation_id} 不存在或不属于当前用户")
+        wanted = made.visibility if visibility is None else (visibility or made.visibility)
+        # 闸只管「从私有翻成团队」这一跳：关策略后保持原样的 team 行还能编辑，
+        # 否则人不改一个字都保存不了——§4.2 说的「不删、只是隐藏」就落空了
+        if wanted == TEAM and made.visibility != TEAM:
+            self._gate_team(wanted, made.target_type)
         return self.annotations.update(
             annotation_id,
             user_id=user_id,
             body_md=self._body(body_md),
             tags=normalize_tags(tags),
-            visibility=made.visibility,
+            visibility=wanted,
             expected_updated_at=expected_updated_at,
         )
 
@@ -200,6 +214,13 @@ class AnnotationService:
         return self.annotations.revisions(annotation_id)
 
     # --- 内部 ---------------------------------------------------------------------------
+
+    def _gate_team(self, visibility: str, target_type: str) -> None:
+        """策略关着就不许**新写** team（D127）；非标的 team 由仓库那同一条闸拒（D121）。"""
+        if visibility == TEAM and target_type == SYMBOL and not self.app_settings.team_sharing():
+            raise ValidationError(
+                "团队共享当前已关闭：这条只能先写成私有，开关在管理后台随时能再打开"
+            )
 
     def _readable(self, made: Annotation, viewer_id: str, team_sharing: bool) -> bool:
         if made.user_id == viewer_id:

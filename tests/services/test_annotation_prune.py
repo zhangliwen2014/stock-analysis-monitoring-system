@@ -24,6 +24,7 @@ from sams.services.annotations import AnnotationService
 from sams.services.attachments import AttachmentService
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
+from sams.storage.repos.app_settings import AppSettingsRepo
 from sams.storage.repos.attachments import AttachmentRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.rules import RuleRepo
@@ -57,6 +58,8 @@ def world(db, settings, tmp_path):
         accounts,
         SimOrderRepo(db, accounts, markets=settings.markets, symbols=symbols),
         settings,
+        # 这些用例不测策略闸：给一个默认开着的仓库把参数占上
+        AppSettingsRepo(db, clock=clock),
     )
     store = AttachmentRepo(db, clock=clock)
     service = AttachmentService(store, annotations, settings, root=tmp_path / "attachments")

@@ -103,6 +103,8 @@ def _render_panel(
                 "at": moment_label(made.created_at, tz),
                 "pinned": made.pinned,
                 "visibility": "团队" if made.visibility == "team" else "私有",
+                # 模板要按可见性本身做分支（关着时给团队行挂提示），中文名当不起判据
+                "visibility_code": made.visibility,
                 "tags": made.tags,
                 "images": thumbs,
                 "missing": max(0, min(len(atts), THUMB_LIMIT) - len(thumbs)),
@@ -123,6 +125,7 @@ def _render_panel(
         rows=rows,
         error=error,
         draft=draft or {},
+        team_sharing=sharing,
         empty_note="还没有批注。写下这只票的逻辑、风险或今天的异动，告警推送会自动带上最近 3 条。",
     )
 
@@ -200,6 +203,7 @@ def annotation_create(
     target_ref: str = Form(""),
     body_md: str = Form(""),
     tags: str = Form(""),
+    visibility: str = Form("private"),
     # `str` 那一支接的就是 httpx/浏览器不发真文件时落进来的普通字段分片
     files: list[UploadFile | str] = _files_field,
 ):
@@ -213,7 +217,7 @@ def annotation_create(
             status_code=400,
             detail="批注要挂在明确的目标上：target_type 与 target_ref 都必填",
         )
-    draft = {"body_md": body_md, "tags": tags}
+    draft = {"body_md": body_md, "tags": tags, "visibility": visibility}
 
     def fail(error: str, status_code: int):
         # 被拒也要回面板本体：htmx swap 的容器是面板，回 error.html 会把整页换掉
@@ -256,6 +260,7 @@ def annotation_create(
             target_ref=target_ref,
             body_md=body_md,
             tags=tags,
+            visibility=visibility.strip() or "private",
         )
     except DatabaseLocked:
         raise
@@ -330,6 +335,7 @@ def annotation_edit(
     body_md: str = Form(""),
     tags: str = Form(""),
     updated_at: str = Form(""),
+    visibility: str = Form(""),
 ):
     web, ctx, user, made = _load_for_write(request, annotation_id)
 
@@ -361,6 +367,7 @@ def annotation_edit(
             body_md=body_md,
             tags=tags,
             expected_updated_at=stamp,
+            visibility=visibility.strip() or None,
         )
     except DatabaseLocked:
         raise

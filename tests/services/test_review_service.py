@@ -22,6 +22,7 @@ from sams.services.ledger import LedgerService
 from sams.services.review import ReviewService
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
+from sams.storage.repos.app_settings import AppSettingsRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -110,6 +111,8 @@ def world(db, settings) -> World:
     annotations = AnnotationService(
         AnnotationRepo(db), users, SymbolRepo(db), theses, RuleRepo(db),
         alerts, accounts, orders, settings,
+        # 复盘用例不测策略闸：系统时钟的默认开关仓库把必填参数占上
+        AppSettingsRepo(db),
     )
     review = ReviewService(
         db,

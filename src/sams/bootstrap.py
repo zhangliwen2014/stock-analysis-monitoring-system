@@ -511,6 +511,9 @@ def _context_on(
     rule_rechecker = Rechecker(
         theses=theses_store, data=rule_data, bus=event_bus, clock=clock
     )
+    # 策略仓库排在批注服务之前：`AnnotationService._gate_team` 每次写 team 都要问它
+    # （D127），漏接线会在构造 AnnotationService 时直接 TypeError——比第一次被拒的批注诚实
+    app_settings = AppSettingsRepo(database, clock=clock)
     annotations_store = AnnotationRepo(database, clock=clock)
     annotations = AnnotationService(
         annotations_store,
@@ -522,6 +525,7 @@ def _context_on(
         sim_accounts,
         sim_orders,
         cfg,
+        app_settings,
     )
     attachments_store = AttachmentRepo(database, clock=clock)
     attachments = AttachmentService(
@@ -538,7 +542,6 @@ def _context_on(
         root=attachments_root(cfg),
         clock=clock,
     )
-    app_settings = AppSettingsRepo(database, clock=clock)
     annotation_context = AnnotationContextProvider(
         annotations_store, users, theses_store, app_settings, cfg
     )

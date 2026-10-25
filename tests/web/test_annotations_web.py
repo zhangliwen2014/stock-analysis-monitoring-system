@@ -363,3 +363,85 @@ def test_panel_caps_thumbnails_at_three_with_overflow_note(logged):
     assert atts[3].id not in panel.text
     assert "还有 1 张" in panel.text
     assert "附件缺失" not in panel.text  # 四张都在磁盘上：missing 不许多报
+
+
+# --- 团队可见写路径（B2：§4.2/D121/D127）---------------------------------------------------
+
+
+def test_symbol_panel_offers_visibility(logged):
+    page = logged.client.get(
+        "/api/partials/annotations",
+        params={"target_type": "symbol", "target_ref": "A:600519"},
+    )
+    assert 'name="visibility"' in page.text
+    assert "团队可见" in page.text
+
+
+def test_thesis_panel_hides_visibility(logged):
+    """非 symbol 目标：D121——不给选择器，那句「仅自己」的说明替代它。"""
+    ctx = logged.context
+    alice = _alice(ctx)
+    rule = ctx.rules_store.create(
+        alice.id,
+        kind="price.cross_below",
+        name="跌破 10 元",
+        target_type="symbol",
+        target_ref="A/601088",
+        params={"price": 10.0},
+        account_id=None,
+    )
+    page = logged.client.get(
+        "/api/partials/annotations",
+        params={"target_type": "rule", "target_ref": rule.id},
+    )
+    assert page.status_code == 200
+    assert 'name="visibility"' not in page.text
+    assert "仅自己" in page.text
+
+
+def test_create_team_flips_badge(logged):
+    resp = logged.client.post(
+        "/annotations",
+        data={
+            "csrf": logged.csrf,
+            "target_type": "symbol",
+            "target_ref": "A:600519",
+            "body_md": "给团队",
+            "visibility": "team",
+        },
+    )
+    assert resp.status_code == 200
+    assert '<span class="badge">团队</span>' in resp.text
+
+
+def test_create_team_refused_when_policy_off(logged):
+    logged.context.app_settings.set("annotations.team_sharing", "off")
+    resp = logged.client.post(
+        "/annotations",
+        data={
+            "csrf": logged.csrf,
+            "target_type": "symbol",
+            "target_ref": "A:600519",
+            "body_md": "给团队",
+            "visibility": "team",
+        },
+    )
+    assert resp.status_code == 400
+    assert "团队共享当前已关闭" in resp.text
+
+
+def test_team_row_sharing_closed_says_so(logged):
+    made = logged.context.annotations.create(
+        _alice(logged.context).id,
+        target_type="symbol",
+        target_ref="A:600519",
+        body_md="共享着",
+        visibility="team",
+    )
+    logged.context.app_settings.set("annotations.team_sharing", "off")
+    page = logged.client.get(
+        "/api/partials/annotations",
+        params={"target_type": "symbol", "target_ref": "A:600519"},
+    )
+    assert "团队共享当前已关闭" in page.text
+    assert made.id in page.text  # §4.2：作者仍可见自己那条

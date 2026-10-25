@@ -15,7 +15,19 @@
       <input name="tags" placeholder="标签，逗号分隔（≤10 个）" value="{{ draft.get("tags") or "" }}">
       <input type="file" name="files" accept="image/png,image/jpeg,image/webp" multiple>
     </div>
-    <p class="muted">可见范围：仅自己（团队共享在计划 5 开放）。</p>
+    {% if target_type == "symbol" %}
+    <div class="ann-editor-row">
+      <label>可见范围
+        <select name="visibility">
+          <option value="private">仅自己</option>
+          <option value="team">团队可见</option>
+        </select>
+      </label>
+      {% if not team_sharing %}<span class="muted">团队共享当前已关闭，选「团队可见」会被退回</span>{% endif %}
+    </div>
+    {% else %}
+    <p class="muted">可见范围：仅自己——团队共享只对标的批注生效（观点、规则、告警、成交都是个人决策数据）。</p>
+    {% endif %}
     <div class="ann-editor-row">
       <button type="button" hx-post="/annotations/preview" hx-include="closest form"
               hx-target="#{{ panel_id }}-preview" hx-swap="innerHTML">预览</button>
@@ -31,6 +43,7 @@
       <span class="muted">{{ row.at }}</span>
       {% if row.pinned %}<span class="badge">置顶</span>{% endif %}
       <span class="badge">{{ row.visibility }}</span>
+      {% if row.visibility_code == "team" and not team_sharing %}<span class="badge">团队共享当前已关闭</span>{% endif %}
       {% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
     </header>
     {# safe 的依据在 `services/markdown.py`：那份配置没有产出可执行内容的分支（D122） #}
@@ -63,6 +76,14 @@
           <input type="hidden" name="updated_at" value="{{ row.updated_at }}">
           <textarea name="body_md" rows="4">{{ row.body_md }}</textarea>
           <input name="tags" value="{{ row.tags|join(', ') }}">
+          {% if target_type == "symbol" %}
+          <select name="visibility">
+            <option value="private"{% if row.visibility_code == "private" %} selected{% endif %}>仅自己</option>
+            <option value="team"{% if row.visibility_code == "team" %} selected{% endif %}>团队可见</option>
+          </select>
+          {% else %}
+          <input type="hidden" name="visibility" value="{{ row.visibility_code }}">
+          {% endif %}
           <button type="submit">保存</button>
         </form>
       </details>
