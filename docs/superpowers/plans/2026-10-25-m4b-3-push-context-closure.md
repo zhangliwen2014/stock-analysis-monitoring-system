@@ -179,14 +179,6 @@ def test_a_negative_budget_drops_everything_too():
     assert text == "" and ids == () and dropped == 1
 ```
 
-注意：上面 `test_pinned_first_then_newest` 里那行三元是我故意留的错写法吗——不是，**修正**：把那行改为
-
-```python
-    _, ids, _ = format_annotation_context((old, fresh, old_pinned))
-```
-
-（写完测试后自查这一行，别把 `(old, pinned=...)` 这种病句带进库里。）
-
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `uv run pytest tests/core/test_push_context.py -q`
@@ -273,14 +265,18 @@ def format_annotation_context(
 
     `budget_bytes` 是「这个通道的正文还剩多少字节」：超预算从**尾部**剪（尾部是
     最新但非置顶的那几条）；连第一条都放不下就整块不发而不是截半行（§7.2）。
-    预算None（`budget_bytes is None`）表示不剪——Web 详情页那种「与推送同源」
+    预算为 `None`（`budget_bytes is None`）表示不剪——Web 详情页那种「与推送同源」
     的展示要的是完整 3 条。
     """
     chosen = _select_annotation_context(items)
     if not chosen:
         return "", (), 0
     lines = [CONTEXT_HEADER] + [annotation_context_line(entry) for entry in chosen]
-    while len(lines) > 2 and budget_bytes is not None and len("\n".join(lines).encode()) > budget_bytes:
+    while (
+        len(lines) > 2
+        and budget_bytes is not None
+        and len("\n".join(lines).encode()) > budget_bytes
+    ):
         lines.pop()
     kept = len(lines) - 1
     if budget_bytes is not None and len("\n".join(lines).encode()) > budget_bytes:
@@ -407,7 +403,9 @@ def test_cjk_in_the_context_is_written_not_escaped(repo, user_id, db) -> None:
 def test_each_channel_row_carries_its_own_context(repo, user_id, db) -> None:
     """每个通道的投递行各记一份（§7.2）：同一批批注在不同通道可能被剪成不同样子。"""
     alert = _alert(repo, user_id)
-    repo.record(alert.id, "chan-1", "sent", context={"ids": ["a"], "dropped": 0, "rendered_chars": 5})
+    repo.record(
+        alert.id, "chan-1", "sent", context={"ids": ["a"], "dropped": 0, "rendered_chars": 5}
+    )
     repo.record(alert.id, "chan-2", "sent", context={"ids": [], "dropped": 1, "rendered_chars": 0})
     first, second = _context_column(db, alert.id)
     assert json.loads(first)["ids"] == ["a"]
@@ -940,7 +938,11 @@ class AnnotationContextProvider:
             )
         )
         # thesis 只有「接收人读得到这条 thesis」才展开：别人的 thesis 连存在都不说（D121）
-        if alert.thesis_id is not None and self.theses.get(alert.user_id, alert.thesis_id) is not None:
+        readable_thesis = (
+            alert.thesis_id is not None
+            and self.theses.get(alert.user_id, alert.thesis_id) is not None
+        )
+        if readable_thesis:
             candidates += list(
                 self.annotations.list_visible(
                     alert.user_id,
@@ -1143,8 +1145,11 @@ def test_the_link_survives_when_the_annotations_do_not_fit(world, db):
         context_provider=lambda a: PushContext(items=(long_a, long_b), link="http://lan/x"),
     )
     logged = _context_rows(world, db, alert.id)
-    assert logged["dingtalk"]["dropped"] == 0 or logged["dingtalk"]["ids"]  # 至少剪或全带，不能凭空消失
-    assert logged["dingtalk"]["ids"]
+    # 两条各 100 字加题头仍在钉钉的 18000 字节以内：这一枚钉的是「剪剩的 id 都要落列」，
+    # dropped 那一路由 `test_a_full_body_drops_the_whole_block_and_says_so` 负责
+    assert logged["dingtalk"]["dropped"] == 0
+    assert logged["dingtalk"]["ids"] == ["a1", "b2"]
+    assert world.made["dingtalk"].sent[-1].body.endswith("详情：http://lan/x")
 ```
 
 文件顶部 import 需补 `json`（`from __future__ import annotations` 之后）。
