@@ -34,7 +34,7 @@ from sams.services.accounts import AccountService
 from sams.services.analysis import AnalysisService
 from sams.services.annotation_prune import AnnotationPruner
 from sams.services.annotations import AnnotationService
-from sams.services.attachments import attachments_root
+from sams.services.attachments import AttachmentService, attachments_root
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
@@ -211,6 +211,12 @@ class ServiceContext:
     annotations_store: AnnotationRepo
     #: 批注用例：五类目标的归属校验在这里，仓库只认「这一行是不是你的」
     annotations: AnnotationService
+    #: 附件仓库：`attachments` 那个名字留给服务
+    attachments_store: AttachmentRepo
+    #: 附件用例：重编码与配额在这里，仓库只管行
+    attachments: AttachmentService
+    #: 批注回收：`sams serve` 的每日 prune 与 CLI 走同一个实例
+    annotation_pruner: AnnotationPruner
     #: 通道凭据的加密器：CLI 要能在不碰 `storage.services.*` 的情况下掩码
     cipher: Cipher
     #: 发送路由（spec §11）
@@ -508,6 +514,21 @@ def _context_on(
         sim_orders,
         cfg,
     )
+    attachments_store = AttachmentRepo(database, clock=clock)
+    attachments = AttachmentService(
+        attachments_store,
+        annotations,
+        cfg,
+        root=attachments_root(cfg),
+        clock=clock,
+    )
+    annotation_pruner = AnnotationPruner(
+        database,
+        annotations_store,
+        attachments_store,
+        root=attachments_root(cfg),
+        clock=clock,
+    )
 
     # 下面四个同步服务与 `UniverseBuilder` 原本就地造在 `return Container(...)` 的参数里。
     # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
@@ -545,13 +566,7 @@ def _context_on(
         quotes=quotes_store,
         task_runs=task_runs,
         heartbeats=heartbeats,
-        annotations=AnnotationPruner(
-            database,
-            annotations_store,
-            AttachmentRepo(database, clock=clock),
-            root=attachments_root(cfg),
-            clock=clock,
-        ),
+        annotations=annotation_pruner,
         clock=clock,
     )
     deps = JobDeps(
@@ -638,6 +653,9 @@ def _context_on(
         alerts_store=alerts_store,
         annotations_store=annotations_store,
         annotations=annotations,
+        attachments_store=attachments_store,
+        attachments=attachments,
+        annotation_pruner=annotation_pruner,
         rules_store=rules_store,
         rule_data=rule_data,
         rule_engine=rule_engine,
@@ -912,6 +930,7 @@ def build_serve(
             quotes=maintenance_ctx.quotes_store,
             task_runs=maintenance_ctx.task_runs,
             heartbeats=maintenance_ctx.heartbeats,
+            annotations=maintenance_ctx.annotation_pruner,
             clock=core.clock,
         )
         worker = NotifyWorker(notify_ctx.notify, core.alerts_queue)

@@ -775,3 +775,25 @@ def test_container_wires_annotations(container):
     assert built.annotations_store.get(made.id) is not None
     rows = built.annotations.list_target(user.id, "symbol", "A:600519")
     assert [row.id for row in rows] == [made.id]
+
+
+def test_container_wires_attachments_and_the_pruner(container):
+    """附件根与库同目录：备份时复制两样东西就够，不需要再记第二个位置。"""
+    from io import BytesIO
+    from pathlib import Path
+
+    from PIL import Image
+
+    built, _ = container
+    user = built.users.create("writer", "correct-horse-battery")
+    note = built.annotations.create(
+        user.id, target_type="symbol", target_ref="A:600519", body_md="先看图"
+    )
+    buffer = BytesIO()
+    Image.new("RGBA", (8, 8), (1, 2, 3, 4)).save(buffer, format="PNG")
+    row = built.attachments.add(user.id, note.id, filename="x.png", data=buffer.getvalue())
+    root = Path(built.settings.db_path).parent / "attachments"
+    assert (root / row.storage_path).is_file()
+    assert built.attachments.resolve(user.id, note.id, row.id).id == row.id
+    assert built.attachments_store.get(row.id) is not None
+    assert built.prune.annotations is built.annotation_pruner
