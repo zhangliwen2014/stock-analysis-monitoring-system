@@ -40,7 +40,7 @@ from sams.services.health import HealthService
 from sams.services.intraday import IntradayMonitor
 from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
-from sams.services.prune import PruneService
+from sams.services.prune import PruneReport, PruneService
 from sams.services.quotes import QuoteBoard, QuoteService
 from sams.services.rules.cache import SnapshotCache
 from sams.services.rules.derive import RuleDeriver
@@ -780,6 +780,34 @@ class FreshScheduleProbe:
             database.close()
 
 
+class FreshPruneRunner:
+    """手动清理自带一条连接：它跑在 `sams-prune-manual` 上，不借维护线程那条（D113）。
+
+    `Database._tx_depth` 只是一个没有锁的重入计数：03:30 那一拍与手动这一下共用同一条
+    连接时，先结束的那边会把另一边正在写的事务一起 COMMIT，半套删除就此被报成一次
+    完整的清理——而唯一会露出这件事的 `last_prune_error` 那里一个字都不会写。
+    一次调用一条连接，用完就关：这个按钮是偶发的，握着库文件等下一次没有意义，
+    而漏关那一条在 Windows 上还挡住删除与改名。
+    """
+
+    def __init__(self, settings: Settings, *, clock: Clock = SYSTEM_CLOCK) -> None:
+        self.settings = settings
+        self.clock = clock
+
+    def run(self, *, dry_run: bool = False) -> PruneReport:
+        database = Database.open(self.settings.db_path)
+        try:
+            return PruneService(
+                database,
+                quotes=QuoteRepo(database),
+                task_runs=TaskRunRepo(database, clock=self.clock),
+                heartbeats=HeartbeatRepo(database, clock=self.clock),
+                clock=self.clock,
+            ).run(dry_run=dry_run)
+        finally:
+            database.close()
+
+
 @dataclass
 class ServeParts:
     """`sams serve` 的四条线程上下文与那一个 `Runtime`。
@@ -866,6 +894,8 @@ def build_serve(
             ),
             monitor=intraday_ctx.intraday,
             prune=prune,
+            # 手动那一下用的是自己那条连接：上面那个 `prune` 属于维护线程（D113）
+            manual_prune=FreshPruneRunner(cfg, clock=core.clock),
             worker=worker,
             board=core.board,
             database=FreshDbProbe(cfg),

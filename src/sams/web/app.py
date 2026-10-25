@@ -67,6 +67,10 @@ class WebState:
     #: 而且一次跑三趟带退避、就压在这条线程池线程上。窗口比测试告警短，因为排障时
     #: 人要连着试几条（改完 url 立刻探一下），而连点照旧要挡
     probes: RateCard
+    #: /admin/sources/probe 的每用户 60 秒一张卡：这个探针打的是真采集（一个源、一整段
+    #: 日线），而且同步跑在页面那条池线程上。少了这张卡，连点就是每次都真发一趟请求，
+    #: 而那条页面请求要等它跑完才返回——三个标签页就能把池线程按死在别人的排障上
+    admin_source_probes: RateCard
 
     def render(self, request: Request, name: str, *, status_code: int = 200, **ctx):
         from sams.web.auth import csrf_value
@@ -118,6 +122,7 @@ def create_app(
         ),
         test_alerts=RateCard(300),
         probes=RateCard(30),
+        admin_source_probes=RateCard(60),
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 

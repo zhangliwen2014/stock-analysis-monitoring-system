@@ -40,10 +40,21 @@ class _DbProbe(Protocol):
     def scalar(self, sql: str) -> Any: ...
 
 
+class _PruneRun(Protocol):
+    """清理的形状：维护线程那台 `PruneService` 与手动那条自带连接的 runner 都长这样。"""
+
+    def run(self, *, dry_run: bool = False) -> PruneReport: ...
+
+
 class _Worker(Protocol):
     """通知线程的形状（结构化）：`NotifyWorker` 与测试替身各长各的。"""
 
     def run(self, *, stop: threading.Event) -> None: ...
+
+
+#: 没接手动清理时念的那一句。这里不退回 `self.prune`：那一条连的是维护线程自己的
+#: 连接，借它写库是 D113 要挡的事故，而那句话屏幕上读得出「这个装配还差一根线」
+NO_MANUAL_PRUNE = "这个运行时没有接手动清理的连接"
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -59,6 +70,7 @@ class Runtime:
         schedule_reading: Callable[[], ScheduleData],
         monitor: IntradayMonitor,
         prune: PruneService,
+        manual_prune: _PruneRun | None = None,
         worker: _Worker | None = None,
         board: QuoteBoard | None = None,
         database: _DbProbe | None = None,
@@ -72,7 +84,12 @@ class Runtime:
         #: 所以读法由组装根注入——生产传一条每次新开连接的探针，测试传个 lambda。
         self.schedule_reading = schedule_reading
         self.monitor = monitor
+        # 维护那一拍用的清理服务：它的连接属于 `sams-maintenance` 那条线程
         self.prune = prune
+        #: 手动那一下用的清理，得自带一条连接：借 `self.prune` 那条就是两条线程共用
+        #: 一个 `Database`，而它的 `_tx_depth` 没有计数锁——03:30 那一拍与手动这一下
+        #: 撞上时，先结束的那边会把另一边正在写的事务一起 COMMIT，半套删除被报成完整的
+        self.manual_prune = manual_prune
         #: 通知线程的消费者：不传就没有第四条线程（CLI 与只跑三条的测试照旧）
         self.worker = worker
         self.board = board
@@ -88,7 +105,8 @@ class Runtime:
         #: 手动清理那条线程：不进 `_threads`（那里装的是 `start()` 起一次的服务线程，
         #: 别处按四条断言），但 `stop()` 照样要 join 它——理由写在 `stop()` 的文档里
         self._prune_thread: threading.Thread | None = None
-        #: 手动清理的结果三件套：HTTP 线程只读属性，不碰库（D113）
+        #: 手动清理的结果三件套：只给健康页看的尽力而为状态——写的是那条清理线程、
+        #: 读的是 HTTP 线程，两边都不等对方，所以屏幕上随时可能是上一轮的旧值
         self.last_prune: str | None = None
         self.last_prune_at: datetime | None = None
         self.last_prune_error: str | None = None
@@ -181,7 +199,11 @@ class Runtime:
         return today if today > now else today + timedelta(days=1)
 
     def run_maintenance(self, *, dry_run: bool = False) -> PruneReport:
-        report = self.prune.run(dry_run=dry_run)
+        return self._run_prune(self.prune, dry_run=dry_run)
+
+    def _run_prune(self, service, *, dry_run: bool) -> PruneReport:
+        """两条线程跑的是同一套保留策略，日志也就得是同一句。"""
+        report = service.run(dry_run=dry_run)
         logger.info(
             "每日清理%s：%s，合计 %d 行",
             "（预演）" if dry_run else "",
@@ -196,6 +218,10 @@ class Runtime:
         DuckDB 单写：清理线程与调度线程抢库锁会互相等，把「正在跑」挡在入口
         比让两条线程在锁上排队好。
         """
+        if self.stop_event.is_set():
+            # 收尾已经走到 join 那一段之后：这时起的线程没人等，`stop()` 返回后
+            # 调用方会去关库，而它可能正握着那条连接写。宁可这一按不跑
+            return False
         with self._prune_lock:
             if self._prune_running:
                 return False
@@ -205,20 +231,37 @@ class Runtime:
             )
             # 句柄在起线程之前就存下：`stop()` 可能在这条线程刚起、还没写属性时来 join
             self._prune_thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            # 起不动时（系统线程见底）这条线程永远不会跑，也就没人归还忙标志：此后
+            # 每次手动清理都答「正在跑」，而其实一条线程都不存在。异常照原样冒出去——
+            # 那是这台机器的资源问题，不该被页面上那句「正在跑」抹平
+            with self._prune_lock:
+                self._prune_running = False
+                if self._prune_thread is thread:
+                    self._prune_thread = None
+            raise
         return True
 
     def _prune_once(self) -> None:
         try:
-            report = self.run_maintenance()
+            if self.manual_prune is None:
+                raise SamsError(NO_MANUAL_PRUNE)
+            report = self._run_prune(self.manual_prune, dry_run=False)
             self.last_prune = f"{len(report.steps)} 步、合计 {report.total} 行"
             self.last_prune_error = None
         except Exception as exc:  # 失败要留在页面上，不是炸掉后台线程
+            # 失败这一次不许留着上一轮的摘要：健康页把那句与这一轮的时间戳并排印，
+            # 读出来就成了「上一次真删了 3 行」，而这一次的删除可能只做了一半
+            self.last_prune = None
             self.last_prune_error = str(exc)
         finally:
-            self.last_prune_at = self.clock.now_utc()
+            # 先还忙标志再写时间戳：等 `last_prune_at` 的读者（测试与页面）看到值时，
+            # 入口必须已经能收下一按；反过来时那一按会被「正在跑」挡在门外
             with self._prune_lock:
                 self._prune_running = False
+            self.last_prune_at = self.clock.now_utc()
 
     def healthz(self) -> dict[str, Any]:
         now = self.clock.now_utc()

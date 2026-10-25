@@ -3,6 +3,8 @@
 {% block content %}
 <h1>健康</h1>
 {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+{# 系统按钮跳回来时的那句话：值由 `pages/admin.py` 里那张白名单折出来，query 原文一个字都不上屏 #}
+{% if notice %}<p class="flash-{{ notice_kind }}">{{ notice }}</p>{% endif %}
 
 {# 这一屏没有一张 `<img>`：所有读数都是文本（T-4），留一份截图等于留一份会外泄的资产。
    时刻全部在 `pages/admin.py` 里折到 display_tz 才到这里，模板不碰 datetime。 #}

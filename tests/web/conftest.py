@@ -88,18 +88,26 @@ def stub_sources():
 def make_web_app(migrated, stub_sources):
     made: list[tuple] = []
 
-    def make():
-        core = build_core(migrated, adapters=stub_sources)
+    def make_app(clock=None):
+        core = build_core(migrated, adapters=stub_sources, clock=clock)
         providers = {market: StubCalendar(market) for market in core.settings.markets}
         contexts = ThreadContexts(core, providers=providers)
         app = create_app(FakeRuntime(), core=core, contexts=contexts)
         made.append((core, contexts))
         return SimpleNamespace(app=app, core=core, contexts=contexts)
 
-    yield make
+    yield make_app
     for core, contexts in made:
         contexts.close_all()
         core.close()
+
+
+@pytest.fixture
+def make_app(make_web_app):
+    """`make_web_app` 那个工厂的别名，只多了 `clock=`：要按注入的时钟装一台 app 的用例
+    才证得出「今天」读的是时钟而不是 `date.today()`（两者在同一个进程里差一天是常态）。
+    """
+    return make_web_app
 
 
 @pytest.fixture

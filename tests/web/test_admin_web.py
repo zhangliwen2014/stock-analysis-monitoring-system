@@ -1,17 +1,24 @@
 """管理页：非 admin 挡在 403，按钮真的落到仓库、请求队列与运行时。
 
-这一层被钉住的三件事：屏幕上既没有 UUID 也没有 ISO 原文（人名按显示名退回登录名，
+这一层被钉住的几件事：屏幕上既没有 UUID 也没有 ISO 原文（人名按显示名退回登录名，
 时刻折到 display_tz 才上屏）；「带的是要变成什么」那种隐藏 input 读的是值而不是
-键在不在（`forms.checked()` 只看键，隐藏 input 永远在，于是降权按下不变）；
-一切仓库调用在端点体内走 `web.contexts.current()`（D113）。
+键在不在（`forms.checked()` 只看键，隐藏 input 永远在，于是降权按下不变）；一切仓库
+调用在端点体内走 `web.contexts.current()`（D113）；每一个 admin 入口都有 403（少一个
+就是那一格谁都能按）；跳转带回来的那句话要真的渲染在目标页上——只看 `Location` 时，
+一句没实现的反馈也是绿的。
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
+import pytest
+from fastapi.testclient import TestClient
+from support import FrozenClock
+
+from sams.services.sources import ProbeResult, SourceAdminService
 from sams.storage.repos.data_sources import SourceRow
 from sams.web.display import moment_label
 
@@ -32,8 +39,30 @@ def _make_bob(ctx):
     return ctx.users.create("bob", "another-correct-horse")
 
 
-def _post(client, path: str, csrf: str, **data):
-    return client.post(path, data={"csrf": csrf, **data}, follow_redirects=False)
+def _post(client, path: str, csrf: str, *, follow: bool = False, **data):
+    return client.post(path, data={"csrf": csrf, **data}, follow_redirects=follow)
+
+
+def _record_probes(monkeypatch) -> list:
+    """把 `SourceAdminService.probe` 换成只记账的假实现：探针打的是真网络。
+
+    钉的是页面那一侧（默认区间、速率卡），真采集那一趟由 services 层的用例管。
+    """
+    calls: list[tuple] = []
+
+    def fake(self, name, market, code, start, end):
+        calls.append((name, market, code, start, end))
+        return ProbeResult(name=name, market=market, code=code, ok=True, rows=3)
+
+    monkeypatch.setattr(SourceAdminService, "probe", fake)
+    return calls
+
+
+def _admin_app(make_app, clock=None):
+    """自己装一台 app：默认的 `logged` 用的是系统时钟，那证不出「读的是注入的时钟」。"""
+    web = make_app(clock=clock)
+    web.contexts.current().users.create("alice", "correct-horse-battery", is_admin=True)
+    return web
 
 
 def test_admin_home_points_at_the_users_page(logged):
@@ -42,16 +71,49 @@ def test_admin_home_points_at_the_users_page(logged):
     assert home.headers["location"] == "/admin/users"
 
 
-def test_admin_pages_refuse_non_admin(web_app):
-    ctx = web_app.context
-    _make_bob(ctx)
-    csrf = _login(web_app.client, "bob", "another-correct-horse")
+#: 每一个 admin 入口都要被角色那道闸挡住。只测其中一个（从前是 `/admin/prune` 一个）
+#: 等于其余的没有闸：删掉 `create_user`/`set_admin`/`reset_password` 里的 `require_admin`
+#: 时，任何一个普通登录用户都能建号、把别人降权、替别人改密码，而测试全绿。
+@pytest.mark.parametrize(
+    ("method", "path", "data"),
+    [
+        ("GET", "/admin", {}),
+        ("GET", "/admin/users", {}),
+        ("GET", "/admin/sources", {}),
+        ("GET", "/admin/channels", {}),
+        ("GET", "/admin/health", {}),
+        (
+            "POST",
+            "/admin/users/create",
+            {"username": "eve", "password": "a-long-enough-passphrase"},
+        ),
+        ("POST", "/admin/users/{uid}/disable", {}),
+        ("POST", "/admin/users/{uid}/enable", {}),
+        ("POST", "/admin/users/{uid}/set_admin", {"is_admin": "1"}),
+        ("POST", "/admin/users/{uid}/reset_password", {"password": "reset-to-this-one-ok"}),
+        ("POST", "/admin/sources/set_enabled", {"name": "akshare", "enabled": "0"}),
+        ("POST", "/admin/sources/probe", {"name": "akshare", "market": "A", "code": "600519"}),
+        ("POST", "/admin/sync", {"market": "A"}),
+        ("POST", "/admin/prune", {"confirm": "yes"}),
+    ],
+)
+def test_every_admin_route_refuses_a_non_admin(web_app, method, path, data):
+    """带着真 CSRF 按下去也是 403：挡人的是角色那道闸，不是 CSRF 那道。
 
-    for path in ("/admin", "/admin/users", "/admin/sources", "/admin/channels", "/admin/health"):
-        assert web_app.client.get(path).status_code == 403, path
-    # 带着真 CSRF 按下去也是 403：挡人的是角色那道闸，不是 CSRF 那道
-    denied = _post(web_app.client, "/admin/prune", csrf, confirm="yes")
-    assert denied.status_code == 403
+    `{uid}` 用的是 bob 自己的 id：403 必须落在 404 之前，所以「目标存不存在」根本
+    不该被读到——读到了就说明那道闸排在后面。
+    """
+    ctx = web_app.context
+    bob = _make_bob(ctx)
+    csrf = _login(web_app.client, "bob", "another-correct-horse")
+    target = path.format(uid=bob.id)
+
+    if method == "GET":
+        response = web_app.client.get(target)
+    else:
+        response = _post(web_app.client, target, csrf, **data)
+
+    assert response.status_code == 403, target
 
 
 def test_users_page_create_duplicate_and_self_guard(logged):
@@ -233,6 +295,42 @@ def test_a_second_prune_is_refused_and_audited_as_a_denial(logged, caplog):
     assert "deny admin.prune" in caplog.text
 
 
+#: 按钮跳回健康页时带的那几个参数 → 页面上该读到的那半句话（白名单在 `admin.py`）
+@pytest.mark.parametrize(
+    ("path", "data", "needle"),
+    [
+        ("/admin/sync", {"market": "A"}, "已排进队列"),
+        ("/admin/prune", {}, "这次没有动手"),
+        ("/admin/prune", {"confirm": "yes"}, "已接受"),
+    ],
+)
+def test_a_button_leaves_its_sentence_on_the_page_it_redirects_to(logged, path, data, needle):
+    """跟进那一次跳转，不是只看 `Location`：只断言那个头的话，那句话没实现也能全绿。
+
+    确认闸的全部意义就是把人停在确认那一屏——「这次没有动手」不上屏时，勾了框按下
+    与没勾按下是同一张屏；而「已接受」落到的那一屏下面还写着「还没跑过」，因为
+    `request_prune` 在线程写读数之前就返回了。
+    """
+    response = _post(logged.client, path, logged.csrf, follow=True, **data)
+    assert response.status_code == 200, response.text
+    assert needle in response.text
+
+
+def test_a_denied_prune_says_busy_on_the_page(logged):
+    logged.runtime.request_prune = lambda: False
+    response = _post(logged.client, "/admin/prune", logged.csrf, follow=True, confirm="yes")
+    assert "已经有一次在跑" in response.text
+    assert "已接受" not in response.text, "被拒的那一次不许看起来像排上了"
+
+
+def test_an_unknown_feedback_value_is_never_put_on_the_page(logged):
+    """query 里只认白名单那四个值：把原文印上屏幕等于往 admin 页塞一个自由文本框。"""
+    page = logged.client.get("/admin/health?prune=not-a-value&sync=whatever")
+    assert page.status_code == 200
+    assert "not-a-value" not in page.text
+    assert "whatever" not in page.text
+
+
 def test_the_prune_summary_and_its_moment_come_from_the_runtime(logged):
     """时刻在 Python 里折（`moment_label`）：模板里 `.astimezone().strftime()` 会印成 UTC。"""
     _post(logged.client, "/admin/prune", logged.csrf, confirm="yes")
@@ -354,6 +452,13 @@ def test_probe_reports_the_errors_it_already_has_words_for(logged):
     assert missing.status_code == 400
     assert "nope" in missing.text
 
+
+def test_a_malformed_probe_range_stays_on_the_page(logged):
+    """那半个日期读不出来要在页面上说 400。
+
+    分成两个用例是因为源探针那张每用户 60 秒的卡：同一台 app 里连着按两次第二次只会
+    拿到 429，这里要问的是日期怎么被拒，不是那张卡放行了几次。
+    """
     bad_date = _post(
         logged.client,
         "/admin/sources/probe",
@@ -364,3 +469,107 @@ def test_probe_reports_the_errors_it_already_has_words_for(logged):
         start="去年今日",
     )
     assert bad_date.status_code == 400
+
+
+def test_the_probe_default_window_follows_the_injected_clock(make_app, monkeypatch):
+    """区间空着时那个默认值取自注入的时钟，不是 `date.today()`（同 `pages/symbol.py`）。
+
+    用 `date.today()` 时那一行「最近 5 天」说的是这台机器的本地日历：本地比 UTC 快的
+    时区里凌晨那几个小时两者差一天，照着屏幕上那句去复现就会多要或少要一天。
+    冻在**将来**是必须的：`auth._active_ok` 拿心跳与真时钟比，回到过去就算人人闲置过期。
+    """
+    frozen = datetime.now(UTC) + timedelta(days=400)
+    web = _admin_app(make_app, clock=FrozenClock(frozen))
+    calls = _record_probes(monkeypatch)
+
+    with TestClient(web.app) as client:
+        csrf = _login(client, "alice", "correct-horse-battery")
+        response = _post(
+            client, "/admin/sources/probe", csrf, name="akshare", market="A", code="600519"
+        )
+
+    assert response.status_code == 200, response.text
+    assert calls == [
+        ("akshare", "A", "600519", (frozen - timedelta(days=5)).date(), frozen.date())
+    ]
+
+
+def test_the_source_probe_gets_one_card_per_user(logged, monkeypatch):
+    """源探针在页面那条线程上打真网络，所以每用户一张卡（60 秒）。
+
+    少了那张卡，连点就是每一次都在池线程上跑一趟真实的日线采集，而这条请求要等它跑完
+    才返回：三个标签页就能把这台机器的池线程按死。通道探针上一任务拿到了卡，源探针是
+    漏掉的另一半——两边都是一次真网络调用，只有这一边还兼着整段采集。
+    """
+    calls = _record_probes(monkeypatch)
+    form = {"name": "akshare", "market": "A", "code": "600519"}
+
+    first = _post(logged.client, "/admin/sources/probe", logged.csrf, **form)
+    assert first.status_code == 200
+    second = _post(logged.client, "/admin/sources/probe", logged.csrf, **form)
+    assert second.status_code == 429
+    assert "60 秒" in second.text
+    assert len(calls) == 1, "被速率卡挡下的那一次不许已经打过网络"
+
+
+def test_channels_page_hides_the_webhook_key_inside_an_error(logged):
+    """`last_error` 不是掩码配置，是抄进来的一句话——里面可能带着能发消息的密钥。
+
+    notifiers 把网络异常原样写进那一列（`wecom.py` 的 `f"{type(exc).__name__}: {exc}"`），
+    而 httpx 那句话里带着整条 URL，`key=` 后面那串就是凭据。这一屏是跨用户总览，
+    于是它把别人那条通道的密钥印给了每一个 admin。隐去之后失败原因要留下：
+    那一格的用处是「为什么没发出去」。
+    """
+    ctx = logged.context
+    bob = _make_bob(ctx)
+    channel = ctx.notify.add(bob.id, "wecom", "群", {"url": "https://example.invalid/hook"})
+    ctx.channels_store.mark_error(
+        channel.id,
+        error=(
+            "ConnectError: client error 'https://qyapi.invalid/send?key=secret123' "
+            + "重发三次都失败 " * 40
+        ),
+    )
+
+    page = logged.client.get("/admin/channels")
+    assert "secret123" not in page.text, "密钥查询参数不能整段抄上屏幕"
+    assert "ConnectError" in page.text, "隐去密钥不许把失败原因一起抹掉"
+    assert "key=" in page.text, "要看得出隐去的是哪一个键"
+    assert "重发三次都失败 " * 40 not in page.text, "那一行是给人读的，不是日志全文"
+    assert "…" in page.text, "截断要留记号：悄悄少掉的那一段会被读成完整的错误"
+
+
+def test_channels_page_dates_the_last_error(logged):
+    """「最近错误」要有日期：没有它，管理员会拿三个月前那一次去判断今天的通知坏了。
+
+    折法与这一屏其余时刻一致：在 Python 里 `moment_label` 到 display_tz，模板不碰 datetime。
+    """
+    ctx = logged.context
+    bob = _make_bob(ctx)
+    channel = ctx.notify.add(bob.id, "wecom", "群", {"url": "https://example.invalid/hook"})
+    ctx.channels_store.mark_error(channel.id, error="超时")
+
+    shown = ctx.channels_store.show(channel.id, user_id=bob.id)
+    page = logged.client.get("/admin/channels")
+    assert "超时" in page.text
+    assert moment_label(shown.last_error_at, ctx.settings.server.display_tz) in page.text
+
+
+def test_disabling_the_last_daily_source_reaches_the_page_as_400(logged):
+    """「别让一个市场没有能取日线的源」那道闸要能从页面走到（spec 计划里的那一条）。
+
+    闸本身在 `services/sources.py`，这里钉的是 web 的翻译：那句 `ValidationError` 变成
+    一个 400 并留在屏幕上。把它当 500 抛出去，管理员读到的是「页面坏了」而不是
+    「我按掉的是这个市场最后一个能取日线的源」。
+    """
+    ctx = logged.context
+    # 先把 A 市其余能取日线的源停掉：仓库那一层不判「会不会让市场失明」，所以绕得开
+    for name in ("akshare", "eastmoney", "tencent"):
+        ctx.data_sources.set_enabled(name, False)
+
+    response = _post(
+        logged.client, "/admin/sources/set_enabled", logged.csrf, name="sina", enabled="0"
+    )
+    assert response.status_code == 400
+    assert "sina" in response.text
+    assert ctx.data_sources.get("sina").enabled is True, "被拒的一次不许留下半个写入"

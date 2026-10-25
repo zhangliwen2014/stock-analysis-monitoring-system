@@ -14,10 +14,15 @@ M4-A 的管理员页是「运维的那一半」：账号生命周期、源启用
 * 「用户」那一列是人不是 id：管理员认的是名字，而 UUID 摆在屏幕上读不出任何信息，
   又恰好是唯一能贴到别处去的那串字符。`_names` 一次 `list_users()` 建表，不是每行
   一次 `get()`——通道几十条就是几十次查询。
+* 按钮跳回来时屏幕上要真的有那句话（`_FEEDBACK`）：只发一个带参数的 redirect 而目标页
+  不读它，等于人按下「触发」后看到的还是按下之前那一屏——那道确认闸就只剩表单里那个框。
+* 抄进库里的一句话不直接上屏：`channels.last_error` 里可能带着 webhook 的密钥查询参数
+  （notifier 把 httpx 那句原样写了进去），所以那一格先隐去再截断（`_error_text`）。
 """
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -33,6 +38,27 @@ router = APIRouter()
 
 #: 表单原文的依赖，提到模块级一份（lint 不许在参数默认值里调用 `Depends`，见 `pages/rules.py`）
 _form_body = Depends(form_data)
+
+#: 系统按钮跳回健康页时带的那几个值 → （提醒的类别, 屏幕上的一句话）。**只认这张表里
+#: 的值**：把 query 原文印上屏幕等于往 admin 页里放一个自由文本框。这句话本身就是那道
+#: 确认闸的一截——「这次没有动手」不上屏时，勾了框按下去与没勾按下去是同一张屏。
+#: 「已接受」也不能省：`request_prune` 在线程写下读数之前就返回了，没有这句话的话，
+#: 按完看到的那一屏还是「还没跑过」，人会再按一次。
+_FEEDBACK = {
+    ("sync", "queued"): ("ok", "同步请求已排进队列：调度线程下一拍会去采这个市场。"),
+    ("prune", "confirm"): ("error", "这次没有动手：勾上确认再按一次，清理才会真删行。"),
+    ("prune", "accepted"): ("ok", "已接受：清理在自己那条线程上跑，跑完的统计写在下面。"),
+    ("prune", "busy"): ("error", "已经有一次在跑，或服务在收尾：清理不排队，这一按没开第二次。"),
+}
+
+
+def _feedback(request: Request) -> tuple[str, str]:
+    """query 里那两个参数折成（类别, 那句话）；不在表里的值一律当没说过。"""
+    for name in ("prune", "sync"):
+        found = _FEEDBACK.get((name, request.query_params.get(name) or ""))
+        if found:
+            return found
+    return "", ""
 
 
 @router.get("/admin")
@@ -227,9 +253,18 @@ def source_probe(
     _csrf: None = Depends(csrf_protect),
     data: dict[str, list[str]] = _form_body,
 ):
-    require_admin(request)
-    ctx = request.app.state.web.contexts.current()
-    today = date.today()
+    admin = require_admin(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    wait = web.admin_source_probes.try_take(admin.id)
+    if wait:
+        # 每用户一张卡（`WebState.admin_source_probes`）：这一趟是真采集，同步压在这条
+        # 池线程上——被挡下的那一次连网络都不该碰
+        raise HTTPException(status_code=429, detail=f"源探针每 60 秒一次：请再等 {wait} 秒")
+    # 空着的区间取注入的时钟而不是 `date.today()`：后者是这台机器的本地日历，而区间按
+    # UTC 那一头算（与 `pages/symbol.py` 同一口径）。本地比 UTC 快的时区里凌晨那几个小时
+    # 两者差一天，探回来的那一段就对不上屏幕上那句「区间空着就是最近 5 天」
+    today = ctx.clock.now_utc().date()
     try:
         start = date.fromisoformat(one(data, "start") or str(today - timedelta(days=5)))
         end = date.fromisoformat(one(data, "end") or str(today))
@@ -245,17 +280,46 @@ def source_probe(
     return _sources_page(request, probe=report)
 
 
+#: webhook 地址里带密钥的那几个查询参数：企业微信用 `key=`、钉钉用 `access_token=`。
+#: notifiers 把网络异常原样写进 `last_error`（`wecom.py` 那句 `f"{type(exc).__name__}:
+#: {exc}"`），而 httpx 的那句话里带着整条 URL——不隐去就是这张跨用户总览把别人那条
+#: 通道的凭据印给了每一个 admin
+_SECRET_QUERY = re.compile(r"([?&])(access_token|token|key|secret)=([^&\s'\"]+)")
+#: 那一格的用处是「为什么没发出去」，不是日志全文：整段 httpx 文本能让一屏放不下
+_ERROR_KEEP = 240
+
+
+def _error_text(text: str) -> str:
+    """先隐去密钥再做截断：反过来做会把截断点落在密钥中间，剩下那半截照样能发消息。"""
+    if not text:
+        return ""
+    cleaned = _SECRET_QUERY.sub(r"\1\2=〔已隐去〕", text)
+    return cleaned if len(cleaned) <= _ERROR_KEEP else f"{cleaned[:_ERROR_KEEP]}…"
+
+
 @router.get("/admin/channels")
 def channels_page(request: Request):
     """跨用户总览：配置在 `Channel` 里按构造就是掩码视图，明文只有一个出口
-    （`ChannelRepo.credentials()`），所以这一屏不可能漏出别人的 webhook。"""
+    （`ChannelRepo.credentials()`），所以「配置」那一列漏不出别人的 webhook。
+
+    `last_error` 不在那套掩码里：它是抄进库里的一句话，而抄进来的人（notifiers）带着
+    整条 URL。所以这一格过 `_error_text`——隐去密钥、截断成人读得完的长度，其余原样。
+    """
     require_admin(request)
     ctx = request.app.state.web.contexts.current()
     names = _names(ctx.users.list_users())
+    tz = ctx.settings.server.display_tz
     rows = [
-        # 库里若躺一条属于已被删掉的用户的老通道（今天没有删用户这条路），那一格退回 id：
-        # 宁可显示一串没人认得的东西，也不替它编一个名字
-        (channel, names.get(channel.user_id, channel.user_id))
+        {
+            "channel": channel,
+            # 库里若躺一条属于已被删掉的用户的老通道（今天没有删用户这条路），那一格退回 id：
+            # 宁可显示一串没人认得的东西，也不替它编一个名字
+            "owner": names.get(channel.user_id, channel.user_id),
+            "error": _error_text(channel.last_error),
+            # 「最近错误」要带日期：只有那句「超时」的话，三个月前那一次与今天这一次在
+            # 屏幕上长得一样，管理员会拿旧的那一次去判断今天的通知坏了
+            "error_at": moment_label(channel.last_error_at, tz) if channel.last_error else "",
+        }
         for channel in ctx.channels_store.list_all()
     ]
     return request.app.state.web.render(request, "admin_channels.html", rows=rows)
@@ -291,9 +355,10 @@ def _health_ctx(web, ctx) -> dict:
                 ),
                 "age": "—" if age is None else f"{age}s",
                 "source": reading.get("source") or "—",
-                # 从未轮询（休市/刚启动）不是故障，轮过且报过错才是：漏掉这个 `ok`
-                # 就会把一个正在报错的市场印成一行的正常读数
-                "note": "" if reading.get("ok", True) else "那一次轮询是失败的",
+                # 从未轮询（休市/刚启动）不是故障，轮过且报过错才是。这一格直接下标：
+                # 给 `ok` 兜一个默认值就是把「读不出」印成「健康」，而被印成健康的是
+                # 那个正在报错的市场
+                "note": "" if reading["ok"] else "那一次轮询是失败的",
             }
         )
     prune_at = web.runtime.last_prune_at
@@ -314,7 +379,14 @@ def _health_ctx(web, ctx) -> dict:
 def health_page(request: Request):
     require_admin(request)
     web = request.app.state.web
-    return web.render(request, "admin_health.html", **_health_ctx(web, web.contexts.current()))
+    notice_kind, notice = _feedback(request)
+    return web.render(
+        request,
+        "admin_health.html",
+        notice_kind=notice_kind,
+        notice=notice,
+        **_health_ctx(web, web.contexts.current()),
+    )
 
 
 @router.post("/admin/sync")

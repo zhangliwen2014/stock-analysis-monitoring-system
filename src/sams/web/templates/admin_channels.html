@@ -4,21 +4,25 @@
 <h1>全部通知通道（只读）</h1>
 <p class="muted">
   配置在这里永远是掩码：明文只有一个出口（凭据解回来只给发送那一步用），
-  而这一屏连那个出口都不走。明细与修改归每个用户自己的设置页。
+  而这一屏连那个出口都不走。「最近错误」那一行是抄进来的一句话，所以里面带的
+  密钥查询参数也一并隐去、过长的那一段截掉。明细与修改归每个用户自己的设置页。
 </p>
 <table>
   <tr>
     <th>用户</th><th>名字</th><th>类型</th><th>默认</th><th>状态</th><th>最近错误</th>
   </tr>
   {# 用户那一列是名字不是 id：管理员认的是人，而那一串十六进制贴到别处去还能用 #}
-  {% for channel, owner in rows %}
+  {% for row in rows %}
   <tr>
-    <td>{{ owner }}</td>
-    <td>{{ channel.name }}</td>
-    <td class="muted">{{ channel.kind }}</td>
-    <td>{% if channel.is_default %}默认{% endif %}</td>
-    <td>{{ "启用" if channel.enabled else "停用" }}</td>
-    <td>{{ channel.last_error or "—" }}</td>
+    <td>{{ row.owner }}</td>
+    <td>{{ row.channel.name }}</td>
+    <td class="muted">{{ row.channel.kind }}</td>
+    <td>{% if row.channel.is_default %}默认{% endif %}</td>
+    <td>{{ "启用" if row.channel.enabled else "停用" }}</td>
+    {# 时刻在 `pages/admin.py` 里折到 display_tz：这一屏两个时钟会读成一次停更 #}
+    <td>
+      {% if row.error %}{{ row.error }}{% if row.error_at %}（{{ row.error_at }}）{% endif %}{% else %}—{% endif %}
+    </td>
   </tr>
   {% else %}
   <tr><td colspan="6" class="muted">库里还没有通道：告警发不出去时先让各人去设置页加一条</td></tr>

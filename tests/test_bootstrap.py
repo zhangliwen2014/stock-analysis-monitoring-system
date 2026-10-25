@@ -17,7 +17,7 @@ from sams.bootstrap import (
     build_core,
     build_serve,
 )
-from sams.core.errors import ValidationError
+from sams.core.errors import StorageError, ValidationError
 from sams.core.events import EventBus, SystemAlarm
 from sams.core.quotes import Quote
 from sams.monitor.queue import QueuedAlertSender
@@ -366,6 +366,29 @@ def test_attaching_the_log_sink_twice_still_logs_each_alarm_once(caplog):
     assert caplog.text.count("hello") == 1
 
 
+def test_the_manual_prune_runner_hands_back_the_connection_it_opened(migrated, monkeypatch):
+    """一次调用一条连接，用完就关：漏关的那一条会一直握着库文件。
+
+    握着库文件不只是占内存：Windows 上它挡住删除与改名，而 `db prune` 的运维路径
+    正是「清理完把这库挪走」。
+    """
+    opened: list[Database] = []
+    real_open = Database.open
+
+    def spy(path):
+        database = real_open(path)
+        opened.append(database)
+        return database
+
+    monkeypatch.setattr(Database, "open", staticmethod(spy))
+    report = bootstrap.FreshPruneRunner(migrated).run(dry_run=True)
+
+    assert report.dry_run is True and report.steps
+    assert len(opened) == 1, "手动清理借来的不该只有一条"
+    with pytest.raises(StorageError, match="SQL 执行失败"):
+        opened[0].scalar("SELECT 1")
+
+
 def test_serve_builds_four_contexts_on_one_core(migrated):
     """四条线程各一条连接（D113），但板子、桶与请求队列是同一份。
 
@@ -387,6 +410,10 @@ def test_serve_builds_four_contexts_on_one_core(migrated):
         assert runtime.board is core.board
         assert runtime.monitor is contexts[1].intraday
         assert runtime.worker is not None
+        # 手动清理不许借维护线程那条连接（D113）：`Database._tx_depth` 没有锁，两次
+        # 清理共用一条连接时先结束的那边会把另一边正在写的事务一起 COMMIT 掉
+        assert runtime.manual_prune is not None
+        assert runtime.manual_prune is not runtime.prune
     finally:
         parts.close()
 

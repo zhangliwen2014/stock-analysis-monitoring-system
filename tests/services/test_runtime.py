@@ -99,23 +99,35 @@ def make_runtime(
     schedule_reading=None,
     monitor=None,
     prune=None,
+    manual_prune=None,
     worker=None,
     board=None,
     database=None,
     clock=None,
 ):
     engine = scheduler or FakeScheduler()
+    scheduled = prune or FakePrune()
     return Runtime(
         settings,
         scheduler=engine,
         schedule_reading=schedule_reading or engine.schedule_data,
         monitor=monitor or FakeMonitor(),
-        prune=prune or FakePrune(),
+        prune=scheduled,
+        # 测试里的便利：没单给手动那条就复用同一个替身。生产里没有这层便利——
+        # 那里的 `manual_prune` 自带一条连接（D113），见 `bootstrap.FreshPruneRunner`
+        manual_prune=manual_prune if manual_prune is not None else scheduled,
         worker=worker,
         board=board if board is not None else FakeBoard(),
         database=database,
         clock=clock or FrozenClock(NOW),
     )
+
+
+def _await_prune(runtime) -> None:
+    """等那条手动清理的线程收手：`request_prune` 立刻返回，读数是它之后写的。"""
+    deadline = datetime.now(UTC) + timedelta(seconds=5)
+    while runtime.last_prune_at is None and datetime.now(UTC) < deadline:
+        time.sleep(0.01)
 
 
 def test_healthz_lists_every_configured_market_before_the_first_poll(settings):
@@ -304,9 +316,7 @@ def test_request_prune_refuses_a_second_run_while_one_is_running(settings):
     assert started.wait(timeout=5) is True
     assert runtime.request_prune() is False
     release.set()
-    deadline = datetime.now(UTC) + timedelta(seconds=5)
-    while runtime.last_prune_at is None and datetime.now(UTC) < deadline:
-        time.sleep(0.01)
+    _await_prune(runtime)
     assert runtime.last_prune == "1 步、合计 3 行"
     assert runtime.last_prune_error is None
 
@@ -318,10 +328,106 @@ def test_a_failing_manual_prune_lands_in_last_prune_error(settings):
 
     runtime = make_runtime(settings, prune=BadPrune())
     assert runtime.request_prune() is True
-    deadline = datetime.now(UTC) + timedelta(seconds=5)
-    while runtime.last_prune_at is None and datetime.now(UTC) < deadline:
-        time.sleep(0.01)
+    _await_prune(runtime)
     assert "库被锁住了" in runtime.last_prune_error
+
+    assert runtime.request_prune() is True, "失败一次后忙标志要回到入口"
+
+
+def test_a_failing_run_does_not_leave_the_previous_summary(settings):
+    """失败那次要清掉上一轮的摘要：健康页把那句与这一轮的时间戳并排印。
+
+    留下旧那句就是「最近一次：1 步、合计 3 行」配上一次失败的时刻——读出来像上一次
+    真删了 3 行，而实际上那一轮的删除只做了一半。
+    """
+
+    class FirstOkThenBoom:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, *, dry_run=False):
+            self.calls += 1
+            if self.calls > 1:
+                raise SamsError("库被锁住了")
+            return PruneReport(dry_run=dry_run, steps=(PruneStep("quotes_snapshot", 3),))
+
+    runtime = make_runtime(settings, manual_prune=FirstOkThenBoom())
+    assert runtime.request_prune() is True
+    _await_prune(runtime)
+    assert runtime.last_prune == "1 步、合计 3 行"
+
+    assert runtime.request_prune() is True
+    deadline = datetime.now(UTC) + timedelta(seconds=5)
+    while runtime.last_prune is not None and datetime.now(UTC) < deadline:
+        time.sleep(0.01)
+    assert runtime.last_prune is None
+    assert "库被锁住了" in runtime.last_prune_error
+
+
+def test_the_manual_prune_runs_on_its_own_service_not_the_scheduled_one(settings):
+    """`request_prune` 走 `manual_prune`，不退回 `self.prune`（D113）。
+
+    生产里 `self.prune` 连的是维护线程那条连接：手动那一下借用它时，03:30 那一拍
+    与这一次会共用 `Database._tx_depth` 那个没有锁的计数——先结束的那边把另一边
+    正在写的事务一起 COMMIT 掉，半套删除会被报成一次完整的清理。
+    """
+    scheduled = FakePrune()
+    manual = FakePrune()
+    runtime = make_runtime(settings, prune=scheduled, manual_prune=manual)
+
+    assert runtime.request_prune() is True
+    _await_prune(runtime)
+    assert manual.calls == 1
+    assert scheduled.calls == 0, "维护线程的连接一次都不许被手动那一下借走"
+
+
+def test_request_prune_without_a_manual_connection_says_so(settings):
+    """没接线就明说：退回 `self.prune` 正是上面那条事故，不是「还有个备胎」。
+
+    这里直接构造 `Runtime` 而不是走 `make_runtime`：那层便利（没单给手动那条就复用
+    `prune`）恰恰是本用例要绕开的东西。
+    """
+    scheduled = FakePrune()
+    engine = FakeScheduler()
+    runtime = Runtime(
+        settings,
+        scheduler=engine,
+        schedule_reading=engine.schedule_data,
+        monitor=FakeMonitor(),
+        prune=scheduled,
+        clock=FrozenClock(NOW),
+    )
+
+    assert runtime.request_prune() is True
+    _await_prune(runtime)
+    assert runtime.last_prune_error == runtime_module.NO_MANUAL_PRUNE
+    assert runtime.last_prune is None
+    assert scheduled.calls == 0
+
+
+def test_a_prune_thread_that_refuses_to_start_returns_the_busy_flag(settings, monkeypatch):
+    """`thread.start()` 抛出来时忙标志要还回去，异常照原样冒出去。
+
+    起不动（系统线程见底）时那条线程永远不会跑，也就没人归还 `_prune_running`：
+    此后每一次手动清理都答「正在跑」，而其实一条线程都不存在。
+    """
+    runtime = make_runtime(settings)
+    real_start = threading.Thread.start
+    attempts = []
+
+    def flaky_start(thread, *args, **kwargs):
+        attempts.append(thread)
+        if len(attempts) == 1:
+            raise RuntimeError("can't start new thread")
+        return real_start(thread, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Thread, "start", flaky_start)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        runtime.request_prune()
+
+    assert runtime.request_prune() is True, "起不来的一次不许把入口永久堵死"
+    _await_prune(runtime)
+    assert runtime.last_prune == "1 步、合计 3 行"
 
 
 def test_stop_waits_for_an_in_flight_manual_prune(settings, monkeypatch):
@@ -348,7 +454,18 @@ def test_stop_waits_for_an_in_flight_manual_prune(settings, monkeypatch):
         assert runtime.stop() is False, "清理还没收手时不许关共享资源"
     finally:
         release.set()
-    deadline = datetime.now(UTC) + timedelta(seconds=5)
-    while runtime.last_prune_at is None and datetime.now(UTC) < deadline:
-        time.sleep(0.01)
+    _await_prune(runtime)
     assert runtime.stop() is True
+
+
+def test_a_stopping_runtime_refuses_a_new_prune(settings):
+    """停机已经开始：这一按若起一条线程，`stop()` 已经走过 join 那一段，
+    返回后调用方就去关库——那条清理会握着一条已经被关掉的连接继续写。
+    """
+    scheduled = FakePrune()
+    runtime = make_runtime(settings, prune=scheduled)
+    runtime.stop_event.set()
+
+    assert runtime.request_prune() is False
+    assert scheduled.calls == 0
+    assert runtime.last_prune_at is None, "什么都没跑，就别写下一次「跑过」的时刻"
