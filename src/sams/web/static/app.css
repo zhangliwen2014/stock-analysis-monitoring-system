@@ -55,3 +55,5 @@ form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
 .md-body img { max-width: 100%; }
 .ann-actions { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
 .md-preview { border: 1px dashed var(--line, #bbb); padding: 8px; margin-top: 8px; }
+.ann-imgs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; align-items: center; }
+.ann-imgs img { max-height: 120px; max-width: 160px; border-radius: 6px; }

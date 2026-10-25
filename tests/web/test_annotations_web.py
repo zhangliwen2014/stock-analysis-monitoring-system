@@ -93,6 +93,15 @@ def _png_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _rgba_png_bytes() -> bytes:
+    """RGBA 模式的 PNG：重编码只给「有 alpha 的图」保留 PNG（services/attachments.py
+    的 has_alpha 支路），RGB 会被统一转成 JPEG——下载用例要钉的是 image/png 那条路，
+    所以喂带 alpha 的那一种。"""
+    buf = io.BytesIO()
+    Image.new("RGBA", (8, 8), (255, 0, 0, 255)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _post_annotation(logged, *, body="今天放量，逻辑没变", files=None):
     """multipart 建批注的公共入口：`files=None` 也发一枚空文件名分片来强制 multipart，
     端点按「文件名为空」丢掉它——与浏览器不选文件直接提交的形状一致。"""
@@ -256,3 +265,101 @@ def test_attachment_uploads_are_limited_to_10_per_minute(logged):
     assert "annotations-panel" in resp.text
     resp = _post_annotation(logged, body="不带图")
     assert resp.status_code == 200
+
+
+def _make_annotation_with_png(logged, filename="截图-首页.png", count=1):
+    """走真实写路建一条带图批注，返回 (Annotation, [Attachment])。
+
+    文件名避开空格与 `>`：断言里要拿它比 percent-encoding，少一个变量少一处错。
+    """
+    resp = _post_annotation(
+        logged,
+        files=[("files", (filename, _rgba_png_bytes(), "image/png"))] * count,
+    )
+    assert resp.status_code == 200 and "被拒" not in resp.text
+    ctx = logged.context
+    alice = _alice(ctx)
+    # list_visible 的 ORDER BY created_at DESC：新条目在 [0]
+    made = ctx.annotations.list_target(alice.id, "symbol", "A:600519")[0]
+    return made, ctx.attachments.list_for(alice.id, made.id)
+
+
+def test_attachment_download_serves_png_inline_with_rfc5987_name(logged):
+    made, atts = _make_annotation_with_png(logged)
+    resp = logged.client.get(f"/annotations/{made.id}/attachments/{atts[0].id}")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("image/png")
+    # inline + RFC 5987：中文名原样带出，浏览器里直接看图而不是先落盘
+    disposition = resp.headers["content-disposition"]
+    assert disposition.startswith("inline;")
+    assert "filename*=UTF-8''" in disposition
+    assert "%E6%88%AA%E5%9B%BE" in disposition  # 「截图」的 percent-encoding
+    assert resp.content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert "private" in resp.headers["cache-control"]
+
+
+def test_attachment_download_folds_foreign_to_404(logged):
+    ctx = logged.context
+    bob = ctx.users.create("bob", "correct-horse-battery")
+    made = ctx.annotations.create(
+        bob.id, target_type="symbol", target_ref="A:600519", body_md="bob 的图"
+    )
+    att = ctx.attachments_store.create(
+        made.id,
+        bob.id,
+        filename="b.png",
+        media_type="image/png",
+        size_bytes=1,
+        sha256="0" * 64,
+        storage_path="bob/x.png",
+        position=0,
+    )
+    resp = logged.client.get(f"/annotations/{made.id}/attachments/{att.id}")
+    assert resp.status_code == 404  # 不可见就是不可见：不回答「文件在不在」
+
+
+def test_download_of_missing_file_says_data_status_not_permission(logged):
+    made, atts = _make_annotation_with_png(logged)
+    path = logged.context.attachments.path_of(atts[0])
+    hidden = path.with_suffix(".hidden")
+    path.rename(hidden)
+    try:
+        resp = logged.client.get(f"/annotations/{made.id}/attachments/{atts[0].id}")
+        assert resp.status_code == 404
+        assert "缺失" in resp.text
+    finally:
+        hidden.rename(path)
+
+
+def test_panel_renders_thumbnails_and_degrades_missing_file(logged):
+    made, atts = _make_annotation_with_png(logged)
+    url = f"/annotations/{made.id}/attachments/{atts[0].id}"
+    panel = logged.client.get(
+        "/api/partials/annotations", params={"target_type": "symbol", "target_ref": "A:600519"}
+    )
+    assert url in panel.text  # 缩略图与下载是同一个 URL：CSP img-src 'self' 放行
+    path = logged.context.attachments.path_of(atts[0])
+    hidden = path.with_suffix(".hidden2")
+    path.rename(hidden)
+    try:
+        panel = logged.client.get(
+            "/api/partials/annotations",
+            params={"target_type": "symbol", "target_ref": "A:600519"},
+        )
+        assert "附件缺失" in panel.text
+        assert url not in panel.text  # 坏图不留 <img>：碎图标比那句话更没信息量
+    finally:
+        hidden.rename(path)
+
+
+def test_panel_caps_thumbnails_at_three_with_overflow_note(logged):
+    made, atts = _make_annotation_with_png(logged, count=4)
+    panel = logged.client.get(
+        "/api/partials/annotations", params={"target_type": "symbol", "target_ref": "A:600519"}
+    )
+    # 每张缩略图的 URL 出现两次（<a href> 与 <img src>），第四张完全不出现
+    for att in atts[:3]:
+        assert panel.text.count(att.id) == 2
+    assert atts[3].id not in panel.text
+    assert "还有 1 张" in panel.text
+    assert "附件缺失" not in panel.text  # 四张都在磁盘上：missing 不许多报

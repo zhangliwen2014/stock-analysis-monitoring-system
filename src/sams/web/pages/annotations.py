@@ -19,6 +19,7 @@ import io
 import re
 import threading
 from datetime import datetime
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 
@@ -33,6 +34,10 @@ router = APIRouter()
 
 #: 面板一屏 20 条：它是「看几条 + 写一条」的地方，不是归档柜；更多去 /annotations（计划 5）
 PANEL_LIMIT = 20
+
+#: 面板一屏最多给 3 张缩略图：它是「看几条 + 写一条」的地方，不是图片墙；
+#: 更多走下载链接或计划 5 的详情页
+THUMB_LIMIT = 3
 
 #: 附件分片的依赖提到模块级一份（B008 不许在参数默认值里调 `File`，
 #: 与 `pages/settings.py` 的 `_form_body` 同一处置）
@@ -78,6 +83,19 @@ def _render_panel(
     )
     rows = []
     for made in items:
+        # N+1 查询是有意的：面板 20 条上限、本地 DuckDB、本地磁盘，一页一屏——
+        # 攒 JOIN 换来的复杂度买不回可感知的延迟
+        atts = ctx.attachments.list_for(user.id, made.id, team_sharing=sharing)
+        thumbs = []
+        for att in atts[:THUMB_LIMIT]:
+            if ctx.attachments.path_of(att).exists():
+                # 缺文件不进 thumbs：碎图标不说话，「附件缺失」那句话才说
+                thumbs.append(
+                    {
+                        "url": f"/annotations/{made.id}/attachments/{att.id}",
+                        "filename": att.filename,
+                    }
+                )
         rows.append(
             {
                 "id": made.id,
@@ -86,6 +104,9 @@ def _render_panel(
                 "pinned": made.pinned,
                 "visibility": "团队" if made.visibility == "team" else "私有",
                 "tags": made.tags,
+                "images": thumbs,
+                "missing": max(0, min(len(atts), THUMB_LIMIT) - len(thumbs)),
+                "extra": max(0, len(atts) - THUMB_LIMIT),
                 "body_html": render_markdown(made.body_md),
                 "body_md": made.body_md,
                 "own": made.user_id == user.id,
@@ -418,4 +439,40 @@ def annotation_delete(
     audit(request, action="annotation.delete", target=made.id, ok=True)
     return _render_panel(
         request, user=user, target_type=made.target_type, target_ref=made.target_ref
+    )
+
+
+# --- 附件 --------------------------------------------------------------------------------
+
+
+@router.get("/annotations/{annotation_id}/attachments/{attachment_id}")
+def download_attachment(request: Request, annotation_id: str, attachment_id: str):
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    try:
+        att = ctx.attachments.resolve(
+            user.id,
+            annotation_id,
+            attachment_id,
+            team_sharing=ctx.app_settings.team_sharing(),
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError:
+        # 「不存在」「不是你的」「不属于这条批注」全是 404：id 探测没有第二种回答
+        raise HTTPException(status_code=404, detail="附件不存在或不可见") from None
+    data = ctx.attachments.load(att)
+    if data is None:
+        # 行在、文件没了：这是数据状态，不是权限，话说两句
+        raise HTTPException(
+            status_code=404, detail="附件文件缺失：库里还有这一行，磁盘上的图已被清理"
+        )
+    return Response(
+        content=data,
+        media_type=att.media_type,
+        headers={
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(att.filename, safe='')}",
+            "Cache-Control": "private, max-age=300",
+        },
     )

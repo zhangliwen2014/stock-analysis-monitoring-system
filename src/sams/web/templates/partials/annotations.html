@@ -35,6 +35,15 @@
     </header>
     {# safe 的依据在 `services/markdown.py`：那份配置没有产出可执行内容的分支（D122） #}
     <div class="md-body">{{ row.body_html | safe }}</div>
+    {% if row.images or row.missing %}
+    <div class="ann-imgs">
+      {% for img in row.images %}
+      <a href="{{ img.url }}"><img src="{{ img.url }}" alt="{{ img.filename }}" loading="lazy"></a>
+      {% endfor %}
+      {% if row.missing %}<span class="muted">附件缺失 {{ row.missing }} 张</span>{% endif %}
+      {% if row.extra %}<span class="muted">还有 {{ row.extra }} 张</span>{% endif %}
+    </div>
+    {% endif %}
     {% if row.own %}
     <footer class="ann-actions">
       <form hx-post="/annotations/{{ row.id }}/pin" hx-target="#{{ panel_id }}" hx-swap="outerHTML">
