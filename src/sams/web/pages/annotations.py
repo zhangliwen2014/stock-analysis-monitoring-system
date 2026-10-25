@@ -88,7 +88,7 @@ def _render_panel(
         atts = ctx.attachments.list_for(user.id, made.id, team_sharing=sharing)
         thumbs = []
         for att in atts[:THUMB_LIMIT]:
-            if ctx.attachments.path_of(att).exists():
+            if ctx.attachments.path_of(att).is_file():
                 # 缺文件不进 thumbs：碎图标不说话，「附件缺失」那句话才说
                 thumbs.append(
                     {
@@ -457,10 +457,10 @@ def download_attachment(request: Request, annotation_id: str, attachment_id: str
             attachment_id,
             team_sharing=ctx.app_settings.team_sharing(),
         )
-    except DatabaseLocked:
-        raise
-    except SamsError:
-        # 「不存在」「不是你的」「不属于这条批注」全是 404：id 探测没有第二种回答
+    except NotFound:
+        # 「不存在」「不是你的」「不属于这条批注」全是 404：id 探测没有第二种回答。
+        # 只折 NotFound：库故障、锁竞争、路径逃逸是另一种话，交给全局 handler 说真消息，
+        # 别把它们谎报成「不存在」
         raise HTTPException(status_code=404, detail="附件不存在或不可见") from None
     data = ctx.attachments.load(att)
     if data is None:
