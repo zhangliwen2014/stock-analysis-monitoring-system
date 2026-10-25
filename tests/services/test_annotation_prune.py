@@ -175,3 +175,23 @@ def test_a_dry_run_changes_nothing(world):
 def test_retention_must_be_positive(world, field):
     with pytest.raises(ValidationError):
         world.pruner.run(**{field: 0})
+
+
+def test_an_old_tmp_part_file_is_reclaimed(world):
+    stale = world.root / ".tmp" / "deadbeef.part"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"partial")
+    old = world.clock.now_utc().timestamp() - 31 * 86400
+    os.utime(stale, (old, old))
+    report = world.pruner.run(purged_days=30, orphan_days=30)
+    assert report.orphan_files == 1
+    assert not stale.exists()
+
+
+def test_a_fresh_tmp_part_file_is_left_alone(world):
+    live = world.root / ".tmp" / "writing.part"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_bytes(b"partial")
+    report = world.pruner.run(purged_days=30, orphan_days=30)
+    assert report.orphan_files == 0
+    assert live.exists()

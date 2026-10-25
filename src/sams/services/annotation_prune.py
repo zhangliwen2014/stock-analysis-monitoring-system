@@ -17,7 +17,7 @@ from pathlib import Path
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import ValidationError
-from sams.services.attachments import TMP_DIR, safe_path
+from sams.services.attachments import safe_path
 from sams.storage.db import Database
 from sams.storage.repos.annotations import AnnotationRepo
 from sams.storage.repos.attachments import AttachmentRepo
@@ -85,7 +85,8 @@ class AnnotationPruner:
                     self.attachments.delete_for(note_id)
                     self.db.execute(
                         "UPDATE annotations SET body_md = '', tags_json = '[]', pinned = FALSE,"
-                        " purged_at = ?, updated_at = ? WHERE id = ?",
+                        " purged_at = ?, updated_at = ?"
+                        " WHERE id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL",
                         [now, now, note_id],
                     )
             for row in attachments:
@@ -109,8 +110,6 @@ class AnnotationPruner:
         found: list[tuple[Path, int]] = []
         for path in sorted(self.root.rglob("*")):
             if not path.is_file():
-                continue
-            if TMP_DIR in path.relative_to(self.root).parts:
                 continue
             relative = path.relative_to(self.root).as_posix()
             if relative in referenced:
