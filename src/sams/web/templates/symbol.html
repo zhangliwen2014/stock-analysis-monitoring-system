@@ -62,4 +62,12 @@
   </table>
   {% else %}<p class="muted">最近没有告警。</p>{% endif %}
 </section>
+
+{# 批注面板：fragment 单独拉取，页面主体不等批注查询（与 quotes 部分同一取舍） #}
+<section class="card">
+  <div hx-get="/api/partials/annotations?target_type=symbol&target_ref={{ market }}:{{ code }}"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">批注加载中…</p>
+  </div>
+</section>
 {% endblock %}

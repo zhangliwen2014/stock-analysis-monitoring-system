@@ -121,4 +121,14 @@
   </form>
   {% endif %}
 </section>
+
+{# 批注面板：只挂在编辑态——新建那一屏还没有 rule_id，批注没有可挂的目标 #}
+{% if rule_id %}
+<section class="card">
+  <div hx-get="/api/partials/annotations?target_type=rule&target_ref={{ rule_id }}"
+       hx-trigger="load" hx-swap="outerHTML">
+    <p class="muted">批注加载中…</p>
+  </div>
+</section>
+{% endif %}
 {% endblock %}

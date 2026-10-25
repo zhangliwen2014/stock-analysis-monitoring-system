@@ -1,0 +1,65 @@
+{# 批注面板 fragment（§6.2）：不 extends base——htmx 把整块 swap 进容器，套着导航就成了画中画。 #}
+<div id="{{ panel_id }}" class="annotations-panel card">
+  <h2>批注</h2>
+  {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  <form class="ann-editor" hx-post="/annotations" hx-encoding="multipart/form-data"
+        hx-target="#{{ panel_id }}" hx-swap="outerHTML">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="target_type" value="{{ target_type }}">
+    <input type="hidden" name="target_ref" value="{{ target_ref }}">
+    <textarea name="body_md" rows="4"
+      placeholder="Markdown 源码：**粗体**、列表、表格都支持；原始 HTML 与图片语法会被转义，截图走下面的附件">
+      {{- draft.get("body_md") or "" -}}</textarea>
+    <div class="ann-editor-row">
+      <input name="tags" placeholder="标签，逗号分隔（≤10 个）" value="{{ draft.get("tags") or "" }}">
+      <input type="file" name="files" accept="image/png,image/jpeg,image/webp" multiple>
+    </div>
+    <p class="muted">可见范围：仅自己（团队共享在计划 5 开放）。</p>
+    <div class="ann-editor-row">
+      <button type="button" hx-post="/annotations/preview" hx-include="closest form"
+              hx-target="#{{ panel_id }}-preview" hx-swap="innerHTML">预览</button>
+      <button type="submit">发布</button>
+    </div>
+    <div id="{{ panel_id }}-preview" class="md-preview"></div>
+  </form>
+  {% for row in rows %}
+  <article class="ann-row">
+    <header>
+      <span class="ann-avatar">{{ row.author[0]|upper }}</span>
+      <strong>{{ row.author }}</strong>
+      <span class="muted">{{ row.at }}</span>
+      {% if row.pinned %}<span class="badge">置顶</span>{% endif %}
+      <span class="badge">{{ row.visibility }}</span>
+      {% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+    </header>
+    {# safe 的依据在 `services/markdown.py`：那份配置没有产出可执行内容的分支（D122） #}
+    <div class="md-body">{{ row.body_html | safe }}</div>
+    {% if row.own %}
+    <footer class="ann-actions">
+      <form hx-post="/annotations/{{ row.id }}/pin" hx-target="#{{ panel_id }}" hx-swap="outerHTML">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="pinned" value="{{ '0' if row.pinned else '1' }}">
+        <button type="submit">{{ "取消置顶" if row.pinned else "置顶" }}</button>
+      </form>
+      <form hx-post="/annotations/{{ row.id }}/delete" hx-target="#{{ panel_id }}" hx-swap="outerHTML"
+            hx-confirm="软删除这条批注？正文保留 30 天后由 prune 回收。">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit">删除</button>
+      </form>
+      <details>
+        <summary>编辑</summary>
+        <form hx-post="/annotations/{{ row.id }}/edit" hx-target="#{{ panel_id }}" hx-swap="outerHTML">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="updated_at" value="{{ row.updated_at }}">
+          <textarea name="body_md" rows="4">{{ row.body_md }}</textarea>
+          <input name="tags" value="{{ row.tags|join(', ') }}">
+          <button type="submit">保存</button>
+        </form>
+      </details>
+    </footer>
+    {% endif %}
+  </article>
+  {% else %}
+  <p class="muted">{{ empty_note }}</p>
+  {% endfor %}
+</div>
