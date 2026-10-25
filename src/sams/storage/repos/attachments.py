@@ -140,17 +140,26 @@ class AttachmentRepo:
         )
 
     def delete(self, attachment_id: str) -> bool:
-        before = self.get(attachment_id)
-        self.db.execute("DELETE FROM annotation_attachments WHERE id = ?", [attachment_id])
-        return before is not None
+        deleted = self.db.scalar(
+            "DELETE FROM annotation_attachments WHERE id = ? RETURNING id", [attachment_id]
+        )
+        return deleted is not None
 
     def delete_for(self, annotation_id: str) -> list[Attachment]:
-        """先取行再删：调用方要拿着这些路径去删文件，删完就再也查不到它们了。"""
-        rows = self.list_for(annotation_id)
-        self.db.execute(
-            "DELETE FROM annotation_attachments WHERE annotation_id = ?", [annotation_id]
+        """单语句 `DELETE ... RETURNING`：拿到的就是被删掉的那些行。
+
+        调用方要拿着这些路径去删文件，所以「读到行」和「行没了」必须发生在同一句里：
+        先查再删的话，两条自动提交语句之间一旦失败，就留下查过但没删的孤儿行。
+        RETURNING 的返回顺序不保证，所以排序在 Python 里做。
+        """
+        rows = self.db.query(
+            f"DELETE FROM annotation_attachments WHERE annotation_id = ? RETURNING {_COLUMNS}",
+            [annotation_id],
         )
-        return rows
+        return sorted(
+            (_to_attachment(row) for row in rows.to_dicts()),
+            key=lambda row: (row.position, row.created_at, row.id),
+        )
 
     def paths(self) -> set[str]:
         rows = self.db.query("SELECT storage_path FROM annotation_attachments")

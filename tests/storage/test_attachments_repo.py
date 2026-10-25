@@ -62,11 +62,13 @@ def test_count_and_total_bytes_are_per_annotation_and_user(repo):
 
 def test_delete_for_returns_the_rows_it_removed(repo):
     first = add(repo)
-    second = add(repo, storage_path="trader/2026/10/b.png")
+    second = add(repo, storage_path="trader/2026/10/b.png", position=1)
+    add(repo, annotation_id="note-2", user_id="keeper", storage_path="keeper/2026/10/x.png")
     removed = repo.delete_for("note-1")
     assert [row.id for row in removed] == [first.id, second.id]
     assert repo.list_for("note-1") == []
     assert repo.delete_for("note-1") == []
+    assert repo.count_for("note-2") == 1
 
 
 def test_paths_are_the_set_the_pruner_needs(repo):
