@@ -108,13 +108,21 @@ class AnnotationPruner:
         if not self.root.exists():
             return []
         found: list[tuple[Path, int]] = []
-        for path in sorted(self.root.rglob("*")):
-            if not path.is_file():
+        try:
+            paths = sorted(self.root.rglob("*"))
+        except OSError as exc:  # 挂载点/权限：扫到哪算哪，总比维护线程整体死掉好
+            logger.warning("附件根目录扫描中断 %s: %s", self.root, exc)
+            return found
+        for path in paths:
+            try:
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(self.root).as_posix()
+                stat = path.stat()
+            except (OSError, ValueError):
                 continue
-            relative = path.relative_to(self.root).as_posix()
             if relative in referenced:
                 continue
-            stat = path.stat()
             moment = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
             if moment > cutoff:
                 continue

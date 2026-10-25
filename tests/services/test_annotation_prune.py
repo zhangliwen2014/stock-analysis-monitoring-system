@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -195,3 +196,28 @@ def test_a_fresh_tmp_part_file_is_left_alone(world):
     report = world.pruner.run(purged_days=30, orphan_days=30)
     assert report.orphan_files == 0
     assert live.exists()
+
+
+def test_an_unreadable_orphan_entry_is_skipped_not_fatal(world, monkeypatch):
+    candidate = world.root / "u1" / "2026" / "01"
+    candidate.mkdir(parents=True)
+    path = candidate / "orphan.png"
+    path.write_bytes(b"x")
+    old = world.clock.now_utc().timestamp() - 31 * 86400
+    os.utime(path, (old, old))
+    real_stat = Path.stat
+
+    def flaky_stat(self, *args, **kwargs):
+        # rglob 给出的是新的 Path 实例，只能 patch 类；带参数的调用是 is_file/exists 发的
+        if self == path and not kwargs:
+            raise PermissionError("挂载点抽风")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    report = world.pruner.run(purged_days=30, orphan_days=30)
+    assert report.orphan_files == 0
+    assert path.exists()
+    monkeypatch.setattr(Path, "stat", real_stat)
+    report = world.pruner.run(purged_days=30, orphan_days=30)
+    assert report.orphan_files == 1
+    assert not path.exists()
