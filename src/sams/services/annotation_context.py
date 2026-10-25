@@ -19,7 +19,7 @@ from sams.core.config import Settings
 from sams.core.notify import SYSTEM_MARKET, AnnotationContext, PushContext
 from sams.services.markdown import plain_text
 from sams.storage.repos.alerts import Alert
-from sams.storage.repos.annotations import SYMBOL, THESIS, AnnotationRepo
+from sams.storage.repos.annotations import SYMBOL, THESIS, Annotation, AnnotationRepo
 from sams.storage.repos.app_settings import AppSettingsRepo
 from sams.storage.repos.theses import ThesisRepo
 from sams.storage.repos.users import UserRepo
@@ -82,18 +82,19 @@ class AnnotationContextProvider:
                 )
             )
         base = self.settings.server.public_base_url
+        # 时区折一次就够：display_tz 在整个循环里不变，逐条重建 ZoneInfo 是白花的开销
+        zone = ZoneInfo(self.settings.server.display_tz)
         return PushContext(
-            items=tuple(self._to_context(alert.user_id, made) for made in candidates),
+            items=tuple(self._to_context(alert.user_id, made, zone) for made in candidates),
             link=f"{base}/alerts/{alert.id}" if base else "",
         )
 
-    def _to_context(self, viewer_id: str, made) -> AnnotationContext:
+    def _to_context(self, viewer_id: str, made: Annotation, zone: ZoneInfo) -> AnnotationContext:
         if made.user_id == viewer_id:
             label = "我"
         else:
             author = self.users.get(made.user_id)
             label = "未知作者" if author is None else (author.display_name or author.username)
-        zone = ZoneInfo(self.settings.server.display_tz)
         return AnnotationContext(
             annotation_id=made.id,
             created_at=made.created_at,

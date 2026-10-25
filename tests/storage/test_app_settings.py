@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from sams.core.errors import ValidationError
@@ -51,8 +53,8 @@ def test_a_write_from_another_repo_instance_is_seen_after_the_cache_expires(db, 
     assert first.team_sharing() is True
     AppSettingsRepo(db).set(TEAM_SHARING, "off")
     assert first.team_sharing() is True  # 5 秒内的旧答案
-    real_monotonic = __import__("time").monotonic
+    real = time.monotonic
     monkeypatch.setattr(
-        "sams.storage.repos.app_settings.time.monotonic", lambda: real_monotonic() + 6.0
+        "sams.storage.repos.app_settings.time.monotonic", lambda: real() + 6.0
     )
     assert first.team_sharing() is False

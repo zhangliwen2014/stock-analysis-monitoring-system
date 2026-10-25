@@ -126,21 +126,18 @@ def test_another_users_private_annotation_never_shows_up(world):
 
 def test_turning_off_team_sharing_hides_team_from_others(world):
     world.annotate("teammate", visibility="team")
+    # `set` 废掉本进程缓存（world.settings_store 就是 fixture provider 持有的那个实例），
+    # 不需要新实例
     world.settings_store.set(TEAM_SHARING, "off")
-    fresh = AnnotationContextProvider(
-        world.annotations, world.users, world.theses, world.settings_store, world.settings
-    )
-    made = fresh(world.alert())
+    made = world.provider(world.alert())
     assert made is not None and made.items == ()
 
 
 def test_the_author_still_sees_their_own_team_annotation_when_sharing_is_off(world):
     world.annotate("viewer", visibility="team")
+    # 同上：`set` 废掉本进程缓存，不需要新实例
     world.settings_store.set(TEAM_SHARING, "off")
-    fresh = AnnotationContextProvider(
-        world.annotations, world.users, world.theses, world.settings_store, world.settings
-    )
-    made = fresh(world.alert())
+    made = world.provider(world.alert())
     assert [item.author_label for item in made.items] == ["我"]
 
 
