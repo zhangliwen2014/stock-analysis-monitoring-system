@@ -10,7 +10,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import StorageError, ValidationError
@@ -20,15 +20,32 @@ from sams.storage.ids import new_id
 
 logger = logging.getLogger("sams.storage.alerts")
 
-#: 与 0001 的 `alerts.status` 一致：人对这条告警做了什么，不是发没发出去
-STATUS = ("new", "handled", "dismissed")
-NEW, HANDLED, DISMISSED = STATUS
+#: 与 0001 的 `alerts.status` 一致：人对这条告警做了什么，不是发没发出去。
+#: `acknowledged` 是「看到了、还没做」，与 `handled`（做了）分开：两者混成一个值时，
+#: 「看到了但没做」与「根本没看到」在复盘里再也分不开（D124）。
+STATUS = ("new", "acknowledged", "handled", "dismissed")
+NEW, ACKNOWLEDGED, HANDLED, DISMISSED = STATUS
+
+#: 处置动作的结构化分类（`alerts.action_kind`）：`other` 是兜底，不是「没填」
+ACTION_KINDS = ("trade", "thesis", "rule", "watch", "other")
+#: 忽略原因的结构化部分（`alerts.dismiss_code`）：文本原因仍写在 `dismiss_reason`
+DISMISS_CODES = (
+    "misreport",
+    "expected",
+    "data_issue",
+    "not_applicable",
+    "duplicate",
+    "other",
+)
+#: 一次处置之后还能撤回的窗口：过了这个点，`undo` 要回答的是「为什么不能」
+UNDO_WINDOW = timedelta(minutes=5)
 
 _ERROR_MAX_CHARS = 400
 
 _ALERT_COLUMNS = (
     "id, user_id, rule_id, account_id, market, code, stage, triggered_at,"
-    " status, payload_json, severity, handled_at, handle_note, dismiss_reason, is_test"
+    " status, payload_json, severity, handled_at, handle_note, dismiss_reason, is_test,"
+    " acknowledged_at, action_kind, action_ref, dismiss_code, thesis_id, deferred_until"
 )
 
 
@@ -88,6 +105,15 @@ class Alert:
     channel_ids: list[str] = field(default_factory=list)
     #: `alerts.is_test` 那一列（0019）：测试告警不进 no_open_alert 与健康积压（D131）
     is_test: bool = False
+    #: 闭环六列（0020）。前五列是「人对这条告警做了什么」的**当前结论**；
+    #: `thesis_id` 是规则经观点展开时留下的快照——推送上下文与详情跳转都要它，
+    #: 但它不是归属键（归属仍然只有 `user_id`）
+    acknowledged_at: datetime | None = None
+    action_kind: str | None = None
+    action_ref: str | None = None
+    dismiss_code: str | None = None
+    thesis_id: str | None = None
+    deferred_until: datetime | None = None
     #: 这三个来自 payload（D120）：要显示与回放的事实，不占列——占列的话措辞改版又要动表
     intraday: bool = False
     quote_ts: datetime | None = None
@@ -119,6 +145,7 @@ class AlertRepo:
         channel_ids: Sequence[str] = (),
         extra: Mapping[str, object] | None = None,
         is_test: bool = False,
+        thesis_id: str | None = None,
         intraday: bool = False,
         quote_ts: datetime | None = None,
         quote_source: str | None = None,
@@ -149,8 +176,8 @@ class AlertRepo:
         self.db.execute(
             "INSERT INTO alerts"
             " (id, user_id, rule_id, account_id, market, code, stage, triggered_at,"
-            " status, payload_json, severity, is_test)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)",
+            " status, payload_json, severity, is_test, thesis_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)",
             [
                 alert_id,
                 user_id,
@@ -163,6 +190,7 @@ class AlertRepo:
                 json.dumps(payload, ensure_ascii=False),
                 severity,
                 bool(is_test),
+                thesis_id,
             ],
         )
         created = self.get(alert_id)
@@ -271,11 +299,15 @@ class AlertRepo:
         提醒」，把账户算进去的话，A 账户里那条未处理的止损会挡不住 B 账户的第二条推送，
         用户收到两条内容一样、只有账户名不同的告警。
         与 `latest_for` 的分工也在这里：那一头管冷却（同键同账户），这一头管刷屏（同票同人）。
+        `acknowledged` 仍算未处理：已读只是「看到了」，不是「做完了」，把它算成关掉的话，
+        看一眼就等于替用户把这条止损结了（D124）。`deferred_until` 不改变状态：稍后是
+        同一个结论加一个时刻，`status` 那一路照样挡着。
         测试告警（D131）不进来：/settings/test-alert 发的那条不该把真告警挡一整天。
         """
         rows = self.db.query(
             f"SELECT {_ALERT_COLUMNS} FROM alerts"
-            " WHERE user_id = ? AND market = ? AND code = ? AND status = 'new'"
+            " WHERE user_id = ? AND market = ? AND code = ?"
+            " AND status IN ('new', 'acknowledged')"
             " AND coalesce(is_test, FALSE) = FALSE"
             " ORDER BY triggered_at DESC, id DESC LIMIT 1",
             [user_id, market, code],
@@ -377,8 +409,12 @@ class AlertRepo:
         `handled` 与 `dismissed` 各写自己那一列：两列问的是两件事（「打算怎么处理」与
         「为什么不处理」），同一句话写两遍，忽略率就会把按错的也算进去。
         """
-        if status not in STATUS:
-            raise ValidationError(f"未知状态 {status!r}：只有 {list(STATUS)}")
+        legacy = (NEW, HANDLED, DISMISSED)
+        if status not in legacy:
+            raise ValidationError(
+                f"set_status 不接受 {status!r}：已读请走 acknowledge()，"
+                f"它不写 handled_at（一条已读的告警仍算未处理）"
+            )
         row = self.get(alert_id)
         if row is None:
             raise StorageError(f"告警 {alert_id} 不存在（处理动作必须落在一条真实告警上）")
@@ -439,6 +475,12 @@ class AlertRepo:
             severity=str(row["severity"] or payload.get("severity") or "mid"),
             channel_ids=list(payload.get("channel_ids") or []),
             is_test=bool(row["is_test"]),
+            acknowledged_at=row["acknowledged_at"],
+            action_kind=row["action_kind"],
+            action_ref=row["action_ref"],
+            dismiss_code=row["dismiss_code"],
+            thesis_id=row["thesis_id"],
+            deferred_until=row["deferred_until"],
             intraday=bool(payload.get("intraday") or False),
             quote_ts=_parse_ts(payload.get("quote_ts")),
             quote_source=(

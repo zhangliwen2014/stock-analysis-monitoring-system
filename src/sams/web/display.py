@@ -10,7 +10,7 @@ from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
 from sams.core.quotes import CLOSED, DELAYED, LIVE, NO_DATA, STALE
-from sams.storage.repos.alerts import DISMISSED, HANDLED, NEW
+from sams.storage.repos.alerts import ACKNOWLEDGED, DISMISSED, HANDLED, NEW
 
 _STATE_LABEL = {
     LIVE: "实时",
@@ -84,9 +84,14 @@ def hhmm(value: dtime | None) -> str:
     return "" if value is None else value.strftime("%H:%M")
 
 
-#: 告警状态的人话名字。键用 `repos/alerts.py` 那三个常量而不是字面量：状态改名时这里
+#: 告警状态的人话名字。键用 `repos/alerts.py` 那几个常量而不是字面量：状态改名时这里
 #: 跟着编译不过或留下一个没人再写得出的旧标签，而字面量只会安静地一直走 `get` 的兜底分支。
-ALERT_STATUS_LABELS = {NEW: "未处理", HANDLED: "已处理", DISMISSED: "已驳回"}
+ALERT_STATUS_LABELS = {
+    NEW: "未处理",
+    ACKNOWLEDGED: "已读",
+    HANDLED: "已处理",
+    DISMISSED: "已驳回",
+}
 
 
 def alert_status(value: str) -> str:

@@ -10,11 +10,21 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from support import FrozenClock
 
 from sams.core.errors import StorageError, ValidationError
 from sams.core.notify import FAILED, NO_CHANNEL, SENT, SUPPRESSED
-from sams.storage.repos.alerts import AlertRepo
+from sams.storage.repos.alerts import (
+    ACKNOWLEDGED,
+    DISMISSED,
+    HANDLED,
+    NEW,
+    STATUS,
+    AlertRepo,
+)
 from sams.storage.repos.users import UserRepo
+
+NOW = datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
 
 CREATE_KW = {
     "rule_id": "r1",
@@ -37,8 +47,13 @@ CREATE_KW = {
 
 
 @pytest.fixture
-def repo(db):
-    return AlertRepo(db)
+def clock():
+    return FrozenClock(NOW)
+
+
+@pytest.fixture
+def repo(db, clock):
+    return AlertRepo(db, clock=clock)
 
 
 @pytest.fixture
@@ -97,7 +112,9 @@ def test_no_channel_and_dnd_rows_have_no_channel(repo, seeded_user):
     repo.record(alert.id, None, SUPPRESSED, error="23:00-07:00 免打扰（mid）", attempts=0)
     rows = repo.deliveries(alert.id)
     assert all(r.channel_id is None for r in rows)
-    assert [r.outcome for r in rows] == [NO_CHANNEL, SUPPRESSED]
+    # 两条落在同一个冻结时刻里，`(ts, id)` 里的 id 是随机串：断言顺序等于断言一个
+    # 不打算提供的承诺（同 `test_record_writes_one_row_per_attempt`）
+    assert sorted(r.outcome for r in rows) == [NO_CHANNEL, SUPPRESSED]
 
 
 def test_a_sent_row_must_name_a_channel(repo, seeded_user):
@@ -136,7 +153,7 @@ def test_get_carries_the_display_fields(repo, seeded_user):
     assert got.rule_name == "PR 低于 0.4"
     assert got.symbol_name == "中国神华"
     assert got.channel_ids == ["c1", "c2"]
-    assert got.status == "new"
+    assert got.status == NEW
 
 
 def test_get_of_an_unknown_alert_is_none(repo):
@@ -162,10 +179,10 @@ def test_list_for_user_is_newest_first(repo, seeded_user, other_user):
 
 def test_list_for_filters_by_status(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
-    repo.set_status(alert.id, "handled", user_id=seeded_user, note="已手动复核")
-    assert repo.list_for(seeded_user, status="new") == []
-    handled = repo.list_for(seeded_user, status="handled")[0]
-    assert handled.status == "handled"
+    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="已手动复核")
+    assert repo.list_for(seeded_user, status=NEW) == []
+    handled = repo.list_for(seeded_user, status=HANDLED)[0]
+    assert handled.status == HANDLED
 
 
 def test_list_for_filters_by_severity_market_code_and_window(db):
@@ -202,7 +219,7 @@ def test_list_for_filters_by_severity_market_code_and_window(db):
 
 def test_set_status_rejects_an_unknown_one(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
-    with pytest.raises(ValidationError, match="状态"):
+    with pytest.raises(ValidationError, match="不接受"):
         repo.set_status(alert.id, "archieved", user_id=seeded_user)
 
 
@@ -295,7 +312,7 @@ def test_latest_open_finds_the_newest_unhandled_alert_on_that_symbol(repo, seede
             "triggered_at": now - timedelta(minutes=30),
         },
     )
-    repo.set_status(first.id, "handled", user_id=seeded_user)
+    repo.set_status(first.id, HANDLED, user_id=seeded_user)
     # 同票上**还有一条更早的 `new`**：只留一条 `new` 的话，删掉 `ORDER BY` 也全绿，
     # 「取最新」这半句根本没被钉住。
     repo.create(
@@ -331,7 +348,7 @@ def test_latest_open_finds_the_newest_unhandled_alert_on_that_symbol(repo, seede
 def test_latest_open_returns_none_once_the_last_one_is_dismissed(repo, seeded_user) -> None:
     got = repo.create(user_id=seeded_user, **CREATE_KW)
     assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is not None
-    repo.set_status(got.id, "dismissed", user_id=seeded_user, note="误报")
+    repo.set_status(got.id, DISMISSED, user_id=seeded_user, note="误报")
     assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is None
 
 
@@ -350,9 +367,9 @@ def test_the_three_columns_a_human_writes_come_back_out(repo, seeded_user):
     读不出就等于屏幕上没有「什么时候按的、留了哪一句」，那一句只能靠记忆——而记忆撑不过第二次复盘。
     """
     alert = repo.create(seeded_user, **CREATE_KW)
-    moved = repo.set_status(alert.id, "handled", user_id=seeded_user, note="已挂条件单")
+    moved = repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="已挂条件单")
 
-    assert moved.status == "handled"
+    assert moved.status == HANDLED
     assert moved.handle_note == "已挂条件单"
     assert moved.dismiss_reason is None
     assert moved.handled_at is not None
@@ -361,7 +378,7 @@ def test_the_three_columns_a_human_writes_come_back_out(repo, seeded_user):
 def test_a_dismissal_keeps_its_reason_in_its_own_column(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
     moved = repo.set_status(
-        alert.id, "dismissed", user_id=seeded_user, note="停牌导致的假跌破"
+        alert.id, DISMISSED, user_id=seeded_user, note="停牌导致的假跌破"
     )
 
     assert moved.dismiss_reason == "停牌导致的假跌破"
@@ -372,33 +389,33 @@ def test_dismissing_without_a_reason_is_refused(repo, seeded_user):
     """§5 那句「dismissed 必须带 reason（喂给忽略率统计）」，落点在仓库层。"""
     alert = repo.create(seeded_user, **CREATE_KW)
     with pytest.raises(ValidationError, match="原因"):
-        repo.set_status(alert.id, "dismissed", user_id=seeded_user)
+        repo.set_status(alert.id, DISMISSED, user_id=seeded_user)
 
-    assert repo.get(alert.id).status == "new", "拒绝不许留下一半的变更"
+    assert repo.get(alert.id).status == NEW, "拒绝不许留下一半的变更"
 
 
 def test_a_blank_reason_is_not_a_reason(repo, seeded_user):
     """空格与空串是同一种东西：那一列要能被统计，收下一句空白就是收下噪音。"""
     alert = repo.create(seeded_user, **CREATE_KW)
     with pytest.raises(ValidationError, match="原因"):
-        repo.set_status(alert.id, "dismissed", user_id=seeded_user, note="   ")
+        repo.set_status(alert.id, DISMISSED, user_id=seeded_user, note="   ")
 
 
 def test_someone_elses_alert_is_not_yours_to_move(repo, seeded_user, other_user):
     """归属闸放在仓库层（D81）：调度器与后台都不经过命令层，挡在命令层对它们是空的。"""
     alert = repo.create(seeded_user, **CREATE_KW)
     with pytest.raises(StorageError, match="不属于"):
-        repo.set_status(alert.id, "handled", user_id=other_user, note="手滑")
+        repo.set_status(alert.id, HANDLED, user_id=other_user, note="手滑")
 
-    assert repo.get(alert.id).status == "new"
+    assert repo.get(alert.id).status == NEW
 
 
 def test_changing_your_mind_replaces_the_previous_sentence(repo, seeded_user):
     """按错了要能改，但「人对这条做过什么」在屏幕上只能有一个答案。"""
     alert = repo.create(seeded_user, **CREATE_KW)
-    repo.set_status(alert.id, "handled", user_id=seeded_user, note="准备挂单")
+    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="准备挂单")
     moved = repo.set_status(
-        alert.id, "dismissed", user_id=seeded_user, note="后来决定这轮不动"
+        alert.id, DISMISSED, user_id=seeded_user, note="后来决定这轮不动"
     )
 
     assert moved.handle_note is None
@@ -407,17 +424,17 @@ def test_changing_your_mind_replaces_the_previous_sentence(repo, seeded_user):
 
 def test_a_known_status_still_needs_a_known_alert(repo, seeded_user):
     with pytest.raises(StorageError, match="不存在"):
-        repo.set_status("ghost", "handled", user_id=seeded_user, note="x")
+        repo.set_status("ghost", HANDLED, user_id=seeded_user, note="x")
 
 
 def test_handling_does_not_stamp_a_moment_for_a_new_one(repo, seeded_user):
     """`new` 没有「处理时刻」：给它盖一个，屏幕上那句「何时处理的」就成了谎。"""
     alert = repo.create(seeded_user, **CREATE_KW)
-    moved = repo.set_status(alert.id, "handled", user_id=seeded_user, note="看了")
-    back = repo.set_status(alert.id, "new", user_id=seeded_user)
+    moved = repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="看了")
+    back = repo.set_status(alert.id, NEW, user_id=seeded_user)
 
     assert moved.handled_at is not None
-    assert back.handled_at is None and back.status == "new"
+    assert back.handled_at is None and back.status == NEW
 
 
 # ---------- 按用户读（屏幕上那串 id 不能变成一个跨用户的读取口）----------
@@ -517,5 +534,25 @@ def test_has_system_alert_needs_both_halves_of_the_system_shape(repo, seeded_use
     system = {"rule_id": None, "account_id": None, "market": "SYS", "code": "calendar"}
     repo.create(seeded_user, **{**CREATE_KW, **system})
     assert repo.has_system_alert(seeded_user, "calendar", since=since) is True
+
+
+# ---------- 四态与闭环六列（M4-B §8.1）----------
+
+
+def test_status_vocabulary_grows_one_middle_state():
+    """ack 与 acted 分开，才能回答「看到了但没做」与「根本没看到」（D124）。"""
+    assert STATUS == ("new", "acknowledged", "handled", "dismissed")
+
+
+def test_create_carries_the_thesis_snapshot(repo, seeded_user):
+    """规则经观点展开时留下 `thesis_id`：推送上下文与详情跳转都要它，但它不是归属键。"""
+    alert = repo.create(seeded_user, thesis_id="t1", **CREATE_KW)
+    assert alert.thesis_id == "t1"
+
+
+def test_list_for_accepts_the_new_status(repo, seeded_user, db):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    db.execute("UPDATE alerts SET status = ? WHERE id = ?", [ACKNOWLEDGED, alert.id])
+    assert [row.id for row in repo.list_for(seeded_user, status=ACKNOWLEDGED)] == [alert.id]
 
 

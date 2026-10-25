@@ -373,3 +373,18 @@ def test_handle_json_shape(container, capsys) -> None:
     # 而且按下的就是这一趟的那一枚：夹具的钟冻在哪个时刻，那一列就是哪个时刻
     stamped = datetime.fromisoformat(body["alert"]["handled_at"])
     assert stamped == container.alerts_store.clock.now_utc()
+
+
+# ---------- 四态：多一个状态，屏幕上就得有那个词 ----------
+
+
+def test_acknowledged_is_spoken_in_chinese(container, capsys, db) -> None:
+    """状态词表是封闭枚举：多一个状态而 CLI 没这个词，`alert show` 会 KeyError。"""
+    from sams.storage.repos.alerts import ACKNOWLEDGED
+
+    assert ACKNOWLEDGED == "acknowledged"
+    alert = make_alert(container)
+    db.execute("UPDATE alerts SET status = 'acknowledged' WHERE id = ?", [alert.id])
+    code, text = out(container, capsys, "show", alert.id, "--user", USER)
+    assert code == 0
+    assert "已读" in text

@@ -24,12 +24,17 @@ from sams.services.actors import resolve_actor
 #: （多取的那一条只用来判断屏幕上要不要说「还有更多」），所以它在这里不生效；
 #: 屏幕上那句「默认 50」的唯一出处就是这个数
 DEFAULT_LIMIT = 50
-#: 屏幕上 `--status` 的三个取值加一个「都要」。`all` 不是库里的状态，是命令层的一个别名，
+#: 屏幕上 `--status` 的取值加一个「都要」。`all` 不是库里的状态，是命令层的一个别名，
 #: 折成 `None` 之后由仓库层去校验真正的取值——校验只有那一个口径
-STATUS_HELP = "new/handled/dismissed（默认 new = 只看没人处理过的），或 all"
-#: 那一列存的是英文（`alerts.status`，取值与仓库层 `STATUS` 那三个一致），屏幕上说中文。
+STATUS_HELP = "new/acknowledged/handled/dismissed（默认 new = 只看没人处理过的），或 all"
+#: 那一列存的是英文（`alerts.status`，取值与仓库层 `STATUS` 那四个一致），屏幕上说中文。
 #: 「全部状态」是 `status=None` 那个分支，不在这个表里
-_STATUS_WORDS = {"new": "未处理", "handled": "已处理", "dismissed": "已忽略"}
+_STATUS_WORDS = {
+    "new": "未处理",
+    "acknowledged": "已读",
+    "handled": "已处理",
+    "dismissed": "已忽略",
+}
 
 
 def add_to(subparsers) -> None:
