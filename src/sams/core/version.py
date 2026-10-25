@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 
-DEFAULT_KINDS = ("rules", "theses", "ledger", "bars")
+DEFAULT_KINDS = ("rules", "theses", "ledger", "bars", "fundamentals")
 
 
 class VersionGate:

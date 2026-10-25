@@ -230,6 +230,49 @@ def test_flow_job_uses_the_latest_stored_day(db, settings):
     assert FundingFlowRepo(db).latest_date("A", "601088") == AS_OF
 
 
+def test_financials_job_bumps_the_gate_because_the_snapshot_reads_it(db, settings):
+    """财报进的是盘中快照里 ROE 那一项（`fundamentals.read`）：写回来就得让缓存知道。
+
+    漏掉这一下的症状同日线那一枚：不是报错，是盘中线程拿着上一期 ROE 继续判，
+    而页面与告警都说「已是最新」。
+    """
+    gate = VersionGate()
+    finance = StubFundamentalsAdapter(["A"], financials=financial_rows())
+    run_financials(
+        replace(deps(db, settings, finance=finance), versions=gate), ctx("601088")
+    )
+    assert gate.current("fundamentals") == 1
+
+
+def test_valuation_job_bumps_the_gate(db, settings):
+    gate = VersionGate()
+    ValuationRepo(db).upsert(valuation([date(2024, 10, 24)]))
+    finance = StubFundamentalsAdapter(["A"], valuation=valuation([date(2024, 10, 24), AS_OF]))
+    run_valuation(
+        replace(deps(db, settings, finance=finance), versions=gate), ctx("601088")
+    )
+    assert gate.current("fundamentals") == 1
+
+
+def test_flow_job_bumps_the_gate(db, settings):
+    gate = VersionGate()
+    FundingFlowRepo(db).upsert(flow_rows([date(2024, 10, 24)], net=1.0e8))
+    finance = StubFundamentalsAdapter(
+        ["A"], flow=flow_rows([date(2024, 10, 24), AS_OF], net=1.0e8)
+    )
+    run_flow(
+        replace(deps(db, settings, finance=finance), versions=gate), ctx("601088")
+    )
+    assert gate.current("fundamentals") == 1
+
+
+def test_a_noop_financials_job_leaves_the_gate_alone(db, settings):
+    """写 0 行还敲一次闸，换来的是一次全市场重读，而库里什么都没变（同 bars 那条）。"""
+    gate = VersionGate()
+    outcome = run_financials(replace(deps(db, settings), versions=gate), ctx())
+    assert outcome.rows_affected == 0 and gate.current("fundamentals") == 0
+
+
 def test_actions_job_skips_a_fully_covered_code(db, settings):
     CorpActionsCoverageRepo(db).record(
         "A",

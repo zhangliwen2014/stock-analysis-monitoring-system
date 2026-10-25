@@ -102,11 +102,23 @@ def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return outcome
 
 
+def _bump_fundamentals(deps: JobDeps, outcome: JobOutcome) -> JobOutcome:
+    """财务/估值/资金流回来就让缓存整表清一次（§5.4）。
+
+    这三条写的是盘中快照里估值那几项的输入（`fundamentals.read`、`valuation.read` 的
+    合成分）：不敲这一下，盘中线程会拿着上一期 ROE、上一日估值继续判，而页面上
+    什么都没变。写 0 行不敲——缓存清空换来的是一次全市场重读，库里却没变。
+    """
+    if outcome.rows_affected > 0:
+        deps.versions.bump("fundamentals")
+    return outcome
+
+
 def run_financials(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     def one(market: str, code: str) -> int:
         return deps.fundamentals.sync_financials(market, code, HISTORY_START, ctx.as_of).written
 
-    return _collect(_units(ctx), one, "财务")
+    return _bump_fundamentals(deps, _collect(_units(ctx), one, "财务"))
 
 
 def run_valuation(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -116,7 +128,7 @@ def run_valuation(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             return 0
         return deps.fundamentals.sync_valuation(market, code, start, ctx.as_of).written
 
-    return _collect(_units(ctx), one, "按日估值")
+    return _bump_fundamentals(deps, _collect(_units(ctx), one, "按日估值"))
 
 
 def run_flow(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -126,7 +138,7 @@ def run_flow(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             return 0
         return deps.fundamentals.sync_flow(market, code, start, ctx.as_of).written
 
-    return _collect(_units(ctx), one, "资金流")
+    return _bump_fundamentals(deps, _collect(_units(ctx), one, "资金流"))
 
 
 #: 数据 job 的登记表：能力名（= 适配器方法名）→ job 名与实现。
@@ -160,6 +172,9 @@ def run_fx(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     那句的前缀都是按它写的，而这里的单位是「一对」。接住的仍然只有 `SamsError`——
     按对隔离与按只隔离是同一条规矩，但那份规矩是两处各写一遍的，所以四个运维 job
     每一个都在自己那一头单独钉一枚：放宽一处不该让其余三处跟着红。
+
+    汇率不敲版本闸：它不进盘中快照缓存——告警文案里的折合是求值时现读的
+    （`engine._fx`），所以这里没有「旧读数」要作废。
     """
     pairs = ctx.universe.fx_pairs
     rows = 0

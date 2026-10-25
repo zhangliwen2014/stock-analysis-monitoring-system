@@ -8,7 +8,7 @@ import pytest
 from support_rules import NOW, USER, Harness, StubQuotes
 
 from sams.core.quotes import Quote
-from sams.core.version import VersionGate
+from sams.core.version import DEFAULT_KINDS, VersionGate
 from sams.services.rules.cache import CacheKey, SnapshotCache
 
 #: 与引擎时钟同一分钟：staleness 闸不能抢在缓存之前把这一趟拒掉
@@ -33,9 +33,10 @@ def test_a_different_day_is_a_miss():
     assert got_cache.get(KEY, day=DAY + timedelta(days=1)) is None
 
 
-@pytest.mark.parametrize("kind", ["rules", "theses", "ledger", "bars"])
+@pytest.mark.parametrize("kind", DEFAULT_KINDS)
 def test_any_version_bump_clears_everything(kind):
-    # 分 kind 失效省下的那点读，不值「哪一版忘了 bump」的风险——四个键一个待遇
+    # 分 kind 失效省下的那点读，不值「哪一版忘了 bump」的风险——每一版一个待遇。
+    # 参数写一份常量而不是手抄列表：新加一版时，这一枚跟着多一条，不会悄悄漏掉
     gate = VersionGate()
     got_cache = SnapshotCache(gate, monotonic=lambda: 0.0)
     got_cache.put(KEY, "snap", day=DAY)

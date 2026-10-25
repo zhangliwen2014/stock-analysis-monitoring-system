@@ -53,6 +53,9 @@ class FakeMonitor:
 class FakeWorker:
     """通知线程的替身：形状照 `_Worker` 协议，记录起止。"""
 
+    #: `stop()` 从这一格算 join 预算：排空窗口之外还要留一次投递（`_Worker.drain_s`）
+    drain_s = 10.0
+
     def __init__(self) -> None:
         self.started = threading.Event()
         self.stopped = threading.Event()
@@ -299,6 +302,36 @@ def test_stop_reports_whether_every_thread_exited(settings, monkeypatch):
         assert stuck.stop() is False
     finally:
         stubborn.release.set()
+
+
+def test_the_notify_budget_is_its_drain_window_plus_one_delivery(settings, monkeypatch):
+    """通知线程停产时还要排空（`NotifyWorker.drain_s`），手上那一单也要发完。
+
+    join 预算与排空窗口取等时，一次**正常**的排水会被读成「没退干净」，`serve` 于是
+    跳过关闭四条连接。这条用例把排空窗口调短，只钉「预算里含了它」这一件事：
+    线程在 base 预算之后、排空+一次投递之内退出，`stop()` 必须报干净。
+    """
+    release = threading.Event()
+    started = threading.Event()
+
+    class Draining:
+        drain_s = 0.3
+
+        def run(self, *, stop):
+            started.set()
+            stop.wait(5)
+            release.wait(5)  # 手上那一单：等用例放行
+
+    runtime = make_runtime(settings, worker=Draining())
+    runtime.start()
+    assert started.wait(2)
+    monkeypatch.setattr(runtime_module, "WORKER_STOP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(runtime_module, "ONE_DELIVERY_S", 0.05)
+    try:
+        threading.Timer(0.2, release.set).start()
+        assert runtime.stop() is True, "0.2s 在排空窗口 0.3s 之内：这一趟是正常停机"
+    finally:
+        release.set()
 
 
 def test_request_prune_refuses_a_second_run_while_one_is_running(settings):

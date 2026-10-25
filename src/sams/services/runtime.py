@@ -35,6 +35,11 @@ MAINTENANCE_AT = time(3, 30)
 #: 盘中与维护线程的排空上限。调度线程另有 `scheduler_tick_s + 30`（§2.1）
 WORKER_STOP_TIMEOUT_S = 10.0
 
+#: 一次投递的预算（webhook 15s、邮件 20s 是各 notifier 自己的网络超时，取上界）。
+#: 通知线程的 join 预算 = 排空窗口 + 这一格：与排空窗口取等时，一次正常的排水
+#: 会被读成「没退干净」，`serve` 于是跳过关闭四条连接
+ONE_DELIVERY_S = 20.0
+
 
 class _DbProbe(Protocol):
     def scalar(self, sql: str) -> Any: ...
@@ -48,6 +53,9 @@ class _PruneRun(Protocol):
 
 class _Worker(Protocol):
     """通知线程的形状（结构化）：`NotifyWorker` 与测试替身各长各的。"""
+
+    #: 停机后还要排空多久。`stop()` 从这一格算 join 预算，不从自己的常量猜
+    drain_s: float
 
     def run(self, *, stop: threading.Event) -> None: ...
 
@@ -164,7 +172,7 @@ class Runtime:
             # 调度线程可能正卡在一个 job 里：等它收尾，但不等一个坏掉的实现
             "scheduler": float(self.settings.scheduler_tick_s) + 30.0,
             "intraday": WORKER_STOP_TIMEOUT_S,
-            "notify": WORKER_STOP_TIMEOUT_S,
+            "notify": self._notify_stop_timeout(),
             "maintenance": WORKER_STOP_TIMEOUT_S,
         }
         clean = True
@@ -197,6 +205,16 @@ class Runtime:
     def next_maintenance_at(self, now: datetime) -> datetime:
         today = datetime.combine(now.date(), MAINTENANCE_AT, tzinfo=UTC)
         return today if today > now else today + timedelta(days=1)
+
+    def _notify_stop_timeout(self) -> float:
+        """通知线程的 join 预算：它自己的排空窗口 + 手上那一单投完。
+
+        排空窗口由 worker 给（`NotifyWorker.drain_s`，这一层不许 import monitor）；
+        一单最多几条通道各有自己的网络超时，这里按一次投递算上界。
+        """
+        if self.worker is None:
+            return WORKER_STOP_TIMEOUT_S
+        return self.worker.drain_s + ONE_DELIVERY_S
 
     def run_maintenance(self, *, dry_run: bool = False) -> PruneReport:
         return self._run_prune(self.prune, dry_run=dry_run)
