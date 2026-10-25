@@ -1,12 +1,12 @@
 """/alerts 收件箱：筛选、详情、处理与重发（spec §6.3）。
 
-状态机住在 `AlertRepo.set_status`（它自己挡归属与驳回空原因），这一层只加两样它没有的东西：
+状态机住在 `AlertRepo` 的处置命令（`act`/`dismiss`/`acknowledge`/`defer`/`undo`，
+归属与驳回空原因在仓库层挡），这一层只加两样它没有的东西：
 「不存在」与「不是你的」答同一个 404，以及把人敲得出来的筛选值折成库里那个键——
 `list_for` 认的 `market` 是 `canonical_market` 的产物，而下拉之外还有人直接改 URL，
 不折一次 `?market=a` 会对着一堆确实存在的告警说「没有命中的告警」；折完了还要挡一句，
 因为筛出一个空列表同样是那句假话（`SYS` 那一档见 `_market_choices`：系统告警与真告警同表）。
-2026-10-25 起本页只走 `ReviewService` 与 `acknowledge/defer/undo`：`set_status` 的
-最后两个调用点（旧 acted/dismiss）已在闭环改造里迁走。
+闭环走 `ReviewService`：引用校验与「成交+闭环同事务」在那一层补。
 
 重发走 `NotifyService.deliver_existing`：正文从库里重建、按**此刻**的通道与免打扰重新选路，
 所以「当时没发出去」与「现在也发不出去」是两句不同的话——`monitor/queue.py` 里那句
@@ -483,7 +483,7 @@ def acted(
     _csrf: None = Depends(csrf_protect),
     data: dict[str, list[str]] = _form_body,
 ):
-    """处置：五类动作（D125）。全部走 `ReviewService`——`set_status` 这条路从此无人走。
+    """处置：五类动作（D125）。全部走 `ReviewService`——引用校验与成交同事务都在那层。
 
     引用选择器按动作分开命名（`thesis_ref`/`rule_ref` 而不是共用 `action_ref` 输入框）：
     没有 JS 的浏览器也要能把三种引用的来源各交各的，而 trade 的引用压根不该从表单来。
