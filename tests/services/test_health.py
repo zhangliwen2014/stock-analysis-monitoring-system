@@ -770,6 +770,46 @@ def test_system_alerts_are_not_counted_as_user_backlog(db, settings) -> None:
     assert report.notify.unhandled_system_oldest == min(r.triggered_at for r in sys_rows)
 
 
+def test_acknowledged_rows_stay_in_both_backlogs(db, settings) -> None:
+    """四条积压查询都把 acknowledged 算作未处理：全按成已读之后，四个数一个都不变小。"""
+    alerts = AlertRepo(db)
+    trader = UserRepo(db).create("trader", PASSWORD).id
+    keeper = UserRepo(db).create("keeper", PASSWORD).id
+    moment = datetime.now(UTC)
+    hour_earlier = moment - timedelta(hours=1)
+    user_rows = [
+        alerts.create(
+            trader,
+            rule_id="rule-1",
+            rule_name="PR 低",
+            account_id=None,
+            account_name="主账户",
+            market="A",
+            code=code,
+            symbol_name="某票",
+            severity="mid",
+            stage="入池",
+            value_text="PR=0.31",
+            threshold_text="PR≤0.4",
+            action_note="",
+            triggered_at=moment,
+        )
+        for code in ("600519", "000001")
+    ]
+    sys_rows = [
+        make_sys_alert(alerts, trader, "sync", hour_earlier),
+        make_sys_alert(alerts, keeper, "sync", hour_earlier),
+    ]
+    for row in [*user_rows, *sys_rows]:
+        alerts.acknowledge(row.id, user_id=row.user_id)
+
+    report = service(db, settings, StubAdapter("akshare", ["A"], sample_bars())).report()
+    assert report.notify.unhandled == 2, "两条用户告警都只是已读，仍算积压"
+    assert report.notify.unhandled_system == 1, "两份管理员副本都读过了，组件问题还在"
+    assert report.notify.unhandled_oldest == moment
+    assert report.notify.unhandled_system_oldest == hour_earlier
+
+
 def test_the_system_backlog_uses_the_same_maybe_line_as_the_rest(tmp_path, settings) -> None:
     """未迁移的库里那两个新数也是 None：沿用 `NotifyData` 那一节其余那几个数的同一条线（D93），
     而不是给系统积压另立第二条「该跑迁移」的判据。库的形状照旧用例的办法造：只到 0014。"""

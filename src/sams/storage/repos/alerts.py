@@ -404,7 +404,11 @@ class AlertRepo:
         ]
 
     def acknowledge(self, alert_id: str, *, user_id: str) -> Alert:
-        """「看到了」。重复调用是幂等的：手机连点两下不该多出一条历史。"""
+        """「看到了」。重复调用是幂等的：手机连点两下不该多出一条历史。
+
+        条件更新（`WHERE status = 'new'`）让输掉竞争的那一次命中 0 行：它照旧返回已读的
+        那一行，但不会再补一条历史——读状态在事务外，两个连接可能都读到 `new`。
+        """
         row = self._owned(alert_id, user_id)
         if row.status == ACKNOWLEDGED:
             return row
@@ -415,17 +419,19 @@ class AlertRepo:
             )
         moment = self.clock.now_utc()
         with self.db.transaction():
-            self.db.execute(
-                "UPDATE alerts SET status = ?, acknowledged_at = ? WHERE id = ?",
-                [ACKNOWLEDGED, moment, alert_id],
+            changed = self.db.scalar(
+                "UPDATE alerts SET status = ?, acknowledged_at = ?"
+                " WHERE id = ? AND status = ? RETURNING id",
+                [ACKNOWLEDGED, moment, alert_id, NEW],
             )
-            self.events.add(
-                alert_id,
-                user_id=user_id,
-                action="ack",
-                from_status=NEW,
-                to_status=ACKNOWLEDGED,
-            )
+            if changed is not None:
+                self.events.add(
+                    alert_id,
+                    user_id=user_id,
+                    action="ack",
+                    from_status=NEW,
+                    to_status=ACKNOWLEDGED,
+                )
         return self._reload(alert_id)
 
     def _owned(self, alert_id: str, user_id: str) -> Alert:

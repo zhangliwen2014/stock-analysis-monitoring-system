@@ -153,7 +153,7 @@ class NotifyData:
     failed: int | None = None
     suppressed: int | None = None
     no_channel: int | None = None
-    #: 未处理（`status='new'`）的**用户**条数与**最早**那一条的时刻。跨全部用户数：健康页是
+    #: 未处理（new + acknowledged）的**用户**条数与**最早**那一条的时刻。跨全部用户数：健康页是
     #: 运维视角，「响了多少没人看」与「谁该看」是两件事。`None` 沿用上面那几个数的同一条线（D93）。
     #: 排除 `market='SYS'`：一条系统告警在每个管理员名下各落一行（D102），混进来的话
     #: 「2 个组件在反复告警、2 个管理员」会显示成「未处理 4 条」——而那两句修法是两个问题

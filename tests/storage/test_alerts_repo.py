@@ -564,8 +564,6 @@ def test_list_for_accepts_the_new_status(repo, seeded_user, db):
     assert [row.id for row in repo.list_for(seeded_user, status=ACKNOWLEDGED)] == [alert.id]
 
 
-
-
 def test_acknowledge_marks_it_read_without_closing_it(repo, seeded_user, clock):
     alert = repo.create(seeded_user, **CREATE_KW)
     moved = repo.acknowledge(alert.id, user_id=seeded_user)
@@ -585,10 +583,44 @@ def test_acknowledge_is_idempotent(repo, seeded_user, clock):
     assert len(repo.events.list_for(alert.id)) == 1
 
 
+def test_a_racing_ack_does_not_write_a_second_event(tmp_path, monkeypatch):
+    """另一个连接先按掉了这一条：本连接的条件更新命中 0 行，不能再补一条历史。"""
+    from sams.storage.db import Database
+    from sams.storage.migrate import apply_migrations
+
+    path = str(tmp_path / "race.duckdb")
+    db = Database.open(path)
+    apply_migrations(db)
+    user = UserRepo(db).create("racer", "correct-horse-battery").id
+    clock = FrozenClock(NOW)
+    repo = AlertRepo(db, clock=clock)
+    alert = repo.create(user, **CREATE_KW)
+    other = Database.open(path)
+
+    def racing():
+        other.execute(
+            "UPDATE alerts SET status = 'acknowledged', acknowledged_at = ? WHERE id = ?",
+            [clock.moment, alert.id],
+        )
+        other.execute(
+            "INSERT INTO alert_events"
+            " (id, alert_id, user_id, action, from_status, to_status, note, ts)"
+            " VALUES ('e-other', ?, ?, 'ack', 'new', 'acknowledged', '', ?)",
+            [alert.id, user, clock.moment],
+        )
+        return clock.moment
+
+    monkeypatch.setattr(clock, "now_utc", racing)
+    moved = repo.acknowledge(alert.id, user_id=user)
+    assert moved.status == ACKNOWLEDGED
+    assert [e.id for e in repo.events.list_for(alert.id)] == ["e-other"]
+    other.close()
+
+
 def test_acknowledge_refuses_a_closed_alert(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
     repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="已挂单")
-    with pytest.raises(Conflict, match="已"):
+    with pytest.raises(Conflict, match="已经是 handled"):
         repo.acknowledge(alert.id, user_id=seeded_user)
 
 
