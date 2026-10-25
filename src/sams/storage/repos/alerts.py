@@ -434,6 +434,120 @@ class AlertRepo:
                 )
         return self._reload(alert_id)
 
+    def act(
+        self,
+        alert_id: str,
+        *,
+        user_id: str,
+        action_kind: str,
+        action_ref: str | None = None,
+        note: str = "",
+    ) -> Alert:
+        """「做了什么」：动作类型必填，能指到实物的动作要带引用。
+
+        只收 `new`/`acknowledged`：`handled` 与 `dismissed` 是终态，再按一次不是新结论，
+        而是把前一次结论覆盖掉，复盘时那个第一次的动作就再也找不回来了。
+        与 `acknowledge` 同一条并发规则：状态列与历史行在同一个事务里，条件更新命中 0 行
+        时不补历史——输掉竞争的那一次没有资格描述发生了什么。
+        """
+        if action_kind not in ACTION_KINDS:
+            raise ValidationError(
+                f"未知处置动作 action_kind={action_kind!r}：只有 {list(ACTION_KINDS)}"
+            )
+        ref = (action_ref or "").strip() or None
+        text = (note or "").strip()
+        if action_kind in ("trade", "thesis", "rule") and ref is None:
+            raise ValidationError(
+                f"{action_kind} 必须带引用（action_ref）：没有单号/观点/规则，"
+                "复盘时这一句「已处置」指不到任何东西"
+            )
+        if action_kind == "other" and len(text) < 2:
+            raise ValidationError(
+                "other 必须写一句说明：只说「已处置」，复盘时仍然不知道做了什么（D125）"
+            )
+        row = self._owned(alert_id, user_id)
+        if row.status not in (NEW, ACKNOWLEDGED):
+            raise Conflict(
+                f"告警 {alert_id} 已经是 {row.status}，终态不可回退；"
+                "要改结论请在批注里说明，或 5 分钟内撤销"
+            )
+        moment = self.clock.now_utc()
+        with self.db.transaction():
+            changed = self.db.scalar(
+                "UPDATE alerts SET status = ?, handled_at = ?, handle_note = ?,"
+                " action_kind = ?, action_ref = ?, dismiss_code = NULL,"
+                " dismiss_reason = NULL, deferred_until = NULL"
+                " WHERE id = ? AND status IN (?, ?) RETURNING id",
+                [HANDLED, moment, text, action_kind, ref, alert_id, NEW, ACKNOWLEDGED],
+            )
+            if changed is None:
+                raise Conflict(
+                    f"告警 {alert_id} 在操作期间已被关闭：终态不可回退，"
+                    "要改结论请在批注里说明，或 5 分钟内撤销"
+                )
+            self.events.add(
+                alert_id,
+                user_id=user_id,
+                action="act",
+                from_status=row.status,
+                to_status=HANDLED,
+                note=f"{action_kind}:{ref or ''} {text}".strip(),
+            )
+        return self._reload(alert_id)
+
+    def dismiss(
+        self,
+        alert_id: str,
+        *,
+        user_id: str,
+        code: str,
+        reason: str = "",
+    ) -> Alert:
+        """「为什么不处理」：原因码是结构化输入，忽略率按它统计。
+
+        与 `act` 共用终态闸：忽略与处置是两种结论，不是一条路上的两步；
+        互相覆盖会让「按错了」与「改主意了」在历史里长得一样。
+        """
+        if code not in DISMISS_CODES:
+            raise ValidationError(
+                f"未知忽略原因 dismiss_code={code!r}：只有 {list(DISMISS_CODES)}"
+            )
+        text = (reason or "").strip()
+        if code in ("misreport", "other") and len(text) < 2:
+            raise ValidationError(
+                f"{code} 必须写一句说明：光有一个原因码，复盘时回答不了"
+                "「这条规则到底误报在哪」"
+            )
+        row = self._owned(alert_id, user_id)
+        if row.status not in (NEW, ACKNOWLEDGED):
+            raise Conflict(
+                f"告警 {alert_id} 已经是 {row.status}，终态不可回退；"
+                "要改结论请在批注里说明，或 5 分钟内撤销"
+            )
+        moment = self.clock.now_utc()
+        with self.db.transaction():
+            changed = self.db.scalar(
+                "UPDATE alerts SET status = ?, handled_at = ?, dismiss_code = ?,"
+                " dismiss_reason = ?, handle_note = NULL, action_kind = NULL,"
+                " action_ref = NULL, deferred_until = NULL"
+                " WHERE id = ? AND status IN (?, ?) RETURNING id",
+                [DISMISSED, moment, code, text, alert_id, NEW, ACKNOWLEDGED],
+            )
+            if changed is None:
+                raise Conflict(
+                    f"告警 {alert_id} 在操作期间已被关闭：终态不可回退，"
+                    "要改结论请在批注里说明，或 5 分钟内撤销"
+                )
+            self.events.add(
+                alert_id,
+                user_id=user_id,
+                action="dismiss",
+                from_status=row.status,
+                to_status=DISMISSED,
+                note=f"{code} {text}".strip(),
+            )
+        return self._reload(alert_id)
+
     def _owned(self, alert_id: str, user_id: str) -> Alert:
         row = self.get(alert_id)
         if row is None:
