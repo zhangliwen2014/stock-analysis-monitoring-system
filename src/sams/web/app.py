@@ -81,6 +81,13 @@ class WebState:
     #: 日线），而且同步跑在页面那条池线程上。少了这张卡，连点就是每次都真发一趟请求，
     #: 而那条页面请求要等它跑完才返回——三个标签页就能把池线程按死在别人的排障上
     admin_source_probes: RateCard
+    #: 批注写入的每用户窗口计数（§10「每分钟 30 条」）。这是**窗口计数不是最小间隔**：
+    #: 用 RateCard(2) 会变成每 2 秒放行一条，连点照样一分钟灌出去 30 条。
+    #: `record_failure` 的名字是登录留下的（`LoginLimiter`），这里记的是每一次尝试
+    annotation_writes: LoginLimiter
+    #: 带附件的每一次写入在 30 条/分钟之外再数一层：写批注的闸门拦不住
+    #: 「一分钟 10 条、每条 5 张图」那种把磁盘当上传目录的用法
+    attachment_uploads: LoginLimiter
 
     def render(self, request: Request, name: str, *, status_code: int = 200, **ctx):
         from sams.web.auth import csrf_value
@@ -133,6 +140,9 @@ def create_app(
         test_alerts=RateCard(300),
         probes=RateCard(30),
         admin_source_probes=RateCard(60),
+        # 每 app 一台：limiter 绝不能做成模块级单例，否则测试之间会串窗口计数
+        annotation_writes=LoginLimiter(max_failures=30, window_s=60),
+        attachment_uploads=LoginLimiter(max_failures=10, window_s=60),
     )
     app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
 
