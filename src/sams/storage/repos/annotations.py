@@ -12,7 +12,7 @@ import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import Conflict, ValidationError
@@ -85,7 +85,15 @@ def _moment(value: datetime) -> datetime:
 
 def _utc(value: datetime) -> datetime:
     """库里读出来的值按 UTC 解释；裸值只可能来自旧行，不当成本地时间。"""
-    return value if value.tzinfo else value.replace(tzinfo=UTC)
+    return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def _reject_team_on_non_symbol(target_type: str, visibility: str) -> None:
+    if visibility == TEAM and target_type != SYMBOL:
+        raise ValidationError(
+            "visibility=team 只对 symbol 生效：别的目标上一条团队批注"
+            "等于泄露「这个对象存在」"
+        )
 
 
 def _json_list(raw: object) -> list[str]:
@@ -135,9 +143,14 @@ class AnnotationRepo:
             raise ValidationError("target_ref 不能为空：一条批注必须说清它是关于什么的")
         if visibility not in VISIBILITIES:
             raise ValidationError(f"未知可见性 {visibility!r}：只有 {list(VISIBILITIES)}")
+        _reject_team_on_non_symbol(target_type, visibility)
         body = body_md or ""
         if not body.strip():
             raise ValidationError("批注正文不能为空")
+        if pinned and self._pinned_count(target_type, ref) >= MAX_PINNED:
+            raise ValidationError(
+                f"同一个目标最多置顶 {MAX_PINNED} 条：再多，置顶就不再是「先看这个」"
+            )
         moment = self.clock.now_utc()
         annotation_id = new_id()
         self.db.execute(
@@ -194,10 +207,15 @@ class AnnotationRepo:
             )
         if visibility not in VISIBILITIES:
             raise ValidationError(f"未知可见性 {visibility!r}：只有 {list(VISIBILITIES)}")
+        _reject_team_on_non_symbol(row.target_type, visibility)
         body = body_md or ""
         if not body.strip():
             raise ValidationError("批注正文不能为空")
         moment = self.clock.now_utc()
+        previous_updated = _utc(row.updated_at)
+        if moment <= previous_updated:
+            # 同一时钟刻度里的第二次编辑也要让 updated_at 前进，否则条件更新分不出新旧
+            moment = previous_updated + timedelta(microseconds=1)
         meta = {
             "before": {"tags": row.tags, "visibility": row.visibility},
             "after": {"tags": list(tags), "visibility": visibility},
@@ -215,7 +233,7 @@ class AnnotationRepo:
                     visibility,
                     moment,
                     annotation_id,
-                    _utc(row.updated_at),
+                    previous_updated,
                 ]
                 changed = self.db.scalar(sql, params)
                 if changed is None:
@@ -263,14 +281,8 @@ class AnnotationRepo:
         if bool(row.pinned) == bool(pinned):
             return row
         if pinned:
-            count = int(
-                self.db.scalar(
-                    "SELECT count(*) FROM annotations"
-                    " WHERE target_type = ? AND target_ref = ? AND pinned"
-                    " AND deleted_at IS NULL AND id <> ?",
-                    [row.target_type, row.target_ref, annotation_id],
-                )
-                or 0
+            count = self._pinned_count(
+                row.target_type, row.target_ref, exclude_id=annotation_id
             )
             if count >= MAX_PINNED:
                 raise ValidationError(
@@ -370,6 +382,20 @@ class AnnotationRepo:
             )
             for row in rows.to_dicts()
         ]
+
+    def _pinned_count(
+        self, target_type: str, target_ref: str, *, exclude_id: str | None = None
+    ) -> int:
+        sql = (
+            "SELECT count(*) FROM annotations"
+            " WHERE target_type = ? AND target_ref = ? AND pinned"
+            " AND deleted_at IS NULL AND purged_at IS NULL"
+        )
+        params: list[object] = [target_type, target_ref]
+        if exclude_id is not None:
+            sql += " AND id <> ?"
+            params.append(exclude_id)
+        return int(self.db.scalar(sql, params) or 0)
 
     def _reload(self, annotation_id: str) -> Annotation:
         row = self.get(annotation_id)

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 import pytest
 from support import FrozenClock
 
-from sams.core.errors import ValidationError
+from sams.core.errors import Conflict, ValidationError
 from sams.storage.repos.annotations import AnnotationRepo
 
 NOW = datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
@@ -71,10 +71,14 @@ def test_team_rows_are_only_visible_when_the_policy_is_on(repo):
     assert [row.id for row in repo.list_visible(OWNER, team_sharing=True)] == [team.id]
 
 
-def test_team_rows_never_leak_from_private_targets(repo):
+def test_team_rows_never_leak_from_private_targets(repo, db):
     """D121：team 只对 symbol 生效。一条 team 批注挂到别人的 thesis 上，
-    等于用一条批注泄露「这个 thesis 存在」。"""
-    add(repo, user=OTHER, visibility="team", target_type="thesis", target_ref="t1")
+    等于用一条批注泄露「这个 thesis 存在」。
+
+    写入路径已经拒收，这里直接改库造出历史遗留的坏行：读过滤仍要兜住它。
+    """
+    legacy = add(repo, user=OTHER, target_type="thesis", target_ref="t1")
+    db.execute("UPDATE annotations SET visibility = 'team' WHERE id = ?", [legacy.id])
     assert repo.list_visible(OWNER, team_sharing=True) == []
 
 
@@ -126,3 +130,34 @@ def test_pagination_keeps_the_order_stable(repo, clock):
     second = repo.list_visible(OWNER, limit=2, offset=2)
     assert [row.body_md for row in first] == ["第 2 条", "第 1 条"]
     assert [row.body_md for row in second] == ["第 0 条"]
+
+
+def test_team_visibility_is_refused_on_non_symbol_targets(repo):
+    with pytest.raises(ValidationError, match="symbol"):
+        add(repo, visibility="team", target_type="thesis", target_ref="t1")
+    made = add(repo, target_type="thesis", target_ref="t1")
+    with pytest.raises(ValidationError, match="symbol"):
+        repo.update(
+            made.id, user_id=OWNER, body_md="改", tags=[], visibility="team"
+        )
+
+
+def test_create_cannot_bypass_the_pin_cap(repo):
+    for index in range(3):
+        add(repo, body_md=f"置顶 {index}", pinned=True)
+    with pytest.raises(ValidationError, match="最多置顶"):
+        add(repo, body_md="第四条", pinned=True)
+
+
+def test_two_edits_in_the_same_clock_tick_still_conflict(repo):
+    """冻结时钟下两次编辑的 now() 相同：updated_at 必须仍前进，旧版本号才分得出来。"""
+    made = add(repo)
+    repo.update(
+        made.id, user_id=OWNER, body_md="第一改", tags=[], visibility="private",
+        expected_updated_at=made.updated_at,
+    )
+    with pytest.raises(Conflict, match="改过"):
+        repo.update(
+            made.id, user_id=OWNER, body_md="第二改", tags=[], visibility="private",
+            expected_updated_at=made.updated_at,
+        )
