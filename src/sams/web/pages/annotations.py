@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
@@ -145,23 +146,29 @@ def _part_size(upload: UploadFile) -> int:
     return size
 
 
+#: 护两张卡的读—判—写：端点跑在线程池上，`LoginLimiter` 自己不带锁（它设计时
+#: 只有一个调用方），`RateCard` docstring 里那条「读—判—写必须同锁」在这里由这把锁补
+_limit_lock = threading.Lock()
+
+
 def _limit_hit(web, user_id: str, *, uploads: int) -> int:
     """§10 的「每分钟 30 条」是窗口计数：先问两张卡要不要等，谁要等就交谁的秒数；
     都放行才各记一次尝试。`record_failure` 的名字是登录留下的，这里记的是每一次尝试——
     窗口要数的是「发过多少次」，不是「失败过多少次」，否则连点永远顶不到上限。"""
-    write_key = ("annotation-write", user_id)
-    wait = web.annotation_writes.blocked_for(write_key)
-    if wait:
-        return wait
-    upload_key = ("attachment-upload", user_id)
-    if uploads:
-        wait = web.attachment_uploads.blocked_for(upload_key)
+    with _limit_lock:
+        write_key = ("annotation-write", user_id)
+        wait = web.annotation_writes.blocked_for(write_key)
         if wait:
             return wait
-    web.annotation_writes.record_failure(write_key)
-    if uploads:
-        web.attachment_uploads.record_failure(upload_key)
-    return 0
+        upload_key = ("attachment-upload", user_id)
+        if uploads:
+            wait = web.attachment_uploads.blocked_for(upload_key)
+            if wait:
+                return wait
+        web.annotation_writes.record_failure(write_key)
+        if uploads:
+            web.attachment_uploads.record_failure(upload_key)
+        return 0
 
 
 @router.post("/annotations")
@@ -202,7 +209,9 @@ def annotation_create(
     clean = _clean_files(files)
     wait = _limit_hit(web, user.id, uploads=len(clean))
     if wait:
-        return fail(f"写批注太频繁了：{wait} 秒后再试（每分钟 30 条）", 429)
+        return fail(
+            f"写得太快：请 {wait} 秒后再来（每分钟 30 条批注、10 次附件上传）", 429
+        )
     limits = ctx.settings.annotations
     if len(clean) > limits.max_attachments:
         return fail(f"一条批注最多 {limits.max_attachments} 张附件", 400)

@@ -242,3 +242,17 @@ def test_create_is_limited_to_30_per_minute(logged):
     assert "30 秒" in resp.text or "秒后" in resp.text
     # 429 也回面板本体（htmx swap 的是面板容器），不是 error.html
     assert "annotations-panel" in resp.text
+
+
+def test_attachment_uploads_are_limited_to_10_per_minute(logged):
+    """§10 的第二张卡：带附件的第 11 次要被 10 次/分钟挡下，
+    而随后一条不带附件的照过——证明挡住它的是上传卡，不是批注卡。"""
+    png = ("files", ("shot.png", _png_bytes(), "image/png"))
+    for i in range(10):
+        resp = _post_annotation(logged, body=f"带图 {i}", files=[png])
+        assert resp.status_code == 200, i
+    resp = _post_annotation(logged, body="第 11 张", files=[png])
+    assert resp.status_code == 429
+    assert "annotations-panel" in resp.text
+    resp = _post_annotation(logged, body="不带图")
+    assert resp.status_code == 200
