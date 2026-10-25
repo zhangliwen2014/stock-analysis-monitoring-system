@@ -17,7 +17,7 @@ from sams.core.errors import Conflict, StorageError, ValidationError
 from sams.core.notify import FAILED, NO_CHANNEL, OUTCOMES, SENT, SEVERITIES, SYSTEM_MARKET
 from sams.storage.db import Database
 from sams.storage.ids import new_id
-from sams.storage.repos.alert_events import AlertEventRepo
+from sams.storage.repos.alert_events import ACT, DISMISS, AlertEventRepo
 
 logger = logging.getLogger("sams.storage.alerts")
 
@@ -551,6 +551,81 @@ class AlertRepo:
                 from_status=row.status,
                 to_status=DISMISSED,
                 note=f"{code} {text}".strip(),
+            )
+        return self._reload(alert_id)
+
+    def defer(self, alert_id: str, *, user_id: str, until: datetime) -> Alert:
+        """稍后提醒：状态不变，只加一个到点时间；不计忽略率（D138）。"""
+        moment = _moment(until)
+        row = self._owned(alert_id, user_id)
+        if row.status not in (NEW, ACKNOWLEDGED):
+            raise Conflict(
+                f"告警 {alert_id} 已经是 {row.status}，不能再稍后："
+                "要重新打开它，请先撤销或写一条批注"
+            )
+        if moment <= self.clock.now_utc():
+            raise ValidationError(
+                "稍后的时间必须在未来：一个已经过去的提醒等于没设，而屏幕上会显示成设过了"
+            )
+        with self.db.transaction():
+            changed = self.db.scalar(
+                "UPDATE alerts SET deferred_until = ? WHERE id = ? AND status = ?"
+                " RETURNING id",
+                [moment, alert_id, row.status],
+            )
+            if changed is None:
+                raise Conflict(
+                    f"告警 {alert_id} 在操作期间已被别人改过：请刷新后再决定怎么处置"
+                )
+            self.events.add(
+                alert_id,
+                user_id=user_id,
+                action="defer",
+                from_status=row.status,
+                to_status=row.status,
+                note=moment.isoformat(),
+            )
+        return self._reload(alert_id)
+
+    def undo(self, alert_id: str, *, user_id: str) -> Alert:
+        """终态后 5 分钟内回到上一态；超过窗口只许写批注（D138）。"""
+        row = self._owned(alert_id, user_id)
+        if row.status not in (HANDLED, DISMISSED):
+            raise Conflict(f"告警 {alert_id} 还是 {row.status}，没有可撤销的终态")
+        terminal_at = row.handled_at
+        if terminal_at is None:
+            raise Conflict(f"告警 {alert_id} 没有终态时刻，无法判断是否还在 5 分钟内")
+        if self.clock.now_utc() - terminal_at > UNDO_WINDOW:
+            raise Conflict(
+                f"告警 {alert_id} 关闭已超过 5 分钟：撤销窗口过了。"
+                "要在复盘里更正，请在批注里写清楚——审计表不是可以随意改写的编辑器"
+            )
+        last = self.events.last(alert_id, actions=(ACT, DISMISS))
+        if last is None:
+            raise Conflict(
+                f"告警 {alert_id} 没有可撤销的动作记录（可能是旧版命令写下的）："
+                "没有可信的上一态就不猜"
+            )
+        previous = last.from_status
+        acknowledged_at = None if previous == NEW else row.acknowledged_at
+        with self.db.transaction():
+            changed = self.db.scalar(
+                "UPDATE alerts SET status = ?, acknowledged_at = ?, handled_at = NULL,"
+                " handle_note = NULL, action_kind = NULL, action_ref = NULL,"
+                " dismiss_code = NULL, dismiss_reason = NULL, deferred_until = NULL"
+                " WHERE id = ? AND status = ? RETURNING id",
+                [previous, acknowledged_at, alert_id, row.status],
+            )
+            if changed is None:
+                raise Conflict(
+                    f"告警 {alert_id} 在操作期间已被别人改过：请刷新后再决定怎么处置"
+                )
+            self.events.add(
+                alert_id,
+                user_id=user_id,
+                action="undo",
+                from_status=row.status,
+                to_status=previous,
             )
         return self._reload(alert_id)
 

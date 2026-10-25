@@ -813,3 +813,98 @@ def test_ack_after_a_racing_close_raises_instead_of_returning_a_closed_alert(
         repo.acknowledge(alert.id, user_id=user)
     assert repo.events.list_for(alert.id) == []
     other.close()
+
+
+# ---------- 稍后提醒与撤销终态（M4-B §8.1）----------
+
+
+def test_defer_keeps_the_status_and_sets_a_wakeup(repo, seeded_user, clock):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    until = clock.moment + timedelta(hours=1)
+    moved = repo.defer(alert.id, user_id=seeded_user, until=until)
+    assert moved.status == NEW
+    assert moved.deferred_until == until
+    event = repo.events.list_for(alert.id)[0]
+    assert event.action == "defer" and event.from_status == event.to_status == NEW
+
+
+def test_a_past_wakeup_is_refused(repo, seeded_user, clock):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    with pytest.raises(ValidationError, match="未来"):
+        repo.defer(alert.id, user_id=seeded_user, until=clock.moment)
+
+
+def test_a_naive_wakeup_is_refused(repo, seeded_user):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    with pytest.raises(ValidationError, match="时区"):
+        repo.defer(alert.id, user_id=seeded_user, until=datetime(2026, 10, 26, 1, 0))
+
+
+def test_defer_refuses_a_terminal_alert(repo, seeded_user, clock):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.dismiss(alert.id, user_id=seeded_user, code="expected")
+    with pytest.raises(Conflict):
+        repo.defer(alert.id, user_id=seeded_user, until=clock.moment + timedelta(hours=1))
+
+
+def test_undo_returns_to_the_previous_state_and_clears_the_conclusion(repo, seeded_user, clock):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.acknowledge(alert.id, user_id=seeded_user)
+    repo.act(alert.id, user_id=seeded_user, action_kind="watch", note="等回踩")
+    clock.advance(minutes=1)
+    moved = repo.undo(alert.id, user_id=seeded_user)
+    assert moved.status == ACKNOWLEDGED
+    assert moved.handled_at is None
+    assert moved.action_kind is None and moved.action_ref is None
+    assert moved.deferred_until is None
+    assert [e.action for e in repo.events.list_for(alert.id)] == ["ack", "act", "undo"]
+
+
+def test_undo_after_five_minutes_is_refused(repo, seeded_user, clock):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.dismiss(alert.id, user_id=seeded_user, code="expected")
+    clock.advance(minutes=5, seconds=1)
+    with pytest.raises(Conflict, match="5 分钟"):
+        repo.undo(alert.id, user_id=seeded_user)
+
+
+def test_undo_needs_a_recorded_transition(repo, seeded_user):
+    """旧入口 set_status 不写事件：那条告警没有可信的上一态，不许猜。"""
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="旧入口")
+    with pytest.raises(Conflict, match="动作记录"):
+        repo.undo(alert.id, user_id=seeded_user)
+
+
+def test_undo_refuses_an_open_alert(repo, seeded_user):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    with pytest.raises(Conflict):
+        repo.undo(alert.id, user_id=seeded_user)
+
+
+def test_a_racing_close_makes_defer_a_conflict_without_an_event(tmp_path, monkeypatch):
+    """另一个连接在 `_owned` 与 UPDATE 之间把这条关了：条件更新命中 0 行，不补历史。"""
+    from sams.storage.db import Database
+    from sams.storage.migrate import apply_migrations
+
+    path = str(tmp_path / "race.duckdb")
+    db = Database.open(path)
+    apply_migrations(db)
+    user = UserRepo(db).create("racer", "correct-horse-battery").id
+    clock = FrozenClock(NOW)
+    repo = AlertRepo(db, clock=clock)
+    alert = repo.create(user, **CREATE_KW)
+    other = Database.open(path)
+
+    def racing():
+        other.execute(
+            "UPDATE alerts SET status = 'handled', handled_at = ? WHERE id = ?",
+            [clock.moment, alert.id],
+        )
+        return clock.moment
+
+    monkeypatch.setattr(clock, "now_utc", racing)
+    with pytest.raises(Conflict, match="操作期间"):
+        repo.defer(alert.id, user_id=user, until=clock.moment + timedelta(hours=1))
+    assert repo.events.list_for(alert.id) == []
+    other.close()
