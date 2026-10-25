@@ -10,6 +10,7 @@ B1 只开私有批注：`team` 的两列已经在 schema 里，但写入口不�
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.config import Settings
@@ -171,6 +172,20 @@ class AnnotationService:
             target_ref=ref,
             limit=limit,
             offset=offset,
+        )
+
+    def list_recent(
+        self,
+        viewer_id: str,
+        *,
+        since: datetime,
+        team_sharing: bool = False,
+        limit: int = 20,
+    ) -> list[Annotation]:
+        """`/review` 的「本周批注」：可见性闸与面板同一条（仓库的 `list_visible`），
+        只是按时间切、不按目标切。复盘要的是「这周写了什么」，不问写在哪个对象上。"""
+        return self.annotations.list_visible(
+            viewer_id, since=since, team_sharing=team_sharing, limit=limit
         )
 
     def list_mine(self, viewer_id: str, *, limit: int = 20, offset: int = 0) -> list[Annotation]:

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from support import FrozenClock
@@ -244,3 +244,11 @@ def test_soft_delete_keeps_a_tombstone_for_later_purge(repo):
     tombstone = repo.get(made.id, include_deleted=True)
     assert tombstone.deleted_by == OWNER
     assert tombstone.purged_at is None
+
+
+def test_list_visible_since_cuts_the_older_rows(repo, clock):
+    add(repo, body_md="上周写的那条")
+    clock.moment = NOW + timedelta(days=3)
+    recent = add(repo, body_md="本周的")
+    rows = repo.list_visible(OWNER, since=NOW + timedelta(days=1))
+    assert [row.id for row in rows] == [recent.id]

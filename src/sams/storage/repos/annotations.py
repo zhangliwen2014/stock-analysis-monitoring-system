@@ -325,6 +325,7 @@ class AnnotationRepo:
         target_ref: str | None = None,
         q: str | None = None,
         tag: str | None = None,
+        since: datetime | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> list[Annotation]:
@@ -356,6 +357,9 @@ class AnnotationRepo:
         if tag:
             clauses.append(_TAG_MATCH)
             params.append(tag)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
         sql = (
             f"SELECT {_ANNOTATION_COLUMNS} FROM annotations"
             f" WHERE {' AND '.join(clauses)}"

@@ -25,7 +25,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 
 from sams.core.codes import canonical_market
 from sams.core.errors import Conflict, DatabaseLocked, SamsError, ValidationError
@@ -706,3 +706,15 @@ def resend(request: Request, _csrf: None = Depends(csrf_protect)):
         detail=f"any_sent={dispatch.any_sent} deliveries={len(dispatch.deliveries)}",
     )
     return _detail_page(request, dispatch=dispatch)
+
+
+@router.get("/api/partials/open-count")
+def open_count(request: Request):
+    """导航徽标的那一个数：htmx 定期取，不整页刷新。只回一个数——这就是这张卡的最小形状。
+
+    口径与 `/review` 顶部、`latest_open` 同一条（`new + acknowledged`、不含测试，
+    D124/D131）：徽标和复盘说的必须是同一件事。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    return PlainTextResponse(str(ctx.alerts_store.count_open(user.id)))

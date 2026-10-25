@@ -41,12 +41,26 @@ DISMISS_CODES = (
 #: 一次处置之后还能撤回的窗口：过了这个点，`undo` 要回答的是「为什么不能」
 UNDO_WINDOW = timedelta(minutes=5)
 
+#: 「积压」的那道闸：触发后 24 小时还没人管的，复盘首屏第一个清单就是它（§6.4）
+OVERDUE_AFTER = timedelta(hours=24)
+
 _ERROR_MAX_CHARS = 400
 
 _ALERT_COLUMNS = (
     "id, user_id, rule_id, account_id, market, code, stage, triggered_at,"
     " status, payload_json, severity, handled_at, handle_note, dismiss_reason, is_test,"
     " acknowledged_at, action_kind, action_ref, dismiss_code, thesis_id, deferred_until"
+)
+
+#: `/review` 的原始行列集：统计与清单要的那十几列。`payload_json` 整列不带回来，
+#: 只把 `rule_name`/`symbol_name` 两格用 `json_extract_string` 挖出来——清单要说
+#: 「哪条规则的哪只票」，而 `_to_alert` 那样的整包解析在这一屏没有买家（D135）。
+_REVIEW_COLUMNS = (
+    "id, rule_id, market, code, triggered_at, status, severity,"
+    " acknowledged_at, handled_at, action_kind, action_ref, dismiss_code,"
+    " thesis_id, deferred_until,"
+    " json_extract_string(payload_json, '$.rule_name') AS rule_name,"
+    " json_extract_string(payload_json, '$.symbol_name') AS symbol_name"
 )
 
 
@@ -317,6 +331,62 @@ class AlertRepo:
             [user_id, market, code],
         )
         return self._to_alert(rows.to_dicts()[0]) if rows.height else None
+
+    def list_window(self, user_id: str, *, since: datetime, until: datetime) -> list[dict]:
+        """复盘窗口的原始行：`triggered_at` 落在 `[since, until)`，升序。
+
+        返回 dict 而不是 `Alert`：复盘要的是列，`_to_alert` 的 payload 解析、名称折算
+        这一屏一样都用不上。`until` 开区间与 `list_for` 同一个约定——零点那一条不该在
+        相邻的两个窗口里各出现一次。测试告警排除（D131）：它不属于任何一周的「新增」。
+        """
+        rows = self.db.query(
+            f"SELECT {_REVIEW_COLUMNS} FROM alerts"
+            " WHERE user_id = ? AND triggered_at >= ? AND triggered_at < ?"
+            " AND coalesce(is_test, FALSE) = FALSE"
+            " ORDER BY triggered_at ASC, id ASC",
+            [user_id, _moment(since), _moment(until)],
+        )
+        return rows.to_dicts()
+
+    def list_overdue(self, user_id: str, *, now: datetime, limit: int = 20) -> list[dict]:
+        """超 24 小时未处理：`new/acknowledged` 且早于 `now - OVERDUE_AFTER`（§8.4，不受窗口限制）。
+
+        `deferred_until` 未到点的排在后面：稍后不改状态，它仍算未处理——但这份清单是
+        用来「现在就办」的，人说了明天再看的条目不占第一行。`CASE` 只是那一层排序，
+        主序仍是触发时间升序（压 oldest 先）。
+        """
+        moment = _moment(now)
+        rows = self.db.query(
+            f"SELECT {_REVIEW_COLUMNS} FROM alerts"
+            " WHERE user_id = ? AND status IN ('new', 'acknowledged')"
+            " AND triggered_at < ? AND coalesce(is_test, FALSE) = FALSE"
+            " ORDER BY CASE WHEN deferred_until IS NOT NULL AND deferred_until > ?"
+            " THEN 1 ELSE 0 END,"
+            " triggered_at ASC, id ASC LIMIT ?",
+            [user_id, moment - OVERDUE_AFTER, moment, int(limit)],
+        )
+        return rows.to_dicts()
+
+    def count_overdue(self, user_id: str, *, now: datetime) -> int:
+        """`list_overdue` 同口径的全量数：清单只列 20 条，顶上那个数必须是全量——
+        把 20 读成「就这些」是这一屏最难被发现的谎。"""
+        moment = _moment(now)
+        return int(self.db.scalar(
+            "SELECT count(*) FROM alerts WHERE user_id = ?"
+            " AND status IN ('new', 'acknowledged') AND triggered_at < ?"
+            " AND coalesce(is_test, FALSE) = FALSE",
+            [user_id, moment - OVERDUE_AFTER],
+        ))
+
+    def count_open(self, user_id: str) -> int:
+        """导航徽标与 `/review` 顶部的「未处理总数」：同一个 `new + acknowledged`，
+        同一条测试排除（D124/D131）。与 `latest_open` 的分工是「一个数 vs 最新一条」。"""
+        return int(self.db.scalar(
+            "SELECT count(*) FROM alerts WHERE user_id = ?"
+            " AND status IN ('new', 'acknowledged')"
+            " AND coalesce(is_test, FALSE) = FALSE",
+            [user_id],
+        ))
 
     def has_system_alert(self, user_id: str, component: str, *, since: datetime) -> bool:
         """这个人名下从 `since` 起有没有过关于这个组件的系统告警（D102 的去重键）。

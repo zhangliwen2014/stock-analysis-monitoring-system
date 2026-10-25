@@ -50,6 +50,7 @@ from sams.web.pages import (
     annotations,
     dashboard,
     portfolio,
+    review,
     rules,
     settings,
     symbol,
@@ -166,6 +167,7 @@ def create_app(
     app.include_router(alerts.router)
     app.include_router(dashboard.router)
     app.include_router(portfolio.router)
+    app.include_router(review.router)
     app.include_router(rules.router)
     app.include_router(settings.router)
     app.include_router(symbol.router)

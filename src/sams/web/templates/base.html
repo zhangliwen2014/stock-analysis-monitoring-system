@@ -19,7 +19,8 @@
       <a href="/portfolio">持仓</a>
       <a href="/theses">论点</a>
       <a href="/rules">规则</a>
-      <a href="/alerts">告警</a>
+      <a href="/alerts">告警<span id="open-count" class="badge" hx-get="/api/partials/open-count" hx-trigger="load, every 60s"></span></a>
+      <a href="/review">复盘</a>
       <a href="/settings">设置</a>
       {% if user.is_admin %}<a href="/admin">管理</a>{% endif %}
     </div>

@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>复盘</h1>
+<form method="get" action="/review" class="inline-form">
+  <select name="window" onchange="this.form.submit()">
+    {% for value, label in window_choices %}
+    <option value="{{ value }}"{% if value == window %} selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit">切换</button>
+</form>
+<p class="muted">窗口 {{ since_label }}，按 display_tz 切。</p>
+
+{% if empty %}
+<p class="muted">{{ empty_note }}</p>
+{% endif %}
+<div class="cards">
+  <div class="card">未处理总数 <a class="num" id="open-total" href="/alerts">{{ open_total }}</a></div>
+  <div class="card">超 24 小时 <a class="num" id="overdue-total" href="/alerts?status=new">{{ overdue_total }}</a></div>
+  <div class="card">本窗口新增 <span class="num" id="window-total">{{ window_total }}</span></div>
+</div>
+
+<h2>超 24 小时未处理</h2>
+{% if overdue %}
+<table>
+  <thead><tr><th>触发</th><th>标的</th><th>规则</th><th>状态</th><th>动作</th></tr></thead>
+  <tbody>
+  {% for row in overdue %}
+  <tr>
+    <td>{{ row.at }}</td>
+    <td><a href="/alerts/{{ row.id }}">{{ row.symbol }}</a></td>
+    <td>{{ row.rule_name }}</td>
+    <td>{{ row.status }}{% if row.deferred %} <span class="badge">你让它稍后提醒</span>{% endif %}</td>
+    <td>
+      <form method="post" action="/alerts/{{ row.id }}/ack" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit">已读</button>
+      </form>
+      <a href="/alerts/{{ row.id }}">处置 / 忽略 / 稍后</a>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">没有超过 24 小时的未处理告警。</p>
+{% endif %}
+
+<h2>忽略/触发比最高的规则</h2>
+{% if ranked %}
+<table>
+  <thead><tr><th>规则</th><th>忽略/触发</th><th>比率</th></tr></thead>
+  <tbody>
+  {% for row in ranked %}
+  <tr><td><a href="{{ row.url }}">{{ row.name }}</a></td><td>{{ row.dismissed }}/{{ row.triggered }}</td><td>{{ row.ratio }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">窗口里没有够样本的规则（触发 ≥ 3 条才排名）。</p>
+{% endif %}
+{% if thin %}
+<h3>样本不足（不参与排名）</h3>
+<ul>
+  {% for row in thin %}
+  <li><a href="{{ row.url }}">{{ row.name }}</a>：{{ row.dismissed }}/{{ row.triggered }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<h2>本窗口已处置</h2>
+{% for row in handled %}
+<div class="row">
+  <a href="/alerts/{{ row.id }}">{{ row.at }}</a>
+  {{ row.rule_name }} —
+  {% if row.url %}<a href="{{ row.url }}">{{ row.label }}</a>{% else %}{{ row.label }}{% endif %}
+</div>
+{% else %}
+<p class="muted">这个窗口里还没有处置记录。</p>
+{% endfor %}
+
+<h2>本窗口批注</h2>
+{% for note in notes %}
+<div class="row">
+  {{ note.at }} · {{ note.target }}{% if note.tags %} · {{ note.tags }}{% endif %}：{{ note.body }}
+</div>
+{% else %}
+<p class="muted">这个窗口里还没有批注。</p>
+{% endfor %}
+
+<details>
+  <summary>统计口径（分子/分母都标出来）</summary>
+  <table>
+    {% for label, value, note in rate_rows %}
+    <tr><td>{{ label }}</td><td>{{ value }}</td><td class="muted">{{ note }}</td></tr>
+    {% endfor %}
+  </table>
+  <h3>动作类型分布</h3>
+  <ul>
+    {% for label, count in action_rows %}<li>{{ label }}：{{ count }}</li>{% endfor %}
+    {% if legacy_handled %}<li>旧版（无动作类型）：{{ legacy_handled }}</li>{% endif %}
+    {% if not action_rows and not legacy_handled %}<li class="muted">窗口内没有处置。</li>{% endif %}
+  </ul>
+  <h3>忽略原因分布</h3>
+  <ul>
+    {% for label, count in dismiss_rows %}<li>{{ label }}：{{ count }}</li>{% endfor %}
+    {% if legacy_dismiss %}<li>旧版（无原因码）：{{ legacy_dismiss }}</li>{% endif %}
+    {% if not dismiss_rows and not legacy_dismiss %}<li class="muted">窗口内没有忽略。</li>{% endif %}
+  </ul>
+</details>
+{% endblock %}

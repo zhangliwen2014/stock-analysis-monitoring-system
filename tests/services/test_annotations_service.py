@@ -297,3 +297,17 @@ def test_pin_is_idempotent(world):
     )
     assert world.service.pin(world.user.id, made.id, pinned=True).pinned is True
     assert world.service.pin(world.user.id, made.id, pinned=True).pinned is True
+
+
+def test_list_recent_forwards_the_window(world):
+    from datetime import timedelta
+
+    world.service.create(
+        world.user.id, target_type="symbol", target_ref="A/600519", body_md="上周的"
+    )
+    world.clock.moment = NOW + timedelta(days=3)
+    recent = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A/600519", body_md="本周的"
+    )
+    got = world.service.list_recent(world.user.id, since=NOW + timedelta(days=1))
+    assert [row.id for row in got] == [recent.id]
