@@ -847,24 +847,59 @@ def test_defer_refuses_a_terminal_alert(repo, seeded_user, clock):
         repo.defer(alert.id, user_id=seeded_user, until=clock.moment + timedelta(hours=1))
 
 
-def test_undo_returns_to_the_previous_state_and_clears_the_conclusion(repo, seeded_user, clock):
+def test_defer_from_acknowledged_keeps_the_middle_state(repo, seeded_user, clock):
     alert = repo.create(seeded_user, **CREATE_KW)
     repo.acknowledge(alert.id, user_id=seeded_user)
+    until = clock.moment + timedelta(hours=1)
+    moved = repo.defer(alert.id, user_id=seeded_user, until=until)
+    assert moved.status == ACKNOWLEDGED
+    event = repo.events.list_for(alert.id)[-1]
+    assert (event.action, event.from_status, event.to_status) == (
+        "defer", ACKNOWLEDGED, ACKNOWLEDGED,
+    )
+    assert event.note == until.isoformat()
+
+
+def test_undo_returns_to_the_previous_state_and_clears_the_conclusion(repo, seeded_user, clock):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    acked_at = repo.acknowledge(alert.id, user_id=seeded_user).acknowledged_at
     repo.act(alert.id, user_id=seeded_user, action_kind="watch", note="等回踩")
     clock.advance(minutes=1)
     moved = repo.undo(alert.id, user_id=seeded_user)
     assert moved.status == ACKNOWLEDGED
+    assert moved.acknowledged_at == acked_at
     assert moved.handled_at is None
     assert moved.action_kind is None and moved.action_ref is None
     assert moved.deferred_until is None
     assert [e.action for e in repo.events.list_for(alert.id)] == ["ack", "act", "undo"]
 
 
+def test_undo_to_new_clears_the_acknowledgement(repo, seeded_user):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.dismiss(alert.id, user_id=seeded_user, code="duplicate")
+    moved = repo.undo(alert.id, user_id=seeded_user)
+    assert moved.status == NEW
+    assert moved.acknowledged_at is None
+    assert moved.dismiss_code is None and moved.dismiss_reason is None
+    assert moved.handled_at is None
+    assert [e.action for e in repo.events.list_for(alert.id)] == ["dismiss", "undo"]
+
+
 def test_undo_after_five_minutes_is_refused(repo, seeded_user, clock):
     alert = repo.create(seeded_user, **CREATE_KW)
     repo.dismiss(alert.id, user_id=seeded_user, code="expected")
-    clock.advance(minutes=5, seconds=1)
+    clock.advance(minutes=5)
     with pytest.raises(Conflict, match="5 分钟"):
+        repo.undo(alert.id, user_id=seeded_user)
+
+
+def test_undo_refuses_when_a_legacy_close_is_newer_than_the_recorded_action(repo, seeded_user):
+    """新入口已读之后，旧入口 set_status 关了它：最新事件仍是那条 ack，
+    不能拿更早的 act 猜上一态。"""
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.acknowledge(alert.id, user_id=seeded_user)
+    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="旧入口")
+    with pytest.raises(Conflict, match="动作记录"):
         repo.undo(alert.id, user_id=seeded_user)
 
 

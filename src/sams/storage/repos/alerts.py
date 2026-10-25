@@ -595,18 +595,22 @@ class AlertRepo:
         terminal_at = row.handled_at
         if terminal_at is None:
             raise Conflict(f"告警 {alert_id} 没有终态时刻，无法判断是否还在 5 分钟内")
-        if self.clock.now_utc() - terminal_at > UNDO_WINDOW:
+        if self.clock.now_utc() - terminal_at >= UNDO_WINDOW:
             raise Conflict(
-                f"告警 {alert_id} 关闭已超过 5 分钟：撤销窗口过了。"
+                f"告警 {alert_id} 关闭已满 5 分钟：撤销窗口已过。"
                 "要在复盘里更正，请在批注里写清楚——审计表不是可以随意改写的编辑器"
             )
-        last = self.events.last(alert_id, actions=(ACT, DISMISS))
-        if last is None:
+        newest = self.events.last(alert_id)
+        if (
+            newest is None
+            or newest.action not in (ACT, DISMISS)
+            or newest.to_status != row.status
+        ):
             raise Conflict(
-                f"告警 {alert_id} 没有可撤销的动作记录（可能是旧版命令写下的）："
+                f"告警 {alert_id} 最新一条记录不是这次关闭的动作记录（可能是旧版命令写下的）："
                 "没有可信的上一态就不猜"
             )
-        previous = last.from_status
+        previous = newest.from_status
         acknowledged_at = None if previous == NEW else row.acknowledged_at
         with self.db.transaction():
             changed = self.db.scalar(
