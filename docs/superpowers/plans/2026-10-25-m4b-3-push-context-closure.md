@@ -218,6 +218,8 @@ class AnnotationContext:
 
     `moment_label` 是**已经折好**的 `MM-DD HH:MM`：时区换算读 `server.display_tz`，
     那是 provider 的事——这一层不许 import 任何配置，也不碰 zoneinfo。
+    `created_at` 必须带时区：两路候选（标的 + 观点）在这里比大小排序，
+    naive 与 aware 混比抛的是 `TypeError`——那会让整块上下文无声降级，闸立在构造。
     """
 
     annotation_id: str
@@ -227,6 +229,10 @@ class AnnotationContext:
     body_text: str
     tags: tuple[str, ...] = ()
     pinned: bool = False
+
+    def __post_init__(self) -> None:
+        if self.created_at.tzinfo is None:
+            raise ValidationError("批注的 created_at 必须带时区：混比 naive/aware 会崩在排序上")
 
 
 @dataclass(frozen=True)
@@ -286,6 +292,7 @@ def format_annotation_context(
         return "", (), 0
     lines = [CONTEXT_HEADER] + [annotation_context_line(entry) for entry in chosen]
     while (
+        # `> 2`：题头不单独留下——只剩题头的「上下文」等于没发，那一路走下面的整块丢弃
         len(lines) > 2
         and budget_bytes is not None
         and len("\n".join(lines).encode()) > budget_bytes
