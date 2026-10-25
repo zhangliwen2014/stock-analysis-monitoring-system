@@ -43,7 +43,6 @@ class World:
     users: UserRepo
     alerts: AlertRepo
     ledger: LedgerService
-    accounts: SimAccountRepo
     orders: SimOrderRepo
     theses: ThesisRepo
     annotations: AnnotationService
@@ -124,7 +123,7 @@ def world(db, settings) -> World:
     )
     return World(
         review=review, users=users, alerts=alerts, ledger=review.ledger,
-        accounts=accounts, orders=orders, theses=theses,
+        orders=orders, theses=theses,
         annotations=annotations, watchlists=review.watchlists,
     )
 
@@ -265,7 +264,9 @@ def test_a_foreign_account_rolls_the_closure_back(world, db):
     # open_account 按用户名解析归属：OTHER 名下这笔，我的 act_with_fill 用不了
     foreign = world.ledger.open_account(OTHER, "别人的账户")
     before = _orders_count(db)
-    with pytest.raises(StorageError, match="不属于|不存在"):
+    # 钉 ledger 那一句（「账户…不属于」），不是 `_owned` 的「告警…不存在」：
+    # 这一个用例要证的正是「账户归属拦在事务里」
+    with pytest.raises(StorageError, match=r"账户.*不属于"):
         world.review.act_with_fill(
             world.uid(), alert.id, account_id=foreign.id, side="buy", qty=100, price=35.0
         )
@@ -273,13 +274,20 @@ def test_a_foreign_account_rolls_the_closure_back(world, db):
     assert world.alerts.get(alert.id).status == "new"
 
 
-def test_non_positive_qty_or_price_is_refused_before_anything_is_written(world, db):
+def test_non_positive_qty_is_refused_before_anything_is_written(world, db):
     account_id = world.funded_account()
     alert = world.alert()
     with pytest.raises(ValidationError):
         world.review.act_with_fill(
             world.uid(), alert.id, account_id=account_id, side="buy", qty=0, price=35.0
         )
+    assert _orders_count(db) == 0
+    assert world.alerts.get(alert.id).status == "new"
+
+
+def test_an_unknown_side_is_refused_before_anything_is_written(world, db):
+    account_id = world.funded_account()
+    alert = world.alert()
     with pytest.raises(ValidationError):
         world.review.act_with_fill(
             world.uid(), alert.id, account_id=account_id, side="hold", qty=100, price=35.0

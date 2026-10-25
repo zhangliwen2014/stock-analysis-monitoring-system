@@ -129,13 +129,14 @@ class ReviewService:
         A 股 T+1、整手、涨跌停这些**不挡**：模拟账本常在补记真实成交，§6.3 说它们
         只该在表单上警告。
         """
+        alert = self._owned(user_id, alert_id)
+        # 先认人再校验格式：id 探测不该从一段 `side` 报错里得到第二种回答
         if side not in SIDES:
             raise ValidationError(f"未知方向 side={side!r}：只有 {list(SIDES)}")
         if qty <= 0 or price <= 0:
             raise ValidationError(
                 "数量与价格必须为正：一条 0 股的成交在复盘里回答不了任何事"
             )
-        alert = self._owned(user_id, alert_id)
         user = self.users.get(user_id)
         if user is None:
             raise StorageError(f"用户 {user_id} 不存在：成交必须有一个记账的人")
