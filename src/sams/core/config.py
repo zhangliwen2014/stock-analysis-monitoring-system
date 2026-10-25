@@ -53,6 +53,8 @@ class ServerCfg:
     tls_certfile: str | None = None
     tls_keyfile: str | None = None
     display_tz: str = "Asia/Shanghai"
+    #: 推送深链的根地址；空 = 不附链接（D126）。只接受 http/https，末尾斜杠在加载时去掉
+    public_base_url: str = ""
 
     def is_loopback(self) -> bool:
         return self.host in LOOPBACK_HOSTS
@@ -82,6 +84,39 @@ class ServerCfg:
             ZoneInfo(self.display_tz)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValidationError(f"server.display_tz 非法: {self.display_tz}") from exc
+        if self.public_base_url and not self.public_base_url.startswith(
+            ("http://", "https://")
+        ):
+            raise ValidationError(
+                "server.public_base_url 只接受 http:// 或 https://："
+                "一个猜出来的地址在手机上点不开，不如不放"
+            )
+
+
+@dataclass(frozen=True)
+class AnnotationsCfg:
+    """批注与附件的上限（spec §9）。所有上限都是**拒绝线**，不是截断线：
+    悄悄截一半的正文比报错更难发现。"""
+
+    attachments_dir: str = ""
+    max_attachments: int = 5
+    max_attachment_mb: int = 5
+    max_user_total_mb: int = 512
+    max_body_chars: int = 20000
+    break_glass_minutes: int = 15
+    break_glass_max_per_hour: int = 5
+
+    def validate(self) -> None:
+        for name, value in (
+            ("max_attachments", self.max_attachments),
+            ("max_attachment_mb", self.max_attachment_mb),
+            ("max_user_total_mb", self.max_user_total_mb),
+            ("max_body_chars", self.max_body_chars),
+            ("break_glass_minutes", self.break_glass_minutes),
+            ("break_glass_max_per_hour", self.break_glass_max_per_hour),
+        ):
+            if value <= 0:
+                raise ValidationError(f"annotations.{name} 必须为正数")
 
 
 @dataclass(frozen=True)
@@ -100,6 +135,7 @@ class Settings:
     #: 报价超过这么久没更新 ⇒ `stale`，价格类规则不评估（spec D134）
     quote_stale_s: int = 60
     server: ServerCfg = field(default_factory=ServerCfg)
+    annotations: AnnotationsCfg = field(default_factory=AnnotationsCfg)
 
     def market_cfg(self, market: str) -> MarketCfg:
         try:
@@ -157,6 +193,20 @@ class Settings:
             ),
             tls_keyfile=str(server_raw["tls_keyfile"]) if server_raw.get("tls_keyfile") else None,
             display_tz=str(server_raw.get("display_tz", "Asia/Shanghai")),
+            public_base_url=str(server_raw.get("public_base_url", "")).rstrip("/"),
+        )
+
+        annotations_raw = raw.get("annotations") or {}
+        annotations = AnnotationsCfg(
+            attachments_dir=str(annotations_raw.get("attachments_dir", "")),
+            max_attachments=int(annotations_raw.get("max_attachments", 5)),
+            max_attachment_mb=int(annotations_raw.get("max_attachment_mb", 5)),
+            max_user_total_mb=int(annotations_raw.get("max_user_total_mb", 512)),
+            max_body_chars=int(annotations_raw.get("max_body_chars", 20000)),
+            break_glass_minutes=int(annotations_raw.get("break_glass_minutes", 15)),
+            break_glass_max_per_hour=int(
+                annotations_raw.get("break_glass_max_per_hour", 5)
+            ),
         )
 
         settings = cls(
@@ -170,6 +220,7 @@ class Settings:
             scheduler_tick_s=int(general.get("scheduler_tick_s", 60)),
             quote_stale_s=int(general.get("quote_stale_s", 60)),
             server=server,
+            annotations=annotations,
         )
         settings.validate()
         return settings
@@ -186,6 +237,7 @@ class Settings:
         if self.quote_stale_s <= 0:
             raise ValidationError("quote_stale_s 必须为正数")
         self.server.validate()
+        self.annotations.validate()
         if not self.report_currency:
             raise ValidationError("report_currency 不能为空")
         for market, cfg in self.markets.items():

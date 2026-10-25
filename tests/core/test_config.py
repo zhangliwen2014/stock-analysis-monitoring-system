@@ -184,3 +184,61 @@ def test_server_numbers_and_timezone_are_validated(tmp_path, line, keyword):
     text = BASE + f"\n[server]\n{line}\n"
     with pytest.raises(ValidationError, match=keyword):
         Settings.load(write(tmp_path, text))
+
+
+def test_annotations_defaults():
+    from sams.core.config import AnnotationsCfg
+
+    cfg = AnnotationsCfg()
+    assert cfg.attachments_dir == ""
+    assert cfg.max_attachments == 5
+    assert cfg.max_attachment_mb == 5
+    assert cfg.max_user_total_mb == 512
+    assert cfg.max_body_chars == 20000
+    assert cfg.break_glass_minutes == 15
+    assert cfg.break_glass_max_per_hour == 5
+
+
+def test_annotations_section_is_read(tmp_path):
+    text = BASE + """
+[annotations]
+attachments_dir = "/srv/sams/attachments"
+max_attachments = 3
+max_body_chars = 5000
+"""
+    settings = Settings.load(write(tmp_path, text))
+    assert settings.annotations.attachments_dir == "/srv/sams/attachments"
+    assert settings.annotations.max_attachments == 3
+    assert settings.annotations.max_body_chars == 5000
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "max_attachments = 0",
+        "max_attachment_mb = 0",
+        "max_user_total_mb = 0",
+        "max_body_chars = 0",
+        "break_glass_minutes = 0",
+        "break_glass_max_per_hour = 0",
+    ),
+)
+def test_annotation_limits_must_be_positive(tmp_path, line):
+    text = BASE + "\n[annotations]\n" + line + "\n"
+    with pytest.raises(ValidationError):
+        Settings.load(write(tmp_path, text))
+
+
+def test_public_base_url_is_trimmed_and_optional(tmp_path):
+    settings = Settings.load(write(tmp_path))
+    assert settings.server.public_base_url == ""
+
+    text = BASE + '\n[server]\npublic_base_url = "https://sams.example.com/"\n'
+    settings = Settings.load(write(tmp_path, text))
+    assert settings.server.public_base_url == "https://sams.example.com"
+
+
+def test_public_base_url_must_be_http_or_https(tmp_path):
+    text = BASE + '\n[server]\npublic_base_url = "ftp://example.com"\n'
+    with pytest.raises(ValidationError, match="public_base_url"):
+        Settings.load(write(tmp_path, text))

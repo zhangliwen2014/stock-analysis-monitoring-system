@@ -61,6 +61,17 @@ idle_timeout_min = 720      # 无操作超时（分钟）：超时后要重新�
 login_max_failures = 5      # 登录失败锁定：窗口内最多失败次数
 login_window_min = 5        # 失败锁定的统计窗口（分钟）
 display_tz = "Asia/Shanghai"  # 页面上「某一天」按这个时区切（收件箱日期筛选）
+public_base_url = ""          # 推送深链根地址；空 = 不附链接。LAN 部署填 http://192.168.x.x:8765
 # 要上 HTTPS 就成对给出证书与私钥（会话 cookie 的 Secure 属性随之自动打开）：
 # tls_certfile = "/path/cert.pem"
 # tls_keyfile = "/path/key.pem"
+
+# 批注与附件（M4-B）。所有上限都是拒绝线：超了报错，不悄悄截断。
+[annotations]
+attachments_dir = ""        # 空 = <db 所在目录>/attachments；备份时这个目录要一起复制
+max_attachments = 5         # 每条批注最多几张截图
+max_attachment_mb = 5       # 单张上限（MB）
+max_user_total_mb = 512     # 每个用户的附件总配额（MB）
+max_body_chars = 20000      # 批注正文上限（字符）
+break_glass_minutes = 15    # admin 单条私有批注的临时查看时长
+break_glass_max_per_hour = 5  # 每管理员每小时最多授权次数（治理参数，不是性能参数）
