@@ -49,14 +49,12 @@ ALTER TABLE notify_log ADD COLUMN IF NOT EXISTS context_json VARCHAR;
 
 ALTER TABLE annotations ADD COLUMN IF NOT EXISTS target_label VARCHAR;
 ALTER TABLE annotations ALTER COLUMN target_label SET DEFAULT '';
-UPDATE annotations SET target_label = '' WHERE target_label IS NULL;
 ALTER TABLE annotations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 ALTER TABLE annotations ADD COLUMN IF NOT EXISTS deleted_by VARCHAR;
 ALTER TABLE annotations ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ;
 
 ALTER TABLE annotation_revisions ADD COLUMN IF NOT EXISTS meta_json VARCHAR;
 ALTER TABLE annotation_revisions ALTER COLUMN meta_json SET DEFAULT '{}';
-UPDATE annotation_revisions SET meta_json = '{}' WHERE meta_json IS NULL;
 
 CREATE TABLE IF NOT EXISTS annotation_attachments (
     id            VARCHAR PRIMARY KEY,
@@ -100,3 +98,9 @@ CREATE INDEX IF NOT EXISTS idx_admin_access_admin
     ON admin_access_log (admin_user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_admin_access_annotation
     ON admin_access_log (annotation_id, created_at);
+
+-- 回填放在所有 DDL 之后：同一事务里 UPDATE 过表之后再 ALTER 该表（哪怕是建索引），
+-- DuckDB 1.5.6 会在 COMMIT 时报 "another transaction has altered this table"；
+-- 0019 也是把回填留在文件最后才躲开同一个坑。
+UPDATE annotations SET target_label = '' WHERE target_label IS NULL;
+UPDATE annotation_revisions SET meta_json = '{}' WHERE meta_json IS NULL;

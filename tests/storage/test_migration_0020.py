@@ -26,6 +26,22 @@ def test_new_tables_exist(tmp_path):
         assert table in names, table
 
 
+def test_required_indexes_exist(tmp_path):
+    db = fresh(tmp_path)
+    indexes = {
+        row["index_name"]
+        for row in db.query("SELECT index_name FROM duckdb_indexes()").to_dicts()
+    }
+    assert {
+        "idx_alert_events_alert",
+        "idx_annotations_target",
+        "idx_annotations_user",
+        "idx_annotation_attachments_annotation",
+        "idx_admin_access_admin",
+        "idx_admin_access_annotation",
+    } <= indexes
+
+
 def test_alerts_gains_the_closure_columns(tmp_path):
     db = fresh(tmp_path)
     assert {
@@ -80,6 +96,60 @@ def test_an_old_handled_row_is_not_rewritten(tmp_path):
     assert row["action_kind"] is None
     assert row["acknowledged_at"] is None
     assert row["dismiss_code"] is None
+
+
+def test_old_annotation_rows_get_empty_defaults(tmp_path):
+    """M3 的批注与修订没有新列；0020 回填空值，但不改写正文与标签。"""
+    partial = tmp_path / "migrations"
+    partial.mkdir()
+    for path in MIGRATIONS_DIR.glob("*.sql"):
+        if path.name < "0020":
+            shutil.copy(path, partial / path.name)
+    db = Database.open(str(tmp_path / "old.duckdb"))
+    apply_migrations(db, partial)
+    db.execute(
+        "INSERT INTO annotations (id, user_id, target_type, target_ref, body_md)"
+        " VALUES ('n1', 'u1', 'symbol', 'A:600519', '旧正文')"
+    )
+    db.execute(
+        "INSERT INTO annotation_revisions (id, annotation_id, user_id, before_md, after_md)"
+        " VALUES ('v1', 'n1', 'u1', '改前', '改后')"
+    )
+
+    shutil.copy(MIGRATIONS_DIR / "0020_annotations_review.sql", partial)
+    assert apply_migrations(db, partial) == ["0020_annotations_review.sql"]
+
+    annotation = db.query(
+        "SELECT target_label, body_md, tags_json, pinned FROM annotations WHERE id = 'n1'"
+    ).to_dicts()[0]
+    assert annotation["target_label"] == ""
+    assert annotation["body_md"] == "旧正文"
+    assert annotation["tags_json"] == "[]"
+    assert annotation["pinned"] is False
+
+    revision = db.query(
+        "SELECT meta_json, before_md, after_md"
+        " FROM annotation_revisions WHERE id = 'v1'"
+    ).to_dicts()[0]
+    assert revision["meta_json"] == "{}"
+    assert revision["before_md"] == "改前"
+    assert revision["after_md"] == "改后"
+
+
+def test_new_rows_get_the_column_defaults(tmp_path):
+    """新库写入不给新列也能落空值：默认值真的生效，而不是只靠回填。"""
+    db = fresh(tmp_path)
+    db.execute(
+        "INSERT INTO annotations (id, user_id, target_type, target_ref, body_md)"
+        " VALUES ('n1', 'u1', 'symbol', 'A:600519', '正文')"
+    )
+    db.execute(
+        "INSERT INTO annotation_revisions (id, annotation_id, user_id, before_md, after_md)"
+        " VALUES ('v1', 'n1', 'u1', '改前', '改后')"
+    )
+
+    assert db.scalar("SELECT target_label FROM annotations WHERE id = 'n1'") == ""
+    assert db.scalar("SELECT meta_json FROM annotation_revisions WHERE id = 'v1'") == "{}"
 
 
 def test_reapplying_is_a_noop(tmp_path):
