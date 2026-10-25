@@ -208,14 +208,17 @@ def annotation_create(
         return fail(f"一条批注最多 {limits.max_attachments} 张附件", 400)
     # 尺寸闸在 create **之前**（§10）：人都传完了才说「批注存了、图没了」，
     # 等于让草稿断在一半。被拒的这次一条都不写，原文回填。
-    for upload in clean:
-        size = _part_size(upload)
-        if size > limits.max_attachment_mb * MB:
-            return fail(
-                f"单张附件最多 {limits.max_attachment_mb} MB"
-                f"（{upload.filename} 有 {size / MB:.1f} MB）：批注还没有写，缩一下再发",
-                400,
-            )
+    oversize = [
+        upload.filename
+        for upload in clean
+        if _part_size(upload) > limits.max_attachment_mb * MB
+    ]
+    if oversize:
+        return fail(
+            f"单张附件最多 {limits.max_attachment_mb} MB，"
+            f"{'、'.join(oversize)} 超了：这条批注一个字都没写，去一半再传",
+            400,
+        )
     try:
         made = ctx.annotations.create(
             user.id,
@@ -232,12 +235,14 @@ def annotation_create(
     for upload in clean:
         try:
             ctx.attachments.add(
-                user.id, made.id, filename=upload.filename or "", data=upload.file.read()
+                user.id, made.id, filename=upload.filename, data=upload.file.read()
             )
+        except DatabaseLocked:
+            raise
         except SamsError as exc:
             # 批注成立之后才拦下的附件不回滚批注：草稿是人的，图只是图——
             # 点名「哪张、为什么」，其余照常上屏
-            rejected.append(f"{upload.filename or '未命名'}：{exc}")
+            rejected.append(f"{upload.filename}：{exc}")
     audit(
         request,
         action="annotation.create",
@@ -280,8 +285,6 @@ def _load_for_write(request: Request, annotation_id: str):
     ctx = web.contexts.current()
     try:
         made = ctx.annotations.get(user.id, annotation_id, team_sharing=True)
-    except DatabaseLocked:
-        raise
     except NotFound as exc:
         raise HTTPException(status_code=404, detail="批注不存在或不可见") from exc
     if made.user_id != user.id:
@@ -313,11 +316,14 @@ def annotation_edit(
     wait = _limit_hit(web, user.id, uploads=0)
     if wait:
         return fail(f"写批注太频繁了：{wait} 秒后再试（每分钟 30 条）", 429)
-    # 版本号必须带：不带 `updated_at` 的编辑就是「我知道的比面板显示的旧」的静默覆盖
-    try:
-        stamp = datetime.fromisoformat(updated_at.strip())
-    except ValueError:
-        return fail("编辑要带上面板给的 updated_at：拿不到版本号就不写", 400)
+    # 空串=人不带版本号来改：服务层跳过并发检查（面板上的编辑永远带着 hidden 的
+    # updated_at，这条支路接的是脚本与旧表单）；坏了的戳才拦
+    stamp: datetime | None = None
+    if updated_at:
+        try:
+            stamp = datetime.fromisoformat(updated_at)
+        except ValueError:
+            return fail("编辑基线的时间戳读不出来：关闭编辑器、重新打开再改", 400)
     try:
         ctx.annotations.edit(
             user.id,
