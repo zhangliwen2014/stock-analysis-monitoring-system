@@ -161,3 +161,86 @@ def test_two_edits_in_the_same_clock_tick_still_conflict(repo):
             made.id, user_id=OWNER, body_md="第二改", tags=[], visibility="private",
             expected_updated_at=made.updated_at,
         )
+
+
+def test_update_writes_a_revision_with_the_before_and_after_tags(repo, clock):
+    made = add(repo)
+    clock.advance(seconds=1)
+    edited = repo.update(
+        made.id,
+        user_id=OWNER,
+        body_md="渠道库存见底，等回款",
+        tags=["逻辑", "风险"],
+        visibility="private",
+        expected_updated_at=made.updated_at,
+    )
+    assert edited.body_md.endswith("等回款")
+    assert edited.tags == ["逻辑", "风险"]
+    revisions = repo.revisions(made.id)
+    assert len(revisions) == 1
+    assert revisions[0].before_md == "渠道库存见底"
+    assert revisions[0].after_md == "渠道库存见底，等回款"
+    assert revisions[0].meta["before"]["tags"] == ["逻辑"]
+    assert revisions[0].meta["after"]["tags"] == ["逻辑", "风险"]
+
+
+def test_a_stale_updated_at_is_a_conflict(repo, clock):
+    made = add(repo)
+    clock.advance(seconds=1)
+    repo.update(
+        made.id,
+        user_id=OWNER,
+        body_md="第一改",
+        tags=[],
+        visibility="private",
+        expected_updated_at=made.updated_at,
+    )
+    with pytest.raises(Conflict, match="改过"):
+        repo.update(
+            made.id,
+            user_id=OWNER,
+            body_md="第二改",
+            tags=[],
+            visibility="private",
+            expected_updated_at=made.updated_at,
+        )
+
+
+def test_only_the_author_can_edit_or_delete(repo):
+    made = add(repo)
+    with pytest.raises(ValidationError, match="不属于"):
+        repo.update(
+            made.id, user_id=OTHER, body_md="改别人的", tags=[], visibility="private"
+        )
+    with pytest.raises(ValidationError, match="不属于"):
+        repo.soft_delete(made.id, user_id=OTHER)
+
+
+def test_pinning_is_capped_at_three_per_target(repo):
+    for index in range(3):
+        add(repo, body_md=f"置顶 {index}", pinned=True)
+    extra = add(repo, body_md="第四条")
+    with pytest.raises(ValidationError, match="最多置顶"):
+        repo.set_pinned(extra.id, user_id=OWNER, pinned=True)
+
+
+def test_pinning_does_not_move_the_edit_clock(repo):
+    """置顶不是编辑：一个开着编辑器的窗口不该因为别人置顶而 409。"""
+    made = add(repo)
+    pinned = repo.set_pinned(made.id, user_id=OWNER, pinned=True)
+    assert pinned.updated_at == made.updated_at
+
+
+def test_editing_a_deleted_annotation_is_a_validation_error(repo):
+    made = add(repo)
+    repo.soft_delete(made.id, user_id=OWNER)
+    with pytest.raises(ValidationError, match="不存在或已删除"):
+        repo.update(made.id, user_id=OWNER, body_md="x", tags=[], visibility="private")
+
+
+def test_soft_delete_keeps_a_tombstone_for_later_purge(repo):
+    made = add(repo)
+    repo.soft_delete(made.id, user_id=OWNER)
+    tombstone = repo.get(made.id, include_deleted=True)
+    assert tombstone.deleted_by == OWNER
+    assert tombstone.purged_at is None
