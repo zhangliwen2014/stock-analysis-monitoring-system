@@ -98,6 +98,25 @@ uv run sams serve                               # http://127.0.0.1:8765
 - 监听局域网：`[server] host = "0.0.0.0"` + `allow_lan = true`，要加密就配
   `tls_certfile/tls_keyfile`。
 
+## 备份与附件（M4-B）
+
+数据仍然是一个 DuckDB 文件，但批注的附件不在库里：它们落在 `attachments_root`——
+`config.toml` 里 `[annotations] attachments_dir` 给的路径，没给就是库文件同级的
+`attachments/` 子目录。**备份 = 把库文件与那个目录一起打包**：批注正文在库里、图片在
+库外，只备库等于删图——行还在、缩略图全指到空文件上（面板会把这种行标成「文件缺失」，
+但备份里没有第二次机会）。
+
+| 键（`[annotations]`） | 默认 | 意思 |
+|---|---|---|
+| `attachments_dir` | 库文件旁的 `attachments/` | 附件根目录 |
+| `max_attachments` | 5 | 每条批注最多几个附件 |
+| `max_attachment_mb` | 5 | 单个附件上限（MB） |
+| `max_user_total_mb` | 512 | 每用户附件总量上限（MB） |
+
+`sams db prune` 顺带清理孤儿文件与软删过期的附件。恢复时把库与附件目录恢复到
+**同一时刻**（先停服务再拷两边）：错开的那一侧要么库指着不存在的文件，要么文件在
+库里没有行。
+
 ## 结构
 
 分层单体，依赖单向向下，`bootstrap.py` 是唯一的组装根。

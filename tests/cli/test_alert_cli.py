@@ -83,7 +83,7 @@ def test_list_shows_only_unhandled_by_default(container, capsys) -> None:
     """默认只看 `new`：复盘时手里要的是一份「还欠谁的」，不是全部历史。"""
     first = make_alert(container, code="000001")
     make_alert(container, code="601088", symbol_name="中国神华")
-    container.alerts_store.set_status(first.id, "handled", user_id=uid(container), note="已复核")
+    container.alerts_store.act(first.id, user_id=uid(container), action_kind="other", note="已复核")
     code, text = out(container, capsys, "list", "--user", USER)
     assert code == 0
     assert "A/601088" in text and "A/000001" not in text
@@ -101,7 +101,7 @@ def test_list_status_all_shows_every_state(container, capsys) -> None:
 def test_list_status_handled_says_so_in_chinese(container, capsys) -> None:
     """库里那一列是英文，屏幕上是中文：两边都要——人靠中文读，机器靠英文查。"""
     alert = make_alert(container)
-    container.alerts_store.set_status(alert.id, "handled", user_id=uid(container))
+    container.alerts_store.act(alert.id, user_id=uid(container), action_kind="watch")
     code, text = out(container, capsys, "list", "--user", USER, "--status", "handled")
     assert code == 0
     assert "名下已处理的告警 1 条" in text
@@ -115,7 +115,7 @@ def test_list_json_filter_names_the_state_it_read(container, capsys) -> None:
     一份「已处理」的清单会被读成「没人看过」。
     """
     alert = make_alert(container)
-    container.alerts_store.set_status(alert.id, "handled", user_id=uid(container))
+    container.alerts_store.act(alert.id, user_id=uid(container), action_kind="watch")
     _, body = payload(container, capsys, "list", "--user", USER, "--status", "handled")
     assert body["filter"] == "handled"
     _, body = payload(container, capsys, "list", "--user", USER, "--status", "all")

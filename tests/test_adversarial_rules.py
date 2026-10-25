@@ -103,7 +103,7 @@ def test_handling_the_open_alert_unmutes_the_next_run(h) -> None:
     rule = h.add(filters={"no_open_alert": True})
     open_row = h.seed_hit(rule_id=rule.id, minutes_ago=31)
     assert "未处理" in h.engine().check(USER).suppressed[0].reason
-    h.alerts.set_status(open_row.id, "handled", user_id=USER, note="已挂条件单")
+    h.alerts.act(open_row.id, user_id=USER, action_kind="other", note="已挂条件单")
     assert len(h.engine().check(USER).raised) == 1
 
 
@@ -111,7 +111,7 @@ def test_dismissing_unmutes_and_keeps_the_reason_for_the_ignore_rate(h) -> None:
     """忽略也是解除：那一列留下来了，静音才不是「按掉就再也看不见」。"""
     rule = h.add(filters={"no_open_alert": True})
     open_row = h.seed_hit(rule_id=rule.id, minutes_ago=31)
-    h.alerts.set_status(open_row.id, "dismissed", user_id=USER, note="除权造成的假跌破")
+    h.alerts.dismiss(open_row.id, user_id=USER, code="misreport", reason="除权造成的假跌破")
     assert len(h.engine().check(USER).raised) == 1
     kept = h.alerts.get(open_row.id)
     assert kept.dismiss_reason == "除权造成的假跌破"

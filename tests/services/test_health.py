@@ -619,9 +619,13 @@ def make_alerts(container, statuses):
         )
         if status == "acknowledged":
             container.alerts_store.acknowledge(alert.id, user_id=user.id)
-        elif status != "new":
-            container.alerts_store.set_status(
-                alert.id, status, user_id=user.id, note="测试"
+        elif status == "handled":
+            container.alerts_store.act(
+                alert.id, user_id=user.id, action_kind="other", note="测试"
+            )
+        elif status == "dismissed":
+            container.alerts_store.dismiss(
+                alert.id, user_id=user.id, code="other", reason="测试"
             )
         made.append(container.alerts_store.get(alert.id))
     return made
@@ -658,8 +662,8 @@ def test_a_dismissed_alert_needs_no_channel_to_leave_the_backlog(db, settings):
     made = make_alerts(container, ["new"])
     # 通道是这条用例的**对照**而不是道具：断言里 `channels == 1` 才说得清它没被算进积压
     container.channels_store.create(made[0].user_id, "desktop", "本机", {})
-    container.alerts_store.set_status(
-        made[0].id, "dismissed", user_id=made[0].user_id, note="不需要通道也能销掉"
+    container.alerts_store.dismiss(
+        made[0].id, user_id=made[0].user_id, code="not_applicable", reason="不需要通道也能销掉"
     )
 
     report = container.health.report()

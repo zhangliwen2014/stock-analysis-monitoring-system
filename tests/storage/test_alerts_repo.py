@@ -179,7 +179,7 @@ def test_list_for_user_is_newest_first(repo, seeded_user, other_user):
 
 def test_list_for_filters_by_status(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
-    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="已手动复核")
+    repo.act(alert.id, user_id=seeded_user, action_kind="other", note="已手动复核")
     assert repo.list_for(seeded_user, status=NEW) == []
     handled = repo.list_for(seeded_user, status=HANDLED)[0]
     assert handled.status == HANDLED
@@ -215,12 +215,6 @@ def test_list_for_filters_by_severity_market_code_and_window(db):
     assert [a.code for a in repo.list_for("u1", rule_id="r2")] == ["00700"]
     assert repo.list_for("u1", limit=1, offset=1)[0].code == "600519"
     assert repo.list_for("u2") == []
-
-
-def test_set_status_rejects_an_unknown_one(repo, seeded_user):
-    alert = repo.create(seeded_user, **CREATE_KW)
-    with pytest.raises(ValidationError, match="不接受"):
-        repo.set_status(alert.id, "archieved", user_id=seeded_user)
 
 
 def test_a_rule_id_may_be_absent(repo, seeded_user):
@@ -312,7 +306,7 @@ def test_latest_open_finds_the_newest_unhandled_alert_on_that_symbol(repo, seede
             "triggered_at": now - timedelta(minutes=30),
         },
     )
-    repo.set_status(first.id, HANDLED, user_id=seeded_user)
+    repo.act(first.id, user_id=seeded_user, action_kind="watch")
     # 同票上**还有一条更早的 `new`**：只留一条 `new` 的话，删掉 `ORDER BY` 也全绿，
     # 「取最新」这半句根本没被钉住。
     repo.create(
@@ -348,7 +342,7 @@ def test_latest_open_finds_the_newest_unhandled_alert_on_that_symbol(repo, seede
 def test_latest_open_returns_none_once_the_last_one_is_dismissed(repo, seeded_user) -> None:
     got = repo.create(user_id=seeded_user, **CREATE_KW)
     assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is not None
-    repo.set_status(got.id, DISMISSED, user_id=seeded_user, note="误报")
+    repo.dismiss(got.id, user_id=seeded_user, code="expected")
     assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is None
 
 
@@ -375,7 +369,7 @@ def test_the_three_columns_a_human_writes_come_back_out(repo, seeded_user):
     读不出就等于屏幕上没有「什么时候按的、留了哪一句」，那一句只能靠记忆——而记忆撑不过第二次复盘。
     """
     alert = repo.create(seeded_user, **CREATE_KW)
-    moved = repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="已挂条件单")
+    moved = repo.act(alert.id, user_id=seeded_user, action_kind="other", note="已挂条件单")
 
     assert moved.status == HANDLED
     assert moved.handle_note == "已挂条件单"
@@ -383,66 +377,18 @@ def test_the_three_columns_a_human_writes_come_back_out(repo, seeded_user):
     assert moved.handled_at is not None
 
 
-def test_a_dismissal_keeps_its_reason_in_its_own_column(repo, seeded_user):
-    alert = repo.create(seeded_user, **CREATE_KW)
-    moved = repo.set_status(
-        alert.id, DISMISSED, user_id=seeded_user, note="停牌导致的假跌破"
-    )
-
-    assert moved.dismiss_reason == "停牌导致的假跌破"
-    assert moved.handle_note is None, "两句不许同时写同一句话"
-
-
-def test_dismissing_without_a_reason_is_refused(repo, seeded_user):
-    """§5 那句「dismissed 必须带 reason（喂给忽略率统计）」，落点在仓库层。"""
-    alert = repo.create(seeded_user, **CREATE_KW)
-    with pytest.raises(ValidationError, match="原因"):
-        repo.set_status(alert.id, DISMISSED, user_id=seeded_user)
-
-    assert repo.get(alert.id).status == NEW, "拒绝不许留下一半的变更"
-
-
-def test_a_blank_reason_is_not_a_reason(repo, seeded_user):
-    """空格与空串是同一种东西：那一列要能被统计，收下一句空白就是收下噪音。"""
-    alert = repo.create(seeded_user, **CREATE_KW)
-    with pytest.raises(ValidationError, match="原因"):
-        repo.set_status(alert.id, DISMISSED, user_id=seeded_user, note="   ")
-
-
 def test_someone_elses_alert_is_not_yours_to_move(repo, seeded_user, other_user):
     """归属闸放在仓库层（D81）：调度器与后台都不经过命令层，挡在命令层对它们是空的。"""
     alert = repo.create(seeded_user, **CREATE_KW)
     with pytest.raises(StorageError, match="不属于"):
-        repo.set_status(alert.id, HANDLED, user_id=other_user, note="手滑")
+        repo.act(alert.id, user_id=other_user, action_kind="other", note="手滑")
 
     assert repo.get(alert.id).status == NEW
 
 
-def test_changing_your_mind_replaces_the_previous_sentence(repo, seeded_user):
-    """按错了要能改，但「人对这条做过什么」在屏幕上只能有一个答案。"""
-    alert = repo.create(seeded_user, **CREATE_KW)
-    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="准备挂单")
-    moved = repo.set_status(
-        alert.id, DISMISSED, user_id=seeded_user, note="后来决定这轮不动"
-    )
-
-    assert moved.handle_note is None
-    assert moved.dismiss_reason == "后来决定这轮不动"
-
-
 def test_a_known_status_still_needs_a_known_alert(repo, seeded_user):
     with pytest.raises(StorageError, match="不存在"):
-        repo.set_status("ghost", HANDLED, user_id=seeded_user, note="x")
-
-
-def test_handling_does_not_stamp_a_moment_for_a_new_one(repo, seeded_user):
-    """`new` 没有「处理时刻」：给它盖一个，屏幕上那句「何时处理的」就成了谎。"""
-    alert = repo.create(seeded_user, **CREATE_KW)
-    moved = repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="看了")
-    back = repo.set_status(alert.id, NEW, user_id=seeded_user)
-
-    assert moved.handled_at is not None
-    assert back.handled_at is None and back.status == NEW
+        repo.act("ghost", user_id=seeded_user, action_kind="watch")
 
 
 # ---------- 按用户读（屏幕上那串 id 不能变成一个跨用户的读取口）----------
@@ -456,7 +402,7 @@ def test_get_can_scope_to_a_user(repo, seeded_user, other_user):
 
 
 def test_get_without_a_user_still_reads_any_row(repo, seeded_user):
-    """默认不挡，且这一条要测住：`record`/`set_status` 内部那次读靠的就是它。
+    """默认不挡，且这一条要测住：`create`/`act`/`dismiss` 内部那次读靠的就是它。
 
     把默认改成「挡」不会报错，只会让那两处把自己的告警读成不存在。
     """
@@ -619,7 +565,7 @@ def test_a_racing_ack_does_not_write_a_second_event(tmp_path, monkeypatch):
 
 def test_acknowledge_refuses_a_closed_alert(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
-    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="已挂单")
+    repo.act(alert.id, user_id=seeded_user, action_kind="watch")
     with pytest.raises(Conflict, match="已经是 handled"):
         repo.acknowledge(alert.id, user_id=seeded_user)
 
@@ -894,23 +840,29 @@ def test_undo_after_five_minutes_is_refused(repo, seeded_user, clock):
 
 
 def test_undo_refuses_when_a_legacy_close_is_newer_than_the_recorded_action(
-    repo, seeded_user
+    repo, seeded_user, clock
 ):
-    """处置过、撤销过、又已读，然后旧入口关了它：最新事件是 ack，
+    """处置过、撤销过、又已读，然后一条旧版关法把它关了：最新事件是 ack，
     不能拿更早那条 act 的 from_status 猜上一态（旧实现会回退到 new）。"""
     alert = repo.create(seeded_user, **CREATE_KW)
     repo.act(alert.id, user_id=seeded_user, action_kind="watch", note="先处置")
     repo.undo(alert.id, user_id=seeded_user)
     repo.acknowledge(alert.id, user_id=seeded_user)
-    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="旧入口")
+    repo.db.execute(
+        "UPDATE alerts SET status = ?, handled_at = ?, handle_note = ? WHERE id = ?",
+        [HANDLED, clock.now_utc(), "旧版关法", alert.id],
+    )
     with pytest.raises(Conflict, match="动作记录"):
         repo.undo(alert.id, user_id=seeded_user)
 
 
-def test_undo_needs_a_recorded_transition(repo, seeded_user):
-    """旧入口 set_status 不写事件：那条告警没有可信的上一态，不许猜。"""
+def test_undo_needs_a_recorded_transition(repo, seeded_user, clock):
+    """旧版关法不写事件：那条告警没有可信的上一态，不许猜。"""
     alert = repo.create(seeded_user, **CREATE_KW)
-    repo.set_status(alert.id, HANDLED, user_id=seeded_user, note="旧入口")
+    repo.db.execute(
+        "UPDATE alerts SET status = ?, handled_at = ?, handle_note = ? WHERE id = ?",
+        [HANDLED, clock.now_utc(), "旧版关法", alert.id],
+    )
     with pytest.raises(Conflict, match="动作记录"):
         repo.undo(alert.id, user_id=seeded_user)
 
