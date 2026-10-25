@@ -32,6 +32,7 @@ from sams.monitor.queue import (
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
 from sams.services.analysis import AnalysisService
+from sams.services.annotation_context import AnnotationContextProvider
 from sams.services.annotation_prune import AnnotationPruner
 from sams.services.annotations import AnnotationService
 from sams.services.attachments import AttachmentService, attachments_root
@@ -45,6 +46,7 @@ from sams.services.ledger import LedgerService
 from sams.services.portfolio import PortfolioService
 from sams.services.prune import PruneReport, PruneService
 from sams.services.quotes import QuoteBoard, QuoteService
+from sams.services.review import ReviewService
 from sams.services.rules.cache import SnapshotCache
 from sams.services.rules.derive import RuleDeriver
 from sams.services.rules.engine import RuleEngine
@@ -71,6 +73,7 @@ from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
+from sams.storage.repos.app_settings import AppSettingsRepo
 from sams.storage.repos.attachments import AttachmentRepo
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
@@ -217,6 +220,12 @@ class ServiceContext:
     attachments: AttachmentService
     #: 批注回收：`sams serve` 的每日 prune 与 CLI 走同一个实例
     annotation_pruner: AnnotationPruner
+    #: 运行时策略（D127）：首期只有团队共享开关，推送 provider 每次都问它
+    app_settings: AppSettingsRepo
+    #: 推送上下文的 provider：注入给 `notify`（构造顺序在它之后，见 `_context_on`）
+    annotation_context: AnnotationContextProvider
+    #: 闭环用例：`sams alert handle` 走的就是它（spec §8.2/§8.3）
+    review: ReviewService
     #: 通道凭据的加密器：CLI 要能在不碰 `storage.services.*` 的情况下掩码
     cipher: Cipher
     #: 发送路由（spec §11）
@@ -529,6 +538,23 @@ def _context_on(
         root=attachments_root(cfg),
         clock=clock,
     )
+    app_settings = AppSettingsRepo(database, clock=clock)
+    annotation_context = AnnotationContextProvider(
+        annotations_store, users, theses_store, app_settings, cfg
+    )
+    #: notify 造在批注之前（装配顺序），provider 只能事后接：队列与 Web 重发都只调
+    #: `deliver_existing(alert_id)`，实例这一格是唯一接得住它的地方（§7.3）
+    notify.context_provider = annotation_context
+    review = ReviewService(
+        database,
+        alerts=alerts_store,
+        ledger=ledger,
+        users=users,
+        theses=theses_store,
+        rules=rules_store,
+        watchlists=watchlists,
+        annotations=annotations,
+    )
 
     # 下面四个同步服务与 `UniverseBuilder` 原本就地造在 `return Container(...)` 的参数里。
     # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
@@ -656,6 +682,9 @@ def _context_on(
         attachments_store=attachments_store,
         attachments=attachments,
         annotation_pruner=annotation_pruner,
+        app_settings=app_settings,
+        annotation_context=annotation_context,
+        review=review,
         rules_store=rules_store,
         rule_data=rule_data,
         rule_engine=rule_engine,

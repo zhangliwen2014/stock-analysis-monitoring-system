@@ -320,7 +320,7 @@ def test_dismiss_without_reason_is_refused_with_two(container, capsys) -> None:
     alert = make_alert(container)
     code, text = out(container, capsys, "dismiss", alert.id, "--user", USER)
     assert code == 2
-    assert "必须带原因" in text
+    assert "必须写一句说明" in text
     _, body = payload(container, capsys, "dismiss", alert.id, "--user", USER)
     assert body["status"] == "refused" and body["exit"] == 2
 
@@ -338,16 +338,21 @@ def test_dismiss_writes_only_the_reason_column(container, capsys) -> None:
     assert got["handle_note"] is None
 
 
-def test_switching_your_mind_replaces_the_previous_sentence(container, capsys) -> None:
-    """`handled → dismissed` 允许，但上一次那句要清掉：留两句就有两个答案。"""
+def test_a_terminal_state_refuses_the_second_opinion(container, capsys) -> None:
+    """终态不可回退（D124）：先 handle 再 dismiss 是 exit 1，不是静默覆盖。
+
+    旧版允许「改主意就换一句」，代价是复盘里第一次的结论再也找不回来——
+    要更正走 5 分钟内的 undo（Web）或再写一条批注，CLI 只把闸亮出来。
+    """
     alert = make_alert(container)
     invoke(container, "handle", alert.id, "--user", USER, "--note", "已挂条件单")
-    code, body = payload(
+    code, text = out(
         container, capsys, "dismiss", alert.id, "--user", USER, "--reason", "其实是误报"
     )
-    assert code == 0
-    assert body["alert"]["handle_note"] is None
-    assert body["alert"]["dismiss_reason"] == "其实是误报"
+    assert code == 1
+    assert "终态不可回退" in text
+    got = container.alerts_store.get(alert.id)
+    assert got.status == "handled" and got.handle_note == "已挂条件单"
 
 
 def test_handle_unknown_alert_is_exit_one(container, capsys) -> None:
@@ -366,13 +371,25 @@ def test_move_other_users_alert_is_refused(container, capsys) -> None:
 
 def test_handle_json_shape(container, capsys) -> None:
     alert = make_alert(container)
-    code, body = payload(container, capsys, "handle", alert.id, "--user", USER)
+    code, body = payload(
+        container, capsys, "handle", alert.id, "--user", USER, "--note", "已复核"
+    )
     assert code == 0 and body["exit"] == 0
     assert body["alert"]["status"] == "handled"
+    assert body["alert"]["action_kind"] == "other"
     # JSON 里的时刻必须解析得开（屏幕上那种短横是给机器读不了的写法），
     # 而且按下的就是这一趟的那一枚：夹具的钟冻在哪个时刻，那一列就是哪个时刻
     stamped = datetime.fromisoformat(body["alert"]["handled_at"])
     assert stamped == container.alerts_store.clock.now_utc()
+
+
+def test_handle_without_a_note_is_refused_with_two(container, capsys) -> None:
+    """`handle` 现在是 acted(other) 的入口：说明必填（D125），拒在仓库层、也有 JSON。"""
+    alert = make_alert(container)
+    code, text = out(container, capsys, "handle", alert.id, "--user", USER)
+    assert code == 2
+    assert "必须写一句说明" in text
+    assert container.alerts_store.get(alert.id).status == "new"
 
 
 # ---------- 四态：多一个状态，屏幕上就得有那个词 ----------
@@ -388,3 +405,94 @@ def test_acknowledged_is_spoken_in_chinese(container, capsys, db) -> None:
     code, text = out(container, capsys, "show", alert.id, "--user", USER)
     assert code == 0
     assert "已读" in text
+
+
+# ---------- ack / defer（spec §8.1：CLI 的闭环动词补全）----------
+
+
+def test_ack_moves_to_acknowledged_and_is_idempotent(container, capsys) -> None:
+    """已读只是中间态：重复点不是新结论（仓库层幂等），第二趟照样 exit 0。"""
+    alert = make_alert(container)
+    code, body = payload(container, capsys, "ack", alert.id, "--user", USER)
+    assert code == 0
+    assert body["alert"]["status"] == "acknowledged"
+    assert body["alert"]["acknowledged_at"] is not None
+    code2, body2 = payload(container, capsys, "ack", alert.id, "--user", USER)
+    assert code2 == 0 and body2["alert"]["acknowledged_at"] == body["alert"]["acknowledged_at"]
+
+
+def test_ack_after_a_terminal_state_is_refused_with_one(container, capsys) -> None:
+    alert = make_alert(container)
+    invoke(container, "handle", alert.id, "--user", USER, "--note", "已挂条件单")
+    code, text = out(container, capsys, "ack", alert.id, "--user", USER)
+    assert code == 1
+    assert "不能再标已读" in text
+
+
+def test_defer_relative_until_lands_on_the_row(container, capsys) -> None:
+    """稍后不改状态，只写一个到点时刻（D138）。
+
+    `_parse_until` 的相对时间按真实钟表折（1h/2d 是「人话的时长」），所以这里的
+    边界比对用 `datetime.now`——夹具冻的是仓库的钟，不是解析器的。
+    """
+    alert = make_alert(container)
+    code, body = payload(container, capsys, "defer", alert.id, "--user", USER, "--until", "2h")
+    assert code == 0
+    assert body["alert"]["status"] == "new"
+    until = datetime.fromisoformat(body["alert"]["deferred_until"])
+    assert until.tzinfo is not None
+    delta = (until - datetime.now(UTC)).total_seconds()
+    assert 1.5 * 3600 < delta < 2.5 * 3600
+
+
+def test_defer_absolute_until_is_accepted(container, capsys) -> None:
+    alert = make_alert(container)
+    code, body = payload(
+        container, capsys, "defer", alert.id, "--user", USER,
+        "--until", "2027-01-01T09:00+08:00",
+    )
+    assert code == 0
+    assert datetime.fromisoformat(body["alert"]["deferred_until"]) == datetime.fromisoformat(
+        "2027-01-01T01:00+00:00"
+    )
+
+
+def test_defer_with_an_unreadable_until_is_refused_with_two(container, capsys) -> None:
+    alert = make_alert(container)
+    code, text = out(container, capsys, "defer", alert.id, "--user", USER, "--until", "很快")
+    assert code == 2
+    assert "读不懂" in text
+
+
+def test_defer_on_a_terminal_state_is_refused_with_one(container, capsys) -> None:
+    alert = make_alert(container)
+    invoke(container, "handle", alert.id, "--user", USER, "--note", "已挂条件单")
+    code, text = out(container, capsys, "defer", alert.id, "--user", USER, "--until", "1h")
+    assert code == 1
+    assert "不能再稍后" in text
+
+
+def test_dismiss_lands_the_other_code(container, capsys) -> None:
+    """CLI 只给 `--reason` ⇒ 原因码落 `other`（§8.5）；code 那一列仍要写得出来。"""
+    alert = make_alert(container)
+    code, body = payload(
+        container, capsys, "dismiss", alert.id, "--user", USER, "--reason", "除权造成的假跌破"
+    )
+    assert code == 0
+    assert body["alert"]["dismiss_code"] == "other"
+    assert body["alert"]["dismiss_reason"] == "除权造成的假跌破"
+
+
+def test_alert_json_carries_the_closure_columns(container, capsys) -> None:
+    """复盘统计读的就是这几列：JSON 里缺一个键，下游就把它读成「没有这件事」。"""
+    alert = make_alert(container)
+    invoke(container, "ack", alert.id, "--user", USER)
+    code, body = payload(container, capsys, "show", alert.id, "--user", USER)
+    assert code == 0
+    got = body["alert"]
+    for key in (
+        "acknowledged_at", "action_kind", "action_ref", "dismiss_code",
+        "deferred_until", "thesis_id",
+    ):
+        assert key in got
+    assert got["acknowledged_at"] is not None and got["action_kind"] is None

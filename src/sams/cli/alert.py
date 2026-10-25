@@ -4,6 +4,10 @@
 `threshold_text`/`action_note`），不按今天的模板重新渲染：重新渲染会在措辞改版之后说谎，
 而「我当时到底看到了什么」正是复盘唯一要看的东西。
 
+闭环的四个动词按 spec §8.1 映射：`handle` 是 acted 的 `other`（说明必填）、
+`dismiss` 落 `dismiss_code=other`、`ack` 与 `defer` 是新增的两格。状态机的闸全在
+仓库层（`AlertRepo`）与 `services/review`，这里只把它们翻成中文和退出码。
+
 这一整个模块不许 import `sams.storage.*`（`ALLOWED["cli"]` 只有 `core` 与 `services`）：
 `alerts`、`notify_log`、`channels` 三张表都通过 `container.alerts_store` /
 `container.channels_store` 读，`users` 通过 `resolve_actor`——那是 `Container` 上装配好的对象。
@@ -14,6 +18,8 @@
 from __future__ import annotations
 
 import argparse
+import re
+from datetime import UTC, datetime, timedelta
 
 from sams.bootstrap import Container
 from sams.cli.common import emit, exit_for, group, refused, stamp
@@ -38,7 +44,9 @@ _STATUS_WORDS = {
 
 
 def add_to(subparsers) -> None:
-    actions = group(subparsers, "alert", "告警：看、标成已处理、带原因忽略")
+    actions = group(
+        subparsers, "alert", "告警：看、已读、处置（说明必填）、忽略（原因必填）、稍后"
+    )
 
     def leaf(name: str, handler, help_text: str) -> argparse.ArgumentParser:
         parser = actions.add_parser(name, help=help_text)
@@ -58,15 +66,30 @@ def add_to(subparsers) -> None:
     )
     show.add_argument("alert_id", help="告警 id（`sams alert list` 每条的 id 那一行）")
 
-    handle = leaf("handle", handle_alert, "标成已处理：这一条从此不再算「没人看过」")
+    handle = leaf("handle", handle_alert, "标成已处置：acted 的 other——说明必填（≥2 字）")
     handle.add_argument("alert_id")
-    handle.add_argument("--note", help="打算怎么处理（可空：那一列不是必填的）")
+    handle.add_argument("--note", help="做了什么（这一条现在必须有：「已处置」三个字回答不了复盘）")
 
     dismiss = leaf("dismiss", dismiss_alert, "忽略一条：必须带原因，那一列是忽略率唯一的输入")
     dismiss.add_argument("alert_id")
     # 不用 argparse 的 required=True：拒在仓库层才能同时给 JSON（D57），
     # argparse 的失败是 SystemExit 加一段 usage，`--json` 的那一侧只读到空 stdin
-    dismiss.add_argument("--reason", help="为什么不处理；不给就拒（拒在仓库层，那里也给 JSON）")
+    dismiss.add_argument(
+        "--reason",
+        help="为什么不处理；不给就拒（拒在仓库层，那里也给 JSON）。"
+        "首期 CLI 只落 other 码：misreport/expected/data_issue/not_applicable/duplicate/other",
+    )
+
+    ack = leaf("ack", ack_alert, "标成已读：从此算「看到了还没做」，仍算未处理")
+    ack.add_argument("alert_id")
+
+    defer = leaf("defer", defer_alert, "稍后提醒：状态不变，写一个到点时刻（D138）")
+    defer.add_argument("alert_id")
+    defer.add_argument(
+        "--until",
+        required=True,
+        help="1h/3h/2d 这样的相对时长，或带时区的绝对时间（2026-10-26T09:30+08:00）",
+    )
 
 
 # ---------- 形状 ----------
@@ -123,6 +146,12 @@ def _alert_payload(alert) -> dict:
         "handled_at": _at(alert.handled_at),
         "handle_note": alert.handle_note,
         "dismiss_reason": alert.dismiss_reason,
+        "acknowledged_at": _at(alert.acknowledged_at),
+        "action_kind": alert.action_kind,
+        "action_ref": alert.action_ref,
+        "dismiss_code": alert.dismiss_code,
+        "deferred_until": _at(alert.deferred_until),
+        "thesis_id": alert.thesis_id,
         "value_text": _text(alert, "value_text"),
         "threshold_text": _text(alert, "threshold_text"),
         "action_note": _text(alert, "action_note"),
@@ -255,6 +284,12 @@ def show_alert(container: Container, args) -> int:
     if alert.rule_id:
         print(f"  规则    {alert.rule_id}")
     print(f"  状态    {alert.status}（{_STATUS_WORDS[alert.status]}）")
+    if alert.acknowledged_at is not None:
+        print(f"  已读    {stamp(alert.acknowledged_at)}")
+    if alert.action_kind:
+        print(f"  动作    {alert.action_kind} {alert.action_ref or ''}".rstrip())
+    if alert.deferred_until is not None:
+        print(f"  稍后    {stamp(alert.deferred_until)}（到点前回收件箱，不计忽略率）")
     if alert.handled_at is not None:
         note = alert.handle_note or alert.dismiss_reason or "（没写）"
         print(f"    {stamp(alert.handled_at)} 按的：{note}")
@@ -268,34 +303,118 @@ def show_alert(container: Container, args) -> int:
     return 0
 
 
-# ---------- handle / dismiss ----------
+# ---------- ack / defer / handle / dismiss ----------
 
 
-def handle_alert(container: Container, args) -> int:
-    return _move(container, args, "handled", args.note or "")
-
-
-def dismiss_alert(container: Container, args) -> int:
-    return _move(container, args, "dismissed", args.reason or "")
-
-
-def _move(container: Container, args, status: str, note: str) -> int:
-    try:
-        user = resolve_actor(container.users, args.user)
-        alert = container.alerts_store.set_status(args.alert_id, status, user_id=user.id, note=note)
-    except SamsError as exc:
-        return refused(args, exc, exit_for(exc))
+def _emit_move(args, alert, lines: list[str]) -> int:
     if args.json:
         emit({"status": "ok", "exit": 0, "alert": _alert_payload(alert)})
         return 0
     print(_one_line(alert).removeprefix("  "))
-    if alert.status == "handled":
-        print(f"  已标成 handled：{alert.handle_note or '（没写备注）'}")
-        print(
-            "  这一条不再算未处理（`no_open_alert` 数的是 status=new/acknowledged）；"
-            "同票上若还有别的新告警，那些照样挡着后面的推送——更响的那一档除外（D94）"
-        )
-    else:
-        print(f"  已忽略：{alert.dismiss_reason}")
-        print("  那一列进忽略率统计：「这条规则是不是在瞎报」只靠它回答")
+    for line in lines:
+        print(line)
     return 0
+
+
+def ack_alert(container: Container, args) -> int:
+    try:
+        user = resolve_actor(container.users, args.user)
+        alert = container.alerts_store.acknowledge(args.alert_id, user_id=user.id)
+    except SamsError as exc:
+        return refused(args, exc, exit_for(exc))
+    return _emit_move(
+        args,
+        alert,
+        [
+            f"  已标成 acknowledged：{stamp(alert.acknowledged_at)}"
+            "（看到了、还没做——同票其余告警照旧挡着）"
+        ],
+    )
+
+
+def defer_alert(container: Container, args) -> int:
+    try:
+        user = resolve_actor(container.users, args.user)
+        until = _parse_until(args.until)
+        alert = container.alerts_store.defer(args.alert_id, user_id=user.id, until=until)
+    except SamsError as exc:
+        return refused(args, exc, exit_for(exc))
+    return _emit_move(
+        args,
+        alert,
+        [
+            f"  已稍后：{stamp(alert.deferred_until)} 之后回收件箱顶部；"
+            f"在那之前状态仍是 {alert.status}"
+        ],
+    )
+
+
+def handle_alert(container: Container, args) -> int:
+    """`handle` 是 acted 的 CLI 入口（§8.1）：动作类型 `other`，说明必填。
+
+    说明的闸在仓库层（`act` 对 `other` 要 ≥2 字），这里不重复——两处闸就会有两处失效。
+    """
+    try:
+        user = resolve_actor(container.users, args.user)
+        alert = container.review.act(
+            user.id, args.alert_id, action_kind="other", note=args.note or ""
+        )
+    except SamsError as exc:
+        return refused(args, exc, exit_for(exc))
+    return _emit_move(
+        args,
+        alert,
+        [
+            f"  已标成 handled：{alert.handle_note}",
+            "  这一条不再算未处理（`no_open_alert` 数的是 status=new/acknowledged）；"
+            "同票上若还有别的新告警，那些照样挡着后面的推送——更响的那一档除外（D94）",
+        ],
+    )
+
+
+def dismiss_alert(container: Container, args) -> int:
+    """CLI 只收 `--reason`，原因码落 `other`（§8.5）：码的枚举入口在 Web 表单。"""
+    try:
+        user = resolve_actor(container.users, args.user)
+        alert = container.alerts_store.dismiss(
+            args.alert_id, user_id=user.id, code="other", reason=args.reason or ""
+        )
+    except SamsError as exc:
+        return refused(args, exc, exit_for(exc))
+    return _emit_move(
+        args,
+        alert,
+        [
+            f"  已忽略：{alert.dismiss_reason}",
+            "  那一列进忽略率统计：「这条规则是不是在瞎报」只靠它回答",
+        ],
+    )
+
+
+_RELATIVE_UNTIL = re.compile(r"^(\d+)([mhd])$")
+_UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_until(value: str) -> datetime:
+    """`1h`/`3h`/`2d` 折成「真实钟表的未来」，绝对时间按 ISO 读。
+
+    相对时长按 `datetime.now` 而不是注入的 `clock` 算吗？——是：稍后提醒是给**人**的
+    时长，仓库那头的闸（`defer` 要求未来时刻）读自己的钟，两边都在真实时间轴上。
+    裸 ISO 时刻按本机时区补（`astimezone()`）：一个不带偏移的「09:30」说的是
+    人那里的 09:30，不是 UTC 的 09:30。
+    """
+    text = (value or "").strip().lower()
+    match = _RELATIVE_UNTIL.match(text)
+    if match:
+        amount = int(match.group(1))
+        if amount < 1:
+            raise ValidationError(f"--until 的相对时长要为正（收到 {value!r}）")
+        return datetime.now(UTC) + timedelta(seconds=amount * _UNIT_SECONDS[match.group(2)])
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValidationError(
+            f"--until 读不懂：{value!r}。用 1h/3h/2d，或带时区的绝对时间"
+            "（例如 2026-10-26T09:30+08:00）"
+        ) from exc
+    return moment if moment.tzinfo is not None else moment.astimezone()

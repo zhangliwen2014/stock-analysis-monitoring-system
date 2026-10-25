@@ -797,3 +797,16 @@ def test_container_wires_attachments_and_the_pruner(container):
     assert built.attachments.resolve(user.id, note.id, row.id).id == row.id
     assert built.attachments_store.get(row.id) is not None
     assert built.prune.annotations is built.annotation_pruner
+
+
+def test_container_wires_the_push_context_and_the_review(container):
+    """provider 只有一格接得住队列与重发：`notify.context_provider`（§7.3）。
+
+    这枚钉的是装配本身的接缝：`AnnotationContextProvider` 改了构造签名而这里没跟上，
+    红的是这一条，而不是某个交易日里通知线程的栈追踪。
+    """
+    built, _ = container
+    assert built.annotation_context is not None
+    assert built.notify.context_provider is built.annotation_context
+    assert built.review is not None
+    assert built.app_settings.team_sharing() is True
