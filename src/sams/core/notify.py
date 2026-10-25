@@ -163,6 +163,104 @@ def trim(text: str, *, limit: int) -> str:
     return kept + "…"
 
 
+# ---------- 推送上下文（spec §7.2，D126）----------
+
+#: 上下文块的题头那一行：屏幕上与 `notify_log` 里都按这一句逐字断言，所以它是常量。
+CONTEXT_HEADER = "—— 最近批注 ——"
+#: 一条推送最多带几条批注（§7.1）。固定 3 条的代价写在 spec §15：重要的旧批注要置顶。
+CONTEXT_MAX_ITEMS = 3
+#: 单行正文的硬上限。`plain_text` 默认也是这个数，这里再挡一次：
+#: provider 递来的若是未压过的原文，一行也不许炸开。
+CONTEXT_LINE_CHARS = 120
+#: 只有文本通道带上下文：语音/桌面的 `LIMITS` 是 140/200 字节，放不下且价值低（D126）。
+PUSH_CONTEXT_KINDS = ("wecom", "dingtalk", "pushplus", "email")
+
+
+@dataclass(frozen=True)
+class AnnotationContext:
+    """一条要进推送的候选批注：只有「这行怎么读」与「谁先谁后」的那几样。
+
+    `moment_label` 是**已经折好**的 `MM-DD HH:MM`：时区换算读 `server.display_tz`，
+    那是 provider 的事——这一层不许 import 任何配置，也不碰 zoneinfo。
+    """
+
+    annotation_id: str
+    created_at: datetime
+    moment_label: str
+    author_label: str
+    body_text: str
+    tags: tuple[str, ...] = ()
+    pinned: bool = False
+
+
+@dataclass(frozen=True)
+class PushContext:
+    """provider 给 router 的那一包：候选批注加深链。
+
+    `items` 为空与 provider 返回 `None` 是两个事实：前者是「这只票没人写过批注」，
+    后者是「这条告警不该有上下文」（系统告警没有标的）。`notify_log.context_json`
+    要能分出这两样，审计才回答得了「为什么那条推送里没有批注」。
+    """
+
+    items: tuple[AnnotationContext, ...] = ()
+    link: str = ""
+
+
+def _select_annotation_context(
+    items: Sequence[AnnotationContext],
+) -> tuple[AnnotationContext, ...]:
+    """按 id 去重（保留第一次出现），置顶优先、其余按时间倒序，最多 3 条（§7.1）。"""
+    seen: set[str] = set()
+    unique: list[AnnotationContext] = []
+    for entry in items:
+        if entry.annotation_id in seen:
+            continue
+        seen.add(entry.annotation_id)
+        unique.append(entry)
+    unique.sort(key=lambda entry: (entry.pinned, entry.created_at), reverse=True)
+    return tuple(unique[:CONTEXT_MAX_ITEMS])
+
+
+def annotation_context_line(item: AnnotationContext) -> str:
+    """一条批注一行：`· MM-DD HH:MM 作者 [标签] 正文`。"""
+    tags = f" [{' '.join(item.tags)}]" if item.tags else ""
+    body = " ".join((item.body_text or "").split())
+    if len(body) > CONTEXT_LINE_CHARS:
+        body = body[: CONTEXT_LINE_CHARS - 1] + "…"
+    return f"· {item.moment_label} {item.author_label}{tags} {body}".rstrip()
+
+
+def format_annotation_context(
+    items: Sequence[AnnotationContext],
+    *,
+    budget_bytes: int | None = None,
+) -> tuple[str, tuple[str, ...], int]:
+    """渲染上下文块，返回（文本、实际带入的 id、被预算剪掉的条数）。
+
+    `budget_bytes` 是「这个通道的正文还剩多少字节」：超预算从**尾部**剪（尾部是
+    最新但非置顶的那几条）；连第一条都放不下就整块不发而不是截半行（§7.2）。
+    预算为 `None`（`budget_bytes is None`）表示不剪——Web 详情页那种「与推送同源」
+    的展示要的是完整 3 条。
+    """
+    chosen = _select_annotation_context(items)
+    if not chosen:
+        return "", (), 0
+    lines = [CONTEXT_HEADER] + [annotation_context_line(entry) for entry in chosen]
+    while (
+        len(lines) > 2
+        and budget_bytes is not None
+        and len("\n".join(lines).encode()) > budget_bytes
+    ):
+        lines.pop()
+    kept = len(lines) - 1
+    if budget_bytes is not None and len("\n".join(lines).encode()) > budget_bytes:
+        # 剪到只剩「题头 + 第一条」仍放不下：题头自己也不发了
+        return "", (), len(items)
+    text = "\n".join(lines)
+    ids = tuple(entry.annotation_id for entry in chosen[:kept])
+    return text, ids, len(items) - kept
+
+
 @runtime_checkable
 class AlertSender(Protocol):
     """规则引擎唯一的发送出口（D95）。`services` 不许 import `monitor`，而投递必须发生。
