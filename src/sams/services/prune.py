@@ -40,6 +40,8 @@ JOB_NAME = "prune"
 class PruneStep:
     name: str
     rows: int
+    #: 计量单位：删文件的步数不是「行」，混进合计会让「预计 N 行」看起来像在数别的东西
+    unit: str = "行"
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,7 @@ class PruneReport:
 
     @property
     def total(self) -> int:
-        return sum(step.rows for step in self.steps)
+        return sum(step.rows for step in self.steps if step.unit == "行")
 
 
 class PruneService:
@@ -163,6 +165,6 @@ def _annotation_steps(report: AnnotationPruneReport) -> tuple[PruneStep, ...]:
     steps = (
         PruneStep("annotations_purged", report.annotations),
         PruneStep("attachments_purged", report.attachments),
-        PruneStep("attachments_orphan", report.orphan_files),
+        PruneStep("attachments_orphan", report.orphan_files, unit="个文件"),
     )
     return tuple(step for step in steps if step.rows)

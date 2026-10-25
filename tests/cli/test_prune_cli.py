@@ -179,13 +179,13 @@ def test_prune_reports_and_collects_orphan_attachments(config_path, capsys):
 
     assert cli.run(["db", "prune", "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "attachments_orphan: 将删除 1 行" in out
+    assert "attachments_orphan: 将删除 1 个文件" in out
     assert "文件: 将删除 1 个（7 字节）" in out
     assert path.exists()
 
     assert cli.run(["db", "prune"]) == 0
     out = capsys.readouterr().out
-    assert "attachments_orphan: 删除 1 行" in out
+    assert "attachments_orphan: 删除 1 个文件" in out
     assert not path.exists()
 
 

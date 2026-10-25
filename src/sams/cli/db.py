@@ -101,7 +101,7 @@ def prune(container, args) -> int:
     )
     verb = "将删除" if report.dry_run else "删除"
     for step in report.steps:
-        print(f"{step.name}: {verb} {step.rows} 行")
+        print(f"{step.name}: {verb} {step.rows} {step.unit}")
     if report.files or report.file_bytes:
         print(f"文件: {verb} {report.files} 个（{report.file_bytes} 字节）")
     print(f"{'预计' if report.dry_run else '合计'}: {report.total} 行")

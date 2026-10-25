@@ -205,3 +205,44 @@ def test_dry_run_reports_files_without_deleting_them(tmp_path, db):
     assert report.files == 1
     assert report.file_bytes == 5
     assert old.exists()
+
+
+def test_retention_values_reach_the_annotation_side(tmp_path, db, monkeypatch):
+    """两个保留天数各自流向各自的一侧：PURGED_DAYS 与 ORPHAN_DAYS 恰好同值，
+    接线写反时全量测试不会有任何人红——这里必须把它们钉成可区分的两个数。"""
+    from sams.services.annotation_prune import AnnotationPruner, AnnotationPruneReport
+    from sams.storage.repos.annotations import AnnotationRepo
+    from sams.storage.repos.attachments import AttachmentRepo
+
+    captured: dict = {}
+
+    def spy(self, **kwargs):
+        captured.update(kwargs)
+        return AnnotationPruneReport()
+
+    monkeypatch.setattr(AnnotationPruner, "run", spy)
+    clock = FrozenClock(NOW)
+    pruner = AnnotationPruner(
+        db,
+        AnnotationRepo(db, clock=clock),
+        AttachmentRepo(db, clock=clock),
+        root=tmp_path / "attachments",
+        clock=clock,
+    )
+    service = PruneService(
+        db,
+        quotes=QuoteRepo(db),
+        task_runs=TaskRunRepo(db, clock=clock),
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        annotations=pruner,
+        clock=clock,
+    )
+    service.run(
+        quotes_sessions=5,
+        task_runs_days=90,
+        heartbeats_keep=2,
+        annotations_purged_days=31,
+        attachments_orphan_days=7,
+    )
+    assert captured["purged_days"] == 31
+    assert captured["orphan_days"] == 7
