@@ -1,5 +1,6 @@
 {# 批注面板 fragment（§6.2）：不 extends base——htmx 把整块 swap 进容器，套着导航就成了画中画。 #}
-<div id="{{ panel_id }}" class="annotations-panel card">
+{# 不带 `card`：三处嵌入的外层已经是 `section.card`，swap 进来再套一层就成了边框叠边框。 #}
+<div id="{{ panel_id }}" class="annotations-panel">
   <h2>批注</h2>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
   <form class="ann-editor" hx-post="/annotations" hx-encoding="multipart/form-data"

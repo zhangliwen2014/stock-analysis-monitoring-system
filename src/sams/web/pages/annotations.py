@@ -47,16 +47,21 @@ def _author_label(ctx, made, viewer_id: str) -> str:
 def _render_panel(
     request: Request,
     *,
+    user,
     target_type: str,
     target_ref: str,
     error: str = "",
     draft: dict | None = None,
     status_code: int = 200,
 ):
-    """面板的唯一渲染出口。`draft` 是被拒表单的原文回填——交回人刚敲的那份，不是折过的。"""
+    """面板的唯一渲染出口。`draft` 是被拒表单的原文回填——交回人刚敲的那份，不是折过的。
+
+    `user` 由端点用 `require_user` 认好后显式传进来：这一层不再回头去摸
+    `request.state.sams_user`。登录的前置条件收在端点那一处，Task 2 复用同一个
+    出口时不必再猜它从哪来。
+    """
     web = request.app.state.web
     ctx = web.contexts.current()
-    user = request.state.sams_user
     sharing = ctx.app_settings.team_sharing()
     tz = ctx.settings.server.display_tz
     items = ctx.annotations.list_target(
@@ -94,7 +99,7 @@ def _render_panel(
 
 @router.get("/api/partials/annotations")
 def annotations_panel(request: Request):
-    require_user(request)
+    user = require_user(request)
     query = request.query_params
     target_type = (query.get("target_type") or "").strip()
     target_ref = (query.get("target_ref") or "").strip()
@@ -105,4 +110,4 @@ def annotations_panel(request: Request):
             status_code=400,
             detail="批注面板要知道挂在哪个目标：target_type 与 target_ref 都必填",
         )
-    return _render_panel(request, target_type=target_type, target_ref=target_ref)
+    return _render_panel(request, user=user, target_type=target_type, target_ref=target_ref)

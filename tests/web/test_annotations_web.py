@@ -22,8 +22,11 @@ def test_panel_renders_visible_annotations_as_fragment(logged):
         "/api/partials/annotations", params={"target_type": "symbol", "target_ref": "A:600519"}
     )
     assert resp.status_code == 200
-    # Markdown 源码渲染成 HTML：粗体活着，星号不该原样出现在正文里
+    # Markdown 源码渲染成 HTML：粗体活着（正文里源码星号已被 render_markdown 折掉，
+    # 但编辑态 textarea 原样回填 body_md，所以整块 fragment 仍见得到 `**渠道**`——不断言它缺席）
     assert "<strong>渠道</strong>" in resp.text
+    # fragment 是裸的：不套 base，否则 swap 进容器就成了画中画
+    assert "<nav" not in resp.text
     assert "逻辑" in resp.text  # 标签
     assert "我" in resp.text  # 自己的批注作者位显示「我」，与推送同一口径
 
