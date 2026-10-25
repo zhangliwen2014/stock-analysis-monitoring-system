@@ -222,6 +222,9 @@ def test_acted_trade_bad_number_writes_neither_order_nor_closure(logged):
     assert ctx.db.scalar(
         "SELECT count(*) FROM sim_orders WHERE account_id = ?", [account.id]
     ) == 0
+    # 刚选的账户/方向要原样交回去：别让它们洗回默认第一项，照着默认再按一次就记错账（§6.3）
+    assert f'value="{account.id}" selected' in resp.text  # account_id 回填生效
+    assert '<option value="buy" selected>' in resp.text  # 刚选的 buy 未被篡改
 
 
 def test_sync_annotation_checkbox_writes_a_prefilled_symbol_note(logged):
@@ -251,6 +254,7 @@ def test_dismiss_requires_code_then_records_it_with_words(logged):
     )
     assert thin.status_code == 400
     assert "misreport 必须写一句说明" in thin.text
+    assert 'value="misreport" selected' in thin.text  # 最常见的拒绝别把刚选的原因码洗掉（§6.3）
 
     ok = logged.client.post(
         f"/alerts/{alert.id}/dismiss",

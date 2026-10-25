@@ -403,10 +403,18 @@ def detail(request: Request):
 
 
 def _draft(data: dict[str, list[str]]) -> dict[str, str]:
-    """被拒重渲染交回的草稿：只交闭环表单会用到的那几格，模板按名字取。"""
+    """被拒重渲染交回的草稿：闭环表单会提交的键全量回，模板按名字取。
+
+    只回半份的话，刚选的账户与方向被洗回默认第一项——照着默认值再按一次，
+    成交就记到错账户上（§6.3「交回人刚敲的那份」）。
+    """
     return {
         key: one(data, key)
-        for key in ("action_kind", "note", "qty", "price", "fee", "code")
+        for key in (
+            "action_kind", "note", "qty", "price", "fee", "code",
+            "account_id", "side", "ts", "thesis_ref", "rule_ref",
+            "sync_annotation",
+        )
     }
 
 
@@ -564,9 +572,13 @@ def dismiss(
     except DatabaseLocked:
         raise
     except Conflict as exc:
-        return _detail_page(request, status_code=409, error=str(exc), reason=typed)
+        return _detail_page(
+            request, status_code=409, error=str(exc), reason=typed, draft=_draft(data)
+        )
     except SamsError as exc:
-        return _detail_page(request, status_code=400, error=str(exc), reason=typed)
+        return _detail_page(
+            request, status_code=400, error=str(exc), reason=typed, draft=_draft(data)
+        )
     if sync:
         # 与 `ReviewService._sync_annotation` 同方向：批注写崩不把已成立的忽略拖回去（§12.1）
         try:

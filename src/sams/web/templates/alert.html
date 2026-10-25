@@ -78,28 +78,29 @@
              placeholder="其他处置必填一句；其余可空"></label>
       {% if related_theses %}
       <label>关联的观点 <select name="thesis_ref">
-        {% for t in related_theses %}<option value="{{ t.id }}">{{ t.label }}</option>{% endfor %}
+        {% for t in related_theses %}<option value="{{ t.id }}" {% if draft.thesis_ref == t.id %}selected{% endif %}>{{ t.label }}</option>{% endfor %}
       </select></label>
       {% else %}<p class="muted">这只票还没有你的观点。</p>{% endif %}
       {% if rules %}
       <label>关联的规则 <select name="rule_ref">
-        {% for r in rules %}<option value="{{ r.id }}">{{ r.label }}</option>{% endfor %}
+        {% for r in rules %}<option value="{{ r.id }}" {% if draft.rule_ref == r.id %}selected{% endif %}>{{ r.label }}</option>{% endfor %}
       </select></label>
       {% endif %}
       <div class="closure-trade">
         <p class="muted">录一笔成交（成交与闭环同一条事务；标的取自这条告警）：</p>
         <label>账户 <select name="account_id">
-          {% for a in accounts %}<option value="{{ a.id }}">{{ a.label }}</option>{% endfor %}
+          {% for a in accounts %}<option value="{{ a.id }}" {% if draft.account_id == a.id %}selected{% endif %}>{{ a.label }}</option>{% endfor %}
         </select></label>
-        <label>方向 <select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
+        {# 没提交过就 buy：buy 只在「明确选过 sell」时让位，draft.side 为空时仍选 buy #}
+        <label>方向 <select name="side"><option value="buy" {% if draft.side != "sell" %}selected{% endif %}>买入</option><option value="sell" {% if draft.side == "sell" %}selected{% endif %}>卖出</option></select></label>
         <label>数量 <input name="qty" size="6" value="{{ draft.qty }}"></label>
         <label>价格 <input name="price" size="8" value="{{ draft.price }}"></label>
         <label>费用 <input name="fee" size="6" value="{{ draft.fee }}"></label>
-        <label>成交时间 <input type="datetime-local" name="ts">（空 = 此刻）</label>
+        <label>成交时间 <input type="datetime-local" name="ts" value="{{ draft.ts }}">（空 = 此刻）</label>
       </div>
       {# §6.3：T+1/整手/涨跌停只警告不拦截——模拟账本常在补记真实成交，这句话得静态挂着 #}
       <p class="muted">A 股 T+1、整手、涨跌停：这里不做拦截，照实记。</p>
-      <label><input type="checkbox" name="sync_annotation" value="on">
+      <label><input type="checkbox" name="sync_annotation" value="on" {% if draft.sync_annotation %}checked{% endif %}>
         同时写一条标的批注（预填这条告警与我的结论）</label>
       <button type="submit">记为已处置</button>
     </form>
@@ -117,7 +118,7 @@
       </select></label>
       <label>说明 <input name="reason" value="{{ reason }}"
              placeholder="误报/其他必填一句；其余可空"></label>
-      <label><input type="checkbox" name="sync_annotation" value="on">
+      <label><input type="checkbox" name="sync_annotation" value="on" {% if draft.sync_annotation %}checked{% endif %}>
         同时写一条标的批注（预填这条告警与我的原因）</label>
       <button type="submit">驳回</button>
       <p class="muted">这条原因会进入本周忽略率。忽略率只统计「驳回」，稍后不算。</p>
