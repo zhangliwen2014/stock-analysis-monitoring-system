@@ -646,7 +646,10 @@ def test_act_with_trade_reference_closes_the_alert(repo, seeded_user, clock):
     assert moved.action_kind == "trade" and moved.action_ref == "o1"
     assert moved.handled_at == clock.moment
     assert moved.handle_note == "补记卖出"
-    assert [e.action for e in repo.events.list_for(alert.id)] == ["act"]
+    events = repo.events.list_for(alert.id)
+    assert [(e.action, e.from_status, e.to_status, e.note) for e in events] == [
+        ("act", "new", "handled", "trade:o1 补记卖出")
+    ]
 
 
 def test_act_from_acknowledged_records_both_events(repo, seeded_user):
@@ -678,6 +681,14 @@ def test_a_terminal_alert_refuses_a_second_action(repo, seeded_user):
         repo.act(alert.id, user_id=seeded_user, action_kind="other", note="再处理")
 
 
+def test_a_terminal_alert_refuses_a_dismiss(repo, seeded_user):
+    """忽略与处置是两种结论：关上之后换一个原因码再按一次不是改主意，是覆盖历史。"""
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.dismiss(alert.id, user_id=seeded_user, code="duplicate")
+    with pytest.raises(Conflict):
+        repo.dismiss(alert.id, user_id=seeded_user, code="expected")
+
+
 def test_dismiss_requires_a_code(repo, seeded_user):
     alert = repo.create(seeded_user, **CREATE_KW)
     with pytest.raises(ValidationError, match="dismiss_code"):
@@ -700,7 +711,10 @@ def test_dismiss_records_the_code_and_reason(repo, seeded_user):
     assert moved.dismiss_code == "expected"
     assert moved.dismiss_reason == "财报前的正常波动"
     assert moved.handled_at is not None
-    assert [e.action for e in repo.events.list_for(alert.id)] == ["dismiss"]
+    events = repo.events.list_for(alert.id)
+    assert [(e.from_status, e.to_status, e.note) for e in events] == [
+        ("new", "dismissed", "expected 财报前的正常波动")
+    ]
 
 
 def test_a_racing_terminal_action_writes_no_event(tmp_path, monkeypatch):
@@ -725,7 +739,77 @@ def test_a_racing_terminal_action_writes_no_event(tmp_path, monkeypatch):
         return clock.moment
 
     monkeypatch.setattr(clock, "now_utc", racing)
-    with pytest.raises(Conflict):
+    with pytest.raises(Conflict, match="操作期间"):
         repo.act(alert.id, user_id=user, action_kind="other", note="已处理")
+    assert repo.events.list_for(alert.id) == []
+    other.close()
+
+
+def test_act_after_a_racing_ack_does_not_record_a_stale_from_status(
+    tmp_path, monkeypatch
+):
+    """另一个连接在 `_owned` 与 UPDATE 之间按了已读：条件是「观测到的那一态」。
+
+    放宽成 `status IN ('new', 'acknowledged')` 时，UPDATE 照样命中，事件却写成
+    new→handled——而历史里上一条说的是 new→acknowledged，两行互相矛盾。
+    """
+    from sams.storage.db import Database
+    from sams.storage.migrate import apply_migrations
+
+    path = str(tmp_path / "race.duckdb")
+    db = Database.open(path)
+    apply_migrations(db)
+    user = UserRepo(db).create("racer", "correct-horse-battery").id
+    clock = FrozenClock(NOW)
+    repo = AlertRepo(db, clock=clock)
+    alert = repo.create(user, **CREATE_KW)
+    other = Database.open(path)
+
+    def racing():
+        other.execute(
+            "UPDATE alerts SET status = 'acknowledged', acknowledged_at = ? WHERE id = ?",
+            [clock.moment, alert.id],
+        )
+        other.execute(
+            "INSERT INTO alert_events"
+            " (id, alert_id, user_id, action, from_status, to_status, note, ts)"
+            " VALUES ('e-ack', ?, ?, 'ack', 'new', 'acknowledged', '', ?)",
+            [alert.id, user, clock.moment],
+        )
+        return clock.moment
+
+    monkeypatch.setattr(clock, "now_utc", racing)
+    with pytest.raises(Conflict, match="操作期间"):
+        repo.act(alert.id, user_id=user, action_kind="watch", note="加自选")
+    assert [e.id for e in repo.events.list_for(alert.id)] == ["e-ack"]
+    other.close()
+
+
+def test_ack_after_a_racing_close_raises_instead_of_returning_a_closed_alert(
+    tmp_path, monkeypatch
+):
+    """输给终态时报错，不能把 handled 那一行当成「已读成功」返回。"""
+    from sams.storage.db import Database
+    from sams.storage.migrate import apply_migrations
+
+    path = str(tmp_path / "race.duckdb")
+    db = Database.open(path)
+    apply_migrations(db)
+    user = UserRepo(db).create("racer", "correct-horse-battery").id
+    clock = FrozenClock(NOW)
+    repo = AlertRepo(db, clock=clock)
+    alert = repo.create(user, **CREATE_KW)
+    other = Database.open(path)
+
+    def racing():
+        other.execute(
+            "UPDATE alerts SET status = 'handled', handled_at = ? WHERE id = ?",
+            [clock.moment, alert.id],
+        )
+        return clock.moment
+
+    monkeypatch.setattr(clock, "now_utc", racing)
+    with pytest.raises(Conflict, match="操作期间"):
+        repo.acknowledge(alert.id, user_id=user)
     assert repo.events.list_for(alert.id) == []
     other.close()

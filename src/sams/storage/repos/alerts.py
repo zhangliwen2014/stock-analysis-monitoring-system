@@ -406,8 +406,10 @@ class AlertRepo:
     def acknowledge(self, alert_id: str, *, user_id: str) -> Alert:
         """「看到了」。重复调用是幂等的：手机连点两下不该多出一条历史。
 
-        条件更新（`WHERE status = 'new'`）让输掉竞争的那一次命中 0 行：它照旧返回已读的
-        那一行，但不会再补一条历史——读状态在事务外，两个连接可能都读到 `new`。
+        条件更新（`WHERE status = 'new'`）让输掉竞争的那一次命中 0 行：输给另一次已读时
+        它是静默的幂等返回，不再补一条历史；输给处置或忽略（终态）时抛 `Conflict`，
+        而不是把一条已经关上的行当成「已读成功」返回——读状态在事务外，
+        两个连接可能都读到 `new`。
         """
         row = self._owned(alert_id, user_id)
         if row.status == ACKNOWLEDGED:
@@ -432,7 +434,12 @@ class AlertRepo:
                     from_status=NEW,
                     to_status=ACKNOWLEDGED,
                 )
-        return self._reload(alert_id)
+        moved = self._reload(alert_id)
+        if changed is None and moved.status != ACKNOWLEDGED:
+            raise Conflict(
+                f"告警 {alert_id} 在操作期间已被关闭（{moved.status}），不能再标已读"
+            )
+        return moved
 
     def act(
         self,
@@ -477,21 +484,21 @@ class AlertRepo:
                 "UPDATE alerts SET status = ?, handled_at = ?, handle_note = ?,"
                 " action_kind = ?, action_ref = ?, dismiss_code = NULL,"
                 " dismiss_reason = NULL, deferred_until = NULL"
-                " WHERE id = ? AND status IN (?, ?) RETURNING id",
-                [HANDLED, moment, text, action_kind, ref, alert_id, NEW, ACKNOWLEDGED],
+                " WHERE id = ? AND status = ? RETURNING id",
+                [HANDLED, moment, text, action_kind, ref, alert_id, row.status],
             )
             if changed is None:
                 raise Conflict(
-                    f"告警 {alert_id} 在操作期间已被关闭：终态不可回退，"
-                    "要改结论请在批注里说明，或 5 分钟内撤销"
+                    f"告警 {alert_id} 在操作期间已被别人改过：请刷新后再决定怎么处置"
                 )
+            detail = f"{action_kind}:{ref}" if ref else action_kind
             self.events.add(
                 alert_id,
                 user_id=user_id,
                 action="act",
                 from_status=row.status,
                 to_status=HANDLED,
-                note=f"{action_kind}:{ref or ''} {text}".strip(),
+                note=" ".join(part for part in (detail, text) if part),
             )
         return self._reload(alert_id)
 
@@ -530,13 +537,12 @@ class AlertRepo:
                 "UPDATE alerts SET status = ?, handled_at = ?, dismiss_code = ?,"
                 " dismiss_reason = ?, handle_note = NULL, action_kind = NULL,"
                 " action_ref = NULL, deferred_until = NULL"
-                " WHERE id = ? AND status IN (?, ?) RETURNING id",
-                [DISMISSED, moment, code, text, alert_id, NEW, ACKNOWLEDGED],
+                " WHERE id = ? AND status = ? RETURNING id",
+                [DISMISSED, moment, code, text, alert_id, row.status],
             )
             if changed is None:
                 raise Conflict(
-                    f"告警 {alert_id} 在操作期间已被关闭：终态不可回退，"
-                    "要改结论请在批注里说明，或 5 分钟内撤销"
+                    f"告警 {alert_id} 在操作期间已被别人改过：请刷新后再决定怎么处置"
                 )
             self.events.add(
                 alert_id,
