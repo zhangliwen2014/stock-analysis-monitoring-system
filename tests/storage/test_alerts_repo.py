@@ -352,6 +352,14 @@ def test_latest_open_returns_none_once_the_last_one_is_dismissed(repo, seeded_us
     assert repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"]) is None
 
 
+def test_latest_open_keeps_an_acknowledged_alert_open(repo, seeded_user, db) -> None:
+    """已读不等于已处置：点一下「已读」不能让同票的其他规则重新开火（M4-B §8.1）。"""
+    got = repo.create(user_id=seeded_user, **CREATE_KW)
+    db.execute("UPDATE alerts SET status = ? WHERE id = ?", [ACKNOWLEDGED, got.id])
+    found = repo.latest_open(seeded_user, CREATE_KW["market"], CREATE_KW["code"])
+    assert found is not None and found.id == got.id
+
+
 def test_latest_open_ignores_another_users_alerts(repo, seeded_user, other_user) -> None:
     """`no_open_alert` 挡的是「这个人已经有一条没点掉的」：别人的那条不算（§10.1）。"""
     repo.create(user_id=other_user, **CREATE_KW)

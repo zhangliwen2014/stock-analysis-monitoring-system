@@ -1,4 +1,4 @@
-"""`sams alert ...` —— 告警的读屏与三态处理（§5 复盘闭环里命令行能做的那一半）。
+"""`sams alert ...` —— 告警的读屏与四态处理（§5 复盘闭环里命令行能做的那一半）。
 
 屏幕上念的是那条告警**当时**写下的那几句话（`payload_json` 里的 `value_text`/
 `threshold_text`/`action_note`），不按今天的模板重新渲染：重新渲染会在措辞改版之后说谎，
@@ -292,7 +292,7 @@ def _move(container: Container, args, status: str, note: str) -> int:
     if alert.status == "handled":
         print(f"  已标成 handled：{alert.handle_note or '（没写备注）'}")
         print(
-            "  这一条不再算未处理（`no_open_alert` 数的是 status=new）；"
+            "  这一条不再算未处理（`no_open_alert` 数的是 status=new/acknowledged）；"
             "同票上若还有别的新告警，那些照样挡着后面的推送——更响的那一档除外（D94）"
         )
     else:
