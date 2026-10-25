@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from support import FrozenClock
 
-from sams.core.errors import NotFound, ValidationError
+from sams.core.errors import Conflict, NotFound, ValidationError
 from sams.services.annotations import AnnotationService, normalize_tags
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
@@ -235,3 +235,65 @@ def test_get_refuses_someone_elses_private_note(world):
     )
     with pytest.raises(NotFound):
         world.service.get(world.user.id, made.id)
+
+
+def test_edit_records_history_and_bumps_updated_at(world):
+    made = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519", body_md="第一版"
+    )
+    world.clock.advance(seconds=2)
+    edited = world.service.edit(
+        world.user.id, made.id, body_md="第二版", tags="#逻辑", expected_updated_at=made.updated_at
+    )
+    assert edited.body_md == "第二版"
+    assert edited.updated_at != made.updated_at
+    history = world.service.revisions(world.user.id, made.id)
+    assert [(row.before_md, row.after_md) for row in history] == [("第一版", "第二版")]
+
+
+def test_a_stale_edit_is_a_conflict(world):
+    made = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519", body_md="第一版"
+    )
+    world.clock.advance(seconds=2)
+    world.service.edit(
+        world.user.id, made.id, body_md="第二版", expected_updated_at=made.updated_at
+    )
+    with pytest.raises(Conflict):
+        world.service.edit(
+            world.user.id, made.id, body_md="第三版", expected_updated_at=made.updated_at
+        )
+
+
+def test_only_the_author_can_edit_pin_or_delete(world):
+    made = world.service.create(
+        world.other.id, target_type="symbol", target_ref="A:600519", body_md="别人的"
+    )
+    for action in (
+        lambda: world.service.edit(world.user.id, made.id, body_md="x"),
+        lambda: world.service.pin(world.user.id, made.id, pinned=True),
+        lambda: world.service.delete(world.user.id, made.id),
+        lambda: world.service.revisions(world.user.id, made.id),
+    ):
+        with pytest.raises(NotFound):
+            action()
+
+
+def test_delete_hides_the_annotation_from_every_read_path(world):
+    made = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519", body_md="要删"
+    )
+    world.service.delete(world.user.id, made.id)
+    assert world.service.list_target(world.user.id, "symbol", "A:600519") == []
+    with pytest.raises(NotFound):
+        world.service.get(world.user.id, made.id)
+    with pytest.raises(NotFound):
+        world.service.edit(world.user.id, made.id, body_md="复活")
+
+
+def test_pin_is_idempotent(world):
+    made = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519", body_md="置顶"
+    )
+    assert world.service.pin(world.user.id, made.id, pinned=True).pinned is True
+    assert world.service.pin(world.user.id, made.id, pinned=True).pinned is True
