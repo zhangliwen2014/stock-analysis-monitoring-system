@@ -10,6 +10,7 @@ router 的价值在于「该发给谁、没发出去时怎么说」。
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 
@@ -23,7 +24,9 @@ from sams.core.notify import (
     SENT,
     SUPPRESSED,
     AlertMessage,
+    AnnotationContext,
     NotifyResult,
+    PushContext,
 )
 from sams.monitor.router import NotifyService
 from sams.storage.crypto import cipher_for
@@ -498,14 +501,23 @@ def test_quote_metadata_survives_the_trip_through_the_row(world):
     assert sent.quote_source == "tencent"
 
 
-def test_a_context_provider_extends_the_body(world):
+def test_a_context_provider_appends_the_block(world):
+    """接缝从「返回一个字符串」改成「返回 PushContext」：题头、行、深链逐字钉住。
+
+    上下文不进 `alerts.payload_json`（§7.1）：告警创建时还不知道发送时刻的批注，
+    这里断言的是**发出去那一刻**的消息体。
+    """
     user = world.user()
     world.add(user.id, "wecom", "群 A")
     alert = world.notify.record(msg(), user_id=user.id)
     world.notify.deliver_existing(
-        alert.id, context_provider=lambda a: "当时你写过：这条线是神华的坑"
+        alert.id,
+        context_provider=lambda a: PushContext(items=(_ctx(a.id),), link=f"http://lan/{a.id}"),
     )
-    assert world.made["wecom"].sent[-1].body.endswith("当时你写过：这条线是神华的坑")
+    sent = world.made["wecom"].sent[-1]
+    assert "—— 最近批注 ——" in sent.body
+    assert "· 10-22 14:03 我 [逻辑] 渠道库存见底" in sent.body
+    assert sent.body.endswith(f"详情：http://lan/{alert.id}")
 
 
 def test_abandon_writes_why_it_never_went_out(world):
@@ -544,9 +556,9 @@ def test_a_vanished_recipient_leaves_a_row_before_raising(world, db):
     db.execute("DELETE FROM users WHERE id = ?", [user.id])
     built: list[str] = []
 
-    def build_context(a: Alert) -> str:
+    def build_context(a: Alert) -> PushContext | None:
         built.append(a.id)
-        return "当时的批注"
+        return None
 
     with pytest.raises(ValidationError, match="没有用户"):
         world.notify.deliver_existing(alert.id, context_provider=build_context)
@@ -555,3 +567,116 @@ def test_a_vanished_recipient_leaves_a_row_before_raising(world, db):
     assert rows[0].outcome == NO_CHANNEL
     assert "接收人" in rows[0].error and "用户" in rows[0].error
     assert built == []
+
+
+# ---------- 推送上下文（计划 3，§7.2）----------
+
+
+def _ctx(alert_id: str, n: str = "ann-1", body: str = "渠道库存见底") -> AnnotationContext:
+    return AnnotationContext(
+        annotation_id=n,
+        created_at=datetime(2026, 10, 22, 6, 3, tzinfo=UTC),
+        moment_label="10-22 14:03",
+        author_label="我",
+        body_text=body,
+        tags=("逻辑",),
+    )
+
+
+def _context_rows(world, db, alert_id: str) -> dict[str, object]:
+    """`kind -> notify_log.context_json`（解析过的），给下面几枚用例共用。"""
+    rows = db.query(
+        "SELECT c.kind AS kind, n.context_json AS context_json"
+        " FROM notify_log n JOIN channels c ON c.id = n.channel_id"
+        " WHERE n.alert_id = ?",
+        [alert_id],
+    ).to_dicts()
+    return {
+        str(row["kind"]): (
+            None if row["context_json"] is None else json.loads(row["context_json"])
+        )
+        for row in rows
+    }
+
+
+def test_the_instance_provider_is_used_without_call_arguments(world):
+    """队列与 Web 重发只传 alert_id：实例那一格是唯一接得住 provider 的地方。"""
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    alert = world.notify.record(msg(), user_id=user.id)
+    world.notify.context_provider = lambda a: PushContext(items=(_ctx(a.id),))
+    world.notify.deliver_existing(alert.id)
+    assert "—— 最近批注 ——" in world.made["wecom"].sent[-1].body
+
+
+def test_each_text_channel_row_carries_its_own_context_json(world, db):
+    """`context_json` 逐通道各记一份（§7.2）：三个通道剪成三个样子，审计要分得开。"""
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    world.add(user.id, "dingtalk", "钉 B")
+    alert = world.notify.record(msg(), user_id=user.id)
+    world.notify.deliver_existing(
+        alert.id, context_provider=lambda a: PushContext(items=(_ctx(a.id),))
+    )
+    logged = _context_rows(world, db, alert.id)
+    expected = "—— 最近批注 ——\n· 10-22 14:03 我 [逻辑] 渠道库存见底"
+    assert logged["wecom"] == {"ids": ["ann-1"], "dropped": 0, "rendered_chars": len(expected)}
+    assert logged["dingtalk"]["ids"] == ["ann-1"]
+
+
+def test_voice_and_desktop_never_carry_the_block(world, db):
+    """语音/桌面不追加（D126）：LIMITS 140/200 字节放不下，而它们的价值在「出声」。"""
+    user = world.user()
+    voice = world.add(user.id, "voice", "本机声音")
+    desktop = world.add(user.id, "desktop", "桌面通知")
+    alert = world.notify.record(
+        msg(severity="strong"), user_id=user.id, channel_ids=[voice.id, desktop.id]
+    )
+    world.notify.deliver_existing(
+        alert.id, context_provider=lambda a: PushContext(items=(_ctx(a.id),))
+    )
+    for kind in ("voice", "desktop"):
+        assert "最近批注" not in world.made[kind].sent[-1].body
+    logged = _context_rows(world, db, alert.id)
+    assert logged["voice"] is None and logged["desktop"] is None
+
+
+def test_a_full_body_drops_the_whole_block_and_says_so(world, db):
+    """正文本身已经顶到通道上限：连一条都放不下 ⇒ 整块不发，而不是截半行（§7.2）。
+
+    context_json 仍要落：`dropped` 记的就是「有几条被预算剪掉」——排查
+    「是不是上下文太长被剪」的人看的是这一列。
+    """
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    alert = world.notify.record(msg(body="字" * 1400), user_id=user.id)
+    original_body = alert.payload["extra"]["body"]
+    world.notify.deliver_existing(
+        alert.id,
+        context_provider=lambda a: PushContext(
+            items=(_ctx(a.id), _ctx(a.id, n="ann-2"))
+        ),
+    )
+    sent = world.made["wecom"].sent[-1]
+    assert sent.body == original_body
+    logged = _context_rows(world, db, alert.id)
+    assert logged["wecom"] == {"ids": [], "dropped": 2, "rendered_chars": 0}
+
+
+def test_the_link_survives_when_the_annotations_do_not_fit(world, db):
+    """预算只够题头加一条：剪批注，深链若还放得下就留着——它不占批注的名额。"""
+    user = world.user()
+    world.add(user.id, "dingtalk", "钉 B")
+    alert = world.notify.record(msg(), user_id=user.id)
+    long_a = _ctx(alert.id, n="a1", body="甲" * 100)
+    long_b = _ctx(alert.id, n="b2", body="乙" * 100)
+    world.notify.deliver_existing(
+        alert.id,
+        context_provider=lambda a: PushContext(items=(long_a, long_b), link="http://lan/x"),
+    )
+    logged = _context_rows(world, db, alert.id)
+    # 两条各 100 字加题头仍在钉钉的 18000 字节以内：这一枚钉的是「剪剩的 id 都要落列」，
+    # dropped 那一路由 `test_a_full_body_drops_the_whole_block_and_says_so` 负责
+    assert logged["dingtalk"]["dropped"] == 0
+    assert logged["dingtalk"]["ids"] == ["a1", "b2"]
+    assert world.made["dingtalk"].sent[-1].body.endswith("详情：http://lan/x")

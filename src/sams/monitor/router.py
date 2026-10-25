@@ -22,12 +22,17 @@ from sams.core.errors import SamsError, StorageError, ValidationError
 from sams.core.events import EventBus, NotifyFailed
 from sams.core.notify import (
     FAILED,
+    LIMITS,
     NO_CHANNEL,
+    PUSH_CONTEXT_KINDS,
     SENT,
     STRONG,
     SUPPRESSED,
     AlertMessage,
     NotifyResult,
+    PushContext,
+    format_annotation_context,
+    format_headline,
     route_for,
 )
 from sams.core.retry import Sleeper, backoff_delays
@@ -104,6 +109,10 @@ class NotifyService:
     参数表里没有 `cipher`：加解密与掩码是 `ChannelRepo` 的事，这一层拿到的一直是
     密文/掩码视图，只有发送前那一次 `credentials()` 例外。也没有 `clock`：投递时刻由
     两个仓库各自的时钟打，这里再收一个就会有两套「现在」。
+
+    `context_provider` 是唯一一个「可能为 None 的取数入口」：取批注这件事坏了不能挡
+    告警，降级住在 provider 自己那一头（`services/annotation_context`），这里只负责
+    在发送时问一次、按通道预算装配。
     """
 
     def __init__(
@@ -117,6 +126,7 @@ class NotifyService:
         sleep: Sleeper = time.sleep,
         attempts: int = 3,
         env: LocalEnv | None = None,
+        context_provider: Callable[[Alert], PushContext | None] | None = None,
     ) -> None:
         self.channels = channels
         self.alerts = alerts
@@ -126,6 +136,11 @@ class NotifyService:
         self.sleep = sleep
         self.attempts = max(1, int(attempts))
         self.env = env
+        #: 推送上下文的 provider（§7.2）。装配顺序决定它多半是**事后赋值**接进来的
+        #: （`bootstrap` 先造 notify、后造批注服务），所以它是一格公开属性而不是
+        #: 只在构造时读一次的闭包：队列与 Web 重发都只调 `deliver_existing(alert_id)`，
+        #: 实例这一格是唯一接得住它的地方
+        self.context_provider = context_provider
 
     def record(
         self,
@@ -169,12 +184,15 @@ class NotifyService:
         )
 
     def deliver_existing(
-        self, alert_id: str, *, context_provider: Callable[[Alert], str] | None = None
+        self,
+        alert_id: str,
+        *,
+        context_provider: Callable[[Alert], PushContext | None] | None = None,
     ) -> DispatchResult:
         """把库里已有的一条告警走完路由与投递。正文从库里重建，不信任内存里的对象。
 
-        `context_provider` 是 M4-B 的缝：把「这条论当时的批注」接在正文后面，
-        队列这一侧不需要知道上下文长什么样。
+        上下文在**发送时**取（§7.3）：排队两分钟后再发，带的是当时的批注而不是
+        入队时的。显式传入的 provider 赢过实例那一格；两边都没有就是不带上下文。
         """
         alert = self.alerts.get(alert_id)
         if alert is None:
@@ -184,14 +202,13 @@ class NotifyService:
         if user is None:
             reason = f"没有用户 {alert.user_id}：告警没有接收人就不能发"
             # 这一条拒绝也要先落一行再抛（模块开头那条不变式对每条拒绝成立）；
-            # raise 保住是给下一个任务的队列用的：它要能区分「没有收件人」，
+            # raise 保住是给队列用的：它要能区分「没有收件人」，
             # 并且会对自己那一侧的失败另调 `abandon`
             self.alerts.record(alert.id, None, NO_CHANNEL, error=reason, attempts=0)
             raise ValidationError(reason)
+        pick = context_provider if context_provider is not None else self.context_provider
+        push = pick(alert) if pick is not None else None
         message = _message_from(alert)
-        note = context_provider(alert) if context_provider is not None else ""
-        if note:
-            message = replace(message, body=f"{message.body}\n{note}")
         dnd = self._dnd_note(user, message)
         if dnd:
             self.alerts.record(alert.id, None, SUPPRESSED, error=dnd, attempts=0)
@@ -201,7 +218,7 @@ class NotifyService:
             self.alerts.record(alert.id, None, NO_CHANNEL, error=refusal, attempts=0)
             return DispatchResult(alert.id, (DeliveryReport("", None, NO_CHANNEL, refusal, 0),))
         return DispatchResult(
-            alert.id, tuple(self._deliver(alert.id, message, node) for node in targets)
+            alert.id, tuple(self._deliver(alert.id, message, node, push) for node in targets)
         )
 
     def abandon(self, alert_id: str, *, reason: str) -> None:
@@ -405,10 +422,48 @@ class NotifyService:
             f"也没有默认通道；已有的是 {sorted({node.kind for node in enabled})}"
         )
 
-    def _deliver(self, alert_id: str, message: AlertMessage, node: Channel) -> DeliveryReport:
-        report = self._attempt(node, message)
+    def _attach_context(
+        self, message: AlertMessage, kind: str, push: PushContext | None
+    ) -> tuple[AlertMessage, dict | None]:
+        """把批注块与深链拼到正文末尾，返回（这条通道该发的消息、context_json 的字典）。
+
+        预算与通道实现同一个口径：企微/钉钉/PushPlus 发的是「标题行 + 正文」，
+        邮件发的是正文（标题走 subject），所以基准文字按 kind 折出来再问剩多少字节。
+        剪不掉就整块不发而不是截半行——那条判据住在 `format_annotation_context`。
+        `push is None` 与「批注为空但要有深链」必须可分：前者不落 `context_json`。
+        """
+        if push is None or kind not in PUSH_CONTEXT_KINDS:
+            return message, None
+        headline = format_headline(message)
+        if kind == "email":
+            base = message.body
+        else:
+            base = f"{headline}\n\n{message.body}" if message.body else headline
+        room = LIMITS[kind] - len(base.encode())
+        text, ids, dropped = format_annotation_context(push.items, budget_bytes=room)
+        if text:
+            room -= len(text.encode())
+        parts = [part for part in (message.body, text) if part]
+        link = f"详情：{push.link}" if push.link else ""
+        if link and len(f"\n{link}".encode()) <= max(room, 0):
+            parts.append(link)
+        body = "\n".join(parts)
+        if body != message.body:
+            message = replace(message, body=body)
+        return message, {"ids": list(ids), "dropped": dropped, "rendered_chars": len(text)}
+
+    def _deliver(
+        self, alert_id: str, message: AlertMessage, node: Channel, push: PushContext | None
+    ) -> DeliveryReport:
+        sent, context = self._attach_context(message, node.kind, push)
+        report = self._attempt(node, sent)
         self.alerts.record(
-            alert_id, node.id, report.outcome, error=report.error, attempts=report.attempts
+            alert_id,
+            node.id,
+            report.outcome,
+            error=report.error,
+            attempts=report.attempts,
+            context=context,
         )
         if report.outcome == FAILED:
             # §12 的「连续失败降 SystemAlarm」那个计数属于调度器（M3-D），不属于这里：
