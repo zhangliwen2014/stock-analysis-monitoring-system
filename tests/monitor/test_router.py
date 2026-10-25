@@ -663,8 +663,11 @@ def test_a_full_body_drops_the_whole_block_and_says_so(world, db):
     assert logged["wecom"] == {"ids": [], "dropped": 2, "rendered_chars": 0}
 
 
-def test_the_link_survives_when_the_annotations_do_not_fit(world, db):
-    """预算只够题头加一条：剪批注，深链若还放得下就留着——它不占批注的名额。"""
+def test_the_link_rides_along_and_every_id_lands_in_the_audit_when_everything_fits(world, db):
+    """预算装得下全部：深链照挂、两个 id 逐字落进 `context_json`——钉的是「满员」那一面。
+    剪枝那两路各有各的用例：整块不发看
+    `test_a_full_body_drops_the_whole_block_and_says_so`，整块不发而深链幸存看下面那枚。
+    """
     user = world.user()
     world.add(user.id, "dingtalk", "钉 B")
     alert = world.notify.record(msg(), user_id=user.id)
@@ -675,8 +678,33 @@ def test_the_link_survives_when_the_annotations_do_not_fit(world, db):
         context_provider=lambda a: PushContext(items=(long_a, long_b), link="http://lan/x"),
     )
     logged = _context_rows(world, db, alert.id)
-    # 两条各 100 字加题头仍在钉钉的 18000 字节以内：这一枚钉的是「剪剩的 id 都要落列」，
-    # dropped 那一路由 `test_a_full_body_drops_the_whole_block_and_says_so` 负责
+    # 两条各 100 字加题头仍在钉钉的 18000 字节以内：ids 一条不少
     assert logged["dingtalk"]["dropped"] == 0
     assert logged["dingtalk"]["ids"] == ["a1", "b2"]
     assert world.made["dingtalk"].sent[-1].body.endswith("详情：http://lan/x")
+
+
+def test_the_link_survives_even_when_the_whole_block_is_cut(world, db):
+    """连「题头 + 第一条」都放不下 ⇒ 整块不发，但深链不该为剪掉的批注陪葬：
+    剩的字节只够那一行 `详情：…`，它仍要挂上——查批注的人靠的就是这条入口（§7.2）。
+    审计要如实报「一条都没渲染、两条被剪」：`dropped` 是排查「为什么没批注」的列。
+
+    尺寸按 pushplus 的 60000 上限折出来：标题行 97 字节，正文 19957 个「字」
+    （59871 字节）留出的余量恰好「装不下 355 字节的题头+首行、装得下 22 字节的深链行」。
+    """
+    user = world.user()
+    pp = world.add(user.id, "pushplus", "公众号")
+    alert = world.notify.record(
+        msg(body="字" * 19957), user_id=user.id, channel_ids=[pp.id]
+    )
+    long_a = _ctx(alert.id, n="a1", body="甲" * 100)
+    long_b = _ctx(alert.id, n="b2", body="乙" * 100)
+    world.notify.deliver_existing(
+        alert.id,
+        context_provider=lambda a: PushContext(items=(long_a, long_b), link="http://lan/x"),
+    )
+    sent = world.made["pushplus"].sent[-1]
+    assert "最近批注" not in sent.body
+    assert sent.body.endswith("详情：http://lan/x")
+    logged = _context_rows(world, db, alert.id)
+    assert logged["pushplus"] == {"ids": [], "dropped": 2, "rendered_chars": 0}
