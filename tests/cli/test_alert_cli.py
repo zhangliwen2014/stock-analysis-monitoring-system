@@ -464,6 +464,16 @@ def test_defer_with_an_unreadable_until_is_refused_with_two(container, capsys) -
     assert "读不懂" in text
 
 
+def test_defer_without_until_is_refused_with_two(container, capsys) -> None:
+    """--until 拒在解析层而不是 argparse：`--json` 才读得到同一句话（D57）。"""
+    alert = make_alert(container)
+    code, text = out(container, capsys, "defer", alert.id, "--user", USER)
+    assert code == 2
+    assert "必填" in text
+    _, body = payload(container, capsys, "defer", alert.id, "--user", USER)
+    assert body["status"] == "refused" and body["exit"] == 2
+
+
 def test_defer_on_a_terminal_state_is_refused_with_one(container, capsys) -> None:
     alert = make_alert(container)
     invoke(container, "handle", alert.id, "--user", USER, "--note", "已挂条件单")

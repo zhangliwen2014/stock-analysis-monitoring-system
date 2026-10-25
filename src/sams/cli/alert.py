@@ -85,10 +85,12 @@ def add_to(subparsers) -> None:
 
     defer = leaf("defer", defer_alert, "稍后提醒：状态不变，写一个到点时刻（D138）")
     defer.add_argument("alert_id")
+    # 不用 argparse 的 required=True：拒在解析层才能同时给 JSON（D57），
+    # argparse 的失败是 SystemExit 加一段 usage，`--json` 的那一侧只读到空 stdin
     defer.add_argument(
         "--until",
-        required=True,
-        help="1h/3h/2d 这样的相对时长，或带时区的绝对时间（2026-10-26T09:30+08:00）",
+        help="不给就拒（拒在解析层，那里也给 JSON）。"
+        "1h/3h/2d 这样的相对时长，或带时区的绝对时间（2026-10-26T09:30+08:00）",
     )
 
 
@@ -395,7 +397,7 @@ _RELATIVE_UNTIL = re.compile(r"^(\d+)([mhd])$")
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400}
 
 
-def _parse_until(value: str) -> datetime:
+def _parse_until(value: str | None) -> datetime:
     """`1h`/`3h`/`2d` 折成「真实钟表的未来」，绝对时间按 ISO 读。
 
     相对时长按 `datetime.now` 而不是注入的 `clock` 算吗？——是：稍后提醒是给**人**的
@@ -404,6 +406,10 @@ def _parse_until(value: str) -> datetime:
     人那里的 09:30，不是 UTC 的 09:30。
     """
     text = (value or "").strip().lower()
+    if not text:
+        raise ValidationError(
+            "--until 必填：用 1h/3h/2d，或带时区的绝对时间（例如 2026-10-26T09:30+08:00）"
+        )
     match = _RELATIVE_UNTIL.match(text)
     if match:
         amount = int(match.group(1))
