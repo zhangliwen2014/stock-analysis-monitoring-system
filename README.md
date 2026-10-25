@@ -82,6 +82,22 @@ A 股裸价跳变超过涨跌停上限且对不上这天的记录（多半是漏
 全历史源不受请求窗口约束（D40）：`sync actions --start/--end` 只决定「从哪问起」，不决定「存几行」。
 拒绝是可恢复的：补上源、补上记录，数字就出来；错数看不出来。
 
+## 启动服务（M4-A）
+
+```bash
+uv run sams db migrate
+uv run sams user add --username alice --admin   # 首个管理员，按提示设密码（至少 12 位）
+uv run sams serve                               # http://127.0.0.1:8765
+```
+
+- 网页上没有自助注册：第二个用户起由 admin 在 `/admin/users` 创建。
+- 密钥用环境变量提供：`export SAMS_SECRET_KEY=...`（它同时是通道凭据的加密材料，
+  换掉它旧通道就解不开了——见 `config/settings.example.toml` 头部的说明）。
+- `serve` 单进程带上三件事：盘中实时监控、每日调度、Web 界面；`/healthz` 看进程状态，
+  `/admin/health`（admin）看心跳、数据源与手动清理。
+- 监听局域网：`[server] host = "0.0.0.0"` + `allow_lan = true`，要加密就配
+  `tls_certfile/tls_keyfile`。
+
 ## 结构
 
 分层单体，依赖单向向下，`bootstrap.py` 是唯一的组装根。

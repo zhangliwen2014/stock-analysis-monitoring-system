@@ -49,3 +49,18 @@ close = "09:30"
 [markets.US.extended.post]
 open = "16:00"
 close = "20:00"
+
+# 服务（M4-A）：`sams serve` 读这一段。默认只绑回环——单用户产品先服务本机一个人。
+# 要给局域网用：host 改成 0.0.0.0 并把 allow_lan 打开（两处必须同时改，单独改 host 起不来）。
+[server]
+host = "127.0.0.1"
+port = 8765
+allow_lan = false
+session_ttl_days = 7        # 登录会话有效期（天）
+idle_timeout_min = 720      # 无操作超时（分钟）：超时后要重新登录
+login_max_failures = 5      # 登录失败锁定：窗口内最多失败次数
+login_window_min = 5        # 失败锁定的统计窗口（分钟）
+display_tz = "Asia/Shanghai"  # 页面上「某一天」按这个时区切（收件箱日期筛选）
+# 要上 HTTPS 就成对给出证书与私钥（会话 cookie 的 Secure 属性随之自动打开）：
+# tls_certfile = "/path/cert.pem"
+# tls_keyfile = "/path/key.pem"
