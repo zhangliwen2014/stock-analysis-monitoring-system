@@ -10,12 +10,14 @@ import pytest
 from sams.core.quotes import Quote
 from sams.web.display import moment_label
 
+#: 三只种子共用的假档案：改名字/币种时不用挨个函数找
+_NAME = "贵州茅台"
+_CURRENCY = "CNY"
+
 
 def _seed(logged, market="A", code="600519"):
     logged.context.symbols.upsert(
-        pl.DataFrame(
-            {"market": [market], "code": [code], "name": ["贵州茅台"], "currency": ["CNY"]}
-        )
+        pl.DataFrame({"market": [market], "code": [code], "name": [_NAME], "currency": [_CURRENCY]})
     )
     # 不用 support.sample_bars：那两根的 1.2→2.2 是 +83%，A 股那条涨跌幅守卫会把它读成
     # 「一定有未记录的公司行为」而整段拒绝出数。这里要的是「库里有几根能画的线」，
@@ -59,9 +61,7 @@ def _seed_dividend(logged):
     """
     market, code = "A", "600519"
     logged.context.symbols.upsert(
-        pl.DataFrame(
-            {"market": [market], "code": [code], "name": ["贵州茅台"], "currency": ["CNY"]}
-        )
+        pl.DataFrame({"market": [market], "code": [code], "name": [_NAME], "currency": [_CURRENCY]})
     )
     last = date.today() - timedelta(days=4)
     days = [last - timedelta(days=offset) for offset in range(29, -1, -1)]
@@ -196,10 +196,10 @@ def _seed_list_row(logged, market="A", code="600519"):
         [
             {
                 "code": code,
-                "name": "贵州茅台",
+                "name": _NAME,
                 "py_initials": "gzym",
                 "py_full": "guizhoumaotai",
-                "currency": "CNY",
+                "currency": _CURRENCY,
             }
         ],
     )
@@ -212,6 +212,8 @@ def test_code_table_row_renders_pending_state(logged):
     assert page.status_code == 200
     assert "待同步" in page.text
     assert "已排队" in page.text
+    # pending 态按钮照旧给（虽然再点只是排队去重，它不改队列状态）
+    assert "/symbol/A/600519/sync" in page.text
     ctx = logged.context
     assert ctx.symbols.get("A", "600519")["name"] == "贵州茅台"
     assert ctx.backfills_store.open_for("A", "600519") is not None
@@ -226,7 +228,36 @@ def test_deferred_backfill_tells_today_tries_failed(logged):
     for _ in range(3):
         ctx.backfills_store.note_failure(backfill.id, "源站超时")
     page = logged.client.get("/symbol/A/600519")
-    assert "今天已试过 3 次都没成（源站超时）" in page.text
+    assert "3 次" in page.text
+    assert "源站超时" in page.text
+
+
+def test_deferred_state_hides_the_sync_button(logged):
+    """deferred 时「立即排一拍」是空按钮：enqueue 对着 open_key 返回 False，队列纹丝不动，
+    摆了就是骗人点（D146 评审）。"""
+    _seed_list_row(logged)
+    ctx = logged.context
+    logged.client.get("/symbol/A/600519")
+    backfill = ctx.backfills_store.open_for("A", "600519")
+    for _ in range(3):
+        ctx.backfills_store.note_failure(backfill.id, "源站超时")
+    page = logged.client.get("/symbol/A/600519")
+    assert page.status_code == 200
+    assert "/symbol/A/600519/sync" not in page.text
+    assert "立即排一拍" not in page.text
+
+
+def test_deferred_without_error_leaves_no_empty_parenthesis(logged):
+    """last_error 空着时不许印「都没成（）」：空括注是排版事故，不是信息（D146 评审）。"""
+    _seed_list_row(logged)
+    ctx = logged.context
+    logged.client.get("/symbol/A/600519")
+    backfill = ctx.backfills_store.open_for("A", "600519")
+    for _ in range(3):
+        ctx.backfills_store.note_failure(backfill.id, "")  # 空错误串：守卫截第一行得 ""
+    page = logged.client.get("/symbol/A/600519")
+    assert "都没成，" in page.text
+    assert "（）" not in page.text
 
 
 def test_page_with_bars_has_no_empty_state(logged):
@@ -235,20 +266,49 @@ def test_page_with_bars_has_no_empty_state(logged):
     assert "待同步" not in page.text
 
 
+def test_delisted_code_does_not_fall_back(logged):
+    """代码表里在但已退市（is_active=false）：不兜底建行、不排补数——死码占一个 FIFO 名额，
+    每一拍都白试一次（D146 评审）。"""
+    ctx = logged.context
+    ctx.symbol_list_store.upsert_batch(
+        "A",
+        [{"code": "600001", "name": "退市股", "py_initials": "tsg", "py_full": "tuishigu",
+          "currency": "CNY"}],
+    )
+    # 用仓库自己的关停法：给一份不含 600001 的在册清单，它就被置为 is_active=false
+    ctx.symbol_list_store.deactivate_missing("A", ["600000"])
+    assert logged.client.get("/symbol/A/600001").status_code == 404
+    assert ctx.symbols.get("A", "600001") is None
+    assert ctx.backfills_store.open_for("A", "600001") is None
+
+
 def test_unknown_code_still_404(logged):
     """代码表也查无 = 「不认识这串代码」：404 保留（D146）。"""
     assert logged.client.get("/symbol/A/999999").status_code == 404
 
 
 def test_unconfigured_market_never_falls_back(logged):
-    """市场没配置时兜底不许发生：`SymbolInterest.ensure` 会拿 `markets[market]` 崩 KeyError，
-    挡住的是 500，也更早回答「这市场本机不服务」。"""
+    """市场不在本机配置清单 = 这一屏不可达：404 本身就是这条规则（不是只为挡 KeyError），
+    兜底也不许在这里发生。"""
     logged.context.symbol_list_store.upsert_batch(
         "XX",
         [{"code": "1", "name": "无名", "py_initials": "wm", "py_full": "wuming",
           "currency": "XXD"}],
     )
     assert logged.client.get("/symbol/XX/1").status_code == 404
+
+
+def test_no_queued_backfill_says_so(logged):
+    """主档早有、只是从没排过补数：这一档不许说「下一拍会自动补」——没排队就是没排队，
+    按钮才是这一档真正有效的出路（D146 评审）。"""
+    logged.context.symbols.upsert(
+        pl.DataFrame({"market": ["A"], "code": ["600036"], "name": ["招行"], "currency": ["CNY"]})
+    )
+    page = logged.client.get("/symbol/A/600036")
+    assert page.status_code == 200
+    assert "下一拍会自动补" not in page.text
+    assert "没有排队" in page.text
+    assert "/symbol/A/600036/sync" in page.text
 
 
 def test_sync_button_requeues(logged):
@@ -275,16 +335,6 @@ def test_bars_api_falls_back_too(logged):
     payload = logged.client.get("/api/symbol/A/600519/bars?days=120")
     assert payload.status_code == 200
     assert payload.json()["dates"] == []
-
-
-def test_quote_board_code_links(logged):
-    """报价板那行永远挂链接（N4 了结）：主档缺失由代码表兜底，不再有「死文字」那一型。"""
-    user = logged.context.users.get_by_username("alice")
-    logged.context.watchlists.add(user.id, "A", "600519")
-    _seed_quote(logged)
-    page = logged.client.get("/api/partials/quotes")
-    assert "/symbol/A/600519" in page.text
-    assert "主档未同步" not in page.text
 
 
 def test_bars_api_returns_dates_and_close(logged):

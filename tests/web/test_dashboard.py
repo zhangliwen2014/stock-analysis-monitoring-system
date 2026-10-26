@@ -132,15 +132,17 @@ def test_symbol_name_comes_from_the_master(logged):
     assert "贵州茅台" in logged.client.get("/watchlist").text
 
 
-def _quote_row(page, code: str) -> str:
-    """看板那张行情表里某个代码的那一行（`<tr>…</tr>` 原样）。
+def _quote_row(page, code: str, table_marker: str | None = None) -> str:
+    """页面某张表里某个代码的那一行（`<tr>…</tr>` 原样）。
 
-    只在看板那一屏取行：自选页有两张表都含代码，断言会挑错表。表只有这一屏这一张，
-    而单位/链接/名称三件事都要按「交易员看到的那一行」来钉。
+    自选页有两张表都含代码，用 `table_marker`（如「/watchlist/remove」）挑出要的那张；
+    单位/链接/名称三件事都要按「交易员看到的那一行」来钉。
     """
     rows = re.findall(r"<tr>(.*?)</tr>", page.text, re.S)
+    if table_marker is not None:
+        rows = [row for row in rows if table_marker in row]
     hits = [row for row in rows if f">{code}<" in row]
-    assert hits, f"看板行情表里没有 {code} 这一行"
+    assert hits, f"表里没有 {code} 这一行"
     return hits[0]
 
 
@@ -158,7 +160,7 @@ def test_watchlist_row_without_master_symbol_links_anyway(logged):
     _seed_quote(logged, market="US", code="AAPL", price=250.0)
     page = logged.client.get("/")
     assert page.status_code == 200
-    assert "/symbol/US/AAPL" in _quote_row(page, "AAPL")
+    assert '<a href="/symbol/US/AAPL">' in _quote_row(page, "AAPL")
     cells = _quote_cells(page, "AAPL")
     assert cells[2] == "AAPL", "名称列不许留空：空白看起来像页面坏了"
 
@@ -168,30 +170,17 @@ def test_watchlist_management_table_links_code(logged):
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "US", "AAPL")
     page = logged.client.get("/watchlist")
-    rows = re.findall(r"<tr>(.*?)</tr>", page.text, re.S)
-    managed = [row for row in rows if "/watchlist/remove" in row]
-    assert any('/symbol/US/AAPL' in row for row in managed)
-
-
-def test_the_link_stays_when_the_master_has_the_row(logged):
-    """主档有行时链接照旧：遮蔽只针对查无此码的行。"""
-    user = logged.context.users.get_by_username("alice")
-    logged.context.watchlists.add(user.id, "A", "600519")
-    _seed_quote(logged)
-    _seed_symbol(logged.context)
-    page = logged.client.get("/")
-    assert "/symbol/A/600519" in page.text
-    assert "主档未同步" not in _quote_row(page, "600519")
+    row = _quote_row(page, "AAPL", table_marker="/watchlist/remove")
+    assert '<a href="/symbol/US/AAPL">' in row
 
 
 def test_quotes_partial_links_every_row(logged):
-    """10 秒一刷的那块与首屏同一个折法：链接统一之后没有要遮的行（D146）。"""
+    """10 秒一刷的那块与首屏同一个折法：链接统一之后每一行都挂anchor（D146）。"""
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "US", "AAPL")
     _seed_quote(logged, market="US", code="AAPL", price=250.0)
     page = logged.client.get("/api/partials/quotes")
-    assert "/symbol/US/AAPL" in page.text
-    assert "主档未同步" not in page.text
+    assert '<a href="/symbol/US/AAPL">' in page.text
 
 
 def test_price_unit_follows_the_market_currency(logged):

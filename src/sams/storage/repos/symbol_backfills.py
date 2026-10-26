@@ -12,6 +12,12 @@ from uuid import uuid4
 
 from sams.storage.db import Database
 
+#: 补数行两个状态的对外名（先例：repos/theses.py 导出 OPENED/TRACKING）：Python 侧的
+#: 调用方不必各写各的字符串；done 只在仓库 SQL 里落，没有 Python 侧的读写方就不导出，
+#: 仓库内部 SQL 里的字面量保持原样（那就是本仓库的落库形态）
+PENDING = "pending"
+DEFERRED = "deferred"
+
 
 @dataclass(frozen=True)
 class BackfillRow:

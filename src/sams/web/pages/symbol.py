@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import NotAdjustable
 from sams.core.quotes import NO_DATA, quote_state
+from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import hms, moment_label, pct_class, state_label
 from sams.web.pages.dashboard import _market_open
@@ -37,21 +38,23 @@ def _require_symbol(request: Request, user, market: str, code: str):
     取、论与告警存的都是归一后的代码，于是 /symbol/HK/700 给一只确实存在的票画出
     「无行情 + 三张空表」。归一一次，下游全部用归一后的这一对。
 
-    主档没有但代码表有 = 「全市场认识这只票、本地档案还没追上」：兜底建行走
-    `SymbolInterest.ensure`（顺带排补数），不再 404（D146）。两个都没有才 404，
-    措辞不变——不给探测者区分「没有」与「不是你的」。
+    主档没有但代码表在册（is_active）= 「全市场认识这只票、本地档案还没追上」：兜底建行走
+    `SymbolInterest.ensure`（顺带排补数），不再 404（D146）。退市码不兜底：给它建行排队
+    是每一拍白试一次的死占用。兜不住才 404，措辞不变——不给探测者区分「没有」与「不是你的」。
     """
     web = request.app.state.web
     ctx = web.contexts.current()
     market = canonical_market(market)
     code = canonical_code(market, code)
     if market not in ctx.settings.markets:
-        # 挡住兜底：ensure 要拿 `markets[market]` 的币种，市场没配置会在服务层 KeyError
+        # 这条 404 与兜底无关：市场不在本机配置清单里本就不可达，兜底只是会晚一步崩 KeyError
         raise HTTPException(status_code=404)
     row = ctx.symbols.get(market, code)
-    if row is None and ctx.symbol_list_store.get(market, code) is not None:
-        ctx.symbol_interest.ensure(market, code, actor=user.username)
-        row = ctx.symbols.get(market, code)
+    if row is None:
+        listed = ctx.symbol_list_store.get(market, code)
+        if listed is not None and listed["is_active"]:
+            ctx.symbol_interest.ensure(market, code, actor=user.username)
+            row = ctx.symbols.get(market, code)
     if row is None:
         raise HTTPException(status_code=404)
     return ctx, market, code, row
@@ -117,16 +120,20 @@ def symbol_page(request: Request, market: str, code: str):
         for alert in ctx.alerts_store.list_for(user.id, market=market, code=code, limit=10)
     ]
 
-    # 空态那一屏的话分三档：队列 deferred（今天试满了）、pending（刚排的）、和压根没排
-    # （主档早就在、只是从没有人求过数）——最后一档说「下一拍会自动补」，不编排队状态
+    # 空态那一屏按队列的三档各说各的：deferred（今天试满）、pending（已排队）、没排过队
     no_bars = ctx.bars.count(market, code) == 0
-    backfill_row = ctx.backfills_store.open_for(market, code)
     backfill_note = None
-    if backfill_row is not None:
-        if backfill_row.status == "deferred":
+    backfill_deferred = False
+    if no_bars:
+        backfill_row = ctx.backfills_store.open_for(market, code)
+        if backfill_row is None:
+            backfill_note = "没有排队：点下面「立即排一拍」，否则等今晚盘后任务。"
+        elif backfill_row.status == DEFERRED:
+            backfill_deferred = True
+            # 括注只在该行真记了错误时才有：空 last_error 印出来是「都没成（）」
+            error = f"（{backfill_row.last_error}）" if backfill_row.last_error else ""
             backfill_note = (
-                f"今天已试过 {backfill_row.tries} 次都没成（{backfill_row.last_error}），"
-                "今晚随盘后任务再试。"
+                f"今天已试过 {backfill_row.tries} 次都没成{error}，今晚随盘后任务再试。"
             )
         else:
             backfill_note = "已排队，下一拍自动开始（一拍至多三只，前面的队首先走）。"
@@ -148,6 +155,7 @@ def symbol_page(request: Request, market: str, code: str):
         alerts=alerts,
         no_bars=no_bars,
         backfill_note=backfill_note,
+        backfill_deferred=backfill_deferred,
     )
 
 
