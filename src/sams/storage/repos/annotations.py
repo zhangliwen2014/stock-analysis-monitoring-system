@@ -114,6 +114,12 @@ def _json_dict(raw: object) -> dict:
     return dict(parsed or {})
 
 
+def _json_text(value: object) -> str:
+    """写侧序列化与读侧 `_json_dict` 对偶：`ensure_ascii=False` 保住中文标签的原文，
+    库里才不是 \\uXXXX 汤——与 create/update 写 tags_json/meta_json 用的完全同一份。"""
+    return json.dumps(value, ensure_ascii=False)
+
+
 class AnnotationRepo:
     def __init__(self, db: Database, *, clock: Clock = SYSTEM_CLOCK) -> None:
         self.db = db
@@ -270,6 +276,28 @@ class AnnotationRepo:
                 ],
             )
         return self._reload(annotation_id)
+
+    def stamp_last_revision_attachments(
+        self, annotation_id: str, attachment_ids: list[str]
+    ) -> None:
+        """把「这次编辑之后有哪些附件」补进最新 revision 的 meta_json（§4.3）。
+
+        附件增删发生在正文 revision 落库**之后**（新文件的 id 要传完才知道），
+        所以是补写而不是随 update 一起写；没有 revision（人不带版本改了个寂寞）就静默跳过。
+        """
+        rows = self.db.query(
+            "SELECT id, meta_json FROM annotation_revisions"
+            " WHERE annotation_id = ? ORDER BY edited_at DESC, id DESC LIMIT 1",
+            [annotation_id],
+        ).to_dicts()
+        if not rows:
+            return
+        meta = _json_dict(rows[0]["meta_json"])
+        meta["attachments"] = [str(item) for item in attachment_ids]
+        self.db.execute(
+            "UPDATE annotation_revisions SET meta_json = ? WHERE id = ?",
+            [_json_text(meta), str(rows[0]["id"])],
+        )
 
     def set_pinned(self, annotation_id: str, *, user_id: str, pinned: bool) -> Annotation:
         """置顶不是编辑：不写 revision，也不动 `updated_at`（开着编辑器的人不该因此 409）。"""

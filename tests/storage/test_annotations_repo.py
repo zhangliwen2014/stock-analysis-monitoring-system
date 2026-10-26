@@ -279,3 +279,23 @@ def test_count_visible_matches_page(repo):
     assert len(rows) == 20 and total == 25
     rows2 = repo.list_visible(OWNER, limit=20, offset=20)
     assert len(rows2) == 5
+
+
+# --- 编辑附件后的 revision 补记（§4.3/Task 4）------------------------------------------------
+
+
+def test_stamp_last_revision_records_attachments(repo):
+    """补写而不是随 update 一起写：新附件的 id 要等文件传完才存在，
+    revision 落库时还不知道「这次编辑之后有哪些附件」。"""
+    made = add(repo, body_md="带图")
+    repo.update(made.id, user_id=OWNER, body_md="改一下", tags=[], visibility="private")
+    repo.stamp_last_revision_attachments(made.id, ["att-a", "att-b"])
+    meta = repo.revisions(made.id)[-1].meta
+    assert meta["attachments"] == ["att-a", "att-b"]
+
+
+def test_stamp_without_revision_is_a_no_op(repo):
+    """没 revision（人没改正文）就静默跳过：给不存在的编辑补记等于伪造历史。"""
+    made = add(repo)
+    repo.stamp_last_revision_attachments(made.id, ["att-a"])
+    assert repo.revisions(made.id) == []

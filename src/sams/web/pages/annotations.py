@@ -57,13 +57,16 @@ TARGET_TYPE_LABELS = {
     "order": "成交",
 }
 
-#: 面板一屏最多给 3 张缩略图：它是「看几条 + 写一条」的地方，不是图片墙；
-#: 更多走下载链接或计划 5 的详情页
-THUMB_LIMIT = 3
+#: 缩略图上限不再钉常量：读 `ctx.settings.annotations.max_attachments`（见 `_render_panel`）——
+#: 张数上限与配额同源，编辑器要能勾选到每一张，3 张封顶会让第 4 张起永远删不掉
 
 #: 附件分片的依赖提到模块级一份（B008 不许在参数默认值里调 `File`，
 #: 与 `pages/settings.py` 的 `_form_body` 同一处置）
 _files_field = File(default=[])
+
+#: 「删哪几张」的勾选框同理提到模块级；勾选没勾时表单一个值都不发，
+#: `default=[]` 就是「这次不动附件」——多值 list 字段必须给默认，否则缺键被 422 拦下
+_remove_attachments_field = Form(default=[])
 
 
 def _panel_id(target_type: str, target_ref: str) -> str:
@@ -100,6 +103,8 @@ def _render_panel(
     ctx = web.contexts.current()
     sharing = ctx.app_settings.team_sharing()
     tz = ctx.settings.server.display_tz
+    # 上限与「一条批注最多几张附件」同源：勾选删除覆盖到的集合必须就是能看到的集合
+    thumb_limit = ctx.settings.annotations.max_attachments
     items = ctx.annotations.list_target(
         user.id, target_type, target_ref, team_sharing=sharing, limit=PANEL_LIMIT
     )
@@ -109,12 +114,14 @@ def _render_panel(
         # 攒 JOIN 换来的复杂度买不回可感知的延迟
         atts = ctx.attachments.list_for(user.id, made.id, team_sharing=sharing)
         thumbs = []
-        for att in atts[:THUMB_LIMIT]:
+        for att in atts[:thumb_limit]:
             if ctx.attachments.path_of(att).is_file():
                 # 缺文件不进 thumbs：碎图标不说话，「附件缺失」那句话才说
+                # `id` 给编辑表单的删除勾选框当值——没有它勾选就没地方落
                 thumbs.append(
                     {
                         "url": f"/annotations/{made.id}/attachments/{att.id}",
+                        "id": att.id,
                         "filename": att.filename,
                     }
                 )
@@ -129,8 +136,8 @@ def _render_panel(
                 "visibility_code": made.visibility,
                 "tags": made.tags,
                 "images": thumbs,
-                "missing": max(0, min(len(atts), THUMB_LIMIT) - len(thumbs)),
-                "extra": max(0, len(atts) - THUMB_LIMIT),
+                "missing": max(0, min(len(atts), thumb_limit) - len(thumbs)),
+                "extra": max(0, len(atts) - thumb_limit),
                 "body_html": render_markdown(made.body_md),
                 "body_md": made.body_md,
                 "own": made.user_id == user.id,
@@ -496,22 +503,47 @@ def annotation_edit(
     tags: str = Form(""),
     updated_at: str = Form(""),
     visibility: str = Form(""),
+    remove_attachments: list[str] = _remove_attachments_field,
+    files: list[UploadFile | str] = _files_field,
 ):
     web, ctx, user, made = _load_for_write(request, annotation_id)
+    clean = _clean_files(files)
+    removed_ids = [item.strip() for item in remove_attachments if item.strip()]
+    draft = {"body_md": body_md, "tags": tags}
 
     def fail(error: str, status_code: int):
+        # 被拒也要回面板本体，并把刚敲的正文/标签回填（与 create 同一条纪律）
         return _render_panel(
             request,
             user=user,
             target_type=made.target_type,
             target_ref=made.target_ref,
             error=error,
+            draft=draft,
             status_code=status_code,
         )
 
-    wait = _limit_hit(web, user.id, uploads=0)
+    wait = _limit_hit(web, user.id, uploads=len(clean))
     if wait:
-        return fail(f"写批注太频繁了：{wait} 秒后再试（每分钟 30 条）", 429)
+        return fail(f"写得太快：请 {wait} 秒后再来（每分钟 30 条批注、10 次附件上传）", 429)
+    limits = ctx.settings.annotations
+    # 增删张数闸与「一条批注最多几张」同源：一次最多动 max_attachments 张，
+    # 全删全加也在一条批注的容量里——闸先于任何写入，被拒的那次一个字节都不动
+    if len(removed_ids) + len(clean) > limits.max_attachments:
+        return fail(f"一次最多动 {limits.max_attachments} 张附件的增删：分批来", 400)
+    # 尺寸闸在 edit **之前**（§10，与 create 同一条纪律）：图超了正文一个字都不动——
+    # 文件落了一半才说「批注改了、图没了」，人被夹在两个半份状态中间
+    oversize = [
+        upload.filename
+        for upload in clean
+        if _part_size(upload) > limits.max_attachment_mb * MB
+    ]
+    if oversize:
+        return fail(
+            f"单张附件最多 {limits.max_attachment_mb} MB，"
+            f"{'、'.join(oversize)} 超了：这条批注一个字都没改",
+            400,
+        )
     # 空串=人不带版本号来改：服务层跳过并发检查（面板上的编辑永远带着 hidden 的
     # updated_at，这条支路接的是脚本与旧表单）；坏了的戳才拦
     stamp: datetime | None = None
@@ -520,8 +552,9 @@ def annotation_edit(
             stamp = datetime.fromisoformat(updated_at)
         except ValueError:
             return fail("编辑基线的时间戳读不出来：关闭编辑器、重新打开再改", 400)
+    before_ids = [att.id for att in ctx.attachments_store.list_for(made.id)]
     try:
-        ctx.annotations.edit(
+        updated = ctx.annotations.edit(
             user.id,
             made.id,
             body_md=body_md,
@@ -532,13 +565,53 @@ def annotation_edit(
     except DatabaseLocked:
         raise
     except Conflict as exc:
-        # 409 也重渲染面板：人要知道的不是「失败了」，而是「现在上面是什么」
+        # 409 也重渲染面板：人要知道的不是「失败了」，而是「现在上面是什么」——
+        # 附件一个没动，文件的读写全排在这次 edit 成功之后
         return fail(str(exc), 409)
     except SamsError as exc:
         return fail(str(exc), 400)
-    audit(request, action="annotation.edit", target=made.id, ok=True)
+    # 正文成立之后才动附件：删一张算一张，失败的点名（与 create 的 rejected 同一话术）
+    rejected: list[str] = []
+    for att_id in removed_ids:
+        try:
+            ctx.attachments.remove(user.id, made.id, att_id)
+        except DatabaseLocked:
+            raise
+        except SamsError as exc:
+            # 勾选指向已消失的附件（重复提交）落进这一支：点名「这张没删成」，
+            # 而不是让一枚陈旧的勾选框 404 掉整次编辑
+            rejected.append(f"删除 {att_id}：{exc}")
+    for upload in clean:
+        try:
+            ctx.attachments.add(
+                user.id, made.id, filename=upload.filename, data=upload.file.read()
+            )
+        except DatabaseLocked:
+            raise
+        except SamsError as exc:
+            rejected.append(f"{upload.filename}：{exc}")
+    after_ids = [att.id for att in ctx.attachments_store.list_for(made.id)]
+    if after_ids != before_ids:
+        # 只在附件真变了才补记：revision 的 meta 答的是「这次编辑之后有哪些图」，
+        # 没动图也写一份就把真动过的那条淹在重复里
+        ctx.annotations_store.stamp_last_revision_attachments(made.id, after_ids)
+    removed_failed = len([r for r in rejected if r.startswith("删除 ")])
+    added_failed = len(rejected) - removed_failed
+    audit(
+        request,
+        action="annotation.edit",
+        target=made.id,
+        ok=not rejected,
+        detail=f"att-{len(removed_ids) - removed_failed}+{len(clean) - added_failed}",
+    )
+    error = f"批注已保存，但附件没全成：{'；'.join(rejected)}" if rejected else ""
+    # 用编辑后那一行的归一键重渲染：面板 id 与行要跟着服务折过的键，不是提交前的旧值
     return _render_panel(
-        request, user=user, target_type=made.target_type, target_ref=made.target_ref
+        request,
+        user=user,
+        target_type=updated.target_type,
+        target_ref=updated.target_ref,
+        error=error,
     )
 
 

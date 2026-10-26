@@ -352,17 +352,135 @@ def test_panel_renders_thumbnails_and_degrades_missing_file(logged):
         hidden.rename(path)
 
 
-def test_panel_caps_thumbnails_at_three_with_overflow_note(logged):
+def test_panel_shows_all_thumbs_within_the_configured_cap(logged):
+    """缩略图上限改读配置（max_attachments，默认 5）：编辑器要能勾选到每一张，
+    4 张就全是 thumbs——旧「3 张封顶 + 还有 N 张」的语义随之作废。"""
     made, atts = _make_annotation_with_png(logged, count=4)
     panel = logged.client.get(
         "/api/partials/annotations", params={"target_type": "symbol", "target_ref": "A:600519"}
     )
-    # 每张缩略图的 URL 出现两次（<a href> 与 <img src>），第四张完全不出现
-    for att in atts[:3]:
-        assert panel.text.count(att.id) == 2
-    assert atts[3].id not in panel.text
-    assert "还有 1 张" in panel.text
+    # 每张附件的 id 出现三次（<a href> 与 <img src> 用 URL，编辑表单的勾选框用裸 id）
+    for att in atts:
+        assert panel.text.count(att.id) == 3
+    assert "还有" not in panel.text  # extra == 0：没有溢出提示
     assert "附件缺失" not in panel.text  # 四张都在磁盘上：missing 不许多报
+
+
+# --- 编辑批注时增删附件（§4.3/§5.4）-----------------------------------------------------------
+
+
+def test_edit_can_add_an_attachment(logged):
+    """编辑不带新文件、也不勾删除时要照常成功（`remove_attachments: list[str] = Form(default=[])`
+    在多分部表单下收 0 个值）——这条钉的是「空提交不被 FastAPI 判 422」。"""
+    ctx = logged.context
+    uid = _alice(ctx).id
+    made = ctx.annotations.create(
+        uid, target_type="symbol", target_ref="A:600519", body_md="先没图", tags=()
+    )
+    panel = logged.client.post(
+        f"/annotations/{made.id}/edit",
+        data={
+            "csrf": logged.csrf,
+            "body_md": "先没图",
+            "tags": "",
+            "updated_at": made.updated_at.isoformat(),
+        },
+        files={"files": ("shot.png", _rgba_png_bytes(), "image/png")},
+    )
+    assert panel.status_code == 200
+    assert "ann-imgs" in panel.text
+    assert len(ctx.attachments_store.list_for(made.id)) == 1
+
+
+def test_edit_can_remove_a_checked_attachment(logged):
+    ctx = logged.context
+    made, atts = _make_annotation_with_png(logged)
+    att = atts[0]
+    path = ctx.attachments.path_of(att)
+    assert path.is_file()
+    panel = logged.client.post(
+        f"/annotations/{made.id}/edit",
+        data={
+            "csrf": logged.csrf,
+            "body_md": made.body_md,
+            "tags": "",
+            "updated_at": made.updated_at.isoformat(),
+            "remove_attachments": att.id,
+        },
+        # 浏览器「没选文件」直接提交发的就是空文件名分片：这里与它同形
+        files=[("files", ("", b""))],
+    )
+    assert panel.status_code == 200
+    assert att.id not in panel.text
+    assert "ann-imgs" not in panel.text  # 图区整个没了
+    assert ctx.attachments_store.list_for(made.id) == []
+    assert not path.exists()
+    # 最新 revision 记的是「这次编辑之后」的附件集合：删干净就是空列表
+    assert ctx.annotations_store.revisions(made.id)[-1].meta["attachments"] == []
+
+
+def test_edit_oversize_keeps_everything(logged):
+    """尺寸闸在改动之前：图超了正文一个字都不动——和 create 同一条纪律（§10）。"""
+    ctx = logged.context
+    made = _seed_annotation(ctx, _alice(ctx), body="原样")
+    big = b"\x89PNG\r\n\x1a\n" + b"0" * (6 * 1024 * 1024)
+    resp = logged.client.post(
+        f"/annotations/{made.id}/edit",
+        data={
+            "csrf": logged.csrf,
+            "body_md": "改了也不该存",
+            "tags": "",
+            "updated_at": made.updated_at.isoformat(),
+        },
+        files=[("files", ("b.png", big, "image/png"))],
+    )
+    assert resp.status_code == 400 and "超了" in resp.text
+    assert ctx.annotations_store.get(made.id).body_md == "原样"
+    assert ctx.attachments_store.list_for(made.id) == []
+
+
+def test_edit_conflict_does_not_touch_attachments(logged):
+    ctx = logged.context
+    made, atts = _make_annotation_with_png(logged)
+    stale = made.updated_at.isoformat()
+    ctx.annotations.edit(_alice(ctx).id, made.id, body_md="另一台设备改过")
+    resp = logged.client.post(
+        f"/annotations/{made.id}/edit",
+        data={
+            "csrf": logged.csrf,
+            "body_md": "冲突正文",
+            "tags": "",
+            "updated_at": stale,
+        },
+        files=[("files", ("c.png", _rgba_png_bytes(), "image/png"))],
+    )
+    assert resp.status_code == 409
+    assert "在你编辑期间被改过" in resp.text
+    # 409 时文件一个都不动：既没加进来，勾选的也没被删
+    assert len(ctx.attachments_store.list_for(made.id)) == len(atts)
+
+
+def test_revision_meta_records_final_attachments(logged):
+    ctx = logged.context
+    uid = _alice(ctx).id
+    made = ctx.annotations.create(
+        uid, target_type="symbol", target_ref="A:600519", body_md="先没图", tags=()
+    )
+    resp = logged.client.post(
+        f"/annotations/{made.id}/edit",
+        data={
+            "csrf": logged.csrf,
+            "body_md": "补一张",
+            "tags": "",
+            "updated_at": made.updated_at.isoformat(),
+        },
+        files={"files": ("shot.png", _rgba_png_bytes(), "image/png")},
+    )
+    assert resp.status_code == 200
+    atts = ctx.attachments_store.list_for(made.id)
+    assert len(atts) == 1
+    revisions = ctx.annotations_store.revisions(made.id)
+    assert revisions[-1].meta["attachments"] == [atts[0].id]
 
 
 # --- 团队可见写路径（B2：§4.2/D121/D127）---------------------------------------------------

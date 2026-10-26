@@ -73,7 +73,8 @@
       </form>
       <details>
         <summary>编辑</summary>
-        <form hx-post="/annotations/{{ row.id }}/edit" hx-target="#{{ panel_id }}" hx-swap="outerHTML">
+        <form hx-post="/annotations/{{ row.id }}/edit" hx-encoding="multipart/form-data"
+              hx-target="#{{ panel_id }}" hx-swap="outerHTML">
           <input type="hidden" name="csrf" value="{{ csrf }}">
           <input type="hidden" name="updated_at" value="{{ row.updated_at }}">
           <textarea name="body_md" rows="4">{{ row.body_md }}</textarea>
@@ -85,6 +86,15 @@
           </select>
           {% else %}
           <input type="hidden" name="visibility" value="{{ row.visibility_code }}">
+          {% endif %}
+          {# 编辑表单multipart化后才能带文件；勾选框的值是附件 id，端点按它删行删文件 #}
+          <input type="file" name="files" accept="image/png,image/jpeg,image/webp" multiple>
+          {% if row.images %}
+          <div class="ann-remove-imgs">
+            {% for img in row.images %}
+            <label><input type="checkbox" name="remove_attachments" value="{{ img.id }}"> 删 {{ img.filename }}</label>
+            {% endfor %}
+          </div>
           {% endif %}
           <button type="submit">保存</button>
         </form>

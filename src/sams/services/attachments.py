@@ -180,6 +180,26 @@ class AttachmentService:
             final.unlink(missing_ok=True)
             raise
 
+    def remove(self, viewer_id: str, annotation_id: str, attachment_id: str) -> Attachment:
+        """作者删附件：先过批注归属（与写正文同一条闸），再删行、再删文件。
+
+        顺序与新增相反——行没了文件才动：中间崩了最坏留一个孤儿文件给 prune，
+        反过来就是「库里指着一张不存在的图」。
+        """
+        made = self.annotations.get(viewer_id, annotation_id)
+        if made.user_id != viewer_id:
+            raise NotFound(f"批注 {annotation_id} 不是你的：删不了别人批注上的附件")
+        row = self.attachments.get(attachment_id)
+        if row is None or row.annotation_id != annotation_id:
+            raise NotFound(f"附件 {attachment_id} 不存在或不属于这条批注")
+        self.attachments.delete(attachment_id)
+        try:
+            self.path_of(row).unlink(missing_ok=True)
+        except OSError as exc:
+            # 行已经没了，配额也随之回落：文件删不掉只是占盘，交给 prune 收尾
+            logger.warning("附件文件删除失败（行已删，交给 prune）：%s", exc)
+        return row
+
     # --- 读 -----------------------------------------------------------------------------
 
     def list_for(

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import UTC, datetime
 from io import BytesIO
@@ -103,6 +104,54 @@ def add(world, data=None, *, note=None, user=None, filename="截图.png"):
 
 def stored(world, row):
     return (world.root / row.storage_path).read_bytes()
+
+
+def test_remove_takes_the_row_and_the_file(world):
+    """作者删附件：行先没、文件后删——顺序反过来就留下一行永远 404 的引用。"""
+    row = add(world)
+    path = world.service.path_of(row)
+    assert path.is_file()
+    removed = world.service.remove(world.user.id, world.note.id, row.id)
+    assert removed.id == row.id
+    assert world.store.get(row.id) is None
+    assert not path.exists()
+
+
+def test_remove_is_author_only(world):
+    row = add(world)
+    with pytest.raises(NotFound):
+        world.service.remove(world.other.id, world.note.id, row.id)
+
+
+def test_remove_rejects_foreign_annotation(world):
+    row = add(world)
+    other_note = world.annotations.create(
+        world.user.id, target_type="symbol", target_ref="A:000001", body_md="另一条", tags=()
+    )
+    with pytest.raises(NotFound):
+        world.service.remove(world.user.id, other_note.id, row.id)
+
+
+def test_removed_bytes_free_the_quota(world, settings):
+    """配额要跟着删除回到可写：总闸数的是「库里的字节」，行不删就永远占着。
+
+    纯色小图重编码后只有几百字节，整 MB 粒度的配额根本填不满——这里用噪点图
+    （PNG 压不动随机噪声，每张约 0.9 MB），把 2 MB 配额逼到「两张放得下、第三张放不下」。
+    """
+    world.service.settings = replace(
+        settings, annotations=replace(settings.annotations, max_user_total_mb=2)
+    )
+    noise = os.urandom(480 * 480 * 4)
+    image = Image.frombytes("RGBA", (480, 480), noise)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    payload = buffer.getvalue()
+    first = add(world, payload)
+    add(world, payload)
+    with pytest.raises(ValidationError, match="配额"):
+        add(world, payload)
+    world.service.remove(world.user.id, world.note.id, first.id)
+    add(world, payload)  # 同配额删一张之后还能再传
 
 
 def test_a_png_is_reencoded_and_stored_under_the_user_folder(world):
