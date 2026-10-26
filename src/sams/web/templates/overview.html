@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% block title %}看板{% endblock %}
 {% block content %}
+{# 大盘条：指数跟着设置走，与自选无关——自选全空也要看见上证（D145） #}
+<div id="index-bar" hx-get="/api/partials/indices" hx-trigger="load, every 30s" hx-swap="innerHTML"></div>
 {% if failed_channels %}
 <section class="card">
   <h2>通知失败</h2>

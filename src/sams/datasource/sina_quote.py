@@ -21,7 +21,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.codes import canonical_code
+from sams.core.codes import canonical_code, looks_like_index_code
 from sams.core.errors import DatasourceError, EmptyResponse, RateLimited
 from sams.core.quotes import MARKET_ZONES, Quote, QuoteBatch
 from sams.datasource.base import a_share_symbol, classify_error
@@ -241,9 +241,19 @@ class SinaQuoteAdapter:
     def quotes(self, market: str, codes: list[str]) -> QuoteBatch:
         if market not in self.markets:
             raise ValueError(f"{self.name} 不支持市场 {market}")
-        wanted = list(dict.fromkeys(canonical_code(market, code) for code in codes))
+        # 新浪报价不覆盖指数（D145）：指数码不进请求、直接进 skipped，不记 errors
+        index_skipped = list(
+            dict.fromkeys(code.strip() for code in codes if looks_like_index_code(market, code))
+        )
+        wanted = list(
+            dict.fromkeys(
+                canonical_code(market, code)
+                for code in codes
+                if not looks_like_index_code(market, code)
+            )
+        )
         if not wanted:
-            return QuoteBatch()
+            return QuoteBatch(skipped=tuple(index_skipped))
         symbols: list[str] = []
         quotable: list[str] = []
         pre_skipped: list[str] = []
@@ -256,7 +266,7 @@ class SinaQuoteAdapter:
             else:
                 quotable.append(code)
         if not quotable:
-            return QuoteBatch(skipped=tuple(pre_skipped))
+            return QuoteBatch(skipped=tuple(pre_skipped) + tuple(index_skipped))
         try:
             text = self._quote_fetch(
                 QUOTE_URL, {"list": ",".join(symbols)}, timeout=self._timeout
@@ -275,7 +285,11 @@ class SinaQuoteAdapter:
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
         # 预跳过的并到批次末尾：parse 只见过能成键的代码，它的 skipped 是「源没给」
-        return QuoteBatch(batch.quotes, batch.skipped + tuple(pre_skipped), batch.errors)
+        return QuoteBatch(
+            batch.quotes,
+            batch.skipped + tuple(pre_skipped) + tuple(index_skipped),
+            batch.errors,
+        )
 
 
 source(

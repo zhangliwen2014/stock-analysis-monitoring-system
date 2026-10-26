@@ -208,6 +208,22 @@ def test_a_batch_of_only_class_shares_never_hits_the_endpoint():
     assert seen == {}
 
 
+def test_the_adapter_skips_index_codes_without_requesting_them():
+    # 新浪报价不覆盖指数（D145）：指数码直接进 skipped，不进请求、不记 errors
+    seen = {}
+
+    def fetch(url, params, *, timeout):
+        seen.update(params=params)
+        return line("sh600519", a_cells())
+
+    adapter = SinaQuoteAdapter(quote_fetch=fetch, clock=FrozenClock(NOW))
+    batch = adapter.quotes("A", ["600519", "sh000001"])
+    assert seen["params"] == {"list": "sh600519"}
+    assert [q.code for q in batch.quotes] == ["600519"]
+    assert batch.skipped == ("sh000001",)
+    assert batch.errors == ()
+
+
 def test_quote_get_maps_429_to_rate_limited(monkeypatch):
     # 429 必须在 raise_for_status 之前判成 RateLimited：路由器对限流退避重试，
     # 对其他异常立刻换源——限流时换源等于把备源也打爆

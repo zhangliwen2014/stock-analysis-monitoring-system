@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from sams.core.codes import canonical_code, canonical_market
@@ -35,9 +35,14 @@ class Universe:
     by_market: Mapping[str, tuple[str, ...]]
     #: (原币, 账户报告币)，只留两者不同的对
     fx_pairs: tuple[tuple[str, str], ...]
+    #: 大盘条与指数轮询的订阅清单：不随用户变，来自 settings（D145）
+    indices_by_market: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def codes(self, market: str) -> tuple[str, ...]:
         return self.by_market.get(canonical_market(market), ())
+
+    def indices(self, market: str) -> tuple[str, ...]:
+        return tuple(self.indices_by_market.get(canonical_market(market), ()))
 
 
 class UniverseBuilder:
@@ -102,7 +107,15 @@ class UniverseBuilder:
             market: tuple(sorted(code for found_market, code in found if found_market == market))
             for market in sorted(markets)
         }
-        return Universe(by_market=by_market, fx_pairs=tuple(sorted(pairs)))
+        # 指数与用户的自选无关：每个配置市场都直接抄一份 settings 的清单（D145）
+        indices_by_market = {
+            market: self.settings.indices.for_market(market) for market in sorted(markets)
+        }
+        return Universe(
+            by_market=by_market,
+            fx_pairs=tuple(sorted(pairs)),
+            indices_by_market=indices_by_market,
+        )
 
 
 def _key(market: str, code: str) -> tuple[str, str]:

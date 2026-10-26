@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.codes import canonical_code
+from sams.core.codes import canonical_code, looks_like_index_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.core.quotes import MARKET_ZONES, Quote, QuoteBatch
 from sams.datasource.base import (
@@ -62,6 +62,9 @@ def tencent_quote_symbol(market: str, code: str) -> str:
     实测 `usAAPL.OQ` 返回空行，而 `usAAPL` 返回正常报价且字段里的代码仍是
     `AAPL.OQ`。所以这里只取裸代码，回显校验由 `echo_matches` 按点前比较。
     """
+    if looks_like_index_code(market, code):
+        # 指数码本来就是腾讯的符号形态（sh000001/hkHSI），再过一遍归一会折成个股（D145）
+        return code
     if market == "A":
         return tencent_symbol(market, code)
     if market == "HK":
@@ -177,11 +180,11 @@ def parse_tencent_quotes(
     """
     if not (text or "").strip():
         raise EmptyResponse("tencent", f"{market} 报价响应为空")
-    parsed: list[list[str]] = []
+    parsed: list[tuple[str, list[str]]] = []
     for raw in text.splitlines():
         match = _TENCENT_LINE.search(raw)
         if match is not None and match.group(2).strip():
-            parsed.append(match.group(2).split("~"))
+            parsed.append((match.group(1), match.group(2).split("~")))
     if not parsed:
         raise EmptyResponse("tencent", f"{market} 报价响应里没有可读的行")
 
@@ -189,15 +192,21 @@ def parse_tencent_quotes(
     skipped: list[str] = []
     errors: list[str] = []
     for code in codes:
-        canonical = canonical_code(market, code)
-        row = next(
-            (
-                fields
-                for fields in parsed
-                if len(fields) > 2 and echo_matches(market, canonical, fields[2])
-            ),
-            None,
-        )
+        is_index = looks_like_index_code(market, code)
+        # 指数码保持源形态（与 index_daily 的键、settings 的键同形），个股码才归一（D145）
+        canonical = code.strip() if is_index else canonical_code(market, code)
+        if is_index:
+            # 指数行的回显字段与个股不同形（field 2 可能是纯数字甚至留空）：按行键比对
+            row = next((fields for key, fields in parsed if key.lower() == canonical.lower()), None)
+        else:
+            row = next(
+                (
+                    fields
+                    for _key, fields in parsed
+                    if len(fields) > 2 and echo_matches(market, canonical, fields[2])
+                ),
+                None,
+            )
         if row is None:
             skipped.append(canonical)
             continue
@@ -379,7 +388,14 @@ class TencentAdapter:
         """一次请求的代码清单由调用方按 `QUOTE_BATCH` 分批（service 层负责），本方法不切片。"""
         if market not in self.markets:
             raise ValueError(f"{self.name} 不支持市场 {market}")
-        wanted = list(dict.fromkeys(canonical_code(market, code) for code in codes))
+        wanted: list[str] = []
+        for code in codes:
+            # 指数码原样透传：canonical_code 会把 sh000001 折成 000001（平安银行）再拼错前缀
+            if looks_like_index_code(market, code):
+                wanted.append(code.strip())
+            else:
+                wanted.append(canonical_code(market, code))
+        wanted = list(dict.fromkeys(wanted))
         if not wanted:
             return QuoteBatch()
         symbols = [tencent_quote_symbol(market, code) for code in wanted]

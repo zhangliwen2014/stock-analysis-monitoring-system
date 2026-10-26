@@ -1,0 +1,17 @@
+{% if segments %}
+<div class="index-bar">
+  {% for segment in segments %}
+  <span class="index-group">
+    <strong>{{ segment.market }}</strong>
+    {% for row in segment.rows %}
+    <span class="badge">
+      {{ row.label }}
+      <strong class="num">{{ money(row.value, row.unit) }}</strong>
+      <span class="{{ row.pct_class }}">{{ pct(row.pct) }}</span>
+      <span class="muted">{{ row.at }}</span>
+    </span>
+    {% endfor %}
+  </span>
+  {% endfor %}
+</div>
+{% endif %}

@@ -42,6 +42,9 @@ form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
 .badge { display: inline-block; padding: 1px 8px; border-radius: 999px;
          border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
 .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* 大盘条（D145）：三市场分组横排，没数据时整条不渲染 */
+.index-bar { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
+.index-group { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
 /* 批注面板（M4-B §6.2） */
 .annotations-panel .ann-editor textarea { width: 100%; font-family: inherit; }

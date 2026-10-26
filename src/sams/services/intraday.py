@@ -9,8 +9,8 @@
 
 **不在这里评估规则**：那一层吃 `QuotePollResult`，由装配决定它跟不跟在这个循环后面——
 这道缝落实为 `IntradayMonitor` 的 `on_poll` 构造参数，本层依旧不认识规则。
-也不 import 调度器：`UniverseBuilder` 只需要一个 `build()` → `.codes()` 的形状，
-把整个调度器拖进来会让「盘中」依赖「盘后」的内部。
+也不 import 调度器：`UniverseBuilder` 只需要一个 `build()` → `.codes()/.indices()`
+的形状，把整个调度器拖进来会让「盘中」依赖「盘后」的内部。
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ logger = logging.getLogger("sams.services.intraday")
 
 class UniverseView(Protocol):
     def codes(self, market: str) -> tuple[str, ...]: ...
+
+    def indices(self, market: str) -> tuple[str, ...]: ...
 
 
 class UniverseSource(Protocol):
@@ -83,7 +85,8 @@ class IntradayMonitor:
                 self.quotes.board.skip(market, reason, now=moment)
                 outcomes.append(MarketPoll(market, skipped=reason))
                 continue
-            codes = universe.codes(market)
+            # 票跟着用户走，指数跟着设置走：自选全空的用户也要看到上证在跳（D145）
+            codes = list(universe.codes(market)) + list(universe.indices(market))
             if not codes:
                 # 开市中但没有任何对象：不是故障，但页面要能说清「为什么没动」
                 self.quotes.board.skip(market, "没有需要监控的标的", now=moment)

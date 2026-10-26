@@ -15,17 +15,26 @@ T0 = datetime(2026, 10, 23, 2, 0, tzinfo=UTC)
 
 
 class FakeUniverse:
-    def __init__(self, by_market: dict[str, tuple[str, ...]]) -> None:
+    def __init__(
+        self,
+        by_market: dict[str, tuple[str, ...]],
+        indices_by_market: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
         self.by_market = by_market
+        self.indices_by_market = indices_by_market or {}
         self.calls = 0
 
     def build(self):
         self.calls += 1
         by_market = self.by_market
+        indices = self.indices_by_market
 
         class View:
             def codes(self, market: str) -> tuple[str, ...]:
                 return by_market.get(market, ())
+
+            def indices(self, market: str) -> tuple[str, ...]:
+                return indices.get(market, ())
 
         return View()
 
@@ -111,6 +120,38 @@ def test_one_markets_failure_does_not_stop_the_next(settings):
     assert [outcome.market for outcome in outcomes] == ["A", "HK", "US"]
     assert outcomes[0].error and "boom" in outcomes[0].error
     assert quotes.board.snapshot()["A"].last_error
+
+
+def test_configured_indices_are_polled_with_the_watchlist(settings):
+    """票跟着用户走，指数跟着设置走：同一轮里两类对象并成一个清单（D145）。"""
+    quotes = FakeQuotes()
+    minutes = monitor(
+        settings,
+        quotes=quotes,
+        universe=FakeUniverse(
+            {"A": ("600519",)}, {"A": ("sh000001", "sz399001"), "HK": ("hkHSI",)}
+        ),
+    )
+
+    minutes.poll_once(now=T0)
+
+    assert ("A", ("600519", "sh000001", "sz399001")) in quotes.calls
+    assert ("HK", ("hkHSI",)) in quotes.calls
+
+
+def test_a_market_with_no_stocks_still_polls_its_indices(settings):
+    """自选全空的用户也要看到上证在跳：空市场不再 skip，指数撑起这一轮。"""
+    quotes = FakeQuotes()
+    minutes = monitor(
+        settings,
+        quotes=quotes,
+        universe=FakeUniverse({"A": ()}, {"A": ("sh000001",)}),
+    )
+
+    outcomes = minutes.poll_once(now=T0)
+
+    assert quotes.calls == [("A", ("sh000001",))]
+    assert outcomes[0].skipped is None
 
 
 def test_a_failed_round_is_logged_and_the_loop_continues(settings):

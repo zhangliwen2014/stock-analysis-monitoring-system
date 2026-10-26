@@ -184,6 +184,41 @@ def test_the_adapter_posts_the_batch_to_the_quote_endpoint():
     assert batch.quotes[0].code == "600519"
 
 
+def test_index_quote_keeps_source_form_and_bypasses_the_echo_check():
+    # 指数行的回显字段与个股不同形（field 2 可能是纯数字甚至留空）：
+    # 按 echo_matches 比对会把 sh000001 折成 000001 再问成平安银行（D145）
+    seen = {}
+
+    def fetch(url, params, *, timeout):
+        seen.update(params=params)
+        return line("sh000001", fields(code="", price="3890.11", ts="20261023100000"))
+
+    adapter = TencentAdapter(quote_fetch=fetch, clock=FrozenClock(NOW))
+    batch = adapter.quotes("A", ["sh000001"])
+    assert seen["params"] == {"q": "sh000001"}
+    assert batch.skipped == () and batch.errors == ()
+    assert batch.quotes[0].code == "sh000001"
+    assert batch.quotes[0].price == 3890.11
+
+
+def test_index_and_stock_codes_share_one_request():
+    seen = {}
+
+    def fetch(url, params, *, timeout):
+        seen.update(params=params)
+        rows = [
+            line("sh600519", fields(code="600519", ts="20261023100000")),
+            line("sh000001", fields(code="000001", price="3890.11", ts="20261023100000")),
+        ]
+        return "\n".join(rows)
+
+    adapter = TencentAdapter(quote_fetch=fetch, clock=FrozenClock(NOW))
+    batch = adapter.quotes("A", ["600519", "sh000001"])
+    assert seen["params"] == {"q": "sh600519,sh000001"}
+    assert [q.code for q in batch.quotes] == ["600519", "sh000001"]
+    assert batch.skipped == ()
+
+
 def test_quote_get_maps_429_to_rate_limited(monkeypatch):
     # 429 必须在 raise_for_status 之前判成 RateLimited：路由器对限流退避重试，
     # 对其他异常立刻换源——限流时换源等于把备源也打爆

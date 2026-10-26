@@ -17,6 +17,7 @@ from fastapi.responses import RedirectResponse
 
 from sams.bootstrap import AppCore, ServiceContext
 from sams.core.codes import currency_override
+from sams.core.config import Settings
 from sams.core.errors import SamsError, ValidationError
 from sams.core.quotes import NO_DATA, quote_state
 from sams.services.symbol_search import normalize_query
@@ -173,6 +174,58 @@ def quotes_partial(request: Request):
     return web.render(
         request, "partials/quotes.html", rows=_quote_rows(ctx, web.core, user.id, now)
     )
+
+
+@router.get("/api/partials/indices")
+def indices_partial(request: Request):
+    """大盘条 fragment：与 quotes partial 同一套「首屏服务端渲染 + htmx 重拉」。"""
+    require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    return web.render(
+        request, "partials/indices.html", segments=_index_rows(ctx, web.core, ctx.settings)
+    )
+
+
+def _index_rows(ctx: ServiceContext, core: AppCore, settings: Settings) -> list[dict]:
+    """报价板新鲜就用板，否则用库内最后一行：休市看不到数，是这一屏最大的旧痛点（D145）。"""
+    segments = []
+    for market in sorted(settings.markets):
+        rows = []
+        unit = _price_unit(ctx, market)
+        for index_code in settings.indices.for_market(market):
+            quote = core.board.get(market, index_code)
+            if quote is not None and not quote.is_stale and quote.price is not None:
+                rows.append(
+                    {
+                        "code": index_code,
+                        "label": settings.indices.label(index_code),
+                        "value": quote.price,
+                        "pct": quote.pct_chg,
+                        "pct_class": pct_class(quote.pct_chg),
+                        "at": "实时",
+                        "unit": unit,
+                    }
+                )
+                continue
+            latest = ctx.index_daily_store.latest_with_change(market, index_code)
+            if latest is None:
+                # 板和库都没有：这一行整个不出现，而不是摆一个「—」冒充有数
+                continue
+            rows.append(
+                {
+                    "code": index_code,
+                    "label": settings.indices.label(index_code),
+                    "value": latest.close,
+                    "pct": latest.change_pct,
+                    "pct_class": pct_class(latest.change_pct),
+                    "at": f"{latest.day:%m-%d} 收盘",
+                    "unit": unit,
+                }
+            )
+        if rows:
+            segments.append({"market": market, "rows": rows})
+    return segments
 
 
 @router.get("/api/symbol-search")

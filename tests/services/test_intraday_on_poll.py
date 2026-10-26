@@ -52,6 +52,9 @@ class _Universe:
     def codes(self, market):
         return ("601088",)
 
+    def indices(self, market):
+        return ()
+
 
 def monitor(settings, on_poll) -> IntradayMonitor:
     # settings夹具带 A/HK/US 三个市场；本模块只关心「一轮=一个市场」的挂钩语义，

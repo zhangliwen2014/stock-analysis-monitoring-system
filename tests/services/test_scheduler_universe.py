@@ -154,6 +154,28 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
     assert universe.codes("hk") == ("00700",)
 
 
+def test_build_carries_the_configured_indices(db, settings):
+    """指数清单进 universe 但不进股票格：票跟着用户走，指数跟着设置走（D145）。"""
+    accounts = SimAccountRepo(db)
+    universe = UniverseBuilder(
+        users=UserRepo(db),
+        watchlists=WatchlistRepo(db),
+        accounts=accounts,
+        orders=SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db)),
+        rules=RuleRepo(db),
+        theses=ThesisRepo(db),
+        data=StubData(WatchlistRepo(db)),
+        settings=settings,
+    ).build()
+    for market in settings.markets:
+        assert universe.indices(market) == settings.indices.for_market(market)
+    assert "sh000001" in universe.indices("A")
+    # 指数不混进股票并集：000001 撞车（平安银行 vs 上证指数）正是分格的原因
+    assert "sh000001" not in universe.codes("A")
+    # 查询侧与市场名归一同口径
+    assert universe.indices("hk") == settings.indices.for_market("HK")
+
+
 def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, caplog):
     """展开失败的规则只跳过自己，其余对象照常进入采集。
 
