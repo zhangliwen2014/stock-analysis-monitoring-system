@@ -193,7 +193,6 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
     segments = []
     for market in sorted(settings.markets):
         rows = []
-        unit = _price_unit(ctx, market)
         market_open = _market_open(ctx, market, now)
         for index_code in settings.indices.for_market(market):
             quote = core.board.get(market, index_code)
@@ -214,7 +213,6 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
                         "pct": quote.pct_chg,
                         "pct_class": pct_class(quote.pct_chg),
                         "at": state_label(state),
-                        "unit": unit,
                     }
                 )
                 continue
@@ -231,7 +229,6 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
                     "pct": latest.change_pct,
                     "pct_class": pct_class(latest.change_pct),
                     "at": index_close_label(latest.day),
-                    "unit": unit,
                 }
             )
         if rows:

@@ -98,13 +98,16 @@ class SymbolListRepo:
             "       WHEN s.code = p.q_up THEN 1"
             "       WHEN s.py_initials = p.q_low THEN 2"
             "       WHEN s.py_full = p.q_low THEN 3"
-            "       WHEN starts_with(s.py_initials, p.q_low) OR starts_with(s.code, p.q_up) THEN 4"
+            "       WHEN starts_with(s.py_initials, p.q_low)"
+            "         OR starts_with(s.code, p.q_up) OR starts_with(s.py_full, p.q_low) THEN 4"
             "       ELSE 5"
             "     END AS tier"
             "   FROM symbol_master s, p"
             "   WHERE s.is_active AND ("
             "     s.code = p.q_up OR s.py_initials = p.q_low OR s.py_full = p.q_low"
             "     OR starts_with(s.code, p.q_up) OR starts_with(s.py_initials, p.q_low)"
+            "     OR starts_with(s.py_full, p.q_low)"
+            "     OR contains(s.code, p.q_up)"
             "     OR contains(lower(s.name), p.q_low) OR contains(s.py_full, p.q_low))"
             ") ORDER BY tier, market, code LIMIT ?",
             [q.upper(), q.lower(), limit],

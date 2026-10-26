@@ -121,6 +121,43 @@ def test_search_rejects_blank_query(repo):
     assert repo.search("   ") == []
 
 
+def test_search_fullpinyin_prefix_is_tier4_not_fragment(repo):
+    """D142 第 4 档含全拼前缀：`pingan` 是 000001 的全拼开头（第 4 档），
+    而对照票只是全拼里含 `pingan`（第 5 档）——旧写法把前者也落下第 5 档，
+    对照票码更小、market/code 兜底序反而把它排前面，档位就露馅。"""
+    repo.upsert_batch(
+        "A",
+        [
+            {
+                "code": "000000",
+                "name": "华平金融",
+                "py_initials": "hpjr",
+                "py_full": "huapinganjirong",
+                "currency": "CNY",
+            }
+        ],
+    )
+    assert [row["code"] for row in repo.search("pingan")] == ["000001", "000000"]
+
+
+def test_search_code_fragment_finds_inner_digits(repo):
+    """敲「0028」要能找到 000028：`contains(code)` 只在 WHERE 放行，档位落第 5 段。"""
+    repo.upsert_batch(
+        "A",
+        [
+            {
+                "code": "000028",
+                "name": "深圳市情",
+                "py_initials": "szsq",
+                "py_full": "shenzhenshiqing",
+                "currency": "CNY",
+            }
+        ],
+    )
+    hits = {(row["market"], row["code"]) for row in repo.search("0028")}
+    assert ("A", "000028") in hits
+
+
 def test_deactivate_missing_counts(repo):
     assert repo.deactivate_missing("A", ["000001"]) == 2
     assert repo.count("A") == 1

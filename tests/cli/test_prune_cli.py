@@ -39,7 +39,7 @@ def config_path(tmp_path, monkeypatch):
 
 
 def seed(db_path):
-    """10 行快照（HK 7 天 + A 3 天）、3 行台账、5 条心跳。"""
+    """10 行快照（HK 7 天 + A 3 天）、3 行台账、5 条心跳、一条过期的补数 done 行。"""
     database = Database.open(db_path)
     try:
         today = date.today()
@@ -67,6 +67,13 @@ def seed(db_path):
                 " VALUES (?, ?, ?)",
                 [f"beat-{index}", beat, beat],
             )
+        # 结案 100 天的 done 行：默认 90 天的保留窗该把它收走（终审 重要1）
+        database.execute(
+            "INSERT INTO symbol_backfills"
+            " (id, market, code, tries, status, open_key, created_at, done_at)"
+            " VALUES ('done-old', 'A', '600519', 0, 'done', NULL, ?, ?)",
+            [now - timedelta(days=100), now - timedelta(days=100)],
+        )
     finally:
         database.close()
 
@@ -100,12 +107,14 @@ def test_prune_dry_run_prints_counts_and_leaves_the_database_untouched(config_pa
     assert "quotes_snapshot: 将删除 2 行" in out
     assert "task_runs: 将删除 2 行" in out
     assert "scheduler_heartbeats: 将删除 3 行" in out
-    assert "预计: 7 行" in out
+    assert "symbol_backfills: 将删除 1 行" in out
+    assert "预计: 8 行" in out
 
     database = open_db(config_path)
     try:
         assert database.row_count("quotes_snapshot") == 10
         assert database.row_count("scheduler_heartbeats") == 5
+        assert database.row_count("symbol_backfills") == 1
         assert database.scalar("SELECT count(*) FROM task_runs WHERE job_name = 'prune'") == 0
     finally:
         database.close()
@@ -131,12 +140,14 @@ def test_prune_deletes_and_writes_one_row_per_step(config_path, capsys):
     )
     out = capsys.readouterr().out
     assert "quotes_snapshot: 删除 2 行" in out
-    assert "合计: 7 行" in out
+    assert "symbol_backfills: 删除 1 行" in out
+    assert "合计: 8 行" in out
 
     database = open_db(config_path)
     try:
         assert database.row_count("quotes_snapshot") == 8
         assert database.row_count("scheduler_heartbeats") == 2
+        assert database.row_count("symbol_backfills") == 0
         rows = database.query(
             "SELECT note, rows_affected FROM task_runs"
             " WHERE job_name = 'prune' ORDER BY rowid"
@@ -145,15 +156,16 @@ def test_prune_deletes_and_writes_one_row_per_step(config_path, capsys):
             "quotes_snapshot",
             "task_runs",
             "scheduler_heartbeats",
+            "symbol_backfills",
         ]
-        assert [row["rows_affected"] for row in rows] == [2, 2, 3]
+        assert [row["rows_affected"] for row in rows] == [2, 2, 3, 1]
     finally:
         database.close()
 
 
 @pytest.mark.parametrize(
     "flag",
-    ["--quotes-sessions", "--task-runs-days", "--heartbeats-keep"],
+    ["--quotes-sessions", "--task-runs-days", "--heartbeats-keep", "--backfill-done-days"],
 )
 def test_zero_retention_is_a_usage_error(config_path, flag):
     """敲错开关是用法错误（退出 2），不是「这次没删东西」（退出 0）。"""

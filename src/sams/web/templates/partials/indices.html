@@ -6,7 +6,8 @@
     {% for row in segment.rows %}
     <span class="badge">
       {{ row.label }}
-      <strong class="num">{{ money(row.value, row.unit) }}</strong>
+      {# 指数点数不是钱：D145 的读数额外不带币种（终审 重要2） #}
+      <strong class="num">{{ money(row.value) }}</strong>
       <span class="{{ row.pct_class }}">{{ pct(row.pct) }}</span>
       <span class="muted">{{ row.at }}</span>
     </span>

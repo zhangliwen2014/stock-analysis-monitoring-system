@@ -8,6 +8,7 @@ unique index，唯一索引里 NULL 互不冲突，于是「开放期只许一�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import uuid4
 
 from sams.storage.db import Database
@@ -105,3 +106,20 @@ class SymbolBackfillRepo:
             [f"{market}|{code}"],
         )
         return None if rows.is_empty() else BackfillRow(**rows.to_dicts()[0])
+
+    def count_done_before(self, cutoff: datetime) -> int:
+        """只数结案早于 `cutoff` 的 done 行（判据 <，与 task_runs 同一族）：
+        pending/deferred 带着 `open_key` 语义，保留策略永远不动它们。"""
+        return int(
+            self.db.scalar(
+                "SELECT count(*) FROM symbol_backfills WHERE status = 'done' AND done_at < ?",
+                [cutoff],
+            )
+            or 0
+        )
+
+    def delete_done_before(self, cutoff: datetime) -> None:
+        self.db.execute(
+            "DELETE FROM symbol_backfills WHERE status = 'done' AND done_at < ?",
+            [cutoff],
+        )

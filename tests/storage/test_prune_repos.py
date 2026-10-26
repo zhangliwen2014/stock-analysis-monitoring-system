@@ -13,7 +13,10 @@ from support import FrozenClock
 
 from sams.core.errors import ValidationError
 from sams.storage.repos.quotes import QuoteRepo
+from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
+
+NOW = datetime(2026, 10, 23, 4, 0, tzinfo=UTC)
 
 
 def add_quote(db, market, code, day, *, price=10.0):
@@ -103,3 +106,28 @@ def test_heartbeats_keep_rejects_zero(db):
         HeartbeatRepo(db).count_beyond(0)
     with pytest.raises(ValidationError, match="keep"):
         HeartbeatRepo(db).delete_beyond(0)
+
+
+def add_backfill(db, row_id, *, status, done_at=None):
+    db.execute(
+        "INSERT INTO symbol_backfills"
+        " (id, market, code, tries, status, open_key, created_at, done_at)"
+        " VALUES (?, 'A', ?, 0, ?, ?, ?, ?)",
+        [row_id, row_id, status, None if status == "done" else f"A|{row_id}", NOW, done_at],
+    )
+
+
+def test_backfill_only_old_done_rows_are_counted_and_deleted(db):
+    """done 行的回收边界：判据 `< cutoff` 与 task_runs 同一族；pending/deferred 永远不动——
+    deferred 带着 `open_key`，删了它就等于把「今天试满了」的票重新排一遍。"""
+    repo = SymbolBackfillRepo(db)
+    add_backfill(db, "done-old", status="done", done_at=NOW - timedelta(days=100))
+    add_backfill(db, "done-edge", status="done", done_at=NOW - timedelta(days=90))
+    add_backfill(db, "done-new", status="done", done_at=NOW - timedelta(days=1))
+    add_backfill(db, "pend", status="pending")
+    add_backfill(db, "defer", status="deferred")
+    cutoff = NOW - timedelta(days=90)
+    assert repo.count_done_before(cutoff) == 1, "等于边界的那一行要留下：判据是 < 不是 <="
+    repo.delete_done_before(cutoff)
+    left = db.query("SELECT id FROM symbol_backfills ORDER BY id").to_dicts()
+    assert [row["id"] for row in left] == ["defer", "done-edge", "done-new", "pend"]

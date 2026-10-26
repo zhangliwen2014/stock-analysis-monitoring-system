@@ -6,7 +6,12 @@ import argparse
 
 from sams.cli.common import group
 from sams.services.annotation_prune import ORPHAN_DAYS, PURGED_DAYS
-from sams.services.prune import KEEP_HEARTBEATS, KEEP_QUOTE_SESSIONS, KEEP_TASK_RUN_DAYS
+from sams.services.prune import (
+    KEEP_BACKFILL_DONE_DAYS,
+    KEEP_HEARTBEATS,
+    KEEP_QUOTE_SESSIONS,
+    KEEP_TASK_RUN_DAYS,
+)
 
 
 def _positive(text: str) -> int:
@@ -30,7 +35,7 @@ def add_to(subparsers) -> None:
 
     parser = actions.add_parser(
         "prune",
-        help="按保留策略清理报价快照、任务台账与调度心跳（sams serve 每日 UTC 03:30 也执行）",
+        help="按保留策略清理快照、台账、心跳与补数结案行（sams serve 每日 UTC 03:30 也执行）",
     )
     parser.add_argument(
         "--quotes-sessions",
@@ -52,6 +57,13 @@ def add_to(subparsers) -> None:
         default=KEEP_HEARTBEATS,
         metavar="N",
         help=f"调度心跳只留最近 N 条（默认 {KEEP_HEARTBEATS}）",
+    )
+    parser.add_argument(
+        "--backfill-done-days",
+        type=_positive,
+        default=KEEP_BACKFILL_DONE_DAYS,
+        metavar="N",
+        help=f"补数 done 行只保留结案后 N 天（默认 {KEEP_BACKFILL_DONE_DAYS}）",
     )
     parser.add_argument(
         "--annotations-purged-days",
@@ -95,6 +107,7 @@ def prune(container, args) -> int:
         quotes_sessions=args.quotes_sessions,
         task_runs_days=args.task_runs_days,
         heartbeats_keep=args.heartbeats_keep,
+        backfill_done_days=args.backfill_done_days,
         annotations_purged_days=args.annotations_purged_days,
         attachments_orphan_days=args.attachments_orphan_days,
         dry_run=args.dry_run,

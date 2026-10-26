@@ -11,6 +11,7 @@ from support import FrozenClock
 from sams.core.errors import ValidationError
 from sams.services.prune import PruneService
 from sams.storage.repos.quotes import QuoteRepo
+from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
 
 NOW = datetime(2026, 10, 23, 4, 0, tzinfo=UTC)
@@ -23,6 +24,7 @@ def make(db, clock=None):
         quotes=QuoteRepo(db),
         task_runs=TaskRunRepo(db, clock=clock),
         heartbeats=HeartbeatRepo(db, clock=clock),
+        backfills=SymbolBackfillRepo(db),
         clock=clock,
     )
 
@@ -58,35 +60,75 @@ def seed_heartbeats(db):
         clock.advance(minutes=1)
 
 
+def seed_backfills(db):
+    # 只有过期的 done 该走：pending/deferred 带着 `open_key` 语义，一条都不许动
+    for row_id, status, done_at in (
+        ("done-old", "done", NOW - timedelta(days=100)),
+        ("done-new", "done", NOW - timedelta(days=1)),
+        ("pend", "pending", None),
+        ("defer", "deferred", None),
+    ):
+        db.execute(
+            "INSERT INTO symbol_backfills"
+            " (id, market, code, tries, status, open_key, created_at, done_at)"
+            " VALUES (?, 'A', ?, 0, ?, ?, ?, ?)",
+            [
+                row_id,
+                row_id,
+                status,
+                None if status == "done" else f"A|{row_id}",
+                NOW,
+                done_at,
+            ],
+        )
+
+
 def test_run_deletes_by_the_three_retention_windows(db):
     seed_quotes(db)
     seed_task_runs(db)
     seed_heartbeats(db)
+    seed_backfills(db)
     report = make(db).run(quotes_sessions=5, task_runs_days=90, heartbeats_keep=2)
     assert report.dry_run is False
     assert [(step.name, step.rows) for step in report.steps] == [
         ("quotes_snapshot", 2),
         ("task_runs", 2),
         ("scheduler_heartbeats", 3),
+        ("symbol_backfills", 1),
     ]
-    assert report.total == 7
+    assert report.total == 8
     assert db.scalar("SELECT count(*) FROM quotes_snapshot WHERE market = 'A'") == 3
     assert db.scalar("SELECT count(*) FROM quotes_snapshot WHERE market = 'HK'") == 5
     left = db.query("SELECT id FROM task_runs WHERE job_name = 'bars'").to_dicts()
     assert [row["id"] for row in left] == ["new"]
     assert db.row_count("scheduler_heartbeats") == 2
+    assert db.query(
+        "SELECT id FROM symbol_backfills ORDER BY id"
+    ).to_dicts() == [{"id": row_id} for row_id in ("defer", "done-new", "pend")]
+
+
+def test_backfill_done_days_is_its_own_knob(db):
+    """done 行的天数独立可调：与 task_runs 同默认，但改一个不许牵动另一个。"""
+    seed_backfills(db)
+    report = make(db).run(
+        quotes_sessions=5, task_runs_days=90, heartbeats_keep=2, backfill_done_days=2
+    )
+    assert ("symbol_backfills", 1) in [(step.name, step.rows) for step in report.steps]
+    assert db.row_count("symbol_backfills") == 3
 
 
 def test_dry_run_counts_are_the_same_numbers_and_change_nothing(db):
     seed_quotes(db)
     seed_task_runs(db)
     seed_heartbeats(db)
+    seed_backfills(db)
     service = make(db)
     dry = service.run(quotes_sessions=5, task_runs_days=90, heartbeats_keep=2, dry_run=True)
-    assert [step.rows for step in dry.steps] == [2, 2, 3]
+    assert [step.rows for step in dry.steps] == [2, 2, 3, 1]
     assert db.row_count("quotes_snapshot") == 10, "dry-run 一行都不删"
     assert db.row_count("task_runs") == 3
     assert db.row_count("scheduler_heartbeats") == 5
+    assert db.row_count("symbol_backfills") == 4
     real = service.run(quotes_sessions=5, task_runs_days=90, heartbeats_keep=2)
     assert [step.rows for step in real.steps] == [step.rows for step in dry.steps]
 
@@ -95,6 +137,7 @@ def test_each_step_leaves_one_prune_row(db):
     seed_quotes(db)
     seed_task_runs(db)
     seed_heartbeats(db)
+    seed_backfills(db)
     make(db).run(quotes_sessions=5, task_runs_days=90, heartbeats_keep=2)
     rows = db.query(
         "SELECT note, rows_affected, status FROM task_runs"
@@ -104,8 +147,9 @@ def test_each_step_leaves_one_prune_row(db):
         "quotes_snapshot",
         "task_runs",
         "scheduler_heartbeats",
+        "symbol_backfills",
     ]
-    assert [row["rows_affected"] for row in rows] == [2, 2, 3]
+    assert [row["rows_affected"] for row in rows] == [2, 2, 3, 1]
     assert all(row["status"] == "ok" for row in rows)
 
 
@@ -115,6 +159,7 @@ def test_each_step_leaves_one_prune_row(db):
         {"quotes_sessions": 0},
         {"task_runs_days": 0},
         {"heartbeats_keep": 0},
+        {"backfill_done_days": 0},
     ],
 )
 def test_zero_retention_is_refused(db, kwargs):
@@ -124,7 +169,7 @@ def test_zero_retention_is_refused(db, kwargs):
 
 
 def test_a_failing_step_rolls_back_the_earlier_deletes(db, monkeypatch):
-    """三个删除是一个写单元：心跳那一步失败时，报价与台账已经删掉的行必须回来。
+    """四个删除是一个写单元：心跳那一步失败时，报价与台账已经删掉的行必须回来。
 
     否则「库磁盘满了」的后果不是一次失败的清理，而是「快照少了两天、台账多了三行
     写着已清理」——下一次清理看到的是一份没删干净的账。
@@ -132,6 +177,7 @@ def test_a_failing_step_rolls_back_the_earlier_deletes(db, monkeypatch):
     seed_quotes(db)
     seed_task_runs(db)
     seed_heartbeats(db)
+    seed_backfills(db)
     service = make(db)
 
     def boom(_keep):
@@ -143,6 +189,7 @@ def test_a_failing_step_rolls_back_the_earlier_deletes(db, monkeypatch):
     assert db.row_count("quotes_snapshot") == 10
     assert db.row_count("task_runs") == 3
     assert db.row_count("scheduler_heartbeats") == 5
+    assert db.row_count("symbol_backfills") == 4
 
 
 def test_annotation_steps_appear_only_when_they_have_something_to_do(tmp_path, db):
@@ -164,6 +211,7 @@ def test_annotation_steps_appear_only_when_they_have_something_to_do(tmp_path, d
         quotes=QuoteRepo(db),
         task_runs=TaskRunRepo(db, clock=clock),
         heartbeats=HeartbeatRepo(db, clock=clock),
+        backfills=SymbolBackfillRepo(db),
         annotations=pruner,
         clock=clock,
     )
@@ -196,6 +244,7 @@ def test_dry_run_reports_files_without_deleting_them(tmp_path, db):
         quotes=QuoteRepo(db),
         task_runs=TaskRunRepo(db, clock=clock),
         heartbeats=HeartbeatRepo(db, clock=clock),
+        backfills=SymbolBackfillRepo(db),
         annotations=pruner,
         clock=clock,
     )
@@ -234,6 +283,7 @@ def test_retention_values_reach_the_annotation_side(tmp_path, db, monkeypatch):
         quotes=QuoteRepo(db),
         task_runs=TaskRunRepo(db, clock=clock),
         heartbeats=HeartbeatRepo(db, clock=clock),
+        backfills=SymbolBackfillRepo(db),
         annotations=pruner,
         clock=clock,
     )

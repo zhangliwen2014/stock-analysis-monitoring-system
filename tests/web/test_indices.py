@@ -98,6 +98,16 @@ def test_market_closed_shows_last_close(logged):
     assert "上证指数" in r.text and "收盘" in r.text and "10-21" in r.text
     # 涨跌幅是库算好的那一列（+1%），不是读取侧再翻历史
     assert "+1.00%" in r.text
+    assert "101.00" in r.text
+
+
+def test_index_points_carry_no_currency(logged):
+    """D145 的读数没有币种：「上证指数 3,890.11 元」把点数说成了钱（终审 重要2）。"""
+    _seed_index(logged.context, [100.0, 101.0])
+    r = logged.client.get("/api/partials/indices")
+    assert "101.00" in r.text
+    for unit in (" 元", " 港元", " 美元"):
+        assert unit not in r.text
 
 
 def test_closed_market_does_not_label_the_board_quote_live(logged_at):
@@ -123,6 +133,7 @@ def test_open_market_board_quote_wins_with_live_badge(logged_at):
     r = page.client.get("/api/partials/indices")
     assert "实时" in r.text
     assert "3,900.00" in r.text and "+0.50%" in r.text
+    assert " 元" not in r.text
     # 两个口径同屏会让读数的人猜哪个是现在的
     assert "收盘" not in r.text
 

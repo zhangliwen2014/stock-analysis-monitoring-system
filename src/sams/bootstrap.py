@@ -643,6 +643,7 @@ def _context_on(
         quotes=quotes_store,
         task_runs=task_runs,
         heartbeats=heartbeats,
+        backfills=backfills_store,
         annotations=annotation_pruner,
         clock=clock,
     )
@@ -941,6 +942,7 @@ class FreshPruneRunner:
                 quotes=QuoteRepo(database),
                 task_runs=TaskRunRepo(database, clock=self.clock),
                 heartbeats=HeartbeatRepo(database, clock=self.clock),
+                backfills=SymbolBackfillRepo(database),
                 clock=self.clock,
             ).run(dry_run=dry_run)
         finally:
@@ -1021,6 +1023,7 @@ def build_serve(
             quotes=maintenance_ctx.quotes_store,
             task_runs=maintenance_ctx.task_runs,
             heartbeats=maintenance_ctx.heartbeats,
+            backfills=maintenance_ctx.backfills_store,
             annotations=maintenance_ctx.annotation_pruner,
             clock=core.clock,
         )
