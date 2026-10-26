@@ -86,6 +86,10 @@ class SymbolListRepo:
 
         CTE `p` 只为了让 `?` 各出现一次——十来个重复 `?` 的实参表错位都错得安静。
         """
+        # 空检索词在 contains/starts_with 下全表命中，空 py 列的无名票会落进第 2 档。
+        # 调用方 normalize_query 已保证非空，这里是仓库层自守，不靠调用方的自觉。
+        if not q.strip():
+            return []
         rows = self.db.query(
             "WITH p AS (SELECT ? AS q_up, ? AS q_low)"
             " SELECT market, code, name, py_initials, py_full FROM ("

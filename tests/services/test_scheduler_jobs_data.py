@@ -35,6 +35,7 @@ from sams.services.scheduler.jobs import (
 )
 from sams.services.scheduler.types import JobContext, JobDeps
 from sams.services.scheduler.universe import Universe
+from sams.services.symbol_master import SymbolMasterSummary
 from sams.services.sync import SyncService
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
@@ -468,6 +469,31 @@ def test_symbol_master_failure_is_one_market_named_error(db, settings):
     assert len(outcome.errors) == 1 and "A" in outcome.errors[0]
     assert outcome.ok is False
     assert "失败" in outcome.note
+
+
+def test_symbol_master_kept_old_shows_in_note(db, settings):
+    """全链空答复、旧表原样保留（D147）：这是 ok 的一轮，note 得把「保留旧表」写进去。
+
+    若沿用「0 行、关停 0」的文案，健康页上和「真的没有新代码」分不开——
+    保留旧表与同步到 0 行是两种处置，note 是唯一能说出这个区别的地方。
+    """
+
+    class KeptOldMaster:
+        def sync(self, market):
+            return SymbolMasterSummary(
+                market=market,
+                source=None,
+                rows=0,
+                deactivated=0,
+                degraded=False,
+                kept_old=True,
+            )
+
+    outcome = run_symbol_master(
+        replace(deps(db, settings), symbol_master=KeptOldMaster()), ctx()
+    )
+    assert outcome.ok is True
+    assert "保留旧表" in outcome.note
 
 
 def test_build_jobs_registers_indices_only_with_repo_and_capability(db, settings):

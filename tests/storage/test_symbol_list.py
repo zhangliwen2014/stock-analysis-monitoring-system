@@ -114,6 +114,13 @@ def test_search_skips_inactive_and_caps(repo):
     assert repo.search("000001") == []
 
 
+def test_search_rejects_blank_query(repo):
+    """空检索词是仓库层的自守：`contains(x, "")` 全表真，无名票（空 py 列）会整个落进第 2 档。
+    现有调用方 `normalize_query` 已保证非空，但仓库不该依赖调用方的自觉。"""
+    assert repo.search("") == []
+    assert repo.search("   ") == []
+
+
 def test_deactivate_missing_counts(repo):
     assert repo.deactivate_missing("A", ["000001"]) == 2
     assert repo.count("A") == 1

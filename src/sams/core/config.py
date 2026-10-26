@@ -256,6 +256,8 @@ class Settings:
         # 而没有任何一屏能解释它为什么在那里
         for market_name in markets:
             given = (idx_raw.get(market_name) or {}).get("codes")
+            if given is not None and not isinstance(given, (list, tuple)):
+                raise ValidationError(f"[indices.{market_name}] codes 必须是代码数组")
             codes_by_market[market_name] = (
                 tuple(given) if given else tuple(DEFAULT_INDEX_CODES.get(market_name, ()))
             )

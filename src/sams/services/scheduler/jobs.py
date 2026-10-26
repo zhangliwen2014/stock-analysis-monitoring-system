@@ -177,7 +177,11 @@ def run_symbol_master(deps: JobDeps, ctx: JobContext) -> JobOutcome:
         return JobOutcome(note=f"{ctx.market} 代码表失败", errors=(f"{ctx.market}: {exc}",))
     return JobOutcome(
         rows_affected=summary.rows,
-        note=f"{ctx.market} 代码表 {summary.rows} 行、关停 {summary.deactivated}",
+        note=(
+            f"{ctx.market} 代码表空答复，保留旧表"
+            if summary.kept_old
+            else f"{ctx.market} 代码表 {summary.rows} 行、关停 {summary.deactivated}"
+        ),
     )
 
 

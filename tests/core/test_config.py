@@ -279,3 +279,13 @@ sh000001 = "沪综指"
     assert s.indices.for_market("A") == ("sh000001",)
     assert s.indices.label("sh000001") == "沪综指"
     assert s.indices.label("unknown") == "unknown"
+
+
+def test_indices_codes_must_be_an_array(tmp_path):
+    """`codes = "sh000001"` 会被 tuple() 拆成一串单字符「指数」：静默入库，bar 上一条都不认识。"""
+    text = THREE_MARKETS + """
+[indices.A]
+codes = "sh000001"
+"""
+    with pytest.raises(ValidationError, match=r"\[indices\.A\] codes"):
+        Settings.load(write(tmp_path, text))

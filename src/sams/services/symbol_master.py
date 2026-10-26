@@ -15,6 +15,7 @@ from pypinyin import Style, lazy_pinyin
 
 from sams.core.codes import currency_override
 from sams.core.config import MarketCfg
+from sams.datasource.registry import AdapterRegistry
 from sams.storage.repos.symbol_list import SymbolListRepo
 
 logger = logging.getLogger("sams.services.symbol_master")
@@ -41,7 +42,7 @@ class SymbolMasterSummary:
 class SymbolMasterSyncService:
     def __init__(
         self,
-        registry,
+        registry: AdapterRegistry,
         symbol_list: SymbolListRepo,
         markets: dict[str, MarketCfg],
     ) -> None:
