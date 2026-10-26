@@ -31,6 +31,7 @@ from sams.monitor.queue import (
 )
 from sams.monitor.router import NotifyService
 from sams.services.accounts import AccountService
+from sams.services.admin_access import BreakGlassService
 from sams.services.analysis import AnalysisService
 from sams.services.annotation_context import AnnotationContextProvider
 from sams.services.annotation_prune import AnnotationPruner
@@ -71,6 +72,7 @@ from sams.services.valuation import ValuationService
 from sams.storage.crypto import Cipher, cipher_for
 from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
+from sams.storage.repos.admin_access import AdminAccessRepo
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
 from sams.storage.repos.app_settings import AppSettingsRepo
@@ -222,6 +224,10 @@ class ServiceContext:
     annotation_pruner: AnnotationPruner
     #: 运行时策略（D127）：首期只有团队共享开关，推送 provider 每次都问它
     app_settings: AppSettingsRepo
+    #: break-glass 授权仓库（D139）：表 0020 就铺好了，这里是它唯一的读者
+    admin_access_store: AdminAccessRepo
+    #: 单条限时授权的用例：admin 页的「能不能读这条正文」问的就是它
+    break_glass: BreakGlassService
     #: 推送上下文的 provider：注入给 `notify`（构造顺序在它之后，见 `_context_on`）
     annotation_context: AnnotationContextProvider
     #: 闭环用例：`sams alert handle` 走的就是它（spec §8.2/§8.3）
@@ -515,6 +521,9 @@ def _context_on(
     # （D127），漏接线会在构造 AnnotationService 时直接 TypeError——比第一次被拒的批注诚实
     app_settings = AppSettingsRepo(database, clock=clock)
     annotations_store = AnnotationRepo(database, clock=clock)
+    # break-glass 排在批注仓库之后：授权前要先能问到那一行（墓碑判断，D139）
+    admin_access_store = AdminAccessRepo(database, clock=clock)
+    break_glass = BreakGlassService(admin_access_store, annotations_store, clock=clock)
     annotations = AnnotationService(
         annotations_store,
         users,
@@ -686,6 +695,8 @@ def _context_on(
         attachments=attachments,
         annotation_pruner=annotation_pruner,
         app_settings=app_settings,
+        admin_access_store=admin_access_store,
+        break_glass=break_glass,
         annotation_context=annotation_context,
         review=review,
         rules_store=rules_store,
