@@ -1044,7 +1044,7 @@ admin 侧（`/admin/annotations` 元数据与用量、团队共享开关、D139 
 每人每小时 5 次、理由进审计）全部落地。
 关键偏差都有出处：`handled` 保留为 acted 不迁旧数据（D124）、trade 引用由服务端铸（D125）、
 附件缩略图与张数同源、admin 附件走新加的 `/admin/.../attachments/...`（「同权」的可执行形状）。
-离线 `uv run pytest -q` <全量数> passed，全绿。
+离线 `uv run pytest -q` 3969 passed，全绿。
 
 ### M5 范围
 
