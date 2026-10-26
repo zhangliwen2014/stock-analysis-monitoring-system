@@ -84,9 +84,6 @@ def _quote_rows(
                 # 主档没这一行（采集还没跑过这个市场）时名称交代码而不是空串：空白格
                 # 读起来像页面坏了，而代码本身就在那一列里站着
                 "name": master.get("name") or item.code,
-                # 有没有主档决定这一行肯不肯挂 /symbol 链接：`_require_symbol` 对查无此码
-                # 一律 404（不区分「没这行」与「没这码」是有意的），挂上去就是死路一条
-                "has_master": symbol is not None,
                 "unit": _price_unit(ctx, item.market, item.code),
                 "note": item.note or "",
                 "price": quote.price if quote else None,

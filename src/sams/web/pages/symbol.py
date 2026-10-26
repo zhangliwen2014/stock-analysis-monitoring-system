@@ -15,20 +15,20 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import NotAdjustable
 from sams.core.quotes import NO_DATA, quote_state
-from sams.web.auth import require_user
+from sams.web.auth import csrf_protect, require_user
 from sams.web.display import hms, moment_label, pct_class, state_label
 from sams.web.pages.dashboard import _market_open
 
 router = APIRouter()
 
 
-def _require_symbol(request: Request, market: str, code: str):
+def _require_symbol(request: Request, user, market: str, code: str):
     """市场没配或库里没有这只票都是 404：不给探测者区分「没有」与「不是你的」。
 
     进来的 URL 先归一再比：库里的键只有一个形态（`canonical_code`），而人能敲出来的
@@ -36,14 +36,22 @@ def _require_symbol(request: Request, market: str, code: str):
     自己会归一），接着的每一眼都过不去——行情板的键是 `(quote.market, quote.code)` 精确
     取、论与告警存的都是归一后的代码，于是 /symbol/HK/700 给一只确实存在的票画出
     「无行情 + 三张空表」。归一一次，下游全部用归一后的这一对。
+
+    主档没有但代码表有 = 「全市场认识这只票、本地档案还没追上」：兜底建行走
+    `SymbolInterest.ensure`（顺带排补数），不再 404（D146）。两个都没有才 404，
+    措辞不变——不给探测者区分「没有」与「不是你的」。
     """
     web = request.app.state.web
     ctx = web.contexts.current()
     market = canonical_market(market)
     code = canonical_code(market, code)
     if market not in ctx.settings.markets:
+        # 挡住兜底：ensure 要拿 `markets[market]` 的币种，市场没配置会在服务层 KeyError
         raise HTTPException(status_code=404)
     row = ctx.symbols.get(market, code)
+    if row is None and ctx.symbol_list_store.get(market, code) is not None:
+        ctx.symbol_interest.ensure(market, code, actor=user.username)
+        row = ctx.symbols.get(market, code)
     if row is None:
         raise HTTPException(status_code=404)
     return ctx, market, code, row
@@ -66,7 +74,7 @@ def _ref_matches(target_ref: str, market: str, code: str) -> bool:
 def symbol_page(request: Request, market: str, code: str):
     user = require_user(request)
     web = request.app.state.web
-    ctx, market, code, symbol = _require_symbol(request, market, code)
+    ctx, market, code, symbol = _require_symbol(request, user, market, code)
     core = web.core
     now = core.clock.now_utc()
     tz = ctx.settings.server.display_tz
@@ -109,6 +117,20 @@ def symbol_page(request: Request, market: str, code: str):
         for alert in ctx.alerts_store.list_for(user.id, market=market, code=code, limit=10)
     ]
 
+    # 空态那一屏的话分三档：队列 deferred（今天试满了）、pending（刚排的）、和压根没排
+    # （主档早就在、只是从没有人求过数）——最后一档说「下一拍会自动补」，不编排队状态
+    no_bars = ctx.bars.count(market, code) == 0
+    backfill_row = ctx.backfills_store.open_for(market, code)
+    backfill_note = None
+    if backfill_row is not None:
+        if backfill_row.status == "deferred":
+            backfill_note = (
+                f"今天已试过 {backfill_row.tries} 次都没成（{backfill_row.last_error}），"
+                "今晚随盘后任务再试。"
+            )
+        else:
+            backfill_note = "已排队，下一拍自动开始（一拍至多三只，前面的队首先走）。"
+
     return web.render(
         request,
         "symbol.html",
@@ -124,14 +146,16 @@ def symbol_page(request: Request, market: str, code: str):
         rules=rules,
         theses=theses,
         alerts=alerts,
+        no_bars=no_bars,
+        backfill_note=backfill_note,
     )
 
 
 @router.get("/api/symbol/{market}/{code}/bars")
 def bars_api(request: Request, market: str, code: str, days: int = 120):
-    require_user(request)
+    user = require_user(request)
     web = request.app.state.web
-    ctx, market, code, _symbol = _require_symbol(request, market, code)
+    ctx, market, code, _symbol = _require_symbol(request, user, market, code)
     end = web.core.clock.now_utc().date()
     start = end - timedelta(days=max(1, min(days, 2000)))
     try:
@@ -156,3 +180,16 @@ def bars_api(request: Request, market: str, code: str, days: int = 120):
             "note": None,
         }
     )
+
+
+@router.post("/symbol/{market}/{code}/sync")
+def symbol_sync(request: Request, market: str, code: str, _csrf: None = Depends(csrf_protect)):
+    """「立即排一拍」：入队下一拍消费，不承诺同步已经发生（D146 空态按钮）。
+
+    走 `_require_symbol` 是因为按钮本身也该能兜底建行：代码表里的票从空态点一下，
+    主档与队列一起补上，而不是先 404 再让人摸不着头脑。
+    """
+    user = require_user(request)
+    ctx, market, code, _row = _require_symbol(request, user, market, code)
+    ctx.symbol_interest.ensure(market, code, actor=user.username)
+    return RedirectResponse(f"/symbol/{market}/{code}", status_code=303)

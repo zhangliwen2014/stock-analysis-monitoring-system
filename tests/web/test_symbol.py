@@ -189,6 +189,104 @@ def test_symbol_page_normalises_a_loose_code(logged):
     assert "微信是入口" in page.text
 
 
+def _seed_list_row(logged, market="A", code="600519"):
+    """只种代码表（symbol_master），主档与日线都不种：D146 兜底要走的正是这个形态。"""
+    logged.context.symbol_list_store.upsert_batch(
+        market,
+        [
+            {
+                "code": code,
+                "name": "贵州茅台",
+                "py_initials": "gzym",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            }
+        ],
+    )
+
+
+def test_code_table_row_renders_pending_state(logged):
+    """代码表认识这只票、主档还没追上：进页兜底建行 + 排一拍，不再 404（D146）。"""
+    _seed_list_row(logged)
+    page = logged.client.get("/symbol/A/600519")
+    assert page.status_code == 200
+    assert "待同步" in page.text
+    assert "已排队" in page.text
+    ctx = logged.context
+    assert ctx.symbols.get("A", "600519")["name"] == "贵州茅台"
+    assert ctx.backfills_store.open_for("A", "600519") is not None
+
+
+def test_deferred_backfill_tells_today_tries_failed(logged):
+    """deferred 的话要说清「今天试过几次、最后错在哪」：光一句待同步会让人反复点按钮。"""
+    _seed_list_row(logged)
+    ctx = logged.context
+    logged.client.get("/symbol/A/600519")  # 兜底那一脚把拍排上
+    backfill = ctx.backfills_store.open_for("A", "600519")
+    for _ in range(3):
+        ctx.backfills_store.note_failure(backfill.id, "源站超时")
+    page = logged.client.get("/symbol/A/600519")
+    assert "今天已试过 3 次都没成（源站超时）" in page.text
+
+
+def test_page_with_bars_has_no_empty_state(logged):
+    _seed(logged)
+    page = logged.client.get("/symbol/A/600519")
+    assert "待同步" not in page.text
+
+
+def test_unknown_code_still_404(logged):
+    """代码表也查无 = 「不认识这串代码」：404 保留（D146）。"""
+    assert logged.client.get("/symbol/A/999999").status_code == 404
+
+
+def test_unconfigured_market_never_falls_back(logged):
+    """市场没配置时兜底不许发生：`SymbolInterest.ensure` 会拿 `markets[market]` 崩 KeyError，
+    挡住的是 500，也更早回答「这市场本机不服务」。"""
+    logged.context.symbol_list_store.upsert_batch(
+        "XX",
+        [{"code": "1", "name": "无名", "py_initials": "wm", "py_full": "wuming",
+          "currency": "XXD"}],
+    )
+    assert logged.client.get("/symbol/XX/1").status_code == 404
+
+
+def test_sync_button_requeues(logged):
+    """「立即排一拍」：入队 + 303 回本页，不承诺同步已经发生（D146）。"""
+    _seed_list_row(logged)
+    response = logged.client.post(
+        "/symbol/A/600519/sync", data={"csrf": logged.csrf}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/symbol/A/600519"
+    assert logged.context.backfills_store.open_for("A", "600519") is not None
+
+
+def test_sync_button_requires_csrf(logged):
+    response = logged.client.post(
+        "/symbol/A/600519/sync", data={"csrf": "bogus"}, follow_redirects=False
+    )
+    assert response.status_code == 403
+
+
+def test_bars_api_falls_back_too(logged):
+    """K 线 JSON 走同一个 `_require_symbol`：只种代码表也该 200（回 note，不是 404）。"""
+    _seed_list_row(logged)
+    payload = logged.client.get("/api/symbol/A/600519/bars?days=120")
+    assert payload.status_code == 200
+    assert payload.json()["dates"] == []
+
+
+def test_quote_board_code_links(logged):
+    """报价板那行永远挂链接（N4 了结）：主档缺失由代码表兜底，不再有「死文字」那一型。"""
+    user = logged.context.users.get_by_username("alice")
+    logged.context.watchlists.add(user.id, "A", "600519")
+    _seed_quote(logged)
+    page = logged.client.get("/api/partials/quotes")
+    assert "/symbol/A/600519" in page.text
+    assert "主档未同步" not in page.text
+
+
 def test_bars_api_returns_dates_and_close(logged):
     _seed(logged)
     payload = logged.client.get("/api/symbol/A/600519/bars?days=120").json()

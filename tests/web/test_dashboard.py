@@ -96,8 +96,7 @@ def test_watchlist_add_remove_roundtrip(logged):
     assert response.status_code == 303
     # 加票即登记兴趣并排补数拍（D144）：库里有它的开放队列行
     assert logged.context.backfills_store.open_for("A", "600519") is not None
-    # 行链接要有主档才挂得出来（没主档点下去是 404 死路），所以先补一行主档再断链接
-    _seed_symbol(logged.context)
+    # 加票那一脚的 ensure 已把主档行建了（D144/D146）：链接直接挂，不再需要补种子
     # 断言行链接而不是裸代码：表单的 placeholder 里也写着 600519，
     # 断「页面里没有这串数字」永远成立不了
     assert "/symbol/A/600519" in client.get("/watchlist").text
@@ -151,19 +150,27 @@ def _quote_cells(page, code: str) -> list[str]:
     return [re.sub(r"<[^>]+>", "", cell).strip() for cell in cells]
 
 
-def test_watchlist_row_without_master_symbol_is_not_a_dead_link(logged):
-    """主档还没同步的自选代码（US 采集没跑过）不许挂 /symbol 链接：点下去是 404，
-    而 404 那一屏（`pages/symbol.py` 的 `_require_symbol`）不区分「没这行」与「没这码」，
-    人只会以为代码写错了。名称列照出代码 + 「主档未同步」提示。"""
+def test_watchlist_row_without_master_symbol_links_anyway(logged):
+    """链接统一（D146/N4）：主档没这行也挂 /symbol 链接——那一屏由代码表兜底建行，
+    兜不住才 404，不再是「点下去必死」的死路。名称列仍交代码：空白看起来像页面坏了。"""
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "US", "AAPL")
     _seed_quote(logged, market="US", code="AAPL", price=250.0)
     page = logged.client.get("/")
     assert page.status_code == 200
-    assert "/symbol/US/AAPL" not in page.text
-    assert "主档未同步" in _quote_row(page, "AAPL")
+    assert "/symbol/US/AAPL" in _quote_row(page, "AAPL")
     cells = _quote_cells(page, "AAPL")
     assert cells[2] == "AAPL", "名称列不许留空：空白看起来像页面坏了"
+
+
+def test_watchlist_management_table_links_code(logged):
+    """自选页管理那张表（带「移除」按钮的）也挂链接：同一个代码，两个入口都得能进个股页。"""
+    user = logged.context.users.get_by_username("alice")
+    logged.context.watchlists.add(user.id, "US", "AAPL")
+    page = logged.client.get("/watchlist")
+    rows = re.findall(r"<tr>(.*?)</tr>", page.text, re.S)
+    managed = [row for row in rows if "/watchlist/remove" in row]
+    assert any('/symbol/US/AAPL' in row for row in managed)
 
 
 def test_the_link_stays_when_the_master_has_the_row(logged):
@@ -177,14 +184,14 @@ def test_the_link_stays_when_the_master_has_the_row(logged):
     assert "主档未同步" not in _quote_row(page, "600519")
 
 
-def test_quotes_partial_masks_the_link_too(logged):
-    """10 秒一刷的那块走的是同一个折法：部分刷新不许把 404 链接又长回来。"""
+def test_quotes_partial_links_every_row(logged):
+    """10 秒一刷的那块与首屏同一个折法：链接统一之后没有要遮的行（D146）。"""
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "US", "AAPL")
     _seed_quote(logged, market="US", code="AAPL", price=250.0)
     page = logged.client.get("/api/partials/quotes")
-    assert "/symbol/US/AAPL" not in page.text
-    assert "主档未同步" in page.text
+    assert "/symbol/US/AAPL" in page.text
+    assert "主档未同步" not in page.text
 
 
 def test_price_unit_follows_the_market_currency(logged):

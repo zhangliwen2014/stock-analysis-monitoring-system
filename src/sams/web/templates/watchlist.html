@@ -24,7 +24,9 @@
     <tr><th>市场</th><th>代码</th><th>备注</th><th></th></tr>
     {% for row in rows %}
     <tr>
-      <td>{{ row.market }}</td><td>{{ row.code }}</td><td>{{ row.note }}</td>
+      <td>{{ row.market }}</td>
+      <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
+      <td>{{ row.note }}</td>
       <td>
         <form method="post" action="/watchlist/remove" class="inline-form">
           <input type="hidden" name="csrf" value="{{ csrf }}">
