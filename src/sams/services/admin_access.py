@@ -1,5 +1,7 @@
-"""break-glass 用例（D139）：单条、15 分钟、每人每小时 5 次、理由 ≥4 字。
+"""break-glass 用例（D139）：单条授权、限时限次、理由 ≥4 字。
 
+时长与次数取自 settings.annotations（治理参数：放宽靠改配置、每次改动留痕，
+数字不写死在这一层）；「至少 4 个字」则是本层固定底线——spec 钉它，不给调。
 规则全在这一层，仓库只存行：审计的「能不能批」得能被没有 DB 的单测问出来。
 不做批量：一屏一条的授权，才是「确需查看」四个字的形状。
 """
@@ -9,13 +11,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.config import Settings
 from sams.core.errors import Conflict, NotFound, ValidationError
 from sams.storage.repos.admin_access import AdminAccess, AdminAccessRepo
 from sams.storage.repos.annotations import AnnotationRepo
 
 MIN_REASON_CHARS = 4
-GRANT_MINUTES = 15
-MAX_PER_HOUR = 5
 
 
 class BreakGlassService:
@@ -23,11 +24,14 @@ class BreakGlassService:
         self,
         logs: AdminAccessRepo,
         annotations: AnnotationRepo,
+        settings: Settings,
         *,
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self.logs = logs
         self.annotations = annotations
+        # 必填而不是默认：漏接线在启动就炸；时长/次数只有一个出处（settings），别再抄一份
+        self.settings = settings
         self.clock = clock
 
     def request_access(
@@ -45,11 +49,12 @@ class BreakGlassService:
             raise NotFound("批注不存在：break-glass 只对真实存在的那一条生效")
         if row.purged_at is not None:
             raise Conflict("正文已被清除：这条批注只剩墓碑，没有可读的东西")
+        max_per_hour = self.settings.annotations.break_glass_max_per_hour
         now = self.clock.now_utc()
         used = self.logs.count_since(admin_user_id, since=now - timedelta(hours=1))
-        if used >= MAX_PER_HOUR:
+        if used >= max_per_hour:
             raise Conflict(
-                f"本小时已授权 {used} 次：每人每小时最多 {MAX_PER_HOUR} 条——"
+                f"本小时已授权 {used} 次：每人每小时最多 {max_per_hour} 条——"
                 "批量排查请把问题写成一条批注让作者自己贴出来"
             )
         return self.logs.grant(
@@ -57,7 +62,8 @@ class BreakGlassService:
             annotation_id=annotation_id,
             owner_user_id=row.user_id,
             reason=text,
-            granted_until=now + timedelta(minutes=GRANT_MINUTES),
+            granted_until=now
+            + timedelta(minutes=self.settings.annotations.break_glass_minutes),
         )
 
     def can_read(

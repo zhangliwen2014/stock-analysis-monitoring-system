@@ -1,12 +1,13 @@
 """break-glass 用例（D139）：单条、限时、限次、留痕——四条都在服务层钉。"""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from support import FrozenClock
 
 from sams.core.errors import Conflict, NotFound, ValidationError
-from sams.services.admin_access import GRANT_MINUTES, MAX_PER_HOUR, BreakGlassService
+from sams.services.admin_access import BreakGlassService
 from sams.storage.repos.admin_access import AdminAccessRepo
 from sams.storage.repos.annotations import AnnotationRepo
 
@@ -24,9 +25,10 @@ def annotations_store(db, clock):
 
 
 @pytest.fixture
-def svc(db, clock, annotations_store):
+def svc(db, clock, annotations_store, settings):
     logs = AdminAccessRepo(db, clock=clock)
-    return BreakGlassService(logs, annotations_store, clock=clock)
+    # settings 走全局夹具：默认 15/5，正是原来的写死值——断言语义不变，只是数字换出处
+    return BreakGlassService(logs, annotations_store, settings, clock=clock)
 
 
 def _own_annotation(annotations_store, user_id="u-1"):
@@ -61,19 +63,43 @@ def test_purged_tombstone_is_refused(svc, annotations_store, clock):
 
 def test_grant_lasting_the_window(svc, annotations_store):
     made = _own_annotation(annotations_store)
+    minutes = svc.settings.annotations.break_glass_minutes
     log = svc.request_access("adm", made.id, "核对除权口径")
-    assert log.granted_until == NOW + timedelta(minutes=GRANT_MINUTES)
+    assert log.granted_until == NOW + timedelta(minutes=minutes)
     assert svc.can_read("adm", made.id, now=NOW)
-    assert not svc.can_read("adm", made.id, now=NOW + timedelta(minutes=GRANT_MINUTES + 1))
+    assert not svc.can_read("adm", made.id, now=NOW + timedelta(minutes=minutes + 1))
 
 
 def test_hourly_cap_per_admin(svc, annotations_store):
-    ids = [
-        _own_annotation(annotations_store, user_id=f"u-{n}").id for n in range(MAX_PER_HOUR + 1)
-    ]
-    for annotation_id in ids[:MAX_PER_HOUR]:
+    cap = svc.settings.annotations.break_glass_max_per_hour
+    ids = [_own_annotation(annotations_store, user_id=f"u-{n}").id for n in range(cap + 1)]
+    for annotation_id in ids[:cap]:
         svc.request_access("adm", annotation_id, "核对除权口径")
     with pytest.raises(Conflict, match="每小时"):
-        svc.request_access("adm", ids[MAX_PER_HOUR], "核对除权口径")
+        svc.request_access("adm", ids[cap], "核对除权口径")
     # 限次是按管理员算的：换个人照样能批
-    assert svc.request_access("adm-2", ids[MAX_PER_HOUR], "核对除权口径") is not None
+    assert svc.request_access("adm-2", ids[cap], "核对除权口径") is not None
+
+
+def test_grant_window_follows_settings(db, clock, annotations_store, settings):
+    # 治理参数只有一个出处：把时长调到 1 分钟，授权窗口就得跟着缩——
+    # 还写死 15 的话这条会红
+    tuned = replace(settings, annotations=replace(settings.annotations, break_glass_minutes=1))
+    logs = AdminAccessRepo(db, clock=clock)
+    svc = BreakGlassService(logs, annotations_store, tuned, clock=clock)
+    made = _own_annotation(annotations_store)
+    log = svc.request_access("adm", made.id, "核对除权口径")
+    assert log.granted_until == NOW + timedelta(minutes=1)
+    assert not svc.can_read("adm", made.id, now=NOW + timedelta(minutes=1))
+
+
+def test_audit_row_pins_owner_admin_and_trimmed_reason(svc, annotations_store):
+    made = _own_annotation(annotations_store, user_id="u-1")
+    # 理由带首尾空白：落库的必须是裁好的那一串（审计要答得出「为什么看」）
+    svc.request_access("adm", made.id, "  核对除权口径  ")
+    row = svc.logs.active("adm", made.id, now=NOW)
+    assert row is not None
+    # owner 与 admin 各钉各的值：把审批人当作者写反，这条当场红
+    assert row.owner_user_id == made.user_id
+    assert row.admin_user_id == "adm"
+    assert row.reason == "核对除权口径"

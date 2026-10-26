@@ -521,9 +521,9 @@ def _context_on(
     # （D127），漏接线会在构造 AnnotationService 时直接 TypeError——比第一次被拒的批注诚实
     app_settings = AppSettingsRepo(database, clock=clock)
     annotations_store = AnnotationRepo(database, clock=clock)
-    # break-glass 排在批注仓库之后：授权前要先能问到那一行（墓碑判断，D139）
+    # 构造顺序：BreakGlassService 需要 annotations_store 已在手——它只读那一行不写（D139）
     admin_access_store = AdminAccessRepo(database, clock=clock)
-    break_glass = BreakGlassService(admin_access_store, annotations_store, clock=clock)
+    break_glass = BreakGlassService(admin_access_store, annotations_store, cfg, clock=clock)
     annotations = AnnotationService(
         annotations_store,
         users,
