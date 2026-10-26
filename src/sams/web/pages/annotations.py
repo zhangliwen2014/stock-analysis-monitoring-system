@@ -137,6 +137,8 @@ def _render_panel(
                 "tags": made.tags,
                 "images": thumbs,
                 "missing": max(0, min(len(atts), thumb_limit) - len(thumbs)),
+                # 这条分支在把 max_attachments 调小之后仍可达（历史行比新上限多），
+                # 不是死代码：上限是拒绝线不是截断线，已经存下的图不能被假装不存在
                 "extra": max(0, len(atts) - thumb_limit),
                 "body_html": render_markdown(made.body_md),
                 "body_md": made.body_md,

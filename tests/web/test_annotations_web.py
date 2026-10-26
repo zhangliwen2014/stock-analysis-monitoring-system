@@ -7,6 +7,9 @@ import io
 import polars as pl
 from PIL import Image
 
+from sams.services.attachments import MB
+from sams.storage.repos.attachments import AttachmentRepo
+
 
 def _alice(ctx):
     return ctx.users.get_by_username("alice")
@@ -442,6 +445,10 @@ def test_edit_oversize_keeps_everything(logged):
 def test_edit_conflict_does_not_touch_attachments(logged):
     ctx = logged.context
     made, atts = _make_annotation_with_png(logged)
+    # 磁盘侧的「一个字节都不动」要拿文件本身比：只数库行，半张落盘的孤儿图
+    # （409 那次上传的字节）就检不出来
+    user_dir = ctx.attachments.root / _alice(ctx).id
+    files_before = sorted(p.relative_to(user_dir) for p in user_dir.rglob("*"))
     stale = made.updated_at.isoformat()
     ctx.annotations.edit(_alice(ctx).id, made.id, body_md="另一台设备改过")
     resp = logged.client.post(
@@ -458,6 +465,81 @@ def test_edit_conflict_does_not_touch_attachments(logged):
     assert "在你编辑期间被改过" in resp.text
     # 409 时文件一个都不动：既没加进来，勾选的也没被删
     assert len(ctx.attachments_store.list_for(made.id)) == len(atts)
+    # 上传的那张图从没落盘：用户目录里的文件与提交前一字不差
+    assert sorted(p.relative_to(user_dir) for p in user_dir.rglob("*")) == files_before
+
+
+def test_edit_count_gate_moves_at_most_max_attachments_per_submit(logged):
+    """张数闸（§5.4）：一次 edit 动的张数（删 + 加）不许超过 max_attachments。
+    全删全加也在一条批注的容量里；超了就在任何写入之前 400，一个字节都不动。"""
+    ctx = logged.context
+    made, atts = _make_annotation_with_png(logged, count=5)  # 默认上限 5，先装满
+    ids = [att.id for att in atts]
+
+    def png(n: str) -> tuple[str, tuple[str, bytes, str]]:
+        return ("files", (n, _rgba_png_bytes(), "image/png"))
+
+    def post_edit(drop_ids: list[str], adds: list[tuple]) -> object:
+        cur = ctx.annotations_store.get(made.id)
+        return logged.client.post(
+            f"/annotations/{made.id}/edit",
+            data={
+                "csrf": logged.csrf,
+                "body_md": cur.body_md,
+                "tags": "",
+                "updated_at": cur.updated_at.isoformat(),
+                "remove_attachments": drop_ids,
+            },
+            files=adds,
+        )
+
+    # 2 删 2 加 = 4 ≤ 5：照常成立
+    resp = post_edit(ids[:2], [png("new1.png"), png("new2.png")])
+    assert resp.status_code == 200
+    assert "批注已保存" not in resp.text
+    after = ctx.attachments_store.list_for(made.id)
+    assert len(after) == 5
+    kept_ids = {att.id for att in after}
+    assert set(ids[:2]).isdisjoint(kept_ids)  # 勾掉的两张真没了
+
+    # 再试 3 删 3 加 = 6 > 5：闸在任何写入之前拦下，正文与附件都停在原样
+    body_now = ctx.annotations_store.get(made.id).body_md
+    resp = post_edit(sorted(kept_ids)[:3], [png(f"x{n}.png") for n in (1, 2, 3)])
+    assert resp.status_code == 400
+    assert "一次最多动" in resp.text
+    assert {att.id for att in ctx.attachments_store.list_for(made.id)} == kept_ids
+    assert ctx.annotations_store.get(made.id).body_md == body_now
+
+
+def test_edit_with_over_quota_file_keeps_body_and_names_the_rejection(logged, monkeypatch):
+    """拒收路径的话术（§5.4）：正文已成立、附件被配额拦下 → 200 面板点名
+    「批注已保存，但附件没全成」——不是 400、也不回滚正文。
+    配额用 monkeypatch 逼总闸（小图重编码后只有几百字节，整 MB 粒度填不满，
+    与 `tests/services/test_attachments_service.py` 同一处置）。"""
+    ctx = logged.context
+    uid = _alice(ctx).id
+    made = ctx.annotations.create(
+        uid, target_type="symbol", target_ref="A:600519", body_md="原正文", tags=()
+    )
+    # 总量报成 513 MB > max_user_total_mb(512)：任何新增都撞总闸
+    monkeypatch.setattr(AttachmentRepo, "total_bytes", lambda self, user_id: 513 * MB)
+    resp = logged.client.post(
+        f"/annotations/{made.id}/edit",
+        data={
+            "csrf": logged.csrf,
+            "body_md": "改过的正文",
+            "tags": "",
+            "updated_at": made.updated_at.isoformat(),
+        },
+        files=[("files", ("over.png", _rgba_png_bytes(), "image/png"))],
+    )
+    assert resp.status_code == 200
+    assert "批注已保存，但附件没全成" in resp.text
+    assert "over.png" in resp.text  # 点名是哪张
+    assert "配额" in resp.text  # 点名为什么
+    # 正文照常落库，文件一张没进：库行与磁盘都停在 0
+    assert ctx.annotations_store.get(made.id).body_md == "改过的正文"
+    assert ctx.attachments_store.list_for(made.id) == []
 
 
 def test_revision_meta_records_final_attachments(logged):

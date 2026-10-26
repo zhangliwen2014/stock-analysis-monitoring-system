@@ -171,7 +171,7 @@ class AnnotationRepo:
                 ref,
                 (target_label or "").strip(),
                 body,
-                json.dumps(list(tags), ensure_ascii=False),
+                _json_text(list(tags)),
                 bool(pinned),
                 visibility,
                 moment,
@@ -235,7 +235,7 @@ class AnnotationRepo:
                 )
                 params = [
                     body,
-                    json.dumps(list(tags), ensure_ascii=False),
+                    _json_text(list(tags)),
                     visibility,
                     moment,
                     annotation_id,
@@ -254,7 +254,7 @@ class AnnotationRepo:
                     " updated_at = ? WHERE id = ?",
                     [
                         body,
-                        json.dumps(list(tags), ensure_ascii=False),
+                        _json_text(list(tags)),
                         visibility,
                         moment,
                         annotation_id,
@@ -271,7 +271,7 @@ class AnnotationRepo:
                     user_id,
                     row.body_md,
                     body,
-                    json.dumps(meta, ensure_ascii=False),
+                    _json_text(meta),
                     moment,
                 ],
             )
