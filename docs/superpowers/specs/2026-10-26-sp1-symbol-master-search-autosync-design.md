@@ -90,7 +90,7 @@ codes = ["sh000001", "sz399001", "sz399006"]
 [indices.HK]
 codes = ["hkHSI", "hkHSTECH", "hkHSCEI"]
 [indices.US]
-codes = ["usSPX", "usIXIC", "usDJI"]
+codes = ["usINX", "usIXIC", "usDJI"]
 [indices.labels]
 sh000001 = "上证指数"
 sz399001 = "深证成指"
@@ -98,7 +98,7 @@ sz399006 = "创业板指"
 hkHSI = "恒生指数"
 hkHSTECH = "恒生科技指数"
 hkHSCEI = "H股指数"
-usSPX = "标普500"
+usINX = "标普500"
 usIXIC = "纳斯达克"
 usDJI = "道琼斯"
 ```
