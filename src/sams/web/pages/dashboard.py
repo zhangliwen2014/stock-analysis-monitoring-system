@@ -19,7 +19,7 @@ from sams.bootstrap import AppCore, ServiceContext
 from sams.core.codes import currency_override
 from sams.core.errors import SamsError, ValidationError
 from sams.core.quotes import DELAYED, LIVE, NO_DATA, quote_state
-from sams.services.symbol_search import normalize_query
+from sams.services.symbol_search import hinted_market, normalize_query
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import hms, index_close_label, pct_class, state_label
 
@@ -252,15 +252,23 @@ def symbol_search_partial(request: Request, code: str = "", market: str = ""):
         }
         for c in ctx.symbol_search.search(code)
     ]
-    # 表单上选中的市场排前面，但不排掉别的：选着 A 搜 00700，答案在 HK
+    # 排序：检索词前缀提示的市场最前，其次表单选中的，最后其余——稳定划分，一个不丢（D141）。
+    # 选着 A 搜 hk00700 时归一已经把前缀剥了，两个市场都可能命中：用户刚刚说过的那一位别输掉
+    hint = hinted_market(code)
     sel = market.strip().upper()
-    rows = [r for r in rows if r["market"] == sel] + [r for r in rows if r["market"] != sel]
+    hinted = [r for r in rows if hint and r["market"] == hint]
+    rest = [r for r in rows if not (hint and r["market"] == hint)]
+    rows = hinted + [r for r in rest if r["market"] == sel] + [
+        r for r in rest if r["market"] != sel
+    ]
     # 「查无」只说给真的查过的检索词：`%%%`、光一个市场字母在归一那步就没了，没查不许说没查到
-    searched = normalize_query(code) is not None
+    query = normalize_query(code)
+    searched = query is not None
     return web.render(
         request,
         "partials/symbol_search.html",
         rows=rows,
+        query=query,
         none_found=searched and not rows,
     )
 

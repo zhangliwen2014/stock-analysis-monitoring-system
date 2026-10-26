@@ -7,7 +7,12 @@ from datetime import date
 import polars as pl
 import pytest
 
-from sams.services.symbol_search import Candidate, SymbolSearchService, normalize_query
+from sams.services.symbol_search import (
+    Candidate,
+    SymbolSearchService,
+    hinted_market,
+    normalize_query,
+)
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
 
@@ -30,6 +35,26 @@ from sams.storage.repos.symbol_list import SymbolListRepo
 )
 def test_normalize(raw, want):
     assert normalize_query(raw) == want
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        ("hk00700", "HK"),
+        ("HK00700", "HK"),
+        ("sh600519", "A"),
+        ("sz000001", "A"),
+        ("bj430047", "A"),
+        ("usAAPL", "US"),
+        ("00700", None),  # 裸码没有前缀可认
+        ("PAYH", None),  # 拼音不是市场字母打头
+        ("HK7", None),  # 剥不动的前缀不算提示（与 normalize 同一条「至少剩两位」）
+        ("HK", None),
+        ("", None),
+    ],
+)
+def test_hinted_market(raw, want):
+    assert hinted_market(raw) == want
 
 
 def _listed(db) -> SymbolListRepo:

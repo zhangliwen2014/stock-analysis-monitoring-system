@@ -59,10 +59,20 @@ def test_selected_market_first_but_others_not_dropped(logged):
     assert body.index('value="00700"') < body.index('value="000001"')
 
 
+def test_prefix_hint_beats_the_selected_market(logged):
+    """选着 A 敲 `hkpayh`：归一剥掉前缀后检索词是 PAYH，两个市场都命中——
+    顺序由前缀提示定（D141）。"""
+    _seed(logged.context)
+    body = logged.client.get("/api/symbol-search?code=hkpayh&market=A").text
+    assert body.index('value="00700"') < body.index('value="000001"')
+
+
 def test_none_found_says_so(logged):
     _seed(logged.context)
     response = logged.client.get("/api/symbol-search?code=不存在的东西")
     assert "查无" in response.text
+    # 「查无」要回显敲过的那串（D143）：只说「查无」的人不知道是自己打错了还是真没有
+    assert "不存在的东西" in response.text
 
 
 def test_empty_query_is_empty_panel(logged):

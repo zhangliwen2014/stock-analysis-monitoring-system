@@ -18,7 +18,7 @@ from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from sams.core.codes import canonical_code, canonical_market
+from sams.core.codes import canonical_code, canonical_market, looks_like_index_code
 from sams.core.errors import NotAdjustable
 from sams.core.quotes import NO_DATA, quote_state
 from sams.storage.repos.symbol_backfills import DEFERRED
@@ -45,6 +45,10 @@ def _require_symbol(request: Request, user, market: str, code: str):
     web = request.app.state.web
     ctx = web.contexts.current()
     market = canonical_market(market)
+    # 指数码在归一之前按**原始**那一段拦下：sh000001 归一后就是 000001=平安银行，
+    # 兜底还会为指数建一行个股档案——指数不是个股页，它的地方是大盘条（D145）
+    if looks_like_index_code(market, code):
+        raise HTTPException(status_code=404)
     code = canonical_code(market, code)
     if market not in ctx.settings.markets:
         # 这条 404 与兜底无关：市场不在本机配置清单里本就不可达，兜底只是会晚一步崩 KeyError

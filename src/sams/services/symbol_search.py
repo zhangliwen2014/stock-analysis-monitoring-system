@@ -15,6 +15,22 @@ from sams.storage.repos.symbol_list import SymbolListRepo
 #: 剥完至少剩两位才剥：`HK7` 那两位是代码本体的一部分，剥掉就查不到任何票
 _PREFIXES = ("SH", "SZ", "BJ", "HK", "US")
 
+#: 前缀背后的市场：主档的市场键是归一名，A 股的前缀却是三个交易所（D141）
+_PREFIX_MARKETS = {"SH": "A", "SZ": "A", "BJ": "A", "HK": "HK", "US": "US"}
+
+
+def hinted_market(raw: str) -> str | None:
+    """检索词开头那个市场前缀指哪张市场：归一剥掉它就等于把用户的选择扔了。
+
+    剥不动的前缀不算提示（与 `normalize_query` 同一条「至少剩两位」），
+    否则 `HK7` 会把一个代码本体说成市场意图。
+    """
+    q = (raw or "").strip().upper().replace(" ", "")
+    for prefix, market in _PREFIX_MARKETS.items():
+        if q.startswith(prefix) and len(q) - len(prefix) >= 2:
+            return market
+    return None
+
 
 def normalize_query(raw: str) -> str | None:
     q = (raw or "").strip().upper().replace(" ", "")

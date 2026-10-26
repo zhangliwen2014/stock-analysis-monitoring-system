@@ -50,6 +50,8 @@ def test_symbol_shapes_for_three_markets():
     assert tencent_quote_symbol("HK", "700") == "hk00700"
     # 报价接口不要交易所后缀：带 .OQ 会返回空行，看起来像「这只票没有报价」
     assert tencent_quote_symbol("US", "AAPL.OQ") == "usAAPL"
+    # 默认清单里的美股标普是 usINX：指数形态原样透传，不再拼前缀（D145）
+    assert tencent_quote_symbol("US", "usINX") == "usINX"
 
 
 def test_a_share_quote_fields_timezone_and_lot_conversion():

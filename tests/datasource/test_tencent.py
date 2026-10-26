@@ -282,7 +282,7 @@ def test_tencent_index_daily_us_empty():
     """腾讯没有指数的美股链：这是一句答复（EmptyResponse），不是故障。"""
     adapter, _, _ = adapter_with(A_PAYLOAD)
     with pytest.raises(EmptyResponse):
-        adapter.index_daily("US", "usSPX", START, END)
+        adapter.index_daily("US", "usINX", START, END)
 
 
 def test_http_429_becomes_rate_limited(monkeypatch):

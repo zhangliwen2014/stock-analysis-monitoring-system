@@ -37,7 +37,8 @@ class MarketCfg:
 DEFAULT_INDEX_CODES: dict[str, tuple[str, ...]] = {
     "A": ("sh000001", "sz399001", "sz399006"),
     "HK": ("hkHSI", "hkHSTECH", "hkHSCEI"),
-    "US": ("usSPX", "usIXIC", "usDJI"),
+    # 美股标普用腾讯认识的符号（usINX）：usSPX 在腾讯那里查无此行，整条 bar 永远空着
+    "US": ("usINX", "usIXIC", "usDJI"),
 }
 
 #: 展示名进配置：各源的指数名参差（「上证指数」/「上证综指」/「sh000001」），
@@ -49,7 +50,7 @@ DEFAULT_INDEX_LABELS: dict[str, str] = {
     "hkHSI": "恒生指数",
     "hkHSTECH": "恒生科技指数",
     "hkHSCEI": "H股指数",
-    "usSPX": "标普500",
+    "usINX": "标普500",
     "usIXIC": "纳斯达克",
     "usDJI": "道琼斯",
 }

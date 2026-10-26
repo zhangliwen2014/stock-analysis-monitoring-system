@@ -163,6 +163,6 @@ def test_looks_like_index_code():
     assert looks_like_index_code("HK", "hkHSI")
     assert looks_like_index_code("HK", "hkHSTECH")
     assert not looks_like_index_code("HK", "00700")
-    assert looks_like_index_code("US", "usSPX")
+    assert looks_like_index_code("US", "usINX")
     assert not looks_like_index_code("US", "AAPL")
     assert not looks_like_index_code("", "sh000001")  # 市场不认就当不是

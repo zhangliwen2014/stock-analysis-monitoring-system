@@ -262,8 +262,10 @@ def test_indices_defaults(tmp_path):
     s = Settings.load(write(tmp_path, THREE_MARKETS))
     assert s.indices.for_market("A") == ("sh000001", "sz399001", "sz399006")
     assert s.indices.for_market("HK") == ("hkHSI", "hkHSTECH", "hkHSCEI")
-    assert s.indices.for_market("US") == ("usSPX", "usIXIC", "usDJI")
+    assert s.indices.for_market("US") == ("usINX", "usIXIC", "usDJI")
     assert s.indices.label("sh000001") == "上证指数"
+    # 腾讯的美股标普符号是 usINX（usSPX 是别家的），默认清单必须用源认识的那串
+    assert s.indices.label("usINX") == "标普500"
 
 
 def test_indices_override(tmp_path):

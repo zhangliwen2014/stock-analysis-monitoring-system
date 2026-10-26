@@ -311,6 +311,32 @@ def test_no_queued_backfill_says_so(logged):
     assert "/symbol/A/600036/sync" in page.text
 
 
+def test_index_shaped_code_is_not_a_stock_page(logged):
+    """指数串不许进个股页（D145 撞车）：`sh000001` 归一后就是 000001=平安银行，
+    认的是 URL 里**原始**那一段——指数的地方是大盘条，兜底也不许为它建个股行。"""
+    _seed_list_row(logged, "A", "000001")  # 在册的 000001：没有守卫的话兜底会放它进来
+    assert logged.client.get("/symbol/A/sh000001").status_code == 404
+    assert logged.client.get("/symbol/A/sz399001").status_code == 404
+    assert logged.client.get("/api/symbol/A/sh000001/bars").status_code == 404
+    response = logged.client.post(
+        "/symbol/A/sh000001/sync", data={"csrf": logged.csrf}, follow_redirects=False
+    )
+    assert response.status_code == 404
+    # HK/US 的指数形态（前缀 + 大写字母尾）同理
+    assert logged.client.get("/symbol/HK/hkHSI").status_code == 404
+    assert logged.client.get("/symbol/US/usIXIC").status_code == 404
+    assert logged.context.symbols.get("A", "000001") is None
+    assert logged.context.backfills_store.open_for("A", "000001") is None
+    # 个股不受伤：裸 6 位与 5 位港股码照旧是股票页
+    assert logged.client.get("/symbol/A/000001").status_code == 200
+    logged.context.symbols.upsert(
+        pl.DataFrame(
+            {"market": ["HK"], "code": ["00700"], "name": ["腾讯控股"], "currency": ["HKD"]}
+        )
+    )
+    assert logged.client.get("/symbol/HK/00700").status_code == 200
+
+
 def test_sync_button_requeues(logged):
     """「立即排一拍」：入队 + 303 回本页，不承诺同步已经发生（D146）。"""
     _seed_list_row(logged)
