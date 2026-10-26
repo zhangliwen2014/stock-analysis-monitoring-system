@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import RedirectResponse
 
 from sams.bootstrap import AppCore, ServiceContext
+from sams.core.codes import currency_override
 from sams.core.errors import SamsError, ValidationError
 from sams.core.quotes import NO_DATA, quote_state
 from sams.web.auth import csrf_protect, require_user
@@ -173,6 +174,40 @@ def quotes_partial(request: Request):
     now = web.core.clock.now_utc()
     return web.render(
         request, "partials/quotes.html", rows=_quote_rows(ctx, web.core, user.id, now)
+    )
+
+
+def _candidate_unit(ctx: ServiceContext, market: str, code: str) -> str:
+    """候选行的单位：先认标的的币种例外（B 股、双柜台），再落市场默认。"""
+    cfg = ctx.settings.markets.get(market)
+    currency = currency_override(market, code) or (cfg.currency if cfg else "")
+    return _CURRENCY_UNITS.get(currency, currency)
+
+
+@router.get("/api/symbol-search")
+def symbol_search_partial(request: Request, code: str = "", market: str = ""):
+    """候选面板：htmx 每敲一个字重来一次，空检索词回空面板，不打扰。"""
+    require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    rows = [
+        {
+            "market": c.market,
+            "code": c.code,
+            "name": c.name,
+            "price": c.close,
+            "unit": _candidate_unit(ctx, c.market, c.code),
+        }
+        for c in ctx.symbol_search.search(code)
+    ]
+    # 表单上选中的市场排前面，但不排掉别的：选着 A 搜 00700，答案在 HK
+    sel = market.strip().upper()
+    rows = [r for r in rows if r["market"] == sel] + [r for r in rows if r["market"] != sel]
+    return web.render(
+        request,
+        "partials/symbol_search.html",
+        rows=rows,
+        none_found=bool(code.strip()) and not rows,
     )
 
 

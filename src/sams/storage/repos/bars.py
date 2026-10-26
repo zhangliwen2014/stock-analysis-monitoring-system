@@ -191,6 +191,25 @@ class BarRepo:
             params.append(end)
         return self.db.query(" ".join(sql) + " ORDER BY code, date", params)
 
+    def last_closes(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], float]:
+        """一批 (市场, 代码) 的库内最后收盘：搜索面板的「昨收」列（D142）。
+
+        一次 `arg_max` 聚合问完，不按票循环——候选十条就是十次查询的旧路，
+        面板是每敲一个字都要重画的。键按读侧同一条规则归一（与 `load`/`latest_date` 一致）。
+        """
+        if not pairs:
+            return {}
+        keys = [(canonical_market(m), canonical_code(m, c)) for m, c in pairs]
+        marks = ", ".join("(?, ?)" for _ in keys)
+        params = [v for pair in keys for v in pair]
+        rows = self.db.query(
+            f"SELECT market, code, arg_max(close, date) AS close FROM bars_daily"
+            f" WHERE adjust = '{ADJUST}' AND (market, code) IN ({marks})"
+            f" GROUP BY market, code",
+            params,
+        )
+        return {(r["market"], r["code"]): float(r["close"]) for r in rows.to_dicts()}
+
     def count(self, market: str | None = None, code: str | None = None) -> int:
         # 与 load/latest_date 同一个口径过滤，否则行数会算进库里另一套复权序列
         sql = "SELECT count(*) FROM bars_daily WHERE adjust = ?"

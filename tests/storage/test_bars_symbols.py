@@ -322,6 +322,25 @@ def test_count_without_a_market_and_with_a_code_is_refused(bars):
     assert bars.count("HK", "700") == 2, "给了市场，别名就算同一个键"
 
 
+# ---------- 搜索面板的「昨收」列（D142）----------
+
+
+def test_last_closes_per_pair(bars, bars_frame):
+    """一批 (市场, 代码) 一次问完：候选十条循环查是旧路，面板每敲一个字都要重画。"""
+    bars.upsert(bars_frame)  # A/600519 三天，收盘逐日抬高
+    got = bars.last_closes([("A", "600519"), ("A", "000001")])
+    assert got[("A", "600519")] == bars_frame.sort("date")["close"][-1]
+    assert ("A", "000001") not in got, "库里没行的票不许被编出一个 0"
+    assert bars.last_closes([]) == {}
+
+
+def test_last_closes_reads_on_the_canonical_key(bars):
+    """读侧与 `load`/`latest_date` 同一条归一规则：别名查不到昨收是旧病复发。"""
+    bars.upsert(support.sample_bars(market="HK", code="700"))
+    got = bars.last_closes([("hk", "HK.00700")])
+    assert set(got) == {("HK", "00700")}
+
+
 
 # ---------- 上市日期（U18：D37 那条豁免终于有了机器来源） ----------
 

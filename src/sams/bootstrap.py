@@ -69,6 +69,7 @@ from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
 from sams.services.symbol_interest import SymbolInterest
 from sams.services.symbol_master import SymbolMasterSyncService
+from sams.services.symbol_search import SymbolSearchService
 from sams.services.sync import SyncService
 from sams.services.theses import ThesisService
 from sams.services.valuation import ValuationService
@@ -183,6 +184,8 @@ class ServiceContext:
     backfills_store: SymbolBackfillRepo
     #: 「有人想看这只票」的登记处（D144）：Web 四个入口的成功路径各挂一次
     symbol_interest: SymbolInterest
+    #: 搜索加票的读模型（D142）：`/api/symbol-search` 面板走的就是这一份
+    symbol_search: SymbolSearchService
     bars: BarRepo
     corp_actions: CorpActionRepo
     corp_actions_coverage: CorpActionsCoverageRepo
@@ -606,6 +609,7 @@ def _context_on(
         backfills=backfills_store,
         markets=cfg.markets,
     )
+    symbol_search = SymbolSearchService(symbol_list_store, bars)
     symbol_master_sync = SymbolMasterSyncService(registry, symbol_list_store, cfg.markets)
     corp_action_sync = CorpActionSyncService(
         registry, corp_actions, corp_actions_coverage, clock=clock
@@ -687,6 +691,7 @@ def _context_on(
         index_daily_store=index_daily_store,
         backfills_store=backfills_store,
         symbol_interest=symbol_interest,
+        symbol_search=symbol_search,
         bars=bars,
         corp_actions=corp_actions,
         corp_actions_coverage=corp_actions_coverage,

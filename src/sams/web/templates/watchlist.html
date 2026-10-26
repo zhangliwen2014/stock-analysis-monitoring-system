@@ -4,15 +4,18 @@
 <section class="card">
   <h1>自选</h1>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
-  <form method="post" action="/watchlist/add" class="panel inline-form">
+  <form method="post" action="/watchlist/add" id="wl-form" class="panel inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <select name="market">
       {% for code in markets %}<option value="{{ code }}">{{ code }}</option>{% endfor %}
     </select>
-    <input name="code" placeholder="代码，如 600519 / 00700 / AAPL">
+    <input name="code" placeholder="代码 / 首字母 / 名称，如 000001、payh、平安"
+           hx-get="/api/symbol-search" hx-trigger="keyup changed delay:300ms"
+           hx-target="#wl-candidates" hx-include="#wl-form" hx-swap="innerHTML">
     <input name="note" placeholder="备注（可空）">
     <button type="submit">加入</button>
   </form>
+  <div id="wl-candidates"></div>
   <div id="quote-board" hx-get="/api/partials/quotes" hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "partials/quotes.html" %}
   </div>

@@ -1,0 +1,23 @@
+{% if rows %}
+<table>
+  <tr><th>市场</th><th>代码</th><th>名称</th><th class="num">昨收</th><th></th></tr>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.market }}</td>
+    <td>{{ row.code }}</td>
+    <td>{{ row.name or "—" }}</td>
+    <td class="num">{{ money(row.price, row.unit) if row.price is not none else "—" }}</td>
+    <td>
+      <form method="post" action="/watchlist/add" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="market" value="{{ row.market }}">
+        <input type="hidden" name="code" value="{{ row.code }}">
+        <button type="submit">加入</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% elif none_found %}
+<p class="muted">查无——代码、拼音首字母、名称都没命中。也可以直接提交试试。</p>
+{% endif %}
