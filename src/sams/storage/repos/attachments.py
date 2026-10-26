@@ -139,6 +139,19 @@ class AttachmentRepo:
             or 0
         )
 
+    def usage_by_user(self) -> list[tuple[str, int, int]]:
+        """每人 `(用户, 附件数, 字节)`：admin 用量表（D136 的「计数与占用」），按字节降序。
+
+        聚合在 SQL 一次做完：全表扫一遍比每人一次 `total_bytes()` 少 N 条查询，
+        而这一屏本来就要整张表。没附件的人不出现——用量表列的是占用了磁盘的人。
+        """
+        rows = self.db.query(
+            "SELECT user_id, count(*) AS cnt, COALESCE(sum(size_bytes), 0) AS bytes"
+            " FROM annotation_attachments GROUP BY user_id ORDER BY bytes DESC",
+            [],
+        ).to_dicts()
+        return [(str(r["user_id"]), int(r["cnt"]), int(r["bytes"])) for r in rows]
+
     def delete(self, attachment_id: str) -> bool:
         deleted = self.db.scalar(
             "DELETE FROM annotation_attachments WHERE id = ? RETURNING id", [attachment_id]

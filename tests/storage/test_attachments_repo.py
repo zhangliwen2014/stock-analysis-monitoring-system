@@ -90,3 +90,13 @@ def test_paths_are_the_set_the_pruner_needs(repo):
 def test_bad_rows_are_refused(repo, field, value):
     with pytest.raises(ValidationError):
         add(repo, **{field: value})
+
+
+def test_usage_by_user_groups_counts_and_bytes(repo):
+    """admin 用量表（D136 的「计数与占用」）：每人一行，按字节降序。"""
+    add(repo, annotation_id="note-1", user_id="trader", size_bytes=100)
+    add(repo, annotation_id="note-1b", user_id="trader", size_bytes=900,
+        storage_path="trader/2026/10/b.png")
+    add(repo, annotation_id="note-2", user_id="keeper", size_bytes=400,
+        storage_path="keeper/2026/10/c.png")
+    assert repo.usage_by_user() == [("trader", 2, 1000), ("keeper", 1, 400)]

@@ -2,6 +2,7 @@
 {% block title %}用户{% endblock %}
 {% block content %}
 <h1>用户</h1>
+<p class="muted"><a href="/admin/annotations">批注与附件</a></p>
 {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
 
 {# 「显示名」那一列已经是折好的名字：空显示名退回登录名，折在 `pages/admin.py` 的 `_names` #}

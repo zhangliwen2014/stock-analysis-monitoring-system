@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{# 单条批注的 admin 视图：头部永远是元数据，正文/revision/附件只在 readable 时出现。
+   readable 的判据只有一处（`pages/admin_annotations.py` 的 `_readable`），这里只管呈现。 #}
+{% block title %}批注详情{% endblock %}
+{% block content %}
+<h1>批注详情</h1>
+{% if notice %}<p class="flash-error">{{ notice }}</p>{% endif %}
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+<table>
+  <tr><th>id</th><td>{{ meta.id }}</td></tr>
+  <tr><th>所有者</th><td>{{ meta.owner }}</td></tr>
+  <tr><th>创建于</th><td>{{ meta.at }}</td></tr>
+  <tr><th>目标</th><td>{{ meta.target }}</td></tr>
+  <tr><th>可见性</th><td><span class="badge">{{ meta.visibility }}</span></td></tr>
+  {% if meta.purged %}<tr><th>状态</th><td>已被清除（软删墓碑）</td></tr>
+  {% elif meta.deleted %}<tr><th>状态</th><td>已删除（正文保留期内）</td></tr>
+  {% endif %}
+  {% if granted_until %}<tr><th>授权到</th><td>{{ granted_until }}</td></tr>{% endif %}
+</table>
+
+{% if meta.purged %}
+<p class="muted">正文已被清除，只剩墓碑：这一条没有任何可读的东西（D136）。</p>
+{% elif readable %}
+<section class="card">
+  <h2>正文</h2>
+  <div class="md-body">{{ body | safe }}</div>
+  {% if images %}
+  <h2>附件</h2>
+  {# 附件与正文同权：链接走 admin 自己的下载路由（普通路由会先被「不是作者」拦死），
+     库里还有行、文件不在了就不列——点下去只会 404 #}
+  {% for img in images %}
+  <a href="{{ img.url }}"><img src="{{ img.url }}" alt="{{ img.filename }}" loading="lazy"></a>
+  {% endfor %}
+  {% endif %}
+  {% if revisions %}
+  <h2>编辑历史</h2>
+  <table>
+    <tr><th>时间</th><th>改前（字）</th><th>改后（字）</th><th>附件</th></tr>
+    {% for rev in revisions %}
+    <tr>
+      <td>{{ rev.at }}</td><td>{{ rev.before }}</td><td>{{ rev.after }}</td>
+      <td>{{ "有记录" if rev.has_attachments else "—" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</section>
+{% else %}
+<section class="card">
+  <h2>正文不可读</h2>
+  <p class="muted">这是私有批注：要读正文、revision 或附件，先为<strong>这一条</strong>申请 break-glass。</p>
+  <form method="post" action="/admin/annotations/{{ meta.id }}/break-glass">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <textarea name="reason" rows="3" placeholder="为什么确需查看这一条（4–200 字，会进审计）" required></textarea>
+    <button type="submit">申请授权</button>
+  </form>
+  <p class="muted">
+    单条、{{ minutes }} 分钟、每小时有限次，理由进审计（D139）；
+    批量排查请写成一条批注让作者自己贴出来。
+  </p>
+</section>
+{% endif %}
+
+<p class="muted"><a href="/admin/annotations">返回批注列表</a></p>
+{% endblock %}

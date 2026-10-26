@@ -1,4 +1,4 @@
-"""break-glass 用例（D139）：单条授权、限时限次、理由 ≥4 字。
+"""break-glass 用例（D139）：单条授权、限时限次、理由 4–200 字。
 
 时长与次数取自 settings.annotations（治理参数：放宽靠改配置、每次改动留痕，
 数字不写死在这一层）；「至少 4 个字」则是本层固定底线——spec 钉它，不给调。
@@ -17,6 +17,10 @@ from sams.storage.repos.admin_access import AdminAccess, AdminAccessRepo
 from sams.storage.repos.annotations import AnnotationRepo
 
 MIN_REASON_CHARS = 4
+#: 理由的下限与上限都来自 spec §6.3/D139（M4-B spec:341）的「4–200 字」：
+#: 上限不是排版偏好——审计里那一格要答的是「为什么看」，贴日志全文进来既读不出
+#: 意图，也会把 admin 页的最近授权表撑坏。
+MAX_REASON_CHARS = 200
 
 
 class BreakGlassService:
@@ -41,6 +45,12 @@ class BreakGlassService:
         if len(text) < MIN_REASON_CHARS:
             raise ValidationError(
                 f"理由至少 {MIN_REASON_CHARS} 个字：写下为什么要看这条私有批注——它会进审计"
+            )
+        if len(text) > MAX_REASON_CHARS:
+            # 消息点名上限：被截了字数的人要知道该删到多少，而不是「再短点」
+            raise ValidationError(
+                f"理由最多 {MAX_REASON_CHARS} 个字（收到 {len(text)} 字）："
+                "审计要的是为什么要看这一条，不是日志全文"
             )
         # 墓碑也要能问得到：默认 get 把 purged/deleted 行折成 None，那条「只剩墓碑」的
         # Conflict 就永远走不到——include_deleted 是这道判断的前提

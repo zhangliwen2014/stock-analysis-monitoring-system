@@ -477,6 +477,27 @@ class AnnotationRepo:
             params.append(since)
         return clauses, params
 
+    def list_metadata(self, *, limit: int = 50, offset: int = 0) -> list[Annotation]:
+        """admin 页的列表（§6.1/D139）：所有人、含墓碑、排已硬清除。
+
+        正文列照带——**遮不遮是页面层的事**，仓库不做权限过滤（权限只有一处才数得清）：
+        与 `list_visible` 那条「可见性下沉到 SQL」的规则并不冲突，那一条管的是
+        「普通读者的 SQL 里不许出现别人的行」，而 admin 问的就是全表有哪些行。
+        排序不带 `pinned`（那是给作者看的次序），按时间倒序：admin 要看的是刚发生的事。
+        """
+        rows = self.db.query(
+            f"SELECT {_ANNOTATION_COLUMNS} FROM annotations"
+            " WHERE purged_at IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            [int(limit), int(offset)],
+        ).to_dicts()
+        return [self._to_annotation(row) for row in rows]
+
+    def count_metadata(self) -> int:
+        """与 `list_metadata` 同一个 WHERE：分页的分母必须与分子同源（同 count_visible）。"""
+        return int(
+            self.db.scalar("SELECT count(*) FROM annotations WHERE purged_at IS NULL", []) or 0
+        )
+
     def revisions(self, annotation_id: str) -> list[Revision]:
         rows = self.db.query(
             f"SELECT {_REVISION_COLUMNS} FROM annotation_revisions"

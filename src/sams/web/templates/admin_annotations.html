@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{# admin 的批注总览（§6.1/D139）：这一屏只有元数据——正文要点对某一条去 break-glass。
+   列表行、用量与最近授权全是 Python 折好的 dict（模板不做换算也不碰 datetime）。 #}
+{% block title %}批注与附件{% endblock %}
+{% block content %}
+<h1>批注与附件</h1>
+{% if notice %}<p class="flash-error">{{ notice }}</p>{% endif %}
+
+<section class="card">
+  <h2>团队共享</h2>
+  <p>当前：<strong>{{ "开" if sharing else "关" }}</strong>（共 {{ total }} 条批注 · 缺失文件 {{ missing }} 个）</p>
+  {# 两个按钮带的是「要变成什么」，与用户页的降权同一读法：值在隐藏 input 里，
+     端点只认 on/off 两个值，别的都 400 #}
+  <form method="post" action="/admin/annotations/policy" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="value" value="on">
+    <button type="submit">开启</button>
+  </form>
+  <form method="post" action="/admin/annotations/policy" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="value" value="off">
+    <button type="submit">关闭</button>
+  </form>
+  <p class="muted">关掉的只是新写的 team 可见性；已写成的行留着，随时能再开。</p>
+</section>
+
+<section class="card">
+  <h2>批注（所有人 · 含软删墓碑 · 正文默认不可读）</h2>
+  <table>
+    <tr>
+      <th>时间</th><th>所有者</th><th>目标</th><th>可见性</th><th>附件</th><th>状态</th><th></th>
+    </tr>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.at }}</td>
+      <td>{{ row.owner }}</td>
+      <td>{{ row.target }}</td>
+      <td><span class="badge">{{ row.visibility }}</span></td>
+      <td>{{ row.attachments }}</td>
+      <td>
+        {% if row.purged %}<span class="badge">已被清除</span>
+        {% elif row.deleted %}<span class="badge">已删除</span>
+        {% endif %}
+      </td>
+      <td><a href="/admin/annotations/{{ row.id }}">详情</a></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="muted">还没有一条批注。</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section class="card">
+  <h2>附件用量</h2>
+  <table>
+    <tr><th>用户</th><th>张数</th><th>占用（MB）</th></tr>
+    {% for row in usage %}
+    <tr><td>{{ row.user }}</td><td>{{ row.count }}</td><td>{{ row.mb }}</td></tr>
+    {% else %}
+    <tr><td colspan="3" class="muted">没有任何附件。</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section class="card">
+  <h2>最近 break-glass 授权</h2>
+  <table>
+    <tr><th>管理员</th><th>批注</th><th>理由</th><th>授权到</th></tr>
+    {% for row in logs %}
+    <tr>
+      <td>{{ row.admin }}</td>
+      <td><a href="{{ row.annotation_at }}">{{ row.annotation[:8] }}</a></td>
+      <td>{{ row.reason }}</td>
+      <td>{{ row.until }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="muted">还没有人动用过这道闸。</td></tr>
+    {% endfor %}
+  </table>
+  <p class="muted">每条授权 {{ minutes }} 分钟：正文、revision 与附件在那一窗口内同权可读（D139）。</p>
+</section>
+
+<p class="muted"><a href="/admin/users">返回用户</a></p>
+{% endblock %}

@@ -44,6 +44,24 @@ def test_reason_needs_four_chars(svc, annotations_store):
         svc.request_access("adm", made.id, "看看")
 
 
+def test_reason_over_two_hundred_chars_is_refused(svc, annotations_store):
+    """spec §6.3/D139（M4-B spec:341）：理由是 4–200 字——上限同样是闸。
+
+    超长不拦的话，审计行里会躺一段贴日志全文的理由：那既不是「确需查看」的一句话，
+    也会把 list_recent 那一屏撑坏。消息点名上限，人才知道该删到多少。
+    """
+    made = _own_annotation(annotations_store)
+    with pytest.raises(ValidationError, match="200"):
+        svc.request_access("adm", made.id, "核" * 201)
+
+
+def test_reason_exactly_two_hundred_chars_is_granted(svc, annotations_store):
+    # 边界是「含 200」：把 <= 写成 < 时这一条当场红
+    made = _own_annotation(annotations_store)
+    log = svc.request_access("adm", made.id, "核" * 200)
+    assert len(log.reason) == 200
+
+
 def test_unknown_annotation_has_no_body_to_read(svc):
     with pytest.raises(NotFound):
         svc.request_access("adm", "ghost", "核对除权口径")

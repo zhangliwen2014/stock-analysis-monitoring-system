@@ -299,3 +299,29 @@ def test_stamp_without_revision_is_a_no_op(repo):
     made = add(repo)
     repo.stamp_last_revision_attachments(made.id, ["att-a"])
     assert repo.revisions(made.id) == []
+
+
+# --- admin 元数据列表（§6.1/D139）--------------------------------------------------------------
+
+
+def test_list_metadata_includes_tombstones_and_excludes_purged(repo):
+    """admin 的元数据列表：不按可见性滤，带软删墓碑，排已硬清除。"""
+    a = add(repo, OWNER, body_md="别人的也列")
+    b = add(repo, OTHER, body_md="将被删")
+    c = add(repo, OWNER, body_md="将被清除")
+    repo.soft_delete(b.id, user_id=OTHER)
+    # 仓库无 purge()——照 services/annotation_prune.py 的裸 SQL 补一行
+    repo.db.execute("UPDATE annotations SET purged_at = ? WHERE id = ?", [NOW, c.id])
+    ids = {r.id for r in repo.list_metadata(limit=50)}
+    assert {a.id, b.id} <= ids and c.id not in ids
+    assert repo.count_metadata() == len(ids)
+
+
+def test_list_metadata_orders_newest_first(repo):
+    """ORDER BY created_at DESC, id DESC：admin 要一眼看到刚写的那条，
+    而同一时刻的多条要有稳定的次序（id 兜底，翻页才不会重复/漏行）。"""
+    first = add(repo, OWNER, body_md="最早")
+    clock_now = NOW + timedelta(minutes=5)
+    repo.clock.moment = clock_now
+    second = add(repo, OWNER, body_md="最晚")
+    assert [r.id for r in repo.list_metadata()] == [second.id, first.id]
