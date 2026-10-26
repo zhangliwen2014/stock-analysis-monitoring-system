@@ -687,6 +687,20 @@ def test_fetch_symbol_list_market_level():
     assert (cn.calls, hk.calls) == (1, 0)
 
 
+def test_fetch_symbol_list_transient_primary_falls_back_and_is_recorded():
+    """主源瞬断不是这张表取不到：按降级链换备源，并把这次失败记进 attempts。"""
+    primary = FakeSymbolListAdapter("akshare", ["A"], TransientError("akshare", "timeout"))
+    backup = FakeSymbolListAdapter("akshare_ths", ["A"], symbol_frame())
+    reg = registry(primary, backup)
+    result = reg.fetch_symbol_list("A")
+    assert result.source == "akshare_ths"
+    assert result.degraded is True
+    assert [(a.source, a.ok) for a in result.attempts] == [
+        ("akshare", False),
+        ("akshare_ths", True),
+    ]
+
+
 def test_fetch_symbol_list_without_capable_source_is_terminal():
     reg = registry(_NoDaily())
     with pytest.raises(DatasourceError, match="没有能取代码表的源"):
