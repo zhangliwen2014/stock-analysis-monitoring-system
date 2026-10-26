@@ -246,7 +246,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_access_annotation
 
 - `GET /annotations/{annotation_id}/attachments/{attachment_id}`：先按批注可见性鉴权，再按 `storage_path` 读文件。
 - 响应头：正确 `Content-Type`、`Content-Length`、`X-Content-Type-Options: nosniff`、`Cache-Control: private, max-age=300`；图片用 `inline`，未知类型不提供。
-- 缩略图：直接用原图 + CSS `max-width`，不生成缩略图文件（单机规模够用）；列表页只加载前 3 张。
+- 缩略图：直接用原图 + CSS `max-width`，不生成缩略图文件（单机规模够用）；列表页只加载前 `max_attachments` 张（默认 5，与张数上限同源——编辑器要能勾选到每一张）。
 - 文件缺失：条目显示「附件缺失」，不 500；admin 健康页统计缺失数。
 - CSP 保持 `img-src 'self' data:`；附件同源，不开 `blob:`/外链。
 
@@ -338,7 +338,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_access_annotation
 - 策略卡：团队共享开关（二次确认文案说明「关闭后既有 team 批注对他人隐藏，数据保留」）。
 - 用量：每用户批注数、附件数、占用字节；总计与配额。
 - 列表：按用户/目标类型/可见性/时间筛选，只出元数据——作者、可见性、目标类型、时间、revision 数、附件数与字节、标签数、是否软删。`team` 且策略开启时显示正文、标签与 `target_label`；`private` 与策略关闭时的 `team` 一律遮蔽正文、标签、附件内容与 `target_label`（symbol 只显示代码，非 symbol 显示「私有 thesis/rule/alert/order」），避免元数据本身泄露策略。
-- Break-glass：被遮蔽的行（`private` 或策略关闭时的 `team`）有「紧急查看」；必须填理由（4–200 字），提交后写 `admin_access_log` 并授权 **该条** 15 分钟。有效期内详情页显示正文、revision 与附件缩略图/下载，顶部常驻「临时授权至 HH:MM，理由：…」横幅；不做批量选择、列表内联正文或导出。过期后详情只回元数据，再看得重新授权。
+- Break-glass：被遮蔽的行（`private` 或策略关闭时的 `team`）有「紧急查看」；必须填理由（4–200 字），提交后写 `admin_access_log` 并授权 **该条** `break_glass_minutes` 分钟（默认 15，治理参数）。有效期内详情页显示正文、revision 与附件缩略图/下载，顶部常驻「临时授权至 HH:MM，理由：…」横幅；不做批量选择、列表内联正文或导出。过期后详情只回元数据，再看得重新授权。
 - 限次：每管理员每小时最多 5 次授权（按 `admin_access_log` 滑动窗口），超限 429 并给出等待时间；理由是自由文本，不做「常用理由」预设以免敷衍。
 - 附件下载：`GET /annotations/{id}/attachments/{att_id}` 对 admin 复用同一授权判断；无有效授权按不存在返回 404。
 - 审计：页面底部列出最近 50 条 break-glass（管理员、批注、作者、理由、授权时间与到期）；只读，不可删改。硬清除后的批注不再可授权，记录仍保留。
