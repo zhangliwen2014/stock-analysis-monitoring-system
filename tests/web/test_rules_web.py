@@ -406,6 +406,20 @@ def test_the_form_does_not_read_rosters_the_template_has_no_box_for(logged, monk
     assert logged.client.get("/rules/new?kind=stop.fixed").status_code == 200
 
 
+def test_a_rule_on_an_unconfigured_market_saves_but_queues_no_backfill(logged):
+    """形状闸只认「市场/代码」两截，不认配置：`ZZ/600519` 存得进规则，但补数挂钩若照它
+    排队会在 `SymbolInterest` 的 `self.markets[market]` 上 KeyError——规则已落库、页面却冒
+    500。未配置的市场本就无补数可言（没有日历也没有数据源），挂钩跳过才是对的。"""
+    response = logged.client.post(
+        "/rules/new", data=_new_rule_data(logged, target_ref="ZZ/600519"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    rule = logged.context.rule_service.list(_alice_id(logged))[0].rule
+    assert rule.target_ref == "ZZ/600519"
+    assert logged.context.backfills_store.open_for("ZZ", "600519") is None
+
+
 def test_the_writes_are_behind_the_csrf_pair(logged):
     """三个写操作都还带着 `csrf_protect`：表单原文那份依赖与它是同一次 body 解析，
     谁也没把谁挤掉（挤掉了就是三条能被人拿页面替别人改规则的口子）。"""

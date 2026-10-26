@@ -44,6 +44,27 @@ def test_fill_buy_then_sell_roundtrip(logged):
     assert [row.qty for row in rows] == [60.0]
 
 
+def test_the_same_fill_posted_twice_queues_the_backfill_once(logged):
+    """浏览器重交（或人连点两次保存）是同一笔成交的第二趟：登记兴趣挂钩再走一遍，
+    主档那一步要么没建、要么原样不动，补数队列靠 `open_key` 去重只许留一条。"""
+    account_id = _open_account(logged)
+    data = {
+        "csrf": logged.csrf, "account_id": account_id, "market": "A",
+        "code": "600519", "side": "buy", "qty": "10", "price": "1500", "fee": "5",
+    }
+    assert logged.client.post("/ledger/fill", data=data, follow_redirects=False).status_code == 303
+    master = logged.context.symbols.get("A", "600519")
+    assert master is not None
+    assert logged.client.post("/ledger/fill", data=data, follow_redirects=False).status_code == 303
+    # 第二次 enqueue 被去重闸退回：开放队列里还是这一条
+    assert logged.context.backfills_store.open_for("A", "600519") is not None
+    assert logged.context.db.scalar(
+        "SELECT count(*) FROM symbol_backfills WHERE market = 'A' AND code = '600519'"
+    ) == 1
+    # 主档没被第二趟动过：行还是那一行
+    assert logged.context.symbols.get("A", "600519") == master
+
+
 def test_fill_with_a_bad_number_rerenders_with_the_error(logged):
     account_id = _open_account(logged)
     response = logged.client.post(

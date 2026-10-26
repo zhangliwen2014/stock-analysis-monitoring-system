@@ -28,6 +28,7 @@ from collections.abc import Sequence
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
+from sams.core.codes import canonical_market
 from sams.core.errors import DatabaseLocked, SamsError, StorageError, ValidationError
 from sams.core.notify import SEVERITIES
 from sams.core.rules import FILTER_KEYS, RULE_KINDS, Template, template_for
@@ -304,7 +305,11 @@ def rule_create(
     # 规则挂在票上也算「想看这只票」：主档 + 补数拍（D144）；引用带市场前缀才拆得出两截
     if target_type == "symbol" and "/" in target_ref:
         ref_market, _, ref_code = target_ref.partition("/")
-        ctx.symbol_interest.ensure(ref_market, ref_code, actor=user.username)
+        # 先归一再对配置：规则照旧落库是规则服务的答案，补数挂钩不该把成功变 500，
+        # 而未配置的市场本就无补数可言（没有日历也没有数据源）——不在配置里就跳过排队
+        ref_market = canonical_market(ref_market)
+        if ref_market in ctx.settings.markets:
+            ctx.symbol_interest.ensure(ref_market, ref_code, actor=user.username)
     return RedirectResponse("/rules", status_code=303)
 
 
