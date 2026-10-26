@@ -325,3 +325,59 @@ def test_list_metadata_orders_newest_first(repo):
     repo.clock.moment = clock_now
     second = add(repo, OWNER, body_md="最晚")
     assert [r.id for r in repo.list_metadata()] == [second.id, first.id]
+
+
+def test_list_metadata_filters_share_one_source_with_count(repo):
+    """§6.5:340 的列表筛选：user/type/visibility/时间窗全部 ?-绑定，
+    而 `count_metadata` 与 `list_metadata` 走同一份 WHERE——分母与分子分叉迟早数错。"""
+    a = add(repo, OWNER)
+    b = add(repo, OTHER, target_type="thesis", target_ref="t-1", target_label="观点")
+    c = add(repo, OWNER, visibility="team")
+    repo.clock.moment = NOW + timedelta(hours=2)
+    d = add(repo, OTHER, body_md="两小时后")
+    cases = [
+        {"user_id": OTHER},
+        {"target_type": "thesis"},
+        {"visibility": "team"},
+        {"since": NOW + timedelta(hours=1)},
+        {"until": NOW + timedelta(hours=1)},
+        {"user_id": OWNER, "target_type": "symbol", "visibility": "private"},
+        {},
+    ]
+    for filt in cases:
+        ids = {r.id for r in repo.list_metadata(**filt, limit=50)}
+        assert repo.count_metadata(**filt) == len(ids), filt
+    assert {r.id for r in repo.list_metadata(user_id=OTHER)} == {b.id, d.id}
+    assert [r.id for r in repo.list_metadata(since=NOW + timedelta(hours=1))] == [d.id]
+    # until 是开区间（页面折成「当天 +1d」）：恰好等于 created_at 的那条不在窗内
+    assert {r.id for r in repo.list_metadata(until=NOW + timedelta(minutes=1))} == {
+        a.id,
+        b.id,
+        c.id,
+    }
+
+
+def test_list_metadata_rejects_unknown_target_type(repo):
+    with pytest.raises(ValidationError, match="target_type"):
+        repo.list_metadata(target_type="stock")
+
+
+def test_count_all_is_the_annotation_quota_column(repo):
+    """用量表的「批注数」：排已硬清除；软删墓碑还算——配额问的是「名下有几条」，
+    30 天保留期里的行仍占着这个人的额度（D136）。"""
+    add(repo, OWNER)
+    add(repo, OWNER, body_md="第二条")
+    soft = add(repo, OWNER, body_md="将被删")
+    repo.soft_delete(soft.id, user_id=OWNER)
+    purged = add(repo, OTHER)
+    repo.db.execute("UPDATE annotations SET purged_at = ? WHERE id = ?", [NOW, purged.id])
+    assert repo.count_all(OWNER) == 3
+    assert repo.count_all(OTHER) == 0
+
+
+def test_count_revisions_counts_edits_only(repo):
+    made = add(repo)
+    assert repo.count_revisions(made.id) == 0
+    repo.update(made.id, user_id=OWNER, body_md="改一版", tags=[], visibility="private")
+    repo.update(made.id, user_id=OWNER, body_md="再改一版", tags=[], visibility="private")
+    assert repo.count_revisions(made.id) == 2

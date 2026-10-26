@@ -477,25 +477,115 @@ class AnnotationRepo:
             params.append(since)
         return clauses, params
 
-    def list_metadata(self, *, limit: int = 50, offset: int = 0) -> list[Annotation]:
-        """admin 页的列表（§6.1/D139）：所有人、含墓碑、排已硬清除。
+    def list_metadata(
+        self,
+        *,
+        user_id: str | None = None,
+        target_type: str | None = None,
+        visibility: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Annotation]:
+        """admin 页的列表（§6.1/D139）：所有人、含墓碑、排已硬清除，可带 §6.5:340 的筛选。
 
         正文列照带——**遮不遮是页面层的事**，仓库不做权限过滤（权限只有一处才数得清）：
         与 `list_visible` 那条「可见性下沉到 SQL」的规则并不冲突，那一条管的是
         「普通读者的 SQL 里不许出现别人的行」，而 admin 问的就是全表有哪些行。
         排序不带 `pinned`（那是给作者看的次序），按时间倒序：admin 要看的是刚发生的事。
         """
+        clauses, params = self._metadata_clauses(
+            user_id=user_id,
+            target_type=target_type,
+            visibility=visibility,
+            since=since,
+            until=until,
+        )
         rows = self.db.query(
             f"SELECT {_ANNOTATION_COLUMNS} FROM annotations"
-            " WHERE purged_at IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            [int(limit), int(offset)],
+            f" WHERE {' AND '.join(clauses)}"
+            " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            params + [int(limit), int(offset)],
         ).to_dicts()
         return [self._to_annotation(row) for row in rows]
 
-    def count_metadata(self) -> int:
+    def count_metadata(
+        self,
+        *,
+        user_id: str | None = None,
+        target_type: str | None = None,
+        visibility: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> int:
         """与 `list_metadata` 同一个 WHERE：分页的分母必须与分子同源（同 count_visible）。"""
+        clauses, params = self._metadata_clauses(
+            user_id=user_id,
+            target_type=target_type,
+            visibility=visibility,
+            since=since,
+            until=until,
+        )
         return int(
-            self.db.scalar("SELECT count(*) FROM annotations WHERE purged_at IS NULL", []) or 0
+            self.db.scalar(
+                f"SELECT count(*) FROM annotations WHERE {' AND '.join(clauses)}", params
+            )
+            or 0
+        )
+
+    def _metadata_clauses(
+        self,
+        *,
+        user_id: str | None,
+        target_type: str | None,
+        visibility: str | None,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> tuple[list[str], list[object]]:
+        """admin 列表筛选的唯一规则源：列表与计数共用（同 `_visibility_clauses` 的原则）。
+        值全部 ?-绑定；`until` 是开区间，页面把「直到某天」折成「那天 +1d 零点」。"""
+        self._require_known_target_type(target_type)
+        if visibility and visibility not in VISIBILITIES:
+            raise ValidationError(f"未知可见性 {visibility!r}：只有 {list(VISIBILITIES)}")
+        clauses = ["purged_at IS NULL"]
+        params: list[object] = []
+        if user_id:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        if target_type:
+            clauses.append("target_type = ?")
+            params.append(target_type)
+        if visibility:
+            clauses.append("visibility = ?")
+            params.append(visibility)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(_moment(since))
+        if until is not None:
+            clauses.append("created_at < ?")
+            params.append(_moment(until))
+        return clauses, params
+
+    def count_all(self, user_id: str | None = None) -> int:
+        """用量表「批注数」列的唯一出处：排已硬清除；软删墓碑还算——
+        30 天保留期里的行仍占着这个人的额度（D136 的配额问的是名下有几条）。"""
+        sql = "SELECT count(*) FROM annotations WHERE purged_at IS NULL"
+        params: list[object] = []
+        if user_id:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        return int(self.db.scalar(sql, params) or 0)
+
+    def count_revisions(self, annotation_id: str) -> int:
+        """列表行的 revision 数（spec:340）：廉价的 SELECT count，
+        别拿 `revisions()` 的全行读来数——那一屏只要一个数字。"""
+        return int(
+            self.db.scalar(
+                "SELECT count(*) FROM annotation_revisions WHERE annotation_id = ?",
+                [annotation_id],
+            )
+            or 0
         )
 
     def revisions(self, annotation_id: str) -> list[Revision]:

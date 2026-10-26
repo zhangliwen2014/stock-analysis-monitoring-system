@@ -74,3 +74,23 @@ def test_list_recent_newest_first(repo, clock):
         clock.advance(minutes=1)
     rows = repo.list_recent(limit=2)
     assert [r.annotation_id for r in rows] == ["ann-202", "ann-201"]
+
+
+def test_oldest_in_window_pins_the_first_grant_made(repo, clock):
+    """等待秒数的唯一钟点源：窗口内**最早发起**那条的 created_at（不是 granted_until 的
+    min——那答的是「最早什么时候到期」，不是「名额什么时候腾出来」）。"""
+    assert repo.oldest_in_window("adm", since=NOW - timedelta(hours=1)) is None
+    repo.grant(
+        admin_user_id="adm", annotation_id="ann-o", owner_user_id="own",
+        reason="核对", granted_until=NOW + timedelta(minutes=15),
+    )
+    clock.advance(minutes=30)
+    repo.grant(
+        admin_user_id="adm", annotation_id="ann-o2", owner_user_id="own",
+        reason="核对", granted_until=clock.now_utc() + timedelta(minutes=15),
+    )
+    assert repo.oldest_in_window("adm", since=NOW) == NOW
+    # 第一条滑出窗口后（since 落在两条之间），最早的就是第二条
+    assert repo.oldest_in_window("adm", since=NOW + timedelta(minutes=1)) == NOW + timedelta(
+        minutes=30
+    )

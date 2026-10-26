@@ -35,6 +35,14 @@ class Conflict(SamsError):
     """
 
 
+class TooManyRequests(SamsError):
+    """滑动窗口内的次数用尽（spec §6.5:342）：break-glass 每小时超限走这一条。
+
+    与 `Conflict` 分开是因为处置不同：Conflict 是「这条现在不能批」（墓碑、状态不符），
+    要换动作；这一条是「过一会儿还能批」，消息里必须带等待秒数，Web 层映射成 429。
+    """
+
+
 class DatabaseLocked(StorageError):
     """库文件被另一个进程以读写方式打开（DuckDB 单写者）。
 

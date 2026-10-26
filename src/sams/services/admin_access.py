@@ -8,11 +8,12 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
-from sams.core.errors import Conflict, NotFound, ValidationError
+from sams.core.errors import Conflict, NotFound, TooManyRequests, ValidationError
 from sams.storage.repos.admin_access import AdminAccess, AdminAccessRepo
 from sams.storage.repos.annotations import AnnotationRepo
 
@@ -61,10 +62,18 @@ class BreakGlassService:
             raise Conflict("正文已被清除：这条批注只剩墓碑，没有可读的东西")
         max_per_hour = self.settings.annotations.break_glass_max_per_hour
         now = self.clock.now_utc()
-        used = self.logs.count_since(admin_user_id, since=now - timedelta(hours=1))
+        window = timedelta(hours=1)
+        used = self.logs.count_since(admin_user_id, since=now - window)
         if used >= max_per_hour:
-            raise Conflict(
-                f"本小时已授权 {used} 次：每人每小时最多 {max_per_hour} 条——"
+            # 滑动窗口（spec:342）：名额腾出的时刻 = 窗口内最早那次发起 + 1h。
+            # 秒数向上取整——宁可让人多等一秒，不要「按消息说的等完再来一次」还是 429。
+            oldest = self.logs.oldest_in_window(admin_user_id, since=now - window)
+            wait = ""
+            if oldest is not None:
+                secs = math.ceil((oldest + window - now).total_seconds())
+                wait = f"，请等待 {max(0, secs)} 秒后再试"
+            raise TooManyRequests(
+                f"每小时最多 {max_per_hour} 次授权：本小时已授权 {used} 次{wait}——"
                 "批量排查请把问题写成一条批注让作者自己贴出来"
             )
         return self.logs.grant(

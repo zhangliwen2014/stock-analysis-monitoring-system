@@ -4,9 +4,12 @@
 * 五个入口全部走 `require_admin`——普通登录用户带着真 CSRF 也是 403，挡人的是角色那道闸；
 * 默认视野是「有哪些行」而不是「写了什么」：列表行有「私有」徽标与 id，但没有正文串；
   正文、revision 与附件只在 team+策略开、或对**这一条**有未过期授权时才出现；
-* 被拒的 break-glass 不许吞状态码：短理由 400、超次 409，且都回详情页重渲染
-  （人要看见「为什么不能读」的下一句是可用的表单，不是错误页一座）；
-* 附件走 admin 自己那条下载路由并有 `Cache-Control: no-store`：私人正文不许进中间缓存。
+  被遮蔽的行连 `target_label` 与标签文字都不上屏（spec:340/549——元数据本身会泄密）；
+* 被拒的 break-glass 不许吞状态码：短理由 400、超滑动窗口 429（带等待秒数）、
+  墓碑 409，且都回详情页重渲染（人要看见「为什么不能读」的下一句是可用的表单，
+  不是错误页一座）；
+* 附件走 admin 自己那条下载路由并有 `Cache-Control: no-store`：私人正文不许进中间缓存；
+  无有效授权时按不存在返回 404（spec:343——403 会把「有这一条」泄露出去）。
 
 过期一类的用例把 app 装在 `FrozenClock` 上并冻在**将来**：`auth._active_ok` 拿心跳与
 真钟比（`pages/admin.py` 同一口径），时钟回到过去会让所有会话当场过期。
@@ -18,6 +21,7 @@ import io
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
@@ -234,7 +238,7 @@ def test_long_reason_is_refused(admin_app):
 
 
 def test_hourly_cap_surfaces(admin_app):
-    """第 6 次是 409 页：Conflict 不许被折成 400——「稍后再来」与「你写错了」是两件事。"""
+    """第 6 次是 429 页（spec:342/530）：带「等待」与秒数——「等多久」是这一屏要答的话。"""
     ctx = admin_app.ctx
     _seed_symbol(ctx)
     bob = _bob(ctx)
@@ -253,8 +257,9 @@ def test_hourly_cap_surfaces(admin_app):
         f"/admin/annotations/{ids[5]}/break-glass",
         data={"csrf": admin_app.csrf, "reason": "核对除权口径"},
     )
-    assert resp.status_code == 409
+    assert resp.status_code == 429
     assert "每小时" in resp.text
+    assert "等待" in resp.text, "超限那句必须给出等待时间（spec:342）"
 
 
 def test_team_body_readable_without_grant(admin_app):
@@ -322,15 +327,17 @@ def test_purged_tombstone_says_body_gone(admin_app):
 
 
 def test_attachment_download_by_admin_grant(admin_app):
-    """有授权 200 + no-store；无授权 403；库里有行、文件没了 404；墓碑 404。"""
+    """有授权 200 + no-store；无授权 404（spec:343：与「不存在」同一句，不泄露存在性）；
+    库里有行、文件没了 404（那是授权之后的事）；墓碑 404。"""
     ctx = admin_app.ctx
     alice = ctx.users.get_by_username("alice")
     made = _private_of_bob(admin_app)
     # 附件按构造是**作者**传上来的：服务层认归属，admin 不会替别人传图
     att = ctx.attachments.add(made.user_id, made.id, filename="截图.png", data=_png_bytes())
-    # 不是作者、也没有授权：普通下载路由会先被「不是作者」拦死，这里 403
+    # 不是作者、也没有授权：按不存在回答——403 会说漏「这条私有批注真的有附件」
     denied = admin_app.client.get(f"/admin/annotations/{made.id}/attachments/{att.id}")
-    assert denied.status_code == 403
+    assert denied.status_code == 404
+    assert "附件不存在" in denied.text
 
     ctx.break_glass.request_access(alice.id, made.id, "核对除权口径")
     ok = admin_app.client.get(f"/admin/annotations/{made.id}/attachments/{att.id}")
@@ -339,10 +346,10 @@ def test_attachment_download_by_admin_grant(admin_app):
     # no-store 是有意的：私人正文不许进中间缓存
     assert ok.headers["cache-control"] == "no-store"
 
-    # 授权过期后同一串地址读不到任何东西
+    # 授权过期后同一串地址读不到任何东西：与无授权同一个 404
     ctx.clock.advance(minutes=16)
     expired = admin_app.client.get(f"/admin/annotations/{made.id}/attachments/{att.id}")
-    assert expired.status_code == 403
+    assert expired.status_code == 404
 
     # 库里还有行、文件不在了：404 要说清是「文件缺失」而不是「没这一条」
     ctx.break_glass.request_access(alice.id, made.id, "核对除权口径")
@@ -371,3 +378,153 @@ def test_detail_lists_attachment_only_when_readable(admin_app):
     ctx.break_glass.request_access(alice.id, made.id, "核对除权口径")
     shown = admin_app.client.get(f"/admin/annotations/{made.id}")
     assert f"/admin/annotations/{made.id}/attachments/{att.id}" in shown.text
+
+
+# --- 遮蔽 target_label 与标签（spec:340/549）------------------------------------------------
+
+
+def test_masked_rows_hide_target_label_and_tags(admin_app):
+    """不可读的行：列表与详情头部都不许出现 label 与标签文字；symbol 只出代码，
+    非 symbol 出字面量「私有 <type>」——元数据本身泄密就不算遮蔽（D139）。"""
+    ctx = admin_app.ctx
+    _seed_symbol(ctx)
+    bob = _bob(ctx)
+    sym = ctx.annotations.create(
+        bob.id,
+        target_type="symbol",
+        target_ref="A:600519",
+        body_md="私有正文",
+        tags=["渠道内幕"],
+    )
+    thesis = ctx.theses.add("bob", "A", "600519").thesis.id
+    th = ctx.annotations.create(
+        bob.id, target_type="thesis", target_ref=thesis, body_md="观点私有", tags=["加仓思路"]
+    )
+    page = admin_app.client.get("/admin/annotations")
+    assert "贵州茅台" not in page.text
+    assert "渠道内幕" not in page.text
+    assert "加仓思路" not in page.text
+    assert "A:600519 观点" not in page.text
+    assert "600519" in page.text, "symbol 遮蔽后仍要给代码：admin 得知道挂的是谁"
+    assert "私有 thesis" in page.text
+    detail = admin_app.client.get(f"/admin/annotations/{sym.id}")
+    assert "贵州茅台" not in detail.text and "渠道内幕" not in detail.text
+    assert "600519" in detail.text
+    th_detail = admin_app.client.get(f"/admin/annotations/{th.id}")
+    assert "私有 thesis" in th_detail.text and "A:600519 观点" not in th_detail.text
+
+
+def test_readable_rows_show_label_and_tags(admin_app):
+    """遮蔽不许顺手关掉可读行：team + 策略开时 label 与标签照上屏（spec:340 前半句）。"""
+    ctx = admin_app.ctx
+    _seed_symbol(ctx)
+    made = ctx.annotations.create(
+        _bob(ctx).id,
+        target_type="symbol",
+        target_ref="A:600519",
+        body_md="团队正文",
+        tags=["渠道"],
+        visibility="team",
+    )
+    page = admin_app.client.get("/admin/annotations")
+    assert "贵州茅台" in page.text and "渠道" in page.text
+    detail = admin_app.client.get(f"/admin/annotations/{made.id}")
+    assert "贵州茅台" in detail.text and "渠道" in detail.text
+
+
+# --- 授权横幅（spec:341/549）---------------------------------------------------------------
+
+
+def test_grant_banner_persists_on_detail(admin_app):
+    """有效期内详情页顶部常驻「临时授权至 HH:MM，理由：…」：授权到点和理由都要在场，
+    人要随时看得见自己此刻为什么在读别人的私有正文。"""
+    made = _private_of_bob(admin_app)
+    resp = admin_app.client.post(
+        f"/admin/annotations/{made.id}/break-glass",
+        data={"csrf": admin_app.csrf, "reason": "核对除权口径"},
+        follow_redirects=True,
+    )
+    assert "临时授权至" in resp.text
+    assert "理由：核对除权口径" in resp.text
+    page = admin_app.client.get(f"/admin/annotations/{made.id}")
+    assert "临时授权至" in page.text and "理由：核对除权口径" in page.text
+
+    admin_app.ctx.clock.advance(minutes=16)
+    gone = admin_app.client.get(f"/admin/annotations/{made.id}")
+    assert "临时授权至" not in gone.text, "过期后横幅随正文一起收回"
+
+
+# --- 列表筛选与配额列（spec:340）------------------------------------------------------------
+
+
+def test_list_filters_by_user_type_visibility_and_window(admin_app):
+    """地址栏四个筛选各管各的；`until` 含当天（+1d 开区间）；野值静默忽略（搜索页读法）。"""
+    ctx = admin_app.ctx
+    _seed_symbol(ctx)
+    bob = _bob(ctx)
+    carol = ctx.users.create("carol", "correct-horse-battery")
+    sym = ctx.annotations.create(
+        bob.id, target_type="symbol", target_ref="A:600519", body_md="A 私有"
+    )
+    thesis = ctx.theses.add("carol", "A", "600519").thesis.id
+    th = ctx.annotations.create(carol.id, target_type="thesis", target_ref=thesis, body_md="观点")
+    filtered = admin_app.client.get(
+        "/admin/annotations",
+        params={"user": "bob", "type": "symbol", "visibility": "private"},
+    )
+    assert sym.id in filtered.text and th.id not in filtered.text
+    assert "共 1 条批注" in filtered.text, "总数必须按同一份筛选算：分母与分子同源"
+    tz = ZoneInfo(ctx.settings.server.display_tz)
+    today = ctx.clock.now_utc().astimezone(tz).date()
+    empty = admin_app.client.get(
+        "/admin/annotations", params={"until": (today - timedelta(days=1)).isoformat()}
+    )
+    assert sym.id not in empty.text and "还没有一条批注" in empty.text
+    both = admin_app.client.get(
+        "/admin/annotations", params={"since": today.isoformat(), "until": today.isoformat()}
+    )
+    assert sym.id in both.text and th.id in both.text
+    bogus = admin_app.client.get(
+        "/admin/annotations",
+        params={"user": "ghost", "type": "stock", "visibility": "public", "since": "不是日期"},
+    )
+    assert bogus.status_code == 200
+    assert sym.id in bogus.text, "认不出的筛选值等于没筛：不许报错，也不许筛成空"
+
+
+def test_list_shows_revision_count_and_usage_annotation_count(admin_app):
+    """列表有「revision 数」列、用量表有「批注数」列（spec:340）：数字各只有一个出处
+    （count_revisions / count_all），这里钉的是它们真的上了屏。"""
+    ctx = admin_app.ctx
+    made = _private_of_bob(admin_app, body="第一版")
+    ctx.attachments.add(made.user_id, made.id, filename="图.png", data=_png_bytes())
+    for body in ("第二版", "第三版"):
+        ctx.annotations_store.update(
+            made.id, user_id=made.user_id, body_md=body, tags=[], visibility="private"
+        )
+    page = admin_app.client.get("/admin/annotations")
+    assert "revision" in page.text and "批注数" in page.text
+    assert "<td>2</td>" in page.text, "两次编辑 = 两条 revision，要能在行里数出来"
+
+
+# --- 审计表扩到 50 条 + 所有者列（spec:340）--------------------------------------------------
+
+
+def test_recent_logs_show_owner_and_fifty_rows(admin_app):
+    """最近授权：一屏 50 条而不是 10 条，且每行带「所有者」——「谁看过谁的什么」
+    是这一表要答的完整问题。"""
+    ctx = admin_app.ctx
+    made = _private_of_bob(admin_app)
+    alice = ctx.users.get_by_username("alice")
+    for n in range(12):
+        ctx.admin_access_store.grant(
+            admin_user_id=alice.id,
+            annotation_id=made.id,
+            owner_user_id=made.user_id,
+            reason=f"核对第{n}次授权",
+            granted_until=ctx.clock.now_utc() + timedelta(minutes=15),
+        )
+    page = admin_app.client.get("/admin/annotations")
+    for n in range(12):
+        assert f"核对第{n}次授权" in page.text, "最近 50 条要都在屏上，不许截成 10"
+    assert page.text.count("<th>所有者</th>") >= 2, "审计表也要有所有者列"

@@ -6,12 +6,16 @@
 <h1>批注详情</h1>
 {% if notice %}<p class="flash-error">{{ notice }}</p>{% endif %}
 {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+{# 有效期内顶部常驻横幅（spec:341/549）：到点与理由都要在场——
+   「你现在为什么读得到别人的私有正文」必须是抬头就能回答的问题 #}
+{% if grant_banner %}<p class="flash-ok">{{ grant_banner }}</p>{% endif %}
 
 <table>
   <tr><th>id</th><td>{{ meta.id }}</td></tr>
   <tr><th>所有者</th><td>{{ meta.owner }}</td></tr>
   <tr><th>创建于</th><td>{{ meta.at }}</td></tr>
   <tr><th>目标</th><td>{{ meta.target }}</td></tr>
+  <tr><th>标签</th><td>{{ meta.tags }}</td></tr>
   <tr><th>可见性</th><td><span class="badge">{{ meta.visibility }}</span></td></tr>
   {% if meta.purged %}<tr><th>状态</th><td>已被清除（软删墓碑）</td></tr>
   {% elif meta.deleted %}<tr><th>状态</th><td>已删除（正文保留期内）</td></tr>

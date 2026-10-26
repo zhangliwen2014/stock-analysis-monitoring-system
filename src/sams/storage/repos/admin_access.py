@@ -116,6 +116,19 @@ class AdminAccessRepo:
             or 0
         )
 
+    def oldest_in_window(self, admin_user_id: str, *, since: datetime) -> datetime | None:
+        """窗口内**最早发起**那条的 created_at，没有行就 None。
+
+        等待秒数只能问这一个时刻：`min(granted_until)` 答的是「最早什么时候到期」，
+        而限次滑出靠的是发起时间——名额腾出的那一刻 = 最早那条 created_at + 窗口长。
+        """
+        raw = self.db.scalar(
+            "SELECT min(created_at) FROM admin_access_log WHERE admin_user_id = ?"
+            " AND created_at >= ?",
+            [admin_user_id, _utc(since)],
+        )
+        return _utc(raw) if raw is not None else None
+
     def list_recent(self, *, limit: int = 20) -> list[AdminAccess]:
         rows = self.db.query(
             f"SELECT {_COLUMNS} FROM admin_access_log"

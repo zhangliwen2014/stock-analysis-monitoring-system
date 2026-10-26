@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from support import FrozenClock
 
-from sams.core.errors import Conflict, NotFound, ValidationError
+from sams.core.errors import Conflict, NotFound, TooManyRequests, ValidationError
 from sams.services.admin_access import BreakGlassService
 from sams.storage.repos.admin_access import AdminAccessRepo
 from sams.storage.repos.annotations import AnnotationRepo
@@ -89,14 +89,29 @@ def test_grant_lasting_the_window(svc, annotations_store):
 
 
 def test_hourly_cap_per_admin(svc, annotations_store):
+    """超限是 429 的形状（spec:342）：带等待秒数——「本小时批满了」要能回答下一句
+    「那我什么时候能批」。秒数取窗口内最早一次授权 + 1h − now。"""
     cap = svc.settings.annotations.break_glass_max_per_hour
     ids = [_own_annotation(annotations_store, user_id=f"u-{n}").id for n in range(cap + 1)]
     for annotation_id in ids[:cap]:
         svc.request_access("adm", annotation_id, "核对除权口径")
-    with pytest.raises(Conflict, match="每小时"):
+    with pytest.raises(TooManyRequests, match="每小时") as excinfo:
         svc.request_access("adm", ids[cap], "核对除权口径")
+    assert "等待 3600 秒" in str(excinfo.value), "五次都发生在 NOW：还要等整一小时"
     # 限次是按管理员算的：换个人照样能批
     assert svc.request_access("adm-2", ids[cap], "核对除权口径") is not None
+
+
+def test_window_slides_after_an_hour(svc, annotations_store, clock):
+    """滑动窗口而不是整点清零（spec:342）：最早一次授权滑出一小时后，名额当场腾出来。"""
+    cap = svc.settings.annotations.break_glass_max_per_hour
+    ids = [_own_annotation(annotations_store, user_id=f"u-{n}").id for n in range(cap + 1)]
+    for annotation_id in ids[:cap]:
+        svc.request_access("adm", annotation_id, "核对除权口径")
+    with pytest.raises(TooManyRequests):
+        svc.request_access("adm", ids[cap], "核对除权口径")
+    clock.advance(minutes=61)
+    assert svc.request_access("adm", ids[cap], "核对除权口径") is not None
 
 
 def test_grant_window_follows_settings(db, clock, annotations_store, settings):

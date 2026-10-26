@@ -26,15 +26,48 @@
 
 <section class="card">
   <h2>批注（所有人 · 含软删墓碑 · 正文默认不可读）</h2>
+  {# 筛选（spec:340）：GET 表单，值全在 Python 白名单里认，野值等于没筛（搜索页同一读法） #}
+  <form method="get" action="/admin/annotations" class="inline-form">
+    <label>用户
+      <select name="user">
+        <option value="">全部用户</option>
+        {% for value, label in user_choices %}
+        <option value="{{ value }}" {% if shown.user == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>目标
+      <select name="type">
+        {% for value, label in type_choices %}
+        <option value="{{ value }}" {% if shown.type == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>可见性
+      <select name="visibility">
+        <option value="">全部</option>
+        <option value="private" {% if shown.visibility == "private" %}selected{% endif %}>私有</option>
+        <option value="team" {% if shown.visibility == "team" %}selected{% endif %}>团队</option>
+      </select>
+    </label>
+    <label>从 <input type="date" name="since" value="{{ shown.since }}"></label>
+    <label>到 <input type="date" name="until" value="{{ shown.until }}"></label>
+    <button type="submit">筛选</button>
+  </form>
   <table>
     <tr>
-      <th>时间</th><th>所有者</th><th>目标</th><th>可见性</th><th>附件</th><th>状态</th><th></th>
+      <th>时间</th><th>所有者</th><th>目标</th><th>标签</th><th>revision 数</th>
+      <th>可见性</th><th>附件</th><th>状态</th><th></th>
     </tr>
     {% for row in rows %}
     <tr>
       <td>{{ row.at }}</td>
       <td>{{ row.owner }}</td>
+      {# 目标与标签的遮法只有一处判据（`_display_target`/`_display_tags`）：
+         不可读的行连 label 都不上屏，这里拿到什么就印什么 #}
       <td>{{ row.target }}</td>
+      <td>{{ row.tags }}</td>
+      <td>{{ row.revisions }}</td>
       <td><span class="badge">{{ row.visibility }}</span></td>
       <td>{{ row.attachments }}</td>
       <td>
@@ -45,7 +78,7 @@
       <td><a href="/admin/annotations/{{ row.id }}">详情</a></td>
     </tr>
     {% else %}
-    <tr><td colspan="7" class="muted">还没有一条批注。</td></tr>
+    <tr><td colspan="9" class="muted">还没有一条批注。</td></tr>
     {% endfor %}
   </table>
 </section>
@@ -53,28 +86,32 @@
 <section class="card">
   <h2>附件用量</h2>
   <table>
-    <tr><th>用户</th><th>张数</th><th>占用（MB）</th></tr>
+    <tr><th>用户</th><th>批注数</th><th>张数</th><th>占用（MB）</th></tr>
     {% for row in usage %}
-    <tr><td>{{ row.user }}</td><td>{{ row.count }}</td><td>{{ row.mb }}</td></tr>
+    <tr>
+      <td>{{ row.user }}</td><td>{{ row.annotations }}</td>
+      <td>{{ row.count }}</td><td>{{ row.mb }}</td>
+    </tr>
     {% else %}
-    <tr><td colspan="3" class="muted">没有任何附件。</td></tr>
+    <tr><td colspan="4" class="muted">没有任何附件。</td></tr>
     {% endfor %}
   </table>
 </section>
 
 <section class="card">
-  <h2>最近 break-glass 授权</h2>
+  <h2>最近 break-glass 授权（最近 50 条）</h2>
   <table>
-    <tr><th>管理员</th><th>批注</th><th>理由</th><th>授权到</th></tr>
+    <tr><th>管理员</th><th>所有者</th><th>批注</th><th>理由</th><th>授权到</th></tr>
     {% for row in logs %}
     <tr>
       <td>{{ row.admin }}</td>
+      <td>{{ row.owner }}</td>
       <td><a href="{{ row.annotation_at }}">{{ row.annotation[:8] }}</a></td>
       <td>{{ row.reason }}</td>
       <td>{{ row.until }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="4" class="muted">还没有人动用过这道闸。</td></tr>
+    <tr><td colspan="5" class="muted">还没有人动用过这道闸。</td></tr>
     {% endfor %}
   </table>
   <p class="muted">每条授权 {{ minutes }} 分钟：正文、revision 与附件在那一窗口内同权可读（D139）。</p>
