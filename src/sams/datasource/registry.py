@@ -32,6 +32,7 @@ from sams.datasource.fx import empty_fx, has_fx
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
 from sams.datasource.sources import known
+from sams.datasource.symbol_list import empty_symbol_list, has_symbol_list
 
 logger = logging.getLogger("sams.datasource.registry")
 
@@ -221,6 +222,26 @@ class FxResult:
         return bool(self.confirmed_empty_by) and self.frame.is_empty()
 
 
+@dataclass(frozen=True)
+class SymbolListResult:
+    """代码表链的返回（D148）：按市场路由、一次答全表，所以既没有 `code` 也没有窗口。
+
+    `empty_everywhere` 与 `fetch_daily` 同侧语义：每个有能力的源都答了「这张表是空的」
+    才攒成一句可落库的「没有」；有一个源挂了就不敢替它确认。
+    """
+
+    market: str
+    source: str
+    frame: pl.DataFrame
+    attempts: tuple[Attempt, ...] = ()
+    skipped: tuple[tuple[str, str], ...] = ()
+    empty_everywhere: bool = False
+
+    @property
+    def degraded(self) -> bool:
+        return len(self.attempts) > 1
+
+
 @dataclass
 class AdapterRegistry:
     """按配置的源优先级取数；主源失败自动降级，并记录每个源的最近结果。"""
@@ -374,11 +395,25 @@ class AdapterRegistry:
             yield _Outcome(name, "ok", frame=frame)
 
     def fetch_daily(self, market: str, code: str, start: date, end: date) -> FetchResult:
+        return self._fetch_bars_frame(market, code, start, end, method="daily_bars")
+
+    def fetch_index_daily(
+        self, market: str, index_code: str, start: date, end: date
+    ) -> FetchResult:
+        """指数日线链：与日线走同一条 `_walk`——「没有」「挂了」「没这能力」
+        在两张表上必须是同一套语义，否则休市看板的空与错分不清。"""
+        return self._fetch_bars_frame(market, index_code, start, end, method="index_daily")
+
+    def _fetch_bars_frame(
+        self, market: str, code: str, start: date, end: date, *, method: str
+    ) -> FetchResult:
+        # 与基本面那条 `_fetch_frame` 差一个词也是没办法：同为「0 行」，这里是「这段确实没交易」
+        # 的成功取数，那里是「这张表没这只票」的待核确认（D43）——两套语义不能共用一个名字。
         attempts: list[Attempt] = []
         skipped: list[tuple[str, str]] = []
         empties: list[str] = []
         causes: list[Exception | None] = []
-        for out in self._walk(market, code, start, end, method="daily_bars"):
+        for out in self._walk(market, code, start, end, method=method):
             if out.kind == "skipped":
                 skipped.append((out.source, out.error))
                 continue
@@ -410,7 +445,8 @@ class AdapterRegistry:
         if not attempts:
             raise DatasourceError(
                 "registry",
-                f"{market} {code} 没有能取日线的源：链 {list(self.sources_for(market))} 里"
+                f"{market} {code} 没有能取{capability(method).label}的源："
+                f"链 {list(self.sources_for(market))} 里"
                 f"被跳过的源 {skipped or []}",
             )
         raise _terminal_error(f"{market} {code} 所有源均失败 → {detail}", causes)
@@ -661,6 +697,93 @@ class AdapterRegistry:
             )
         )
         raise _terminal_error(reason, [cause for _, _, cause in failed])
+
+    def fetch_symbol_list(self, market: str) -> SymbolListResult:
+        """代码表链：与 `fetch_fx` 同一套归类，差别只在**按市场路由**（代码表有市场维度）。
+
+        一次答全表、没有窗口，所以没有 `_call_fx` 的日期裁剪段；仍然记源健康、
+        仍然在连续失败时发 SystemAlarm（D148）。「全链都说这张表是空的」才是
+        `empty_everywhere`，掺进一次失败就出声——把空表写进仓库等于删掉现有清单。
+        """
+        cap = capability("symbol_list")
+        attempts: list[Attempt] = []
+        skipped: list[tuple[str, str]] = []
+        empties: list[str] = []
+        failed: list[tuple[str, str, Exception | None]] = []
+        for name in self.sources_for(market):
+            adapter = self.adapter(name)
+            if not has_symbol_list(adapter):
+                logger.info("代码表 跳过 %s（%s 链上没有这个能力）", name, market)
+                skipped.append((name, cap.lacking))
+                continue
+            try:
+                frame = self._call_symbol_list(name, market)
+            except _SourceFailed as exc:
+                attempts.append(Attempt(name, False, exc.tries, exc.error))
+                failed.append((name, exc.error, exc.cause))
+                continue
+            except EmptyResponse as exc:
+                attempts.append(Attempt(name, True, 1, f"无数据: {exc}"))
+                empties.append(name)
+                logger.info("代码表 %s 说 %s 这张表是空的，换源", name, market)
+                continue
+            self._mark_ok(name)
+            attempts.append(Attempt(name, True))
+            return SymbolListResult(market, name, frame, tuple(attempts), tuple(skipped))
+
+        if empties and not failed:
+            return SymbolListResult(
+                market,
+                empties[0],
+                empty_symbol_list(),
+                tuple(attempts),
+                tuple(skipped),
+                empty_everywhere=True,
+            )
+
+        detail = "；".join(f"{name}: {error}" for name, error, _ in failed) or "（无）"
+        if not attempts:
+            raise DatasourceError(
+                "registry",
+                f"{market} 没有能取代码表的源：链 {list(self.sources_for(market))}",
+            )
+        causes = [cause for _, _, cause in failed]
+        raise _terminal_error(f"{market} 所有源均取代码表失败 → {detail}", causes)
+
+    def _call_symbol_list(self, name: str, market: str) -> pl.DataFrame:
+        """对单个源的一次代码表取数：限速、退避、归类，逐行照抄 `_call_fx`，只删日期裁剪。"""
+        adapter = self.adapter(name)
+        if self.bucket is not None:
+            self.bucket.acquire()
+        calls = 0
+
+        def invoke() -> pl.DataFrame:
+            nonlocal calls
+            calls += 1
+            return adapter.symbol_list(market)
+
+        try:
+            frame = call_with_backoff(
+                invoke,
+                attempts=self.attempts_per_source,
+                retryable=RETRYABLE,
+                sleep=self.sleep,
+                label=f"{name}:symbol_list {market}",
+            )
+        except EmptyResponse:
+            raise
+        except DatasourceError as exc:
+            self._mark_failure(name, exc)
+            raise _SourceFailed(name, calls, str(exc), exc) from exc
+        except Exception as exc:  # noqa: BLE001 — 适配器漏归类时兜底，路由不能被打断
+            wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
+            self._mark_failure(name, wrapped)
+            raise _SourceFailed(name, calls, str(wrapped), exc) from exc
+        out = frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
+        if out.is_empty():
+            # 一个 0 行的帧与一次 `EmptyResponse` 是同一句话：这张表没内容，继续问下一个源
+            raise EmptyResponse(name, f"{market} 代码表返回 0 行")
+        return out
 
     def _call_fx(self, name: str, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
         """对单个源的一次汇率取数：限速、退避、归类，与 `_call` 同一套预算。

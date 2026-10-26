@@ -265,6 +265,9 @@ def test_the_three_new_kinds_are_registered_as_capabilities():
         "汇率",
         # 报价没有窗口，一次问一批（U18）
         "报价",
+        # SP1 两种（D148）：代码表一次答全市场，指数日线与日线同窗不同表
+        "代码表",
+        "指数日线",
     ]
 
 

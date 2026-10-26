@@ -136,5 +136,48 @@ class SinaAdapter:
             )
         return frame
 
+    def index_daily(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+        """指数日线：与 `daily_bars` 同一个端点，symbol 用源形态指数码原样（D148）。
 
-source("sina", options=("timeout",), note="新浪 A 股日线，只有最近约 1023 根")(SinaAdapter)
+        不过 `a_share_symbol`：`sh000001` 再折一次会归成 `000001` 拼成 `sz000001`，
+        问成平安银行；新浪只有 A 股，别的市场按 `EmptyResponse` 答（是答复不是故障）。
+        """
+        if market != "A":
+            raise EmptyResponse("sina", f"新浪指数日线只有 A 股，收到 {market}")
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        today = self._clock.today()
+        # 根数必须按 start→**今天** 算，不是 start→end：接口只给「最近 N 根」，
+        # 数据右端永远是今天。按区间长度算会少要——然后过滤出 0 根，
+        # 一次补数看起来成功，实际什么都没写进去。
+        needed = int((today - start).days * 5 / 7) + 5
+        if needed > MAX_BARS:
+            raise DatasourceError(
+                "sina",
+                f"请求区间约需 {needed} 根日线，超过本源单次上限 {MAX_BARS} 根"
+                f"（约 {MAX_BARS * 7 // 5} 个日历天）；更早的历史请走其它源",
+            )
+        params = {
+            "symbol": code,
+            "scale": "240",
+            "ma": "no",
+            "datalen": str(min(needed, MAX_BARS)),
+        }
+        try:
+            payload = self._get(KLINE_URL, params, timeout=self._timeout)
+        except Exception as exc:  # noqa: BLE001 — 只包网络这一跳，解析异常不该被归成「瞬时故障」
+            raise classify_error(self.name, exc) from exc
+        frame = parse_sina_daily(payload, code=code, start=start, end=end)
+        if frame.is_empty():
+            # 请求够了、区间内一根没有：区间太老（本源只覆盖最近约 500 个交易日）
+            # 或那段时间确实停市。报「无数据」让路由继续问下一个源，而不是交回空帧
+            raise EmptyResponse(
+                "sina", f"{code} 在 {start}~{end} 内 0 根（已请求 {needed} 根到今天）"
+            )
+        # normalize_bars 把 code 归一个股形态，而指数表的键要源形态（sh000001 ≠ 平安银行，D145）
+        return frame.with_columns(pl.lit(code).alias("code"))
+
+
+source(
+    "sina", options=("timeout",), note="新浪 A 股日线 + 指数日线，只有最近约 1023 根"
+)(SinaAdapter)

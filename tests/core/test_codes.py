@@ -148,3 +148,21 @@ def test_only_a_shares_exchange_folds_a_cash_dividend_into_the_daily_change():
     assert exchange_folds_dividend_into_daily_change("US") is False
     # 大小写不许开出第三个答案：这句话讲的不是拼写，是哪个交易所在算数
     assert exchange_folds_dividend_into_daily_change("a") is True
+
+
+# ---------------------------------------------------------------- 指数码识别
+
+
+def test_looks_like_index_code():
+    from sams.core.codes import looks_like_index_code
+
+    assert looks_like_index_code("A", "sh000001")
+    assert looks_like_index_code("A", "sz399006")
+    assert not looks_like_index_code("A", "000001")  # 个股归一形态
+    assert not looks_like_index_code("A", "sh1000002")  # 位数不对
+    assert looks_like_index_code("HK", "hkHSI")
+    assert looks_like_index_code("HK", "hkHSTECH")
+    assert not looks_like_index_code("HK", "00700")
+    assert looks_like_index_code("US", "usSPX")
+    assert not looks_like_index_code("US", "AAPL")
+    assert not looks_like_index_code("", "sh000001")  # 市场不认就当不是

@@ -153,6 +153,26 @@ def test_transport_error_is_classified():
         adapter.daily_bars("A", "600519", date(2026, 10, 1), TODAY)
 
 
+# --- 指数日线（D148）：同一个端点，symbol 用源形态指数码原样 --------------------------
+
+
+def test_sina_index_daily_a():
+    adapter, get = adapter_with(WIDE)
+    out = adapter.index_daily("A", "sh000001", date(2026, 9, 1), date(2026, 9, 10))
+    # 不过 a_share_symbol：sh000001 已是新浪要的形态，再折一次会把指数问成个股或直接炸
+    assert get.calls[0]["symbol"] == "sh000001"
+    assert out["code"].unique().to_list() == ["sh000001"]
+    assert out["date"].to_list() == [date(2026, 9, 1), date(2026, 9, 2)]
+
+
+def test_sina_index_daily_hk_is_empty_answer():
+    """新浪只有 A 股：别的市场是一句答复，降级链据此继续问下一个源。"""
+    adapter, get = adapter_with(WIDE)
+    with pytest.raises(EmptyResponse):
+        adapter.index_daily("HK", "hkHSI", TODAY, TODAY)
+    assert get.calls == [], "拒绝必须发生在请求之前"
+
+
 def test_http_429_is_rate_limited_not_a_generic_failure(monkeypatch):
     """限流要退避重试同一个源，而不是立刻换源——那等于把备源也一起打爆。"""
     import sams.datasource.sina as module

@@ -18,8 +18,10 @@ from sams.datasource.actions import has_actions
 from sams.datasource.base import has_bars
 from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
 from sams.datasource.fx import has_fx
+from sams.datasource.index_daily import has_index_daily
 from sams.datasource.listed_date import has_listed_date
 from sams.datasource.quote import has_quotes
+from sams.datasource.symbol_list import has_symbol_list
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,9 @@ CAPABILITIES: dict[str, Capability] = {
     "fx_rate": Capability(label="汇率", lacking="不提供汇率", probe=has_fx),
     # 报价没有窗口，一次问一批；`chain_for(market, "quote")` 仍按这份判据过滤
     "quote": Capability(label="报价", lacking="不提供报价", probe=has_quotes),
+    # 代码表没有窗口也没有单个代码：一次答全表，按市场路由（D148）
+    "symbol_list": Capability(label="代码表", lacking="不提供代码表", probe=has_symbol_list),
+    "index_daily": Capability(label="指数日线", lacking="不提供指数日线", probe=has_index_daily),
 }
 
 

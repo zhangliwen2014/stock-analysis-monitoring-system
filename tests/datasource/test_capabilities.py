@@ -30,6 +30,8 @@ def test_the_kind_name_is_the_adapter_method_name():
         "listed_date",
         "fx_rate",
         "quote",
+        "symbol_list",
+        "index_daily",
     }
 
 
@@ -55,6 +57,32 @@ def test_the_lacking_reason_is_per_kind_and_states_the_capability():
     """`skipped` 里那句「为什么这个源没被调用」要能被打印，所以它跟着种类走。"""
     assert CAPABILITIES["daily_bars"].lacking == "不提供日线"
     assert CAPABILITIES["corp_actions"].lacking == "不提供公司行为"
-    assert known()["akshare_hk"].capabilities == ("corp_actions",)
+    assert known()["akshare_hk"].capabilities == ("corp_actions", "symbol_list")
     entries = catalog().by_kind()
-    assert entries["tencent"].capabilities == ("daily_bars", "quote")
+    assert entries["tencent"].capabilities == ("daily_bars", "quote", "index_daily")
+
+
+# --- SP1 新增两种：代码表与指数日线（D148） -----------------------------------------
+
+
+def test_the_two_new_kinds_are_registered_with_labels():
+    assert capability("symbol_list").label == "代码表"
+    assert capability("symbol_list").lacking == "不提供代码表"
+    assert capability("index_daily").label == "指数日线"
+
+
+def test_the_new_probes_answer_on_method_presence_only():
+    """D38 的判据不变：谁能干这件事只看方法在不在，不看配置。"""
+
+    class WithBoth:
+        def symbol_list(self, market): ...
+
+        def index_daily(self, market, code, start, end): ...
+
+    class WithNeither:
+        pass
+
+    assert capability("symbol_list").probe(WithBoth())
+    assert capability("index_daily").probe(WithBoth())
+    assert not capability("symbol_list").probe(WithNeither())
+    assert not capability("index_daily").probe(WithNeither())

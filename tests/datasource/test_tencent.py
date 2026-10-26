@@ -13,6 +13,7 @@ import polars as pl
 import pytest
 
 from sams.core.errors import EmptyResponse, FieldDrift, RateLimited, TransientError
+from sams.datasource.base import BAR_COLUMNS
 from sams.datasource.tencent import (
     TencentAdapter,
     _bars_for,
@@ -246,6 +247,42 @@ def test_transport_failures_are_classified(boom, expected):
     adapter, _, _ = adapter_with(boom)
     with pytest.raises(expected):
         adapter.daily_bars("A", "600519", START, END)
+
+
+# --- 指数日线（D148）：同一个 kline 端点，符号不过 tencent_symbol ----------------------
+
+
+#: 指数的响应节点键就是源形态的指数码
+INDEX_A_PAYLOAD = {
+    "code": 0,
+    "data": {"sh000001": {"day": [["2024-01-02", "1", "2", "3", "4", "5"]]}},
+}
+
+
+def test_tencent_index_daily_a():
+    get = FakeGet(INDEX_A_PAYLOAD)
+    adapter = TencentAdapter(get=get)
+    out = adapter.index_daily("A", "sh000001", START, END)
+    assert out.columns == BAR_COLUMNS
+    # 源形态原样入库：tencent_symbol 会把 sh000001 再折一次，问成别的票
+    assert out["code"].unique().to_list() == ["sh000001"]
+    assert get.calls[0][1].startswith("sh000001,day,")
+
+
+def test_tencent_index_daily_hk_uses_kline_endpoint():
+    payload = {"code": 0, "data": {"hkHSI": {"day": [["2024-01-02", "1", "2", "3", "4", "5"]]}}}
+    get = FakeGet(payload)
+    adapter = TencentAdapter(get=get)
+    out = adapter.index_daily("HK", "hkHSI", START, END)
+    assert out["close"].to_list() == [2.0]
+    assert get.calls[0][0].endswith("kline/kline")
+
+
+def test_tencent_index_daily_us_empty():
+    """腾讯没有指数的美股链：这是一句答复（EmptyResponse），不是故障。"""
+    adapter, _, _ = adapter_with(A_PAYLOAD)
+    with pytest.raises(EmptyResponse):
+        adapter.index_daily("US", "usSPX", START, END)
 
 
 def test_http_429_becomes_rate_limited(monkeypatch):

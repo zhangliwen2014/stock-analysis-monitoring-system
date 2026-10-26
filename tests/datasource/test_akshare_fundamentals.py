@@ -301,6 +301,8 @@ def test_the_adapter_now_declares_three_more_kinds():
         "valuation",
         "funding_flow",
         "listed_date",
+        # SP1 加的一格（D148）：A 股全市场代码表
+        "symbol_list",
     )
 
 

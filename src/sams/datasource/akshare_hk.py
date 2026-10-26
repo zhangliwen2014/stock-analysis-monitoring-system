@@ -1,7 +1,7 @@
 """港股公司行为：东财「港股分红派息」→ 标准列。纯解析，网络调用留在适配器里。
 
-这个源只有公司行为能力，没有日线（分层上它是独立的一个 `@source`，不挂到 akshare A 股
-适配器上：`markets` 一旦并集，HK 的日线链就会多出一个只会失败的成员）。
+这个源只有公司行为与代码表两种能力，没有日线（分层上它是独立的一个 `@source`，不挂到
+akshare A 股适配器上：`markets` 一旦并集，HK 的日线链就会多出一个只会失败的成员）。
 
 三条口径，每条错了都不会报错：
 
@@ -28,10 +28,11 @@ from datetime import date
 import polars as pl
 
 from sams.core.codes import canonical_code
-from sams.core.errors import DatasourceError, FieldDrift
+from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift
 from sams.datasource.actions import empty_actions, normalize_actions
 from sams.datasource.base import classify_error, to_date_expr
 from sams.datasource.sources import source
+from sams.datasource.symbol_list import normalize_symbol_list
 
 logger = logging.getLogger("sams.datasource")
 
@@ -175,6 +176,16 @@ def akshare_hk_payout(symbol: str) -> pl.DataFrame:
     return pl.from_pandas(frame)
 
 
+def akshare_hk_symbol_list() -> pl.DataFrame:
+    """真实网络调用：港股实时快照，全市场代码表只取它的 代码/名称 两列（D148）。"""
+    import akshare as ak
+
+    frame = ak.stock_hk_spot_em()
+    if frame is None or len(frame) == 0:
+        raise EmptyResponse("akshare_hk", "港股代码表返回空")
+    return pl.from_pandas(frame)
+
+
 def _to_polars(frame) -> pl.DataFrame:
     return frame if isinstance(frame, pl.DataFrame) else pl.from_pandas(frame)
 
@@ -184,8 +195,13 @@ class AkshareHkAdapter:
     markets = frozenset({"HK"})
     corp_actions_full_history = True
 
-    def __init__(self, payout_fetch: Callable[[str], pl.DataFrame] = akshare_hk_payout) -> None:
+    def __init__(
+        self,
+        payout_fetch: Callable[[str], pl.DataFrame] = akshare_hk_payout,
+        list_fetch: Callable[[], pl.DataFrame] = akshare_hk_symbol_list,
+    ) -> None:
         self._payout_fetch = payout_fetch
+        self._list_fetch = list_fetch
 
     def corp_actions(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         if market not in self.markets:
@@ -204,5 +220,20 @@ class AkshareHkAdapter:
             raise classify_error(self.name, exc) from exc
         return actions
 
+    def symbol_list(self, market: str) -> pl.DataFrame:
+        """港股全市场代码表（东财港股快照的 代码/名称 列，D148）。
 
-source("akshare_hk", note="东财港股分红派息（只有公司行为，没有日线）")(AkshareHkAdapter)
+        非 HK 抛 `EmptyResponse` 而不是 `ValueError`：这句是答复不是故障，
+        降级链要继续问下一个源，健康表也不该因此记一笔。
+        """
+        if market not in self.markets:
+            raise EmptyResponse(self.name, f"港股代码表不覆盖 {market} 市场")
+        try:
+            return normalize_symbol_list("HK", _to_polars(self._list_fetch()))
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
+
+source("akshare_hk", note="东财港股分红派息 + 港股代码表（没有日线）")(AkshareHkAdapter)

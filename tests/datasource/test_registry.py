@@ -13,6 +13,7 @@ from sams.datasource.actions import empty_actions
 from sams.datasource.base import BAR_COLUMNS
 from sams.datasource.ratelimit import TokenBucket
 from sams.datasource.registry import AdapterRegistry
+from sams.datasource.symbol_list import empty_symbol_list
 from sams.storage.repos.source_health import SourceHealthRepo
 
 D1, D2 = date(2024, 1, 2), date(2024, 1, 3)
@@ -588,3 +589,119 @@ def test_a_chain_with_no_daily_source_is_terminal():
     with pytest.raises(DatasourceError, match="没有能取日线的源") as caught:
         reg.fetch_daily("A", "600519", D1, D2)
     assert not isinstance(caught.value, TransientError)
+
+
+# --- SP1 两条新链：指数日线与代码表（D148） ------------------------------------------
+
+
+class FakeIndexAdapter:
+    """与 FakeAdapter 同一套按脚本应答，只是方法名换成 index_daily。"""
+
+    def __init__(self, name: str, markets=("A",), *outcomes) -> None:
+        self.name = name
+        self.markets = frozenset(markets)
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def index_daily(self, market, code, start, end):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class FakeSymbolListAdapter:
+    """按脚本应答，方法是 symbol_list(market)：没有代码也没有窗口。"""
+
+    def __init__(self, name: str, markets=("A",), *outcomes) -> None:
+        self.name = name
+        self.markets = frozenset(markets)
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def symbol_list(self, market):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def symbol_frame() -> pl.DataFrame:
+    return pl.DataFrame({"code": ["000001", "600519"], "name": ["平安银行", "贵州茅台"]})
+
+
+def test_fetch_index_daily_walks_chain():
+    primary = FakeIndexAdapter("sina", ["A"], TransientError("sina", "timeout"))
+    backup = FakeIndexAdapter("tencent", ["A"], frame("tencent"))
+    reg = registry(primary, backup)
+    result = reg.fetch_index_daily("A", "sh000001", D1, D2)
+    assert result.source == "tencent"
+    assert result.degraded
+    assert [a.source for a in result.attempts] == ["sina", "tencent"]
+
+
+def test_fetch_index_daily_all_empty_is_empty_not_failure():
+    reg = registry(
+        FakeIndexAdapter("sina", ["A"], EmptyResponse("sina", "无")),
+        FakeIndexAdapter("tencent", ["A"], EmptyResponse("tencent", "无")),
+    )
+    result = reg.fetch_index_daily("A", "sh000001", D1, D2)
+    assert result.empty_everywhere and result.frame.is_empty()
+    assert result.frame.columns == BAR_COLUMNS
+
+
+def test_fetch_index_daily_skips_sources_without_the_capability():
+    bars_only = FakeAdapter("akshare", ["A"], frame("akshare"))
+    with_index = FakeIndexAdapter("tencent", ["A"], frame("tencent"))
+    reg = registry(bars_only, with_index)
+    result = reg.fetch_index_daily("A", "sh000001", D1, D2)
+    assert result.source == "tencent"
+    assert result.skipped == (("akshare", "不提供指数日线"),)
+    assert bars_only.calls == 0
+
+
+def test_fetch_index_daily_chain_without_any_index_source_is_terminal():
+    reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")))
+    with pytest.raises(DatasourceError, match="指数日线"):
+        reg.fetch_index_daily("A", "sh000001", D1, D2)
+
+
+def test_fetch_symbol_list_market_level():
+    """代码表按市场路由：A 股链不该把港股源叫起来——它那张表根本不在同一个接口上。"""
+    cn = FakeSymbolListAdapter("akshare", ["A"], symbol_frame())
+    hk_rows = pl.DataFrame({"code": ["00700"], "name": ["腾讯控股"]})
+    hk = FakeSymbolListAdapter("akshare_hk", ["HK"], hk_rows)
+    reg = AdapterRegistry(
+        adapters={"akshare": cn, "akshare_hk": hk},
+        market_sources={"A": ("akshare",), "HK": ("akshare_hk",)},
+        sleep=lambda _s: None,
+    )
+    result = reg.fetch_symbol_list("A")
+    assert (result.source, result.degraded) == ("akshare", False)
+    assert result.frame.to_dicts() == [
+        {"code": "000001", "name": "平安银行"},
+        {"code": "600519", "name": "贵州茅台"},
+    ]
+    assert (cn.calls, hk.calls) == (1, 0)
+
+
+def test_fetch_symbol_list_without_capable_source_is_terminal():
+    reg = registry(_NoDaily())
+    with pytest.raises(DatasourceError, match="没有能取代码表的源"):
+        reg.fetch_symbol_list("A")
+
+
+def test_fetch_symbol_list_zero_rows_is_empty_everywhere():
+    """0 行帧与 EmptyResponse 是同一句话：整条链都说没有才攒成 empty_everywhere。"""
+    reg = registry(
+        FakeSymbolListAdapter("akshare", ["A"], empty_symbol_list()),
+        FakeSymbolListAdapter("akshare_ths", ["A"], EmptyResponse("akshare_ths", "表是空的")),
+    )
+    result = reg.fetch_symbol_list("A")
+    assert result.empty_everywhere
+    assert result.frame.is_empty()
+    assert result.frame.columns == ["code", "name"]
+    assert result.source == "akshare"
+    assert [a.source for a in result.attempts] == ["akshare", "akshare_ths"]

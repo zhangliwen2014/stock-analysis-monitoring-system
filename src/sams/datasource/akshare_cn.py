@@ -43,6 +43,7 @@ from sams.datasource.fundamentals import (
     normalize_valuation,
 )
 from sams.datasource.sources import source
+from sams.datasource.symbol_list import normalize_symbol_list
 
 logger = logging.getLogger("sams.datasource")
 
@@ -325,6 +326,16 @@ def akshare_flow(symbol: str, market_tag: str) -> pl.DataFrame:
     return pl.from_pandas(frame)
 
 
+def akshare_symbol_list() -> pl.DataFrame:
+    """真实网络调用：A 股全市场代码表（源就给 code/name 两列，D148）。"""
+    import akshare as ak
+
+    frame = ak.stock_info_a_code_name()
+    if frame is None or len(frame) == 0:
+        raise EmptyResponse("akshare", "A 股代码表返回空")
+    return pl.from_pandas(frame)
+
+
 def attach_dividend_yield(indicators: pl.DataFrame, payouts: pl.DataFrame) -> pl.DataFrame:
     """把分红送配表里的股息率按**报告期**并到财务指标上，产出一列 `股息率`。
 
@@ -373,6 +384,7 @@ class AkshareAdapter:
         valuation_fetch: Callable[[str], pl.DataFrame] = akshare_valuation,
         flow_fetch: Callable[[str, str], pl.DataFrame] = akshare_flow,
         listing_fetch: Callable[[str], pl.DataFrame] = akshare_listing_info,
+        list_fetch: Callable[[], pl.DataFrame] = akshare_symbol_list,
     ) -> None:
         self._fetch = fetch
         self._fhps_fetch = fhps_fetch
@@ -380,6 +392,7 @@ class AkshareAdapter:
         self._valuation_fetch = valuation_fetch
         self._flow_fetch = flow_fetch
         self._listing_fetch = listing_fetch
+        self._list_fetch = list_fetch
 
     def corp_actions(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         """A 股分红送配。源没有日期参数，一次给全史——那就把全史都交回去，**不按窗口切**。
@@ -528,6 +541,21 @@ class AkshareAdapter:
             raise classify_error(self.name, exc) from exc
         return day
 
+    def symbol_list(self, market: str) -> pl.DataFrame:
+        """A 股全市场代码表，出口只留 (code, name) 两列（D148）。
+
+        别的市场抛 `EmptyResponse` 而不是 `ValueError`：「这张表我不给」是一句答复，
+        降级链据此继续问下一个源，不该把它记成这个源挂了。
+        """
+        if market not in self.markets:
+            raise EmptyResponse(self.name, f"A 股代码表不覆盖 {market} 市场")
+        try:
+            return normalize_symbol_list("A", _as_polars(self._list_fetch()))
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
 
 def _as_polars(frame) -> pl.DataFrame:
     if isinstance(frame, pl.DataFrame):
@@ -539,7 +567,7 @@ def _as_polars(frame) -> pl.DataFrame:
 source(
     "akshare",
     note=(
-        "akshare A 股主源（日线 + 分红送配 + 基本面 + 按日估值 + 资金流 + 上市日期，"
+        "akshare A 股主源（日线 + 分红送配 + 基本面 + 按日估值 + 资金流 + 上市日期 + 代码表，"
         "底层都是东财）"
     ),
 )(AkshareAdapter)

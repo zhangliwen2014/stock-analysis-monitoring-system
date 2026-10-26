@@ -124,3 +124,22 @@ def daily_price_limit(market: str, code: str) -> float | None:
         return 0.10
     # B 股（900/200）与其它老代码：不猜——判错一次的代价是把正常行情说成除权
     return None
+
+
+def looks_like_index_code(market: str, code: str) -> bool:
+    """源形态的指数码（sh000001/hkHSI/usSPX）。
+
+    000001 是平安银行也是上证指数：区分靠这层市场前缀，轮询与入库据此分叉，
+    否则个股表和指数表会互相冒名。HK/US 后缀 2~6 位大写字母（HSCEI 5 位、HSTECH 6 位）。
+    """
+    c = code.strip()
+    tail = c[2:]
+    if not tail:
+        return False
+    if market == "A":
+        return c[:2].lower() in ("sh", "sz", "bj") and tail.isdigit() and len(tail) == 6
+    if market == "HK":
+        return c[:2].lower() == "hk" and tail.isalpha() and tail.isupper() and len(tail) <= 6
+    if market == "US":
+        return c[:2].lower() == "us" and tail.isalpha() and tail.isupper() and len(tail) <= 6
+    return False

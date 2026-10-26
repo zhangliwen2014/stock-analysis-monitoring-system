@@ -347,6 +347,34 @@ class TencentAdapter:
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
 
+    def index_daily(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+        """指数日线：与 `daily_bars` 同一个端点，唯一差别是符号构造（D148）。
+
+        指数码（sh000001/hkHSI）已带源前缀，**不过 `tencent_symbol`**——
+        再折一次会把 `sh000001` 归一成 `000001` 再拼成 `sz000001`，问成平安银行；
+        腾讯没有指数的美股那一跳按 `EmptyResponse` 答，让降级链继续问下一个源。
+        """
+        if market not in ("A", "HK"):
+            raise EmptyResponse("tencent", f"腾讯指数日线没有 {market} 市场")
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        symbol = code
+        params = {
+            # 逗号分隔的一串参数：symbol, 周期, 起, 止, 根数[, 复权位]
+            # A 股走 fqkline，复权位必须**留空但保留**（少这一位会被接口按默认口径处理，
+            # 而 kline/kline 那条路又不接受第六位——两个端点的参数形状不一样）
+            "param": kline_param(market, symbol, start, end, _bars_for(start, end))
+        }
+        try:
+            payload = self._get(KLINE_PATHS[market], params, timeout=self._timeout)
+            bars = parse_tencent_daily(payload, market=market, code=code, symbol=symbol)
+            # normalize_bars 把 code 归一个股形态（sh000001→000001），而指数表的键要源形态（D145）
+            return bars.with_columns(pl.lit(code).alias("code"))
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
     def quotes(self, market: str, codes: list[str]) -> QuoteBatch:
         """一次请求的代码清单由调用方按 `QUOTE_BATCH` 分批（service 层负责），本方法不切片。"""
         if market not in self.markets:
@@ -389,6 +417,6 @@ def _bars_for(start: date, end: date) -> int:
 
 
 # 放在模块末尾：装饰器要等类定义完才拿得到 markets
-source("tencent", options=("timeout",), note="腾讯 gtimg 日线，A/HK/US 三市场，不复权")(
+source("tencent", options=("timeout",), note="腾讯 gtimg 日线 + A/HK 指数日线，三市场，不复权")(
     TencentAdapter
 )
