@@ -1,5 +1,7 @@
 """补数队列：open_key 去重、结案后可重开、三次失败转 deferred（D144）。"""
 
+import pytest
+
 from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 
 
@@ -19,11 +21,20 @@ def test_note_failure_defers(db):
     repo.enqueue("A", "600519")
     row = repo.take_pending()[0]
     assert repo.note_failure(row.id, "boom\nstack") == "pending"
-    assert repo.note_failure(row.id, "boom") == "pending"
-    assert repo.note_failure(row.id, "boom") == "deferred"
+    # 多行错误只留第一行：这一句才是 splitlines 的证明（三次调用各用可区分的字符串）
+    assert repo.open_for("A", "600519").last_error == "boom"
+    assert repo.note_failure(row.id, "second line only") == "pending"
+    assert repo.note_failure(row.id, "kapow") == "deferred"
     row = repo.open_for("A", "600519")
     # deferred 仍占着开放键；错误只存第一行
-    assert (row.status, row.tries, row.last_error) == ("deferred", 3, "boom")
+    assert (row.status, row.tries, row.last_error) == ("deferred", 3, "kapow")
+
+
+def test_note_failure_unknown_id_raises(db):
+    """失踪的 id 不返回假字符串："None" 会被调用方当成一个未知状态继续排下去。"""
+    repo = SymbolBackfillRepo(db)
+    with pytest.raises(ValueError, match="不存在"):
+        repo.note_failure("deadbeef", "boom")
 
 
 def test_take_pending_respects_limit(db):

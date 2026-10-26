@@ -23,6 +23,11 @@ class BackfillRow:
     status: str
 
 
+#: `BackfillRow` 的列清单：take_pending 与 open_for 读的是同一个形状，
+#: 两处各写一遍时，加一列只需要改一个地方
+_OPEN_COLUMNS = "id, market, code, tries, last_error, status"
+
+
 class SymbolBackfillRepo:
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -48,7 +53,7 @@ class SymbolBackfillRepo:
     def take_pending(self, limit: int = 3) -> list[BackfillRow]:
         # 不回读 created_at：TIMESTAMPTZ 取回不稳（房规），这里只需要它排序
         rows = self.db.query(
-            "SELECT id, market, code, tries, last_error, status FROM symbol_backfills"
+            f"SELECT {_OPEN_COLUMNS} FROM symbol_backfills"
             " WHERE status = 'pending' ORDER BY created_at, id LIMIT ?",
             [limit],
         )
@@ -70,7 +75,11 @@ class SymbolBackfillRepo:
         )
 
     def note_failure(self, row_id: str, error: str, *, max_tries: int = 3) -> str:
-        """记一次失败，返回新状态：pending 或 deferred。"""
+        """记一次失败，返回新状态：pending 或 deferred。
+
+        多行错误（traceback）只存第一行：`last_error` 是给「这票为什么没补上」
+        那一格看的一句话，不是日志转储。
+        """
         first_line = (error.splitlines() or [""])[0][:200]
         with self.db.transaction():
             self.db.execute(
@@ -79,15 +88,14 @@ class SymbolBackfillRepo:
                 " WHERE id = ?",
                 [first_line, max_tries, row_id],
             )
-            status = self.db.scalar(
-                "SELECT status FROM symbol_backfills WHERE id = ?", [row_id]
-            )
+            status = self.db.scalar("SELECT status FROM symbol_backfills WHERE id = ?", [row_id])
+        if status is None:
+            raise ValueError(f"补数记录 {row_id} 不存在")
         return str(status)
 
     def open_for(self, market: str, code: str) -> BackfillRow | None:
         rows = self.db.query(
-            "SELECT id, market, code, tries, last_error, status FROM symbol_backfills"
-            " WHERE open_key = ?",
+            f"SELECT {_OPEN_COLUMNS} FROM symbol_backfills WHERE open_key = ?",
             [f"{market}|{code}"],
         )
         return None if rows.is_empty() else BackfillRow(**rows.to_dicts()[0])

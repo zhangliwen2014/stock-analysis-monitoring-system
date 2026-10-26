@@ -7,7 +7,14 @@
 
 from __future__ import annotations
 
+import polars as pl
+
 from sams.storage.db import Database
+
+#: 集合写那六列（market 由调用方整批给一个值）：显式 schema 让「整列都是 None」也落定
+#: 为 Utf8，而不是 polars 的 NULL 类型让 INSERT 报一句不带列名的转换错。
+_BATCH_COLUMNS = ("market", "code", "name", "py_initials", "py_full", "currency")
+_VIEW = "incoming_symbol_master"
 
 
 class SymbolListRepo:
@@ -15,22 +22,39 @@ class SymbolListRepo:
         self.db = db
 
     def upsert_batch(self, market: str, rows: list[dict]) -> None:
-        """一行一 INSERT OR REPLACE：整表周更本来就是全列覆盖。"""
-        with self.db.transaction():
-            for row in rows:
+        """一次集合写覆盖全列：整表周更本来就是全列覆盖，逐行 INSERT 只是把它调成 N 次往返。
+
+        走 `register` + `INSERT OR REPLACE ... SELECT`（`symbols.upsert` 的先例）；
+        `is_active` 与 `updated_at` 由 SQL 侧给（常量 true 与 now()），不进 polars 帧。
+        """
+        if not rows:
+            return
+        frame = pl.DataFrame(
+            {
+                "market": [market] * len(rows),
+                "code": [row["code"] for row in rows],
+                "name": [row["name"] for row in rows],
+                "py_initials": [row["py_initials"] for row in rows],
+                "py_full": [row["py_full"] for row in rows],
+                "currency": [row["currency"] for row in rows],
+            },
+            schema={c: pl.Utf8 for c in _BATCH_COLUMNS},
+        )
+        # 同一批里同码两次（源给重了行）时留最后一条：DuckDB 不会为「帧内部相撞」报约束错，
+        # 于是「哪条胜出」全凭它内部的处理次序 —— 显式 dedupe 与 symbols._prepare 同规则
+        frame = frame.unique(subset=["market", "code"], keep="last")
+        self.db.register(_VIEW, frame)
+        try:
+            with self.db.transaction():
                 self.db.execute(
                     "INSERT OR REPLACE INTO symbol_master"
                     " (market, code, name, py_initials, py_full, currency, is_active, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, true, now())",
-                    [
-                        market,
-                        row["code"],
-                        row["name"],
-                        row["py_initials"],
-                        row["py_full"],
-                        row["currency"],
-                    ],
+                    " SELECT market, code, name, py_initials, py_full, currency, true, now()"
+                    f" FROM {_VIEW}"
                 )
+        finally:
+            # 不放进 finally 的话，写失败的批次会把视图挂在连接上，下次同名注册读到残留
+            self.db.unregister(_VIEW)
 
     def deactivate_missing(self, market: str, codes: list[str]) -> int:
         """把该市场当前活跃、却不在这份清单里的码关停；返回关停数。"""
