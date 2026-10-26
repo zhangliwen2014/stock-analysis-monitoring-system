@@ -424,13 +424,15 @@ def test_a_lowercase_market_echoes_the_shape_that_was_written(config_path, capsy
 def test_an_actions_only_source_is_not_counted_as_a_bars_backup(config_path, capsys):
     """akshare_hk 拉不到价格。把它当港股日线的第二个源，屏幕上就是「有两个源，正常」，
     而 ⚠ 日线单源永远不出现——D38 分能力记账就是为了这一屏不说假话。
+    （SP1 起 akshare_hk 还多一个代码表能力：「仅」后面的那串就是它此刻的本事清单，
+    能力长了这一屏要跟着长，这才是分能力记账的本意。）
     """
     assert cli.run(["source", "unroute", "HK", "tencent"]) == 0
     capsys.readouterr()
 
     assert cli.run(["health"]) == 0
     out = capsys.readouterr().out
-    assert "yfinance → akshare_hk(仅公司行为)" in out
+    assert "yfinance → akshare_hk(仅公司行为、代码表)" in out
     assert "⚠ 日线单源" in out
 
 
