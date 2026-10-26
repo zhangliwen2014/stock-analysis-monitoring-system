@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
@@ -23,6 +23,15 @@ _STATE_LABEL = {
 
 def state_label(state: str) -> str:
     return _STATE_LABEL.get(state, state)
+
+
+def index_close_label(day: date) -> str:
+    """大盘条落回库里最后一行时那一格：`10-21 收盘`。
+
+    「收盘」这个字眼和上面那几个状态词一样归这里定：看板两屏（自选行与大盘条）说的是
+    同一套话，改名时不会一半屏幕跟着、一半留在路由里。
+    """
+    return f"{day:%m-%d} 收盘"
 
 
 def pct(value: float | None) -> str:

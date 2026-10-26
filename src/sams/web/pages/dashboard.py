@@ -17,12 +17,11 @@ from fastapi.responses import RedirectResponse
 
 from sams.bootstrap import AppCore, ServiceContext
 from sams.core.codes import currency_override
-from sams.core.config import Settings
 from sams.core.errors import SamsError, ValidationError
-from sams.core.quotes import NO_DATA, quote_state
+from sams.core.quotes import DELAYED, LIVE, NO_DATA, quote_state
 from sams.services.symbol_search import normalize_query
 from sams.web.auth import csrf_protect, require_user
-from sams.web.display import hms, pct_class, state_label
+from sams.web.display import hms, index_close_label, pct_class, state_label
 
 router = APIRouter()
 
@@ -182,28 +181,39 @@ def indices_partial(request: Request):
     require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
+    now = web.core.clock.now_utc()
     return web.render(
-        request, "partials/indices.html", segments=_index_rows(ctx, web.core, ctx.settings)
+        request, "partials/indices.html", segments=_index_rows(ctx, web.core, now)
     )
 
 
-def _index_rows(ctx: ServiceContext, core: AppCore, settings: Settings) -> list[dict]:
-    """报价板新鲜就用板，否则用库内最后一行：休市看不到数，是这一屏最大的旧痛点（D145）。"""
+def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]:
+    """报价板「此刻还活着」就用板，否则用库内最后一行：休市看不到数，是这一屏最大的旧痛点（D145）。"""
+    settings = ctx.settings
     segments = []
     for market in sorted(settings.markets):
         rows = []
         unit = _price_unit(ctx, market)
+        market_open = _market_open(ctx, market, now)
         for index_code in settings.indices.for_market(market):
             quote = core.board.get(market, index_code)
-            if quote is not None and not quote.is_stale and quote.price is not None:
+            # 判活与自选行同一个口径（`quote_state`）：`is_stale` 只说「源没给时刻」，
+            # 不说「它旧」——休市时板上那笔永远不 stale，拿它当判活会把几小时前的价叫「实时」
+            state = NO_DATA
+            if quote is not None:
+                state = quote_state(
+                    quote, now=now, market_open=market_open, stale_s=settings.quote_stale_s
+                )
+            if state in (LIVE, DELAYED):
                 rows.append(
                     {
                         "code": index_code,
                         "label": settings.indices.label(index_code),
                         "value": quote.price,
+                        # 源的涨跌幅按源自己给的前收盘算，与库里那列的基线不同，可以不相等
                         "pct": quote.pct_chg,
                         "pct_class": pct_class(quote.pct_chg),
-                        "at": "实时",
+                        "at": state_label(state),
                         "unit": unit,
                     }
                 )
@@ -217,9 +227,10 @@ def _index_rows(ctx: ServiceContext, core: AppCore, settings: Settings) -> list[
                     "code": index_code,
                     "label": settings.indices.label(index_code),
                     "value": latest.close,
+                    # 仓库这列是本仓库按前一根日线算的，与源那一列基线不同，同一日可能给出不同数
                     "pct": latest.change_pct,
                     "pct_class": pct_class(latest.change_pct),
-                    "at": f"{latest.day:%m-%d} 收盘",
+                    "at": index_close_label(latest.day),
                     "unit": unit,
                 }
             )
