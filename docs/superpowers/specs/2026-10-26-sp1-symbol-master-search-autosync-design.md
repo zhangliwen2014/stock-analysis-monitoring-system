@@ -19,8 +19,8 @@
 | D140 | 全市场代码表作为**基础数据**入库：新表 `symbol_master(market, code, name, …)`，每周盘后全量同步 **A+HK**；美股列表源弱（yfinance 限流史），留接口不做 | 代码表同时是搜索的库、名称的显示源、主档兜底的行来源——一块地基三处用 |
 | D141 | 入库时用 **pypinyin** 预计算两列：`py_initials`（首字母，`平安银行→payh`）与 `py_full`（全拼 `pinganyinhang`，无声调、小写）。输入侧归一：剥市场前缀（`hk00700`/`sh600519`/`usAAPL`→定市场+大写代码）、大小写不敏感、剥空白 | 顶流（雪球/同花顺）都同时接受首字母与全拼；预计算让查询成为一条带索引的 LIKE，逐键现算 7 千行是死路。多音字取 pypinyin 默认读音，接受个别票要换写法才命中——搜索是发现手段，登记代码永远兜底（D143） |
 | D142 | 候选排序钉死：**代码精确 > 首字母精确 > 全拼精确 > 前缀（首字母/全拼/代码）> 片段（代码/中文名）**，同级按代码升序；上限 10 条。每条候选显示 市场徽标/代码/名称/**昨收**（昨收只读本地 `bars_daily`，没同步过显示「—」，一次批量查询、零网络） | 可预期 > 聪明。热度/市值排序等 SP3 快照有数后再升级，接口留权重钩子 |
-| D143 | 交互：自选页加票框改为搜了再加——htmx 防抖（300ms）拉 `/api/symbol-search?q=`；**点候选行=直接加入自选**（加票页里的点击意图明确，免二次确认）；查无提示「没找到与 X 匹配的 A股/港股：换个写法，或直接按代码登记」；「直接登记」对**不在代码表**的代码照收（新上市/表未更新），随后走自动补数 | 顶流惯例是搜索→个股页→关注两步；我们是列表加票场景，一步到位。直登入口保住「代码表不是存在的裁判」这一条：表是加速器不是门槛 |
-| D144 | 自动补数：加自选、录成交、建规则、立论点**四个入口**统一调 `SymbolInterest.ensure(market, code, actor)`——它建主档行（代码表有名字就带名字）、查 `bars_daily` 无该股日线则写一行 `symbol_backfills(market, code, tries, last_error, created_at, done_at)`。调度器每拍（10s）消费**至多 3 条** pending：走现有 `sync.sync_daily`（顺带补主档、公司行为按既有链）；同票累计失败 3 次 ⇒ 置 `deferred`，个股页提示「今晚会随盘后任务再试」，次日盘后链成功即清账 | 「今天加票明天才有数」是试用者的头号困惑；每拍限 3 条防止一次导入打满源；失败停手与源冷却语义一致。写表而非直调调度器：layering 不破（服务层不 import scheduler，bootstrap 只给表两侧开门） |
+| D143 | 交互：自选页加票框改为搜了再加——htmx 防抖（300ms）拉 `/api/symbol-search?code=`；**点候选行=直接加入自选**（加票页里的点击意图明确，免二次确认）；查无提示「没找到与 X 匹配的 A股/港股：换个写法，或直接按代码登记」；「直接登记」对**不在代码表**的代码照收（新上市/表未更新），随后走自动补数 | 顶流惯例是搜索→个股页→关注两步；我们是列表加票场景，一步到位。直登入口保住「代码表不是存在的裁判」这一条：表是加速器不是门槛 |
+| D144 | 自动补数：加自选、录成交、建规则、立论点**四个入口**统一调 `SymbolInterest.ensure(market, code, actor)`——它建主档行（代码表有名字就带名字）、查 `bars_daily` 无该股日线则写一行 `symbol_backfills(market, code, tries, last_error, created_at, done_at)`。调度器每拍（默认 60s，`scheduler_tick_s`）消费**至多 3 条** pending：走现有 `sync.sync_daily`（顺带补主档、公司行为按既有链）；同票累计失败 3 次 ⇒ 置 `deferred`，个股页提示「今晚会随盘后任务再试」，次日盘后链成功即清账 | 「今天加票明天才有数」是试用者的头号困惑；每拍限 3 条防止一次导入打满源；失败停手与源冷却语义一致。写表而非直调调度器：layering 不破（服务层不 import scheduler，bootstrap 只给表两侧开门） |
 | D145 | 指数独立表 `index_daily(market, index_code, date, open, high, low, close, prev_close, change_pct, source)`：键 `sh000001` 这类带市场前缀的指数代码，**不进 `bars_daily`**（000001 撞车）。清单配置驱动：`[indices]` 默认 9 个——A：上证指数 sh000001、深证成指 sz399001、创业板指 sz399006；HK：恒生 hkHSI、恒生科技 hkHSTECH、H股指数 hkHSCEI；US：标普500 usSPX、纳斯达克 usIXIC、道指 usDJI。数据源给 **腾讯/新浪** 加 `index_daily` 能力（method 走 `chain_for`/`_walk`，窗口型），盘后随市场每日链更新 | 顶流行情页第一屏就是指数；休市显示最近交易日收盘+涨跌幅，正是用户要的「大盘基本情况」 |
 | D146 | 个股页可达性：`/symbol/{market}/{code}` 对**代码表内**任何票可进（进页时主档缺失即由代码表兜底建行）；无日线时不再 404，渲染空态「该股数据待同步」+「立即排一拍」按钮（= `SymbolInterest.ensure`）。自选与持仓的行内代码统一链到个股页（上轮 N4 就此了结）；代码表也查无的票保留 404 | 空态和 404 说的是两件不同的事：「有这只票、数还没来」vs「不认识这串代码」 |
 | D147 | 代码表周同步语义：整批 upsert；本批缺失的旧行不删，置 `is_active=false`（退市/摘牌：搜索与候选不再出，但已挂自选/告警的行仍可渲染名称）。同步失败沿用旧表并在源健康记账——「代码表拿不到」绝不能把搜索变成错误页 | 代码表是显示层地基，宁可旧不可空 |
@@ -32,27 +32,29 @@
 
 ```sql
 CREATE TABLE symbol_master (
-  market TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL,
-  py_initials TEXT, py_full TEXT, is_active BOOLEAN DEFAULT true,
-  synced_at TIMESTAMPTZ NOT NULL,
+  market VARCHAR NOT NULL, code VARCHAR NOT NULL, name VARCHAR,
+  py_initials VARCHAR NOT NULL, py_full VARCHAR NOT NULL, currency VARCHAR,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (market, code)
 );
-CREATE INDEX symbol_master_py ON symbol_master(market, py_initials, code);
+CREATE INDEX symbol_master_search ON symbol_master(market, py_initials, code);
 
 CREATE TABLE index_daily (
-  market TEXT NOT NULL, index_code TEXT NOT NULL, date DATE NOT NULL,
-  open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
-  prev_close DOUBLE, change_pct DOUBLE, source TEXT NOT NULL,
+  market VARCHAR NOT NULL, index_code VARCHAR NOT NULL, date DATE NOT NULL,
+  open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE NOT NULL,
+  volume DOUBLE, amount DOUBLE,
+  prev_close DOUBLE, change_pct DOUBLE, source VARCHAR,
   PRIMARY KEY (market, index_code, date)
 );
 
 CREATE TABLE symbol_backfills (
-  id TEXT PRIMARY KEY,             -- uuid
-  market TEXT NOT NULL, code TEXT NOT NULL,
-  open_key TEXT,                   -- '{market}|{code}'，结案置 NULL
-  tries INT NOT NULL DEFAULT 0, last_error TEXT,
-  status TEXT NOT NULL,            -- pending | deferred | done（done 行留给 prune 回收）
-  created_at TIMESTAMPTZ NOT NULL, done_at TIMESTAMPTZ
+  id VARCHAR PRIMARY KEY,            -- uuid
+  market VARCHAR NOT NULL, code VARCHAR NOT NULL,
+  tries INTEGER NOT NULL DEFAULT 0, last_error VARCHAR,
+  status VARCHAR NOT NULL,           -- pending | deferred | done（done 行留给 prune 回收）
+  open_key VARCHAR,                  -- '{market}|{code}'，结案置 NULL
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), done_at TIMESTAMPTZ
 );
 CREATE UNIQUE INDEX symbol_backfills_open ON symbol_backfills(open_key);
 ```
@@ -61,7 +63,7 @@ CREATE UNIQUE INDEX symbol_backfills_open ON symbol_backfills(open_key);
 partial unique index（`... WHERE status IN ('pending','deferred')` 那句直接报错），
 所以开放期写非空占位、结案置 NULL——唯一索引里 NULL 互不冲突，同一只票结完之后还能再排。
 
-`py_initials/py_full` 允许 NULL：手工直登、不在清单的票进 `symbols` 主档即可，代码表不强造行。
+`name` 可空（源偶发无名），`py_initials/py_full` 非空：手工直登、不在清单的票进 `symbols` 主档即可，代码表不强造行。
 
 ### 2.2 组件与数据流
 
@@ -69,7 +71,7 @@ partial unique index（`... WHERE status IN ('pending','deferred')` 那句直接
 - **`SymbolMasterSync`（services）**：调 `registry.fetch_symbol_list(market)` → pypinyin 两列 → upsert + 缺席置 `is_active=false`。每周调度项：新 `JobSpec("symbol_master", WEEKLY, market, …)`，A/HK 各一。
 - **`SymbolInterest`（services）**：`ensure(market, code, actor) -> EnsureReport`。四入口（dashboard 加自选、ledger 成交、rules 创建、theses 创建）在各自写成功后调用；它只做三件事：建主档（查代码表取名字）、判 `bars_daily` 空、上表插 pending（`open_key` 唯一索引保证幂等，见 §2.1）。
 - **backfill 消费**：调度器 tick 里 `requests.drain()` 之后新增一步——取 `status=pending ORDER BY created_at LIMIT 3`，逐条 `sync.sync_daily(market, code, as_of-INITIAL_SYNC_DAYS, as_of)`；成功 → `done`；`SamsError` → `tries+1,last_error`，`tries≥3` 转 `deferred`。deferred 不再每拍碰；盘后链按 universe 自然重试，成功后把该股 backfill 清账（`sync_daily` 出口挂一步清账，避免同一票空转）。
-- **搜索**：`GET /api/symbol-search?q=`（登录用户，htmx partial）。归一（D141）→ 单条 SQL 按 D142 分档取候选（`LIMIT 10`，`is_active=true`）→ 批量昨收 → 渲染候选行；候选行的加票按钮 POST 现有 `/watchlist/add`（服务端解析 market+code，前端传来的只有候选 id，不接受自由文本注入）。
+- **搜索**：`GET /api/symbol-search?code=`（登录用户，htmx partial）。归一（D141）→ 单条 SQL 按 D142 分档取候选（`LIMIT 10`，`is_active=true`）→ 批量昨收 → 渲染候选行；候选行的加票按钮 POST 现有 `/watchlist/add`（服务端解析 market+code，前端传来的只有候选 id，不接受自由文本注入）。
 - **大盘条**：看板模板顶部 partial `/api/partials/indices`：每市场读 `index_daily` 最近两日（收盘+涨跌幅+日期）；盘中若有指数即时报价（见下）以快照优先。休市文案示例：「上证 3,890.11 +0.42%（10-24 收盘）」。
 - **指数盘中**：`quote` 轮询 universe 追加配置的指数代码（`UniverseBuilder` 增 `indices(market)` 一组），tencent/sina 的 `fetch_quotes` 按既有代码映射扩展支持指数串。**失败不影响日线路径**：报价拿不到指数时条子退回昨收盘语义。
 
