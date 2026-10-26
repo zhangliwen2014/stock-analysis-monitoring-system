@@ -30,7 +30,7 @@ from fastapi.responses import RedirectResponse
 
 from sams.core.errors import Conflict, DatabaseLocked, SamsError, TooManyRequests
 from sams.services.markdown import render_markdown
-from sams.storage.repos.annotations import TARGET_TYPES
+from sams.storage.repos.annotations import TARGET_TYPES, VISIBILITIES
 from sams.storage.repos.app_settings import TEAM_SHARING
 from sams.web.auth import audit, csrf_protect, require_admin
 from sams.web.display import moment_label
@@ -108,30 +108,50 @@ def _day_start(raw: str | None, tz: str, *, next_day: bool = False) -> datetime 
     return midnight + timedelta(days=1) if next_day else midnight
 
 
-def _list_filters(request: Request, ctx, users) -> dict:
+def _list_filters(request: Request, ctx, users) -> tuple[dict, dict]:
     """§6.5:340 的四项筛选：值全在白名单/可解析才进 WHERE，野值静默忽略。
-    `user` 认用户名——地址栏里躺 uuid 既不可读也没人抄得动。"""
+    `user` 认用户名——地址栏里躺 uuid 既不可读也没人抄得动。
+
+    一并返回 `shown`（表单回显）：校验与回显同源，「进了 WHERE 的那一份」和
+    「回填到表单的那一份」就不可能分叉——被丢弃的野值在 shown 里同样是空，看起来就是没筛。
+    """
     query = request.query_params
     filters: dict = {}
+    shown: dict[str, str] = {"user": "", "type": "", "visibility": "", "since": "", "until": ""}
     wanted_user = (query.get("user") or "").strip()
     if wanted_user:
         hit = next((u for u in users if u.username == wanted_user), None)
         if hit is not None:
             filters["user_id"] = hit.id
+            shown["user"] = wanted_user
     wanted_type = (query.get("type") or "").strip()
     if wanted_type in TARGET_TYPES:
         filters["target_type"] = wanted_type
+        shown["type"] = wanted_type
     wanted_visibility = (query.get("visibility") or "").strip()
-    if wanted_visibility in ("private", "team"):
+    if wanted_visibility in VISIBILITIES:
         filters["visibility"] = wanted_visibility
+        shown["visibility"] = wanted_visibility
     tz = ctx.settings.server.display_tz
     since = _day_start(query.get("since"), tz)
     if since is not None:
         filters["since"] = since
+        shown["since"] = (query.get("since") or "").strip()
     until = _day_start(query.get("until"), tz, next_day=True)
     if until is not None:
         filters["until"] = until
-    return filters
+        shown["until"] = (query.get("until") or "").strip()
+    return filters, shown
+
+
+def _usage_row(user: str, annotations: int, att_count: int, size_bytes: int) -> dict:
+    """用量表一行的唯一折法：MB 换算只写一次，两个分支（有批注的人 / 只剩字节的人）共用。"""
+    return {
+        "user": user,
+        "annotations": annotations,
+        "count": att_count,
+        "mb": f"{size_bytes / (1024 * 1024):.1f}",
+    }
 
 
 def _meta_rows(ctx, admin, made_by: dict[str, str], sharing: bool, filters: dict) -> list[dict]:
@@ -148,6 +168,7 @@ def _meta_rows(ctx, admin, made_by: dict[str, str], sharing: bool, filters: dict
                 "updated": moment_label(made.updated_at, tz),
                 "target": _display_target(made, readable),
                 "tags": _display_tags(made, readable),
+                # 逐行数 revision：与上面 `_readable` 同一取舍，一屏 50 行换不来一次 JOIN
                 "revisions": ctx.annotations_store.count_revisions(made.id),
                 "visibility": "团队" if made.visibility == "team" else "私有",
                 "attachments": ctx.attachments_store.count_for(made.id),
@@ -167,33 +188,23 @@ def admin_annotations_page(request: Request):
     users = ctx.users.list_users()
     names = {user.id: (user.display_name or user.username) for user in users}
     sharing = ctx.app_settings.team_sharing()
-    filters = _list_filters(request, ctx, users)
+    filters, shown = _list_filters(request, ctx, users)
     # 行集由批注拥有者驱动（spec:339）：`usage_by_user()` 设计上不列零附件的人，
     # 只由附件驱动会让「只有批注」的用户在配额表里查无此人
     annotation_counts = ctx.annotations_store.count_by_user()
     att_usage = ctx.attachments_store.usage_by_user()
     att_stats = {user_id: (count, size_bytes) for user_id, count, size_bytes in att_usage}
-    usage = [
-        {
-            "user": names.get(user_id, user_id[:8]),
-            # 批注数与行集同源（`count_by_user`）：逐行再问一次就是两个出处
-            "annotations": count,
-            "count": att_stats.get(user_id, (0, 0))[0],
-            "mb": f"{att_stats.get(user_id, (0, 0))[1] / (1024 * 1024):.1f}",
-        }
-        for user_id, count in annotation_counts
-    ]
+    usage = []
+    for user_id, count in annotation_counts:
+        att_count, size_bytes = att_stats.get(user_id, (0, 0))
+        # 批注数与行集同源（`count_by_user`）：逐行再问一次就是两个出处
+        usage.append(_usage_row(names.get(user_id, user_id[:8]), count, att_count, size_bytes))
     listed = {user_id for user_id, _ in annotation_counts}
     # 有附件但批注已被硬清除的用户：字节还占着盘，行不许消失
     for user_id, att_count, size_bytes in att_usage:
         if user_id not in listed:
             usage.append(
-                {
-                    "user": names.get(user_id, user_id[:8]),
-                    "annotations": 0,
-                    "count": att_count,
-                    "mb": f"{size_bytes / (1024 * 1024):.1f}",
-                }
+                _usage_row(names.get(user_id, user_id[:8]), 0, att_count, size_bytes)
             )
     logs = [
         {
@@ -221,20 +232,8 @@ def admin_annotations_page(request: Request):
         logs=logs,
         minutes=ctx.settings.annotations.break_glass_minutes,
         notice=_notice(request, with_minutes=False),
-        # shown 回显「有效的那一份」：野值不进 WHERE 也不回填表单，表单看起来就是没筛
-        shown={
-            "user": (request.query_params.get("user") or "").strip()
-            if "user_id" in filters
-            else "",
-            "type": filters.get("target_type", ""),
-            "visibility": filters.get("visibility", ""),
-            "since": (request.query_params.get("since") or "").strip()
-            if "since" in filters
-            else "",
-            "until": (request.query_params.get("until") or "").strip()
-            if "until" in filters
-            else "",
-        },
+        # 回显与校验同源（`_list_filters`）：野值不进 WHERE 也不回填表单
+        shown=shown,
         user_choices=[(user.username, names.get(user.id, user.username)) for user in users],
         type_choices=[("", "全部目标"), *[(t, TARGET_TYPE_LABELS[t]) for t in TARGET_TYPES]],
     )

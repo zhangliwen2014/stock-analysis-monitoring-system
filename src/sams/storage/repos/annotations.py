@@ -34,6 +34,10 @@ _ANNOTATION_COLUMNS = (
 )
 _REVISION_COLUMNS = "id, annotation_id, user_id, before_md, after_md, meta_json, edited_at"
 
+#: 配额问句的唯一口径（`count_all` 与 `count_by_user` 共用）：排已硬清除，软删墓碑还算
+#: （D136）。两处各写一遍 `purged_at IS NULL`，改一处就会让「名下有几条」和用量表对不上。
+_QUOTA_WHERE = "purged_at IS NULL"
+
 #: 标签精确匹配、大小写不敏感。`%`/`_` 在这里没有特殊含义——这正是「搜索不是 LIKE」。
 _TAG_MATCH = (
     "list_contains(list_transform("
@@ -569,9 +573,8 @@ class AnnotationRepo:
 
     def count_all(self, user_id: str | None = None) -> int:
         """单用户的批注数（配额问「名下有几条」）。用量表的行集与数字走
-        `count_by_user`——逐行问这里会把零附件的用户从屏上丢掉。同口径：
-        排已硬清除；软删墓碑还算（D136）。"""
-        sql = "SELECT count(*) FROM annotations WHERE purged_at IS NULL"
+        `count_by_user`——逐行问这里会把零附件的用户从屏上丢掉。同口径：见 `_QUOTA_WHERE`。"""
+        sql = f"SELECT count(*) FROM annotations WHERE {_QUOTA_WHERE}"
         params: list[object] = []
         if user_id:
             sql += " AND user_id = ?"
@@ -580,11 +583,11 @@ class AnnotationRepo:
 
     def count_by_user(self) -> list[tuple[str, int]]:
         """admin 用量表行集的唯一出处：每行 = 一个批注拥有者（spec:339——
-        零附件的用户也要上屏，行集不能由附件侧驱动）。口径与 `count_all` 一致：
-        排已硬清除、软删墓碑还算；按批注数降序。"""
+        零附件的用户也要上屏，行集不能由附件侧驱动）。口径与 `count_all` 一致（同一份
+        `_QUOTA_WHERE`）：排已硬清除、软删墓碑还算；按批注数降序。"""
         rows = self.db.query(
             "SELECT user_id, count(*) AS cnt FROM annotations"
-            " WHERE purged_at IS NULL GROUP BY user_id"
+            f" WHERE {_QUOTA_WHERE} GROUP BY user_id"
             " ORDER BY cnt DESC, user_id",
             [],
         ).to_dicts()

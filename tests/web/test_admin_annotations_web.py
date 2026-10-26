@@ -365,6 +365,11 @@ def test_attachment_download_by_admin_grant(admin_app):
     )
     purged = admin_app.client.get(f"/admin/annotations/{made.id}/attachments/{att.id}")
     assert purged.status_code == 404
+    # 三种 404 必须同一个身子：不存在 / 已被清除 / 没授权在屏幕上不许读出任何区别
+    #（403→404 改的就是「不泄露存在性」，多一句文案也算泄露）
+    ghost = admin_app.client.get("/admin/annotations/ghost/attachments/ghost")
+    assert ghost.status_code == 404
+    assert purged.text == denied.text == ghost.text
 
 
 def test_detail_lists_attachment_only_when_readable(admin_app):
@@ -495,7 +500,7 @@ def test_list_filters_by_user_type_visibility_and_window(admin_app):
 
 def test_list_shows_revision_count_and_usage_annotation_count(admin_app):
     """列表有「revision 数」列、用量表有「批注数」列（spec:340）：数字各只有一个出处
-    （count_revisions / count_all），这里钉的是它们真的上了屏。"""
+    （count_revisions / count_by_user），这里钉的是它们真的上了屏。"""
     ctx = admin_app.ctx
     made = _private_of_bob(admin_app, body="第一版")
     ctx.attachments.add(made.user_id, made.id, filename="图.png", data=_png_bytes())
@@ -523,11 +528,12 @@ def test_usage_table_shows_users_without_attachments(admin_app):
 
 def test_recent_logs_show_owner_and_fifty_rows(admin_app):
     """最近授权：一屏 50 条而不是 10 条，且每行带「所有者」——「谁看过谁的什么」
-    是这一表要答的完整问题。"""
+    是这一表要答的完整问题。种 51 条而不是 12 条：只种到上限以下，
+    「限 50」和「限 10」都能过，等于没钉住上限。"""
     ctx = admin_app.ctx
     made = _private_of_bob(admin_app)
     alice = ctx.users.get_by_username("alice")
-    for n in range(12):
+    for n in range(51):
         ctx.admin_access_store.grant(
             admin_user_id=alice.id,
             annotation_id=made.id,
@@ -536,6 +542,7 @@ def test_recent_logs_show_owner_and_fifty_rows(admin_app):
             granted_until=ctx.clock.now_utc() + timedelta(minutes=15),
         )
     page = admin_app.client.get("/admin/annotations")
-    for n in range(12):
-        assert f"核对第{n}次授权" in page.text, "最近 50 条要都在屏上，不许截成 10"
+    # 冻钟下 created_at 全等，被挤出去的那一条由 id 决定：数数量，不点名
+    shown = [n for n in range(51) if f"核对第{n}次授权" in page.text]
+    assert len(shown) == 50, "51 条授权要正好截成最近 50 条"
     assert page.text.count("<th>所有者</th>") >= 2, "审计表也要有所有者列"
