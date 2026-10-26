@@ -2,6 +2,8 @@
 {% block title %}告警{% endblock %}
 {% block content %}
 <h1>告警</h1>
+{# 这一句只可能来自应用自己发的 303（白名单见 pages/alerts.py 的 _INBOX_NOTICES） #}
+{% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}
 
 <form method="get" action="/alerts" class="panel grid">
   <label>状态

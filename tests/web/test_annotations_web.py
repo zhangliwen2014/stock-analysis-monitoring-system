@@ -170,6 +170,30 @@ def test_create_stores_a_real_png_attachment(logged):
     assert atts[0].filename == "shot.png"
 
 
+def _corrupt_png_bytes() -> bytes:
+    """合法到 IHDR、坏在 IDAT CRC 的 PNG：Pillow verify() 为此抛内建 SyntaxError
+    （`services/attachments.py` 把它折成 ValidationError 的那一个输入形状）。"""
+    data = bytearray(_png_bytes())
+    index = data.find(b"IDAT")
+    data[index + 7] ^= 0xFF
+    return bytes(data)
+
+
+def test_create_with_corrupt_png_gets_the_rejection_notice_not_500(logged):
+    """坏图不是 500：批注照常保存，附件点名被拒（「批注已保存，但这些附件被拒…」）。
+    钉住这条是因为 Pillow 对坏字节用的是内建 SyntaxError——它一旦漏出附件层，
+    写路上只兜 SamsError 的分支接不住。"""
+    resp = _post_annotation(
+        logged, files=[("files", ("broken.png", _corrupt_png_bytes(), "image/png"))]
+    )
+    assert resp.status_code == 200
+    assert "批注已保存，但这些附件被拒" in resp.text
+    assert "broken.png" in resp.text
+    ctx = logged.context
+    rows = ctx.annotations.list_target(_alice(ctx).id, "symbol", "A:600519")
+    assert len(rows) == 1  # 批注存了：坏图不回滚草稿
+
+
 def test_edit_with_fresh_stamp_saves(logged):
     ctx = logged.context
     alice = _alice(ctx)
@@ -731,6 +755,18 @@ def test_search_type_bad_value_says_so(logged):
     page = logged.client.get("/annotations", params={"type": "planet"})
     assert page.status_code == 200
     assert "未知批注目标" in page.text
+
+
+def test_search_page_beyond_the_last_page_is_clamped(logged):
+    """page=999 不该渲染「第 999/1 页」还带一个能点的「上一页」（无限往回走）：
+    total>0 时页码折回最后一页并按折后的值取——与 page=abc 静默回第 1 页同一处置。"""
+    ctx = logged.context
+    _create_sym(ctx, _alice(ctx), "只此一条")
+    page = logged.client.get("/annotations", params={"page": "5"})
+    assert page.status_code == 200
+    assert "第 1/1 页" in page.text
+    assert "上一页" not in page.text
+    assert "只此一条" in page.text  # 折回来的那一页真的有内容
 
 
 def test_search_pagination_second_page(logged):

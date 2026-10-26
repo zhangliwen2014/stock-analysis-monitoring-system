@@ -88,6 +88,19 @@ def test_unknown_market_is_named_in_the_error():
         service().provider("US")
 
 
+def test_a_missing_calendar_source_is_named_in_words_not_a_list_repr():
+    """这句话会原样上屏（告警详情的稍后拒绝）：`sorted()` 交出去的是 Python 的
+    list repr——「已配置: ['A', 'HK', 'US']」在页面上长得像出了 bug。"""
+    svc = CalendarService(
+        FakeStore(), {"US": FakeProvider(), "A": FakeProvider(), "HK": FakeProvider()}
+    )
+    with pytest.raises(CalendarSourceError) as caught:
+        svc.provider("SYS")
+    message = str(caught.value)
+    assert "可用市场：A、HK、US" in message
+    assert "[" not in message and "'" not in message
+
+
 def test_stored_day_is_read_without_calling_the_provider():
     stored = trading_day(date(2026, 3, 9))
     store = FakeStore(days=[stored])

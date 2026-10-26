@@ -91,8 +91,10 @@ class CalendarService:
         try:
             return self.providers[canonical_market(market)]
         except KeyError:
+            # 这句话会原样上屏（告警详情的稍后拒绝），所以是文字名单不是 list repr
             raise CalendarSourceError(
-                f"市场 {market} 没有日历来源，已配置: {sorted(self.providers)}"
+                f"市场 {market} 没有日历来源，可用市场："
+                + "、".join(sorted(self.providers))
             ) from None
 
     def refresh(self, market: str, year: int) -> int:

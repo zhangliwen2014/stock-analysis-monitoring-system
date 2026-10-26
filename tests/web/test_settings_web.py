@@ -476,17 +476,23 @@ def test_probe_is_rate_limited(logged, monkeypatch):
 
 
 def test_test_alert_is_recorded_and_rate_limited(logged):
+    """成功不再整页重渲染（200 会被刷新重提交），303 回收件箱带那一句白名单提醒：
+    「告警建了没有」仍由库里的行与投递记录钉，不由这一屏的 HTML。"""
     ctx = logged.context
     first = logged.client.post(
         "/settings/test-alert", data={"csrf": logged.csrf}, follow_redirects=False
     )
-    assert first.status_code == 200
+    assert first.status_code == 303
+    assert first.headers["location"].startswith("/alerts?notice=")
     (row,) = ctx.alerts_store.list_for(_alice_id(logged))
     assert (row.market, row.code, row.is_test) == (SYSTEM_MARKET, "test", True)
     assert [item.outcome for item in ctx.alerts_store.deliveries(row.id)] == [
         "no_channel",
     ], "没有启用通道时选路在发送之前就拒绝"
-    assert "no_channel" in first.text
+
+    followed = logged.client.get(first.headers["location"])
+    assert followed.status_code == 200
+    assert "已发出这条测试告警" in followed.text
 
     second = logged.client.post(
         "/settings/test-alert", data={"csrf": logged.csrf}, follow_redirects=False

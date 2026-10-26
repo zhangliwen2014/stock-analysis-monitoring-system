@@ -86,6 +86,12 @@ DEFER_HOURS = {"1h": 1, "3h": 3}
 DEFER_OPEN = "open"
 DEFER_CHOICES = (("1h", "1 小时"), ("3h", "3 小时"), (DEFER_OPEN, "明天开盘"))
 
+#: 收件箱唯一肯上屏的提醒原文（与 admin 的 `_FEEDBACK` 同一道白名单纪律：query 里的
+#: 原文不名单就不出现，否则 `/alerts?notice=` 就是一个自由文本框）。发件人是
+#: `/settings/test-alert` 的 303——成功不再整页重渲染，刷新也就不会重提交
+INBOX_TEST_ALERT_NOTICE = "已发出这条测试告警：详情里看得见投递记录"
+_INBOX_NOTICES = frozenset({INBOX_TEST_ALERT_NOTICE})
+
 
 def _day_bound(value: str, tz_name: str, *, end: bool = False) -> datetime | None:
     """「某一天」按 display_tz 切：since 取当天零点；until 是排他上界，取**次日**零点。
@@ -202,6 +208,7 @@ def _list_page(
     page: int,
     has_more: bool,
     markets: tuple[tuple[str, str], ...],
+    notice: str = "",
 ):
     web = request.app.state.web
     return web.render(
@@ -211,6 +218,7 @@ def _list_page(
         groups=groups,
         chosen=chosen,
         page=page,
+        notice=notice,
         prev_url=_page_url(page - 1, chosen) if page > 1 else "",
         next_url=_page_url(page + 1, chosen) if has_more else "",
         # 空列表那句话由页码决定：越界的那一页说「没有命中的告警」是假话
@@ -288,6 +296,14 @@ def _detail_page(
         for t in ctx.theses.list(user.username)
         if (t.market, t.code) == (alert.market, alert.code)
     ]
+    # 「明天开盘」要问日历：SYS 这类告警的 market 没有日历来源，把这一档放进下拉
+    # 等于递一个必然 400 的按钮；那里只剩 1 小时 / 3 小时（POST 那侧的拒绝仍在，下拉只是不进人眼）
+    has_calendar = canonical_market(alert.market) in ctx.calendar.providers
+    defer_choices = (
+        DEFER_CHOICES
+        if has_calendar
+        else tuple(choice for choice in DEFER_CHOICES if choice[0] != DEFER_OPEN)
+    )
     return web.render(
         request,
         "alert.html",
@@ -317,7 +333,7 @@ def _detail_page(
         # 表单的两张码表与三个下拉（全部取自服务层，模板零查询）
         action_kinds=[(k, action_label(k)) for k in ACTION_KINDS],
         dismiss_codes=[(c, dismiss_label(c)) for c in DISMISS_CODES],
-        defer_choices=DEFER_CHOICES,
+        defer_choices=defer_choices,
         related_theses=related_theses,
         rules=[
             {"id": r.id, "label": f"{r.name}（{r.kind}）"}
@@ -386,6 +402,10 @@ def inbox(request: Request):
         "since": since,
         "until": until,
     }
+    # 只认名单里那一句（见 `_INBOX_NOTICES`）：其余 query 原文一律当没有
+    notice = request.query_params.get("notice") or ""
+    if notice not in _INBOX_NOTICES:
+        notice = ""
     return _list_page(
         request,
         groups=groups,
@@ -393,6 +413,7 @@ def inbox(request: Request):
         page=page,
         has_more=has_more,
         markets=markets,
+        notice=notice,
     )
 
 

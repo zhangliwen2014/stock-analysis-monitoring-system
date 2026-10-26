@@ -205,6 +205,18 @@ def test_only_png_jpeg_webp_are_accepted(world, payload, word):
         add(world, payload)
 
 
+def test_a_corrupt_png_is_refused_not_crashed(world):
+    """坏到 IDAT CRC 对不上的 PNG：Pillow 的 verify() 对这种字节用**内建 SyntaxError**
+    发信号（bad header checksum），它不是 OSError 也不是 ValidationError。
+    附件层的契约是「所有拒绝都是 ValidationError」——漏出去的那条路在 web 写路上
+    只有兜 SamsError 的分支接不住，代价是一屏 500。"""
+    data = bytearray(image_bytes())
+    index = data.find(b"IDAT")
+    data[index + 7] ^= 0xFF  # IDAT 块 CRC 的最后一个字节
+    with pytest.raises(ValidationError, match="图片解码失败"):
+        add(world, bytes(data))
+
+
 def test_an_oversized_upload_is_refused_before_decoding(world, settings):
     world.service.settings = replace(
         settings, annotations=replace(settings.annotations, max_attachment_mb=1)

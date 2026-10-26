@@ -31,6 +31,7 @@ datetime，页面模块也不 `strftime`——连回填 `<input type=time>` 那�
 from __future__ import annotations
 
 from datetime import time as dtime
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -41,6 +42,7 @@ from sams.storage.repos.channels import Channel
 from sams.web.auth import audit, csrf_protect, require_user
 from sams.web.display import hhmm, moment_label
 from sams.web.forms import form_data, one
+from sams.web.pages.alerts import INBOX_TEST_ALERT_NOTICE
 
 router = APIRouter()
 
@@ -404,4 +406,8 @@ def test_alert(request: Request, _csrf: None = Depends(csrf_protect)):
         ok=dispatch.any_sent,
         detail=f"deliveries={len(dispatch.deliveries)}",
     )
-    return _page(request, dispatch=dispatch)
+    # 成功不再整页重渲染（200 会被刷新重提交），303 回收件箱带那一句白名单提醒——
+    # 「告警建了没有」由收件箱里的行与徽标回答，不由这一屏的 HTML
+    return RedirectResponse(
+        f"/alerts?{urlencode({'notice': INBOX_TEST_ALERT_NOTICE})}", status_code=303
+    )

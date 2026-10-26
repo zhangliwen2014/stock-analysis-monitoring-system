@@ -13,7 +13,9 @@
     <span class="muted">{{ triggered_at }}</span>
     {% if alert.is_test %}<span class="badge">测试</span>{% endif %}
     {% if intraday %}<span class="badge">盘中</span>{% endif %}
-    {% if deferred %}<span class="badge">你让它稍后提醒：稍后至 {{ deferred }}</span>{% endif %}
+    {# 稍后不改状态（D138）：「稍后至」是它唯一的痕迹，得说清这一格只作展示，
+       否则人会等一个「到点自动做什么」的动作 #}
+    {% if deferred %}<span class="badge">你让它稍后提醒：稍后至 {{ deferred }}（只作展示：稍后不改状态）</span>{% endif %}
   </p>
   <table>
     <tr><th>项</th><th>内容</th></tr>
@@ -45,6 +47,9 @@
     <button type="submit">撤销（终态 5 分钟内）</button>
   </form>
   {% endif %}
+  {# 窗口过了按钮就没了，这句话留着：人回来找刚才关上的那条时要知道窗口只有 5 分钟，
+     而「让它稍后提醒」不在可撤销名单里（那是设计，不是漏） #}
+  {% if terminal %}<p class="muted">终态 5 分钟内可在本页撤销；「让它稍后提醒」不在可撤销名单里。</p>{% endif %}
 </section>
 
 {% if can_act %}

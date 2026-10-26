@@ -110,6 +110,11 @@ def _reencode(data: bytes) -> tuple[str, str, bytes]:
         raise ValidationError("读不出这张图：文件头像是图片，内容却不是") from exc
     except (OSError, Image.DecompressionBombError) as exc:
         raise ValidationError(f"图片解码失败：{exc}") from exc
+    except SyntaxError as exc:
+        # Pillow 的 verify() 对坏字节（如 IDAT CRC 不符）用的是**内建 SyntaxError**：
+        # 它不是 OSError 也不是图片族的异常，单列一支折成 ValidationError，
+        # 否则这条会漏过 web 写路只兜 SamsError 的分支，代价是一屏 500
+        raise ValidationError(f"图片解码失败：{exc}") from exc
 
 
 class AttachmentService:

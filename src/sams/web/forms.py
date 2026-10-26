@@ -16,6 +16,32 @@ from fastapi import Request
 from sams.core.rules import FILTER_KEYS, Template
 
 
+def _latin1_defaulted(request: Request) -> bool:
+    """starlette 对 urlencoded 体的字段值是写死的 `decode("latin-1")`
+    （`formparsers.FormParser.parse`，HTTP 的历史默认），Content-Type 里的 charset
+    它根本不看。这里只认「urlencoded 且没声明 charset」的请求去猜裸字节：
+    声明了 charset 的客户端我们不改口——那不是我们能替它翻译的东西。"""
+    content_type = (request.headers.get("content-type") or "").lower()
+    return (
+        content_type.startswith("application/x-www-form-urlencoded")
+        and "charset" not in content_type
+    )
+
+
+def _repair_utf8(value: str) -> str:
+    """把 latin-1 读出来的裸 UTF-8 字节折回正确字符：整串能编回 latin-1（每字符
+    < U+0100）且那些字节是**合法** UTF-8 才折，严格失败就原样保留。
+    浏览器一律 percent-encode，解出来是 > U+00FF 的字符会撞 UnicodeEncodeError
+    原样返回；真 latin-1 的裸字节（如 lone 0xE9）过不了 UTF-8 校验，也原样返回。
+    """
+    if value.isascii():
+        return value
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+
 async def form_data(request: Request) -> dict[str, list[str]]:
     """表单原文，同名多值都留着（复选框组与多选 select）。
 
@@ -23,9 +49,14 @@ async def form_data(request: Request) -> dict[str, list[str]]:
     不会解析两次，也不会把 body 读空。
     """
     form = await request.form()
+    repair = _latin1_defaulted(request)
     data: dict[str, list[str]] = {}
     for key, value in form.multi_items():
-        data.setdefault(key, []).append(value if isinstance(value, str) else "")
+        text = value if isinstance(value, str) else ""
+        # 只折值不折键：键是代码里的字段名，永远该是 ASCII，出现乱码是请求错不是编码问题
+        if repair:
+            text = _repair_utf8(text)
+        data.setdefault(key, []).append(text)
     return data
 
 

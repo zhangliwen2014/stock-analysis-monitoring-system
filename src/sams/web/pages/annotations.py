@@ -260,8 +260,8 @@ def annotations_search(
         error = f"未知批注目标 {type_key!r}：只有 {', '.join(sorted(TARGET_TYPES))}"
         type_key = ""
     if not error:
-        try:
-            rows_read, total = ctx.annotations.search(
+        def fetch(page_index: int):
+            return ctx.annotations.search(
                 user.id,
                 q=q.strip() or None,
                 tag=tag.strip() or None,
@@ -269,12 +269,27 @@ def annotations_search(
                 scope=scope_key,
                 team_sharing=ctx.app_settings.team_sharing(),
                 limit=PAGE_SIZE,
-                offset=(page_no - 1) * PAGE_SIZE,
+                offset=(page_index - 1) * PAGE_SIZE,
             )
+
+        try:
+            rows_read, total = fetch(page_no)
         except DatabaseLocked:
             raise
         except SamsError as exc:
             error, rows_read, total = str(exc), [], 0
+        # total>0 而页码越界：折回最后一页再取——「第 999/1 页」加一个能点的「上一页」
+        # 是一条走不到头的路，静默回第 1 页的那条纪律（page=abc）在这里同样成立
+        if not error and total > 0:
+            last_page = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            if page_no > last_page:
+                page_no = last_page
+                try:
+                    rows_read, total = fetch(page_no)
+                except DatabaseLocked:
+                    raise
+                except SamsError as exc:
+                    error, rows_read, total = str(exc), [], 0
     tz = ctx.settings.server.display_tz
     accounts = None  # 成交目标的存在性检查要账户列表；按页取一次，N+1 到此为止
     rows = []

@@ -369,6 +369,80 @@ def test_detail_says_a_resend_can_double_send(logged):
     assert "会被再发一次" in page.text
 
 
+def test_defer_offers_open_only_when_the_market_has_a_calendar(logged):
+    """「明天开盘」要问日历：SYS 告警没有日历来源，下拉里给这一档等于递一个
+    必然 400 的按钮。没有日历的那条只剩 1 小时 / 3 小时两档。"""
+    ctx = logged.context
+    alice = _alice(ctx)
+    mine = _seed(ctx, user_id=alice.id)
+    system = _seed(ctx, user_id=alice.id, market=SYSTEM_MARKET, code="scheduler", rule_name=None)
+
+    detail = logged.client.get(f"/alerts/{mine.id}")
+    assert detail.status_code == 200
+    assert 'value="open"' in detail.text and "明天开盘" in detail.text
+
+    sys_page = logged.client.get(f"/alerts/{system.id}")
+    assert sys_page.status_code == 200
+    assert 'value="open"' not in sys_page.text and "明天开盘" not in sys_page.text
+    assert 'value="1h"' in sys_page.text and 'value="3h"' in sys_page.text
+
+
+def test_defer_open_on_a_system_alert_400s_in_words_not_list_repr(logged):
+    """手搓的 POST 照旧要挡（下拉只是不进人眼，不是判据），但那句话得是人话：
+    「可用市场：A、HK、US」，不是日历服务读出来的 `['A', 'HK', 'US']` repr。"""
+    ctx = logged.context
+    system = _seed(
+        ctx, user_id=_alice(ctx).id, market=SYSTEM_MARKET, code="scheduler", rule_name=None
+    )
+    resp = logged.client.post(
+        f"/alerts/{system.id}/defer", data={"csrf": logged.csrf, "until": "open"}
+    )
+    assert resp.status_code == 400
+    assert "可用市场：A、HK、US" in resp.text
+    assert "[&#39;" not in resp.text  # repr 里的引号在 HTML 里逃成 &#39;——那不该上屏
+
+
+def test_terminal_detail_shows_the_undo_window_copy(logged):
+    """终态那一区要说清撤销窗口（UNDO_WINDOW=5 分钟，仓库的常量）：过了窗口按钮
+    不再渲染，但那句话得留着——人会回来找刚才关掉的那条。"""
+    ctx = logged.context
+    alert = _seed(ctx, user_id=_alice(ctx).id)
+    logged.client.post(
+        f"/alerts/{alert.id}/acted",
+        data={"csrf": logged.csrf, "action_kind": "other", "note": "减半仓"},
+        follow_redirects=False,
+    )
+    detail = logged.client.get(f"/alerts/{alert.id}")
+    assert "5 分钟内可在本页撤销" in detail.text
+
+
+def test_deferred_badge_says_the_expiry_is_display_only(logged):
+    """稍后不改状态（D138），「稍后至」是那一格唯一的痕迹：旁边要点明它只作展示，
+    否则人会等一个「到点自动做什么」的动作。"""
+    ctx = logged.context
+    alert = _seed(ctx, user_id=_alice(ctx).id)
+    logged.client.post(
+        f"/alerts/{alert.id}/defer",
+        data={"csrf": logged.csrf, "until": "1h"},
+        follow_redirects=False,
+    )
+    detail = logged.client.get(f"/alerts/{alert.id}")
+    assert "稍后至" in detail.text and "只作展示" in detail.text
+
+
+def test_inbox_shows_only_notices_the_app_itself_emitted(logged):
+    """与 admin 的 `_FEEDBACK` 同一道白名单纪律：query 里的原文不上名单就不上屏，
+    否则收件箱里躺着一个自由文本框。名单那一句是 /settings/test-alert 发出去的。"""
+    arbitrary = logged.client.get("/alerts", params={"notice": "随便一句话"})
+    assert "随便一句话" not in arbitrary.text
+
+    known = logged.client.get(
+        "/alerts", params={"notice": "已发出这条测试告警：详情里看得见投递记录"}
+    )
+    assert known.status_code == 200
+    assert "已发出这条测试告警" in known.text
+
+
 def test_dismiss_400_refills_what_was_typed(logged):
     """被拒的重渲染要把人刚敲的那份交回框里（同 `pages/rules.py`）：清掉它等于让人
     从零再敲一遍。今天真会拒的那一句是空原因，所以交的是「敲了空格、被 strip 成空」——
