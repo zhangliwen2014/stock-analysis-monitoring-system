@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -30,6 +31,44 @@ class MarketCfg:
             return ZoneInfo(self.tz)
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise ValidationError(f"市场 {self.market} 时区非法: {self.tz}") from exc
+
+
+#: 大盘条默认问的那九只（D145）：内置一份，配置没写时也能渲染出一条 bar。
+DEFAULT_INDEX_CODES: dict[str, tuple[str, ...]] = {
+    "A": ("sh000001", "sz399001", "sz399006"),
+    "HK": ("hkHSI", "hkHSTECH", "hkHSCEI"),
+    "US": ("usSPX", "usIXIC", "usDJI"),
+}
+
+#: 展示名进配置：各源的指数名参差（「上证指数」/「上证综指」/「sh000001」），
+#: 界面念什么必须由这一份说了算，否则同一条 bar 换个源就改名字。
+DEFAULT_INDEX_LABELS: dict[str, str] = {
+    "sh000001": "上证指数",
+    "sz399001": "深证成指",
+    "sz399006": "创业板指",
+    "hkHSI": "恒生指数",
+    "hkHSTECH": "恒生科技指数",
+    "hkHSCEI": "H股指数",
+    "usSPX": "标普500",
+    "usIXIC": "纳斯达克",
+    "usDJI": "道琼斯",
+}
+
+
+@dataclass(frozen=True)
+class IndicesCfg:
+    """大盘条问「画哪几只、叫什么」，答案全部在这里（D145）。"""
+
+    codes_by_market: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: {k: tuple(v) for k, v in DEFAULT_INDEX_CODES.items()}
+    )
+    labels: Mapping[str, str] = field(default_factory=lambda: dict(DEFAULT_INDEX_LABELS))
+
+    def for_market(self, market: str) -> tuple[str, ...]:
+        return tuple(self.codes_by_market.get(market, ()))
+
+    def label(self, index_code: str) -> str:
+        return self.labels.get(index_code, index_code)
 
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -136,6 +175,8 @@ class Settings:
     quote_stale_s: int = 60
     server: ServerCfg = field(default_factory=ServerCfg)
     annotations: AnnotationsCfg = field(default_factory=AnnotationsCfg)
+    #: 大盘条的指数与展示名（D145）：默认那九只，配置写了整组覆盖
+    indices: IndicesCfg = field(default_factory=IndicesCfg)
 
     def market_cfg(self, market: str) -> MarketCfg:
         try:
@@ -209,6 +250,19 @@ class Settings:
             ),
         )
 
+        idx_raw = raw.get("indices") or {}
+        codes_by_market: dict[str, tuple[str, ...]] = {}
+        # 只给已配置的市场铺默认：一个没配的市场凭空有三只指数，job 会登记、日线会入库，
+        # 而没有任何一屏能解释它为什么在那里
+        for market_name in markets:
+            given = (idx_raw.get(market_name) or {}).get("codes")
+            codes_by_market[market_name] = (
+                tuple(given) if given else tuple(DEFAULT_INDEX_CODES.get(market_name, ()))
+            )
+        labels = dict(DEFAULT_INDEX_LABELS)
+        labels.update({str(k): str(v) for k, v in (idx_raw.get("labels") or {}).items()})
+        indices = IndicesCfg(codes_by_market=codes_by_market, labels=labels)
+
         settings = cls(
             db_path=str(db_path),
             secret_key=str(secret_key),
@@ -221,6 +275,7 @@ class Settings:
             quote_stale_s=int(general.get("quote_stale_s", 60)),
             server=server,
             annotations=annotations,
+            indices=indices,
         )
         settings.validate()
         return settings

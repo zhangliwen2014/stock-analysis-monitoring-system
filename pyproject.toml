@@ -19,6 +19,7 @@ dependencies = [
     "pillow>=13.0.0",
     "polars>=2.0.0",
     "pyarrow>=26.0.0",
+    "pypinyin>=0.55.0",
     "python-multipart>=0.0.32",
     "requests>=2.34.2",
     "uvicorn>=0.54.0",

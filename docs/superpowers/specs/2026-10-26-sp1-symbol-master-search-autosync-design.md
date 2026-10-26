@@ -49,13 +49,17 @@ CREATE TABLE index_daily (
 CREATE TABLE symbol_backfills (
   id TEXT PRIMARY KEY,             -- uuid
   market TEXT NOT NULL, code TEXT NOT NULL,
+  open_key TEXT,                   -- '{market}|{code}'，结案置 NULL
   tries INT NOT NULL DEFAULT 0, last_error TEXT,
   status TEXT NOT NULL,            -- pending | deferred | done（done 行留给 prune 回收）
   created_at TIMESTAMPTZ NOT NULL, done_at TIMESTAMPTZ
 );
-CREATE UNIQUE INDEX symbol_backfills_open ON symbol_backfills(market, code)
-  WHERE status IN ('pending','deferred');
+CREATE UNIQUE INDEX symbol_backfills_open ON symbol_backfills(open_key);
 ```
+
+去重键走 `open_key` 而不是原计划的 partial unique index：DuckDB 2.0 实测不支持
+partial unique index（`... WHERE status IN ('pending','deferred')` 那句直接报错），
+所以开放期写非空占位、结案置 NULL——唯一索引里 NULL 互不冲突，同一只票结完之后还能再排。
 
 `py_initials/py_full` 允许 NULL：手工直登、不在清单的票进 `symbols` 主档即可，代码表不强造行。
 
@@ -79,9 +83,6 @@ CREATE UNIQUE INDEX symbol_backfills_open ON symbol_backfills(market, code)
 ### 2.4 配置
 
 ```toml
-[general]
-symbol_master_sync_weekday = 1   # 周一盘后全量刷代码表（当周错过则 catch-up 窗口 10 天内补）
-
 [indices.A]
 codes = ["sh000001", "sz399001", "sz399006", "sh000300"]
 [indices.HK]
@@ -101,6 +102,10 @@ usDJI = "道琼斯"
 ```
 
 展示名进配置：各源的指数名参差，界面念什么必须稳定。
+
+代码表不设 `symbol_master_sync_weekday` 那一格：WEEKLY 周期本身在整周收满时到期
+（`due.py` 的 `weekly_due`，判据是「下一个交易日已进下一 ISO 周」的那个收盘），
+再加一个星期几旋钮就是让同一个 job 有两个互相矛盾的到期日。
 
 ## 3. 错误处理
 

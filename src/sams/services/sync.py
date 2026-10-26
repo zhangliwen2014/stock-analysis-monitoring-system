@@ -1,5 +1,6 @@
 """日线同步用例：降级取数 → 补主档 → 幂等入库。
 
+指数日线（`sync_index`）复用同一条链，但既不补主档也不归一代码——它进的是另一张表。
 分工：「用哪个源、失败了换谁」在 datasource.registry，「存成什么」在 storage.repos，
 这里只回答「一次同步需要几步、结果如何汇报」。
 """
@@ -17,6 +18,7 @@ from sams.core.config import MarketCfg
 from sams.core.errors import DatasourceError
 from sams.datasource.registry import AdapterRegistry, Attempt
 from sams.storage.repos.bars import BarRepo
+from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.symbols import SymbolRepo
 
 logger = logging.getLogger("sams.services.sync")
@@ -44,11 +46,15 @@ class SyncService:
         bars: BarRepo,
         symbols: SymbolRepo,
         markets: dict[str, MarketCfg],
+        *,
+        indices: IndexDailyRepo | None = None,
     ) -> None:
         self.registry = registry
         self.bars = bars
         self.symbols = symbols
         self.markets = markets
+        #: 指数日线仓库：只有大盘条那条链用得到，所以它不跟着 `bars` 必填
+        self.indices = indices
 
     def currency_of(self, market: str, code: str) -> str:
         try:
@@ -87,6 +93,34 @@ class SyncService:
             written=written,
             degraded=result.degraded,
             latest_date=self.bars.latest_date(market, code),
+            attempts=result.attempts,
+        )
+
+    def sync_index(self, market: str, index_code: str, start: date, end: date) -> SyncSummary:
+        """指数日线：降级链与个股同一条，但不补主档——指数不是票。
+
+        帧里那列 `code` 换成 `index_code` 再入库：指数表与个股表分键（000001 两边都占）。
+        """
+        assert self.indices is not None  # job 登记前已查过能力与注入，这里只兜编程错误
+        result = self.registry.fetch_index_daily(market, index_code, start, end)
+        if result.empty_everywhere:
+            return SyncSummary(
+                market=market,
+                code=index_code,
+                empty=True,
+                latest_date=self.indices.latest_date(market, index_code),
+                attempts=result.attempts,
+            )
+        frame = result.frame.rename({"code": "index_code"})
+        written = self.indices.upsert(frame)
+        return SyncSummary(
+            market=market,
+            code=index_code,
+            source=result.source,
+            fetched=frame.height,
+            written=written,
+            degraded=result.degraded,
+            latest_date=self.indices.latest_date(market, index_code),
             attempts=result.attempts,
         )
 

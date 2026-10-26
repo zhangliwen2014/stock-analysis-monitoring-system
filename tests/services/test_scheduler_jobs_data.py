@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
@@ -16,6 +17,7 @@ from support import sample_actions, sample_bars
 from support_fundamentals import StubFundamentalsAdapter
 from support_valuation import financial_rows, flow_rows, valuation
 
+from sams.core.config import IndicesCfg
 from sams.core.errors import RateLimited
 from sams.core.version import VersionGate
 from sams.datasource.registry import AdapterRegistry
@@ -27,6 +29,7 @@ from sams.services.scheduler.jobs import (
     run_bars,
     run_financials,
     run_flow,
+    run_indices,
     run_valuation,
 )
 from sams.services.scheduler.types import JobContext, JobDeps
@@ -36,6 +39,7 @@ from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
+from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.symbols import SymbolRepo
 
 AS_OF = date(2024, 10, 25)
@@ -80,22 +84,78 @@ class RecordingBarsAdapter:
         return sample_actions(market=market, code=code, source=self.name)
 
 
-def deps(db, settings, *, bars=None, finance=None, hk=None):
-    """装配这条链上真正跑到的那几个服务；汇率/日历/规则那几个槽位这里是 None，本文件不跑它们。"""
+class ListingBarsAdapter(RecordingBarsAdapter):
+    """akshare 的真实清单里还有代码表（`akshare_cn.symbol_list`）：这一枚就是它。
+
+    注册表按「方法名在不在」判能力，所以代码表那一道的正例只要方法存在就够了，
+    答回来的那两行没人读——`build_jobs` 只问链上有没有谁。
+    """
+
+    def symbol_list(self, market):
+        return pl.DataFrame({"code": ["000001"], "name": ["平安银行"]})
+
+
+class StubIndexAdapter:
+    """指数日线的记录替身：与真实的 `tencent.index_daily` 同签名，只吃 A 市。
+
+    只回被问到的最后一天：源给宽区间是常态，`_fetch_bars_frame` 那一头会裁掉之外日子，
+    这里裁好才不会让「写了几行」替窗口说话。
+    """
+
+    name = "tencent"
+    markets = ("A",)
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, date, date]] = []
+
+    def index_daily(self, market, code, start, end):
+        self.calls.append((market, code, start, end))
+        return sample_bars(market=market, code=code, source=self.name, start=end).filter(
+            pl.col("date") == end
+        )
+
+
+def deps(
+    db,
+    settings,
+    *,
+    bars=None,
+    finance=None,
+    hk=None,
+    index=None,
+    with_indices=True,
+):
+    """装配这条链上真正跑到的那几个服务；汇率/日历/规则那几个槽位这里是 None，本文件不跑它们。
+
+    `index` 给 A 市那条链添一个指数日线的源，`with_indices=False` 则让 `SyncService`
+    拿不到指数仓库——大盘条那两道闸（能力与注入）要分开钉。
+    """
     bars = bars or RecordingBarsAdapter()
     hk = hk or RecordingBarsAdapter(name="yfinance", markets=("HK",))
     finance = finance or StubFundamentalsAdapter(["A"])
     finance.name = "eastmoney"
+    adapters = {"akshare": bars, "yfinance": hk, "eastmoney": finance}
+    market_sources: dict[str, tuple[str, ...]] = {
+        "A": ("akshare", "eastmoney"),
+        "HK": ("yfinance",),
+    }
+    if index is not None:
+        adapters[index.name] = index
+        market_sources["A"] = (*market_sources["A"], index.name)
     registry = AdapterRegistry(
-        adapters={"akshare": bars, "yfinance": hk, "eastmoney": finance},
-        market_sources={"A": ("akshare", "eastmoney"), "HK": ("yfinance",)},
-        sleep=lambda _: None,
+        adapters=adapters, market_sources=market_sources, sleep=lambda _: None
     )
     symbols = SymbolRepo(db)
     return JobDeps(
         settings=settings,
         registry=registry,
-        sync=SyncService(registry, BarRepo(db), symbols, settings.markets),
+        sync=SyncService(
+            registry,
+            BarRepo(db),
+            symbols,
+            settings.markets,
+            indices=IndexDailyRepo(db) if with_indices else None,
+        ),
         corp_actions=CorpActionSyncService(
             registry, CorpActionRepo(db), CorpActionsCoverageRepo(db)
         ),
@@ -332,3 +392,70 @@ def test_build_jobs_skips_a_market_without_any_source(db, settings):
     built.registry.market_sources = {"A": ("akshare", "eastmoney")}
     jobs = build_jobs(built)
     assert ("bars", "A") in {(job.name, job.market) for job in jobs}
+
+
+# --- 大盘条：窗口同日线，两道闸各管一件事 ----------------------------------------------------
+
+
+def one_index(settings):
+    """把 A 市那组指数收成一只：默认那三只里另外两只没存过，会各自多问一次 730 天的
+    回补窗口，把「这一只落后一天」那一句淹在计数里。"""
+    return replace(settings, indices=IndicesCfg(codes_by_market={"A": ("sh000001",)}))
+
+
+def index_rows(market: str, index_code: str, day: date) -> pl.DataFrame:
+    """入库形态的一行指数日线（键名已是 `index_code`）：源形态那一列由 `sync_index` 改名。"""
+    return (
+        sample_bars(market=market, code=index_code, source="tencent", start=day)
+        .filter(pl.col("date") == day)
+        .rename({"code": "index_code"})
+    )
+
+
+def titles(deps_obj: JobDeps) -> set[tuple[str, str | None]]:
+    return {(job.name, job.market) for job in build_jobs(deps_obj)}
+
+
+def test_indices_job_is_incremental(db, settings):
+    IndexDailyRepo(db).upsert(index_rows("A", "sh000001", date(2024, 10, 24)))
+    adapter = StubIndexAdapter()
+    outcome = run_indices(deps(db, one_index(settings), index=adapter), ctx())
+    assert adapter.calls == [("A", "sh000001", AS_OF, AS_OF)]
+    assert outcome.ok and outcome.rows_affected == 1
+    assert IndexDailyRepo(db).latest_date("A", "sh000001") == AS_OF
+
+
+def test_indices_job_skips_an_index_already_at_as_of(db, settings):
+    """追平到今天就不该再问链：与 `test_fx_job_skips_a_pair_already_at_as_of` 同一条。"""
+    IndexDailyRepo(db).upsert(index_rows("A", "sh000001", AS_OF))
+    adapter = StubIndexAdapter()
+    outcome = run_indices(deps(db, one_index(settings), index=adapter), ctx())
+    assert adapter.calls == []
+    assert outcome.rows_affected == 0 and outcome.errors == ()
+
+
+def test_build_jobs_registers_symbol_master_only_with_service_and_capability(db, settings):
+    """两道闸各钉一头：服务没注入（这个部署就没这条链）与服务在但源给不了代码表，
+    后果都是「第一次跑到这里才出声」，而注册表看起来是完整的。"""
+    plain = deps(db, settings)
+    assert ("symbol_master", "A") not in titles(plain)
+    # 服务给了但 A 市链上没人提供代码表
+    assert ("symbol_master", "A") not in titles(replace(plain, symbol_master=SimpleNamespace()))
+    # 链上有源但服务没装
+    listing = deps(db, settings, bars=ListingBarsAdapter())
+    assert ("symbol_master", "A") not in titles(listing)
+    # 两边都齐才登记
+    assert ("symbol_master", "A") in titles(
+        replace(listing, symbol_master=SimpleNamespace())
+    )
+
+
+def test_build_jobs_registers_indices_only_with_repo_and_capability(db, settings):
+    assert ("indices", "A") not in titles(deps(db, settings))
+    # 有能力但 SyncService 没拿到指数仓库：登记了就是在 job 里撞那句 assert
+    assert ("indices", "A") not in titles(
+        deps(db, settings, index=StubIndexAdapter(), with_indices=False)
+    )
+    assert ("indices", "A") in titles(deps(db, settings, index=StubIndexAdapter()))
+    # 链上没有指数源的 HK/US 不登记
+    assert ("indices", "HK") not in titles(deps(db, settings, index=StubIndexAdapter()))

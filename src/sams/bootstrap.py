@@ -66,6 +66,7 @@ from sams.services.scheduler.types import JobDeps, JobSpec
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
+from sams.services.symbol_master import SymbolMasterSyncService
 from sams.services.sync import SyncService
 from sams.services.theses import ThesisService
 from sams.services.valuation import ValuationService
@@ -85,12 +86,14 @@ from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.fx import FxRepo
+from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.quotes import QuoteHealthRepo, QuoteRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
+from sams.storage.repos.symbol_list import SymbolListRepo
 from sams.storage.repos.symbols import SymbolRepo
 from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
 from sams.storage.repos.theses import ThesisRepo
@@ -169,6 +172,10 @@ class ServiceContext:
     users: UserRepo
     sessions: SessionRepo
     symbols: SymbolRepo
+    #: 全市场代码表（D140）：搜索与个股页读它，写入只有周同步那一条
+    symbol_list_store: SymbolListRepo
+    #: 指数日线（D145）：大盘条读它，写入只有 `sync_index` 那一条
+    index_daily_store: IndexDailyRepo
     bars: BarRepo
     corp_actions: CorpActionRepo
     corp_actions_coverage: CorpActionsCoverageRepo
@@ -194,6 +201,8 @@ class ServiceContext:
     fundamental_sync: FundamentalSyncService
     #: 汇率那条链：没有市场维度，所以它不跟着 `sync`/`fundamental_sync` 走市场路由
     fx_sync: FxSyncService
+    #: 代码表周同步（D141）：调度器登记的 job 与 CLI 走的就是这一份
+    symbol_master_sync: SymbolMasterSyncService
     fundamentals: FundamentalService
     screen: ScreenService
     analysis: AnalysisService
@@ -571,7 +580,11 @@ def _context_on(
     # 下面四个同步服务与 `UniverseBuilder` 原本就地造在 `return Container(...)` 的参数里。
     # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
     # 测试替换或事后调一处参数，另一处照旧跑——症状不是报错，是「改了没生效」
-    sync = SyncService(registry, bars, symbols, cfg.markets)
+    # 仓库排在消费方之前：`sync` 的 `indices` 槽位与代码表同步吃的就是这两个对象
+    symbol_list_store = SymbolListRepo(database)
+    index_daily_store = IndexDailyRepo(database)
+    sync = SyncService(registry, bars, symbols, cfg.markets, indices=index_daily_store)
+    symbol_master_sync = SymbolMasterSyncService(registry, symbol_list_store, cfg.markets)
     corp_action_sync = CorpActionSyncService(
         registry, corp_actions, corp_actions_coverage, clock=clock
     )
@@ -619,6 +632,7 @@ def _context_on(
         recheck=rule_rechecker,
         users=users,
         versions=versions,
+        symbol_master=symbol_master_sync,
     )
     scheduler = Scheduler(
         cfg,
@@ -645,6 +659,8 @@ def _context_on(
         users=users,
         sessions=sessions,
         symbols=symbols,
+        symbol_list_store=symbol_list_store,
+        index_daily_store=index_daily_store,
         bars=bars,
         corp_actions=corp_actions,
         corp_actions_coverage=corp_actions_coverage,
@@ -666,6 +682,7 @@ def _context_on(
         corp_action_sync=corp_action_sync,
         fundamental_sync=fundamental_sync,
         fx_sync=fx_sync,
+        symbol_master_sync=symbol_master_sync,
         fundamentals=fundamentals,
         screen=ScreenService(
             financials_store, valuation_store, symbols, scan_store, clock=clock

@@ -77,13 +77,15 @@ class StubFxAdapter:
 def deps(db, settings, *, fx=None, calendar=None, rules=None, recheck=None, users=None):
     """三个数据服务的槽位这里是 None——本文件不跑数据 job。
 
+    `sync` 是唯一的例外：`build_jobs` 会问它「拿到指数仓库没有」来决定登记不登记，
+    所以那一格给一个只会答 `indices=None` 的空壳（本文件仍然一次数据 job 都不跑）。
     注册表给空的那一套：`build_jobs` 因此一个数据 job 都不登记，注册表那一枚用例
     断的就只有这四个运维 job。
     """
     return JobDeps(
         settings=settings,
         registry=AdapterRegistry(adapters={}, market_sources={}, sleep=lambda _: None),
-        sync=None,  # type: ignore[arg-type]
+        sync=SimpleNamespace(indices=None),  # type: ignore[arg-type]
         corp_actions=None,  # type: ignore[arg-type]
         fundamentals=None,  # type: ignore[arg-type]
         fx=fx,

@@ -75,3 +75,9 @@ max_user_total_mb = 512     # 每个用户的附件总配额（MB）
 max_body_chars = 20000      # 批注正文上限（字符）
 break_glass_minutes = 15    # admin 单条私有批注的临时查看时长
 break_glass_max_per_hour = 5  # 每管理员每小时最多授权次数（治理参数，不是性能参数）
+
+# 大盘条指数清单：写了的市场整组覆盖默认，不写用内置九只
+# [indices.A]
+# codes = ["sh000001"]
+# [indices.labels]
+# sh000001 = "上证指数"

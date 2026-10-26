@@ -9,6 +9,7 @@ from sams.core.errors import DatasourceError
 from sams.datasource.registry import EMPTY_BARS, Attempt, FetchResult
 from sams.services.sync import SyncService
 from sams.storage.repos.bars import BarRepo
+from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.symbols import SymbolRepo
 
 D1, D2 = date(2024, 1, 2), date(2024, 1, 3)
@@ -32,14 +33,25 @@ def bars_frame(source: str = "yfinance") -> pl.DataFrame:
 
 
 class StubRegistry:
-    """只回答路由结果，好让同步用例与降级逻辑分开测试。"""
+    """只回答路由结果，好让同步用例与降级逻辑分开测试。
+
+    `fetch_index_daily` 与 `fetch_daily` 共用同一份 `result`：一枚用例只喂一种帧，
+    分成两个槽位只会把「忘了喂指数帧」变成 TypeError，而不是看得见的断言失败。
+    """
 
     def __init__(self, result: FetchResult | Exception) -> None:
         self.result = result
         self.calls: list[tuple] = []
+        self.index_calls: list[tuple] = []
 
     def fetch_daily(self, market, code, start, end) -> FetchResult:
         self.calls.append((market, code, start, end))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+    def fetch_index_daily(self, market, index_code, start, end) -> FetchResult:
+        self.index_calls.append((market, index_code, start, end))
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -165,3 +177,60 @@ def test_currency_is_overridden_by_the_code_segment(db, settings):
     assert svc.currency_of("A", "200011") == "HKD"  # 深市 B 股
     assert svc.currency_of("HK", "80700") == "CNY"  # 腾讯人民币双柜台
     assert svc.currency_of("HK", "08100") == "HKD"  # 08xxx 是港股创业板，仍是 HKD
+
+
+# --- 指数日线：同一条链，但入库进的是另一张表（D145） ---------------------------------------
+
+I1, I2, I3 = date(2026, 10, 19), date(2026, 10, 20), date(2026, 10, 21)
+
+
+def index_result(**kw) -> FetchResult:
+    """三日指数帧，列集与个股日线一致（`code` 那一列在入库前才换成 index_code）。"""
+    frame = pl.DataFrame(
+        {
+            "market": ["A", "A", "A"],
+            "code": ["sh000001", "sh000001", "sh000001"],
+            "date": [I1, I2, I3],
+            "open": [3000.0, 3100.0, 3200.0],
+            "high": [3050.0, 3150.0, 3250.0],
+            "low": [2950.0, 3050.0, 3150.0],
+            "close": [3010.0, 3120.0, 3230.0],
+            "volume": [1.0e8, 1.1e8, 1.2e8],
+            "amount": [None, None, None],
+            "source": ["tencent", "tencent", "tencent"],
+        }
+    )
+    defaults = dict(
+        market="A",
+        code="sh000001",
+        frame=frame,
+        source="tencent",
+        attempts=(Attempt("tencent", True),),
+    )
+    return FetchResult(**{**defaults, **kw})
+
+
+def make_index_service(db, settings, result) -> tuple[SyncService, IndexDailyRepo]:
+    registry = StubRegistry(result)
+    indices = IndexDailyRepo(db)
+    svc = SyncService(
+        registry, BarRepo(db), SymbolRepo(db), settings.markets, indices=indices
+    )
+    return svc, indices
+
+
+def test_sync_index_writes_with_prev(db, settings):
+    svc, indices = make_index_service(db, settings, index_result())
+    summary = svc.sync_index("A", "sh000001", I1, I3)
+    assert summary.written == 3
+    latest = indices.latest_with_change("A", "sh000001")
+    assert latest.change_pct is not None
+    # 指数不建主档
+    assert SymbolRepo(db).get("A", "sh000001") is None
+
+
+def test_sync_index_empty(db, settings):
+    empty = index_result(frame=EMPTY_BARS, source="", attempts=(), empty_everywhere=True)
+    svc, _ = make_index_service(db, settings, empty)
+    summary = svc.sync_index("A", "sh000001", I1, I3)
+    assert summary.empty is True and summary.written == 0

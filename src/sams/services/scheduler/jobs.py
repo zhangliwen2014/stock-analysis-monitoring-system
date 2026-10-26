@@ -7,9 +7,12 @@
 后面四个（汇率、日历、规则、复检）单元不是票：按**对**、按**年**、按**用户**隔离，
 「坏一个不带走其余」这句是同一条，写法各是一小段循环。
 
+另两个的单元是整个市场或一组代码：`symbol_master` 一周一次刷整张代码表（一张表拆不成
+按只隔离），`indices` 吃 `[indices]` 里那几只（D141/D145）。
+
 窗口规则：
 
-* 日线/按日估值/资金流/汇率：库里有最新一天就从下一天起，没有就回补 730 天
+* 日线/按日估值/资金流/汇率/指数日线：库里有最新一天就从下一天起，没有就回补 730 天
   （汇率那一头问的是「这一对还缺哪段」，所以读的是 `FxRepo.latest_date`，不看陈旧度）；
 * 公司行为：除非已有「全历史且覆盖到今天」的确认，否则从 1990 年起；
 * 财务：每次都从 1990 年起——报告期数据是重述的，增量窗口会漏掉旧期的修正。
@@ -165,6 +168,38 @@ def _has(deps: JobDeps, market: str, method: str) -> bool:
         return False
 
 
+def run_symbol_master(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """代码表一周一次，单元是整个市场：一张表拆不成「按只隔离」。"""
+    assert ctx.market is not None
+    try:
+        summary = deps.symbol_master.sync(ctx.market)
+    except SamsError as exc:
+        return JobOutcome(note=f"{ctx.market} 代码表失败", errors=(f"{ctx.market}: {exc}",))
+    return JobOutcome(
+        rows_affected=summary.rows,
+        note=f"{ctx.market} 代码表 {summary.rows} 行、关停 {summary.deactivated}",
+    )
+
+
+def run_indices(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """大盘条那几只指数：窗口按每只各自的库内最新日，与日线同一条规则。
+
+    单位是「一只指数」而不是「一只票」，所以它不并进 `_DATA_JOBS` 那张按票登记的表：
+    指数不在 universe 里，配置里的 `[indices]` 才是它的清单（D145）。
+    """
+    assert ctx.market is not None
+    assert deps.sync.indices is not None  # 登记前查过注入，这里只兜编程错误
+
+    def one(market: str, index_code: str) -> int:
+        start = _window(deps.sync.indices.latest_date(market, index_code), ctx.as_of)
+        if start is None:
+            return 0
+        return deps.sync.sync_index(market, index_code, start, ctx.as_of).written
+
+    units = [(ctx.market, ic) for ic in deps.settings.indices.for_market(ctx.market)]
+    return _collect(units, one, "指数日线")
+
+
 def run_fx(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """汇率没有市场维度：对象来自账户的币种对，窗口按每对各自的库内最新日。
 
@@ -279,7 +314,7 @@ def run_recheck(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
 def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
     """注册顺序就是同一个 tick 里的执行顺序：
-    每个市场：数据链 → 周复检 → 规则；然后汇率；最后日历。
+    每个市场：代码表 → 数据链 → 指数 → 周复检 → 规则；然后汇率；最后日历。
 
     周复检排在规则之前说的是**同一晚之内**：`thesis.drift` 读的是复检写下的
     `baseline_items`，没有它就只拿到「这条论还没有分项基线」那一句。先复检，那条论当晚
@@ -289,9 +324,14 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
     """
     jobs: list[JobSpec] = []
     for market in sorted(deps.settings.markets):
+        # 代码表排市场组最前：当晚新上市的票先进表，后面的搜索与补数才找得到它
+        if deps.symbol_master is not None and _has(deps, market, "symbol_list"):
+            jobs.append(JobSpec("symbol_master", WEEKLY, market, partial(run_symbol_master, deps)))
         for method, name, run in _DATA_JOBS:
             if _has(deps, market, method):
                 jobs.append(JobSpec(name, DAILY, market, partial(run, deps)))
+        if deps.sync.indices is not None and _has(deps, market, "index_daily"):
+            jobs.append(JobSpec("indices", DAILY, market, partial(run_indices, deps)))
         jobs.append(JobSpec("recheck", WEEKLY, market, partial(run_recheck, deps)))
         jobs.append(JobSpec("rules", DAILY, market, partial(run_rules, deps)))
     jobs.append(JobSpec("fx", FX, None, partial(run_fx, deps)))

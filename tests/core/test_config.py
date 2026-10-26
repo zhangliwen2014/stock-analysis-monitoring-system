@@ -242,3 +242,40 @@ def test_public_base_url_must_be_http_or_https(tmp_path):
     text = BASE + '\n[server]\npublic_base_url = "ftp://example.com"\n'
     with pytest.raises(ValidationError, match="public_base_url"):
         Settings.load(write(tmp_path, text))
+
+
+THREE_MARKETS = BASE + """
+[markets.HK]
+tz = "Asia/Hong_Kong"
+currency = "HKD"
+sources = ["yfinance"]
+
+[markets.US]
+tz = "America/New_York"
+currency = "USD"
+sources = ["yfinance"]
+"""
+
+
+def test_indices_defaults(tmp_path):
+    """不写 `[indices]` 也要有内置那九只：大盘条不该因为没人配过就整条不渲染（D145）。"""
+    s = Settings.load(write(tmp_path, THREE_MARKETS))
+    assert s.indices.for_market("A") == ("sh000001", "sz399001", "sz399006")
+    assert s.indices.for_market("HK") == ("hkHSI", "hkHSTECH", "hkHSCEI")
+    assert s.indices.for_market("US") == ("usSPX", "usIXIC", "usDJI")
+    assert s.indices.label("sh000001") == "上证指数"
+
+
+def test_indices_override(tmp_path):
+    """写了的市场整组覆盖：默认那九只不会和自定义的混成一段没法解释的清单。"""
+    text = THREE_MARKETS + """
+[indices.A]
+codes = ["sh000001"]
+
+[indices.labels]
+sh000001 = "沪综指"
+"""
+    s = Settings.load(write(tmp_path, text))
+    assert s.indices.for_market("A") == ("sh000001",)
+    assert s.indices.label("sh000001") == "沪综指"
+    assert s.indices.label("unknown") == "unknown"

@@ -21,6 +21,7 @@ from sams.services.fx import FxSyncService
 from sams.services.rules.engine import RuleEngine
 from sams.services.rules.recheck import Rechecker
 from sams.services.scheduler.universe import Universe
+from sams.services.symbol_master import SymbolMasterSyncService
 from sams.services.sync import SyncService
 from sams.storage.repos.users import UserRepo
 
@@ -91,3 +92,6 @@ class JobDeps:
     #: 默认自建一份，job 那一头永远敲得到；装配根（Task 15）会把盘中线程用的那一份
     #: 传进来——两边各拿一份计数的话，盘后的 bump 清不掉盘中那份缓存
     versions: VersionGate = field(default_factory=VersionGate)
+    #: 代码表周同步（D141）：带默认值，所以没装这一层的部署照旧能构造 `JobDeps`——
+    #: `build_jobs` 见到 None 就不登记那个 job，而不是起不来
+    symbol_master: SymbolMasterSyncService | None = None
