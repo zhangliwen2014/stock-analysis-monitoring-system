@@ -375,6 +375,17 @@ def test_count_all_is_the_annotation_quota_column(repo):
     assert repo.count_all(OTHER) == 0
 
 
+def test_count_by_user_is_the_usage_table_row_source(repo):
+    """用量表行集以批注拥有者驱动（spec:339）：零附件的用户也要有自己的一行。
+    口径与 `count_all` 一致——排已硬清除、墓碑还算；按批注数降序。"""
+    add(repo, OWNER)
+    add(repo, OWNER, body_md="第二条")
+    add(repo, OTHER)
+    ghost = add(repo, "u3")
+    repo.db.execute("UPDATE annotations SET purged_at = ? WHERE id = ?", [NOW, ghost.id])
+    assert repo.count_by_user() == [(OWNER, 2), (OTHER, 1)]
+
+
 def test_count_revisions_counts_edits_only(repo):
     made = add(repo)
     assert repo.count_revisions(made.id) == 0

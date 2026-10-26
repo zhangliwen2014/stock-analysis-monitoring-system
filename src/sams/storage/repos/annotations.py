@@ -568,14 +568,27 @@ class AnnotationRepo:
         return clauses, params
 
     def count_all(self, user_id: str | None = None) -> int:
-        """用量表「批注数」列的唯一出处：排已硬清除；软删墓碑还算——
-        30 天保留期里的行仍占着这个人的额度（D136 的配额问的是名下有几条）。"""
+        """单用户的批注数（配额问「名下有几条」）。用量表的行集与数字走
+        `count_by_user`——逐行问这里会把零附件的用户从屏上丢掉。同口径：
+        排已硬清除；软删墓碑还算（D136）。"""
         sql = "SELECT count(*) FROM annotations WHERE purged_at IS NULL"
         params: list[object] = []
         if user_id:
             sql += " AND user_id = ?"
             params.append(user_id)
         return int(self.db.scalar(sql, params) or 0)
+
+    def count_by_user(self) -> list[tuple[str, int]]:
+        """admin 用量表行集的唯一出处：每行 = 一个批注拥有者（spec:339——
+        零附件的用户也要上屏，行集不能由附件侧驱动）。口径与 `count_all` 一致：
+        排已硬清除、软删墓碑还算；按批注数降序。"""
+        rows = self.db.query(
+            "SELECT user_id, count(*) AS cnt FROM annotations"
+            " WHERE purged_at IS NULL GROUP BY user_id"
+            " ORDER BY cnt DESC, user_id",
+            [],
+        ).to_dicts()
+        return [(str(row["user_id"]), int(row["cnt"])) for row in rows]
 
     def count_revisions(self, annotation_id: str) -> int:
         """列表行的 revision 数（spec:340）：廉价的 SELECT count，

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import io
+import re
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.parse import unquote
@@ -505,6 +506,16 @@ def test_list_shows_revision_count_and_usage_annotation_count(admin_app):
     page = admin_app.client.get("/admin/annotations")
     assert "revision" in page.text and "批注数" in page.text
     assert "<td>2</td>" in page.text, "两次编辑 = 两条 revision，要能在行里数出来"
+
+
+def test_usage_table_shows_users_without_attachments(admin_app):
+    """spec:339：用量表行集以批注拥有者驱动——零附件用户的批注数不许隐身。
+    `usage_by_user()` 设计上就不列没附件的人；只由附件驱动，「只有批注」的人
+    在配额表里永远查无此人。"""
+    _private_of_bob(admin_app)  # bob 名下一条批注、零附件
+    page = admin_app.client.get("/admin/annotations")
+    row = re.search(r"<td>bob</td><td>1</td>\s*<td>0</td><td>0\.0</td>", page.text)
+    assert row, "用量表要有 bob 一行：批注 1 / 张数 0 / 0.0 MB"
 
 
 # --- 审计表扩到 50 条 + 所有者列（spec:340）--------------------------------------------------

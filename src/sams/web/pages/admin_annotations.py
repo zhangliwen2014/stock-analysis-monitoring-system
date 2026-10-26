@@ -168,16 +168,33 @@ def admin_annotations_page(request: Request):
     names = {user.id: (user.display_name or user.username) for user in users}
     sharing = ctx.app_settings.team_sharing()
     filters = _list_filters(request, ctx, users)
+    # 行集由批注拥有者驱动（spec:339）：`usage_by_user()` 设计上不列零附件的人，
+    # 只由附件驱动会让「只有批注」的用户在配额表里查无此人
+    annotation_counts = ctx.annotations_store.count_by_user()
+    att_usage = ctx.attachments_store.usage_by_user()
+    att_stats = {user_id: (count, size_bytes) for user_id, count, size_bytes in att_usage}
     usage = [
         {
             "user": names.get(user_id, user_id[:8]),
-            # 批注数与「用量表只有一个出处」同规则：问 `count_all`，不在页面里折 SQL
-            "annotations": ctx.annotations_store.count_all(user_id),
-            "count": count,
-            "mb": f"{size_bytes / (1024 * 1024):.1f}",
+            # 批注数与行集同源（`count_by_user`）：逐行再问一次就是两个出处
+            "annotations": count,
+            "count": att_stats.get(user_id, (0, 0))[0],
+            "mb": f"{att_stats.get(user_id, (0, 0))[1] / (1024 * 1024):.1f}",
         }
-        for user_id, count, size_bytes in ctx.attachments_store.usage_by_user()
+        for user_id, count in annotation_counts
     ]
+    listed = {user_id for user_id, _ in annotation_counts}
+    # 有附件但批注已被硬清除的用户：字节还占着盘，行不许消失
+    for user_id, att_count, size_bytes in att_usage:
+        if user_id not in listed:
+            usage.append(
+                {
+                    "user": names.get(user_id, user_id[:8]),
+                    "annotations": 0,
+                    "count": att_count,
+                    "mb": f"{size_bytes / (1024 * 1024):.1f}",
+                }
+            )
     logs = [
         {
             "admin": names.get(row.admin_user_id, row.admin_user_id[:8]),
