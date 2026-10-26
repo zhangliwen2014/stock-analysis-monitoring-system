@@ -12,7 +12,7 @@ from sams.core.codes import canonical_code, canonical_market
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
 
-#: 剥前缀要求剩下至少两位：`HK7` 那两位是代码本体的一部分，剥掉就查不到任何票
+#: 剥完至少剩两位才剥：`HK7` 那两位是代码本体的一部分，剥掉就查不到任何票
 _PREFIXES = ("SH", "SZ", "BJ", "HK", "US")
 
 

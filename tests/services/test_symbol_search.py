@@ -24,6 +24,7 @@ from sams.storage.repos.symbol_list import SymbolListRepo
         ("", None),
         ("   ", None),
         ("HK", None),  # 前缀吃掉后没剩下东西
+        ("HK7", "HK7"),  # 只剩一位不是市场前缀：那是代码本体，不许剥
         ("x" * 100, "X" * 64),
     ],
 )
@@ -71,7 +72,7 @@ def test_search_attaches_last_close_from_bars(db):
     assert svc.search("600519")[0].close == 1499.5
 
 
-def test_empty_or_symbol_only_query_does_not_hit_db(db):
+def test_blank_junk_or_symbol_only_query_does_not_hit_db(db):
     class Boom:
         def search(self, *a, **k):
             raise AssertionError("空检索词不该打库")
@@ -79,3 +80,4 @@ def test_empty_or_symbol_only_query_does_not_hit_db(db):
     svc = SymbolSearchService(Boom(), BarRepo(db))
     assert svc.search("") == []
     assert svc.search("%%%") == []
+    assert svc.search("HK") == []

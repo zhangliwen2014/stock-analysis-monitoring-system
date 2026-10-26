@@ -70,6 +70,14 @@ def test_empty_query_is_empty_panel(logged):
     assert "查无" not in response.text and "<table" not in response.text
 
 
+def test_unsearchable_query_is_empty_panel_without_none_found(logged):
+    """剥完不剩东西的检索词（乱符号、光一个市场字母）不是「查无」：没有检索就没有查。"""
+    for junk in ("%%%", "HK"):
+        response = logged.client.get("/api/symbol-search", params={"code": junk})
+        assert "查无" not in response.text, junk
+        assert "<table" not in response.text, junk
+
+
 def test_last_close_column_two_states(logged):
     ctx = logged.context
     ctx.symbol_list_store.upsert_batch(

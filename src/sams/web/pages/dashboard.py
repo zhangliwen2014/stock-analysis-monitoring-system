@@ -19,6 +19,7 @@ from sams.bootstrap import AppCore, ServiceContext
 from sams.core.codes import currency_override
 from sams.core.errors import SamsError, ValidationError
 from sams.core.quotes import NO_DATA, quote_state
+from sams.services.symbol_search import normalize_query
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import hms, pct_class, state_label
 
@@ -47,14 +48,14 @@ def _market_open(ctx: ServiceContext, market: str, now: datetime) -> bool:
 _CURRENCY_UNITS = {"CNY": "元", "HKD": "港元", "USD": "美元"}
 
 
-def _price_unit(ctx: ServiceContext, market: str) -> str:
-    """这一行现价的单位，取市场的配置币种（`Settings.markets[...].currency`）。
+def _price_unit(ctx: ServiceContext, market: str, code: str = "") -> str:
+    """这一行现价的单位：先认标的的币种例外（B 股、双柜台），再落市场的配置币种。
 
     折算发生在页面这一侧：模板拿到的就是「港元」，不再拿市场代码去猜币种。
     市场从配置里撤了（自选里留着旧市场的行）时交空串——那一格只剩数字，比编一个单位诚实。
     """
     cfg = ctx.settings.markets.get(market)
-    currency = cfg.currency if cfg else ""
+    currency = currency_override(market, code) or (cfg.currency if cfg else "")
     return _CURRENCY_UNITS.get(currency, currency)
 
 
@@ -86,7 +87,7 @@ def _quote_rows(
                 # 有没有主档决定这一行肯不肯挂 /symbol 链接：`_require_symbol` 对查无此码
                 # 一律 404（不区分「没这行」与「没这码」是有意的），挂上去就是死路一条
                 "has_master": symbol is not None,
-                "unit": _price_unit(ctx, item.market),
+                "unit": _price_unit(ctx, item.market, item.code),
                 "note": item.note or "",
                 "price": quote.price if quote else None,
                 "pct": quote.pct_chg if quote else None,
@@ -177,13 +178,6 @@ def quotes_partial(request: Request):
     )
 
 
-def _candidate_unit(ctx: ServiceContext, market: str, code: str) -> str:
-    """候选行的单位：先认标的的币种例外（B 股、双柜台），再落市场默认。"""
-    cfg = ctx.settings.markets.get(market)
-    currency = currency_override(market, code) or (cfg.currency if cfg else "")
-    return _CURRENCY_UNITS.get(currency, currency)
-
-
 @router.get("/api/symbol-search")
 def symbol_search_partial(request: Request, code: str = "", market: str = ""):
     """候选面板：htmx 每敲一个字重来一次，空检索词回空面板，不打扰。"""
@@ -196,18 +190,20 @@ def symbol_search_partial(request: Request, code: str = "", market: str = ""):
             "code": c.code,
             "name": c.name,
             "price": c.close,
-            "unit": _candidate_unit(ctx, c.market, c.code),
+            "unit": _price_unit(ctx, c.market, c.code),
         }
         for c in ctx.symbol_search.search(code)
     ]
     # 表单上选中的市场排前面，但不排掉别的：选着 A 搜 00700，答案在 HK
     sel = market.strip().upper()
     rows = [r for r in rows if r["market"] == sel] + [r for r in rows if r["market"] != sel]
+    # 「查无」只说给真的查过的检索词：`%%%`、光一个市场字母在归一那步就没了，没查不许说没查到
+    searched = normalize_query(code) is not None
     return web.render(
         request,
         "partials/symbol_search.html",
         rows=rows,
-        none_found=bool(code.strip()) and not rows,
+        none_found=searched and not rows,
     )
 
 

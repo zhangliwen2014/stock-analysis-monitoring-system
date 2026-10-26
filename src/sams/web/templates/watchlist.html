@@ -11,7 +11,7 @@
     </select>
     <input name="code" placeholder="代码 / 首字母 / 名称，如 000001、payh、平安"
            hx-get="/api/symbol-search" hx-trigger="keyup changed delay:300ms"
-           hx-target="#wl-candidates" hx-include="#wl-form" hx-swap="innerHTML">
+           hx-target="#wl-candidates" hx-include="select[name=market]" hx-swap="innerHTML">
     <input name="note" placeholder="备注（可空）">
     <button type="submit">加入</button>
   </form>

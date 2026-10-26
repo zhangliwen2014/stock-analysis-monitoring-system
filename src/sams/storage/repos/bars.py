@@ -204,9 +204,9 @@ class BarRepo:
         params = [v for pair in keys for v in pair]
         rows = self.db.query(
             f"SELECT market, code, arg_max(close, date) AS close FROM bars_daily"
-            f" WHERE adjust = '{ADJUST}' AND (market, code) IN ({marks})"
+            f" WHERE adjust = ? AND (market, code) IN ({marks})"
             f" GROUP BY market, code",
-            params,
+            [ADJUST, *params],
         )
         return {(r["market"], r["code"]): float(r["close"]) for r in rows.to_dicts()}
 

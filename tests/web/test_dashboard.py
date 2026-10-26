@@ -200,3 +200,18 @@ def test_price_unit_follows_the_market_currency(logged):
     assert _quote_cells(page, "00700")[3] == "400.00 港元"
     assert _quote_cells(page, "AAPL")[3] == "250.00 美元"
     assert _quote_cells(page, "600519")[3] == "1,500.00 元"
+
+
+def test_board_unit_follows_currency_override_for_dual_counter(logged):
+    """行情板与搜索面板共用同一条单位规则：双柜台 80700 在板上也得报「元」，不随市场默认写港元。"""
+    user = logged.context.users.get_by_username("alice")
+    logged.context.watchlists.add(user.id, "HK", "80700")
+    _seed_quote(logged, market="HK", code="80700", price=300.0)
+    assert _quote_cells(logged.client.get("/"), "80700")[3] == "300.00 元"
+
+
+def test_watchlist_search_input_includes_only_the_market_select(logged):
+    """搜索框只带上市场下拉：整表单入 GET 查询串会把 csrf 和备注写进 URL 与日志。"""
+    page = logged.client.get("/watchlist")
+    assert 'hx-include="select[name=market]"' in page.text
+    assert 'hx-include="#wl-form"' not in page.text
