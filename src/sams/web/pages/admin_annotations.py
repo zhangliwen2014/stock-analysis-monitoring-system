@@ -94,6 +94,15 @@ def _display_tags(made, readable: bool) -> str:
     return "、".join(made.tags) or "—"
 
 
+def _names(ctx) -> dict[str, str]:
+    """用户 id → 屏幕上的人名（显示名优先，其次用户名）。
+
+    列表、审计表与详情页共用这一份折法：写第二处就会有一处把 32 位 id 直接端上去，
+    而那串 id 在屏上没有第二个用处——「谁写的」这个问题就答不出来了（spec:340）。
+    """
+    return {user.id: (user.display_name or user.username) for user in ctx.users.list_users()}
+
+
 def _day_start(raw: str | None, tz: str, *, next_day: bool = False) -> datetime | None:
     """`YYYY-MM-DD` 折成 display_tz 的零点（`until` 要 +1d 才是开区间上界）。
     认不出来就 None——地址栏手滑不判 400，「等于没筛」与搜索页同一读法。"""
@@ -168,6 +177,9 @@ def _meta_rows(ctx, admin, made_by: dict[str, str], sharing: bool, filters: dict
                 "updated": moment_label(made.updated_at, tz),
                 "target": _display_target(made, readable),
                 "tags": _display_tags(made, readable),
+                # 那一行的入口叫什么，取决于点下去看得见什么（spec:341）：
+                # 遮蔽行落地就是「申请授权」那张卡，写「详情」是把人骗进一屏表单
+                "readable": readable,
                 # 逐行数 revision：与上面 `_readable` 同一取舍，一屏 50 行换不来一次 JOIN
                 "revisions": ctx.annotations_store.count_revisions(made.id),
                 "visibility": "团队" if made.visibility == "team" else "私有",
@@ -186,7 +198,7 @@ def admin_annotations_page(request: Request):
     web = request.app.state.web
     ctx = web.contexts.current()
     users = ctx.users.list_users()
-    names = {user.id: (user.display_name or user.username) for user in users}
+    names = _names(ctx)
     sharing = ctx.app_settings.team_sharing()
     filters, shown = _list_filters(request, ctx, users)
     # 行集由批注拥有者驱动（spec:339）：`usage_by_user()` 设计上不列零附件的人，
@@ -266,7 +278,14 @@ def policy_set(
         detail=f"{old}->{wanted}",
     )
     label = "开" if wanted == "on" else "关"
-    return RedirectResponse(f"/admin/annotations?notice=策略已切到 {label}", status_code=303)
+    # 那句提醒由 `_notice` 的白名单认，所以这里写的是它认得的原文（quote 只给地址栏）
+    target = f"/admin/annotations?notice={quote(f'策略已切到 {label}')}"
+    if request.headers.get("hx-request", "").lower() == "true":
+        # 「关闭」那一条走的是 htmx（二次确认只在 htmx 的请求上有意义）：给它 303 的话，
+        # 浏览器跟着跳转、htmx 再把整页 HTML 塞进表单那一格，页面套页面。
+        # `HX-Redirect` 是把跳转交回浏览器：地址栏、提示语与那张卡片都是重新渲染的那份
+        return Response(status_code=204, headers={"HX-Redirect": target})
+    return RedirectResponse(target, status_code=303)
 
 
 def _detail(
@@ -310,7 +329,8 @@ def _detail(
         status_code=status_code,
         meta={
             "id": made.id,
-            "owner": made.user_id,
+            # 所有者与列表同一份折法（`_names`）：详情写裸 id 会让人以为这是两条不同的记录
+            "owner": _names(ctx).get(made.user_id, made.user_id[:8]),
             "at": moment_label(made.created_at, tz),
             "target": _display_target(made, readable),
             "tags": _display_tags(made, readable),

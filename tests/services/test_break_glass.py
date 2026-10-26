@@ -89,17 +89,32 @@ def test_grant_lasting_the_window(svc, annotations_store):
 
 
 def test_hourly_cap_per_admin(svc, annotations_store):
-    """超限是 429 的形状（spec:342）：带等待秒数——「本小时批满了」要能回答下一句
-    「那我什么时候能批」。秒数取窗口内最早一次授权 + 1h − now。"""
+    """超限是 429 的形状（spec:342）：带等待时长——「本小时批满了」要能回答下一句
+    「那我什么时候能批」。秒数取窗口内最早一次授权 + 1h − now，屏上按分与秒念出来：
+    「请等待 3213 秒」没人能在心里换算出几点，而这一句是要催人离开的。"""
     cap = svc.settings.annotations.break_glass_max_per_hour
     ids = [_own_annotation(annotations_store, user_id=f"u-{n}").id for n in range(cap + 1)]
     for annotation_id in ids[:cap]:
         svc.request_access("adm", annotation_id, "核对除权口径")
     with pytest.raises(TooManyRequests, match="每小时") as excinfo:
         svc.request_access("adm", ids[cap], "核对除权口径")
-    assert "等待 3600 秒" in str(excinfo.value), "五次都发生在 NOW：还要等整一小时"
+    assert "等待 60 分 0 秒后再试" in str(excinfo.value), "五次都发生在 NOW：还要等整一小时"
+    assert "3600 秒" not in str(excinfo.value), "整小时的等待不许只剩一个秒数"
     # 限次是按管理员算的：换个人照样能批
     assert svc.request_access("adm-2", ids[cap], "核对除权口径") is not None
+
+
+def test_wait_under_a_minute_says_seconds_only(svc, annotations_store, clock):
+    """不满一分钟的等待不写「0 分 27 秒」：那个 0 分是废话；也不写「约 1 分钟」——
+    不足一分钟说成一分钟，是把人支出去多等三十秒再撞一次 429。"""
+    cap = svc.settings.annotations.break_glass_max_per_hour
+    ids = [_own_annotation(annotations_store, user_id=f"u-{n}").id for n in range(cap + 1)]
+    for annotation_id in ids[:cap]:
+        svc.request_access("adm", annotation_id, "核对除权口径")
+    clock.advance(seconds=3600 - 27)
+    with pytest.raises(TooManyRequests) as excinfo:
+        svc.request_access("adm", ids[cap], "核对除权口径")
+    assert "等待 27 秒后再试" in str(excinfo.value)
 
 
 def test_window_slides_after_an_hour(svc, annotations_store, clock):

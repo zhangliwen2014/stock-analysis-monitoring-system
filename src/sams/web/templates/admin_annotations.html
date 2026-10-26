@@ -16,7 +16,12 @@
     <input type="hidden" name="value" value="on">
     <button type="submit">开启</button>
   </form>
-  <form method="post" action="/admin/annotations/policy" class="inline-form">
+  {# 关掉这一条要当面问一句（spec §6.1:341 钉的二次确认文案）：后果写在说明里，
+     人在提交之后才会读到。`hx-confirm` 只挂在 htmx 的请求上，所以这一条同时换成
+     `hx-post`——端点对带 `HX-Request` 的那一次答 `HX-Redirect`，整页跳转照旧 #}
+  <form method="post" action="/admin/annotations/policy" class="inline-form"
+        hx-post="/admin/annotations/policy"
+        hx-confirm="关闭后既有 team 批注对他人隐藏，数据保留">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <input type="hidden" name="value" value="off">
     <button type="submit">关闭</button>
@@ -75,7 +80,11 @@
         {% elif row.deleted %}<span class="badge">已删除</span>
         {% endif %}
       </td>
-      <td><a href="/admin/annotations/{{ row.id }}">详情</a></td>
+      {# spec:341：遮蔽的那一行入口叫「紧急查看」——点下去就是那张申请授权的卡，
+         写「详情」等于先骗人进去再告诉他读不到。可读的行照旧叫「详情」 #}
+      <td>
+        <a href="/admin/annotations/{{ row.id }}">{{ "详情" if row.readable else "紧急查看" }}</a>
+      </td>
     </tr>
     {% else %}
     <tr><td colspan="9" class="muted">还没有一条批注。</td></tr>

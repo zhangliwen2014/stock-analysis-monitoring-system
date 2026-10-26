@@ -13,6 +13,7 @@ from datetime import date
 import pytest
 
 from sams.core.errors import DatabaseLocked
+from sams.core.rules import FILTER_KEYS
 from sams.storage.repos.rules import RuleRepo
 
 
@@ -411,6 +412,24 @@ def test_the_writes_are_behind_the_csrf_pair(logged):
     assert logged.client.post(f"/rules/{rule_id}/edit", data={"name": "x"}).status_code == 403
     assert logged.client.post(f"/rules/{rule_id}/toggle", data={"csrf": ""}).status_code == 403
     assert logged.context.rule_service.show(_alice_id(logged), rule_id).rule.name == "止损"
+
+
+def test_every_stored_filter_switch_comes_back_checked(logged):
+    """四个开关全开着时，编辑页要四个都勾着；都关着时一个都不许勾。少回填一格（或一格
+    都不回填）说明那一格读的是表单默认而不是库里那一份——照着这一屏交一次保存，
+    就把人开着的降噪开关关了。（试运行缺陷批次 2 报的就是这一条。）"""
+    on_id = _add(logged, filters=dict.fromkeys(FILTER_KEYS, True))
+    off_id = _add(
+        logged, name="静默止损", target_ref="A/000002", filters=dict.fromkeys(FILTER_KEYS, False)
+    )
+    on_page = logged.client.get(f"/rules/{on_id}/edit")
+    assert on_page.status_code == 200
+    for key in FILTER_KEYS:
+        assert f'name="filter_{key}" checked' in on_page.text, key
+    off_page = logged.client.get(f"/rules/{off_id}/edit")
+    assert off_page.status_code == 200
+    for key in FILTER_KEYS:
+        assert f'name="filter_{key}" checked' not in off_page.text, key
 
 
 def test_the_edit_page_echoes_what_is_stored(logged):

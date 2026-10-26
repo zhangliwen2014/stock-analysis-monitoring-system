@@ -218,6 +218,13 @@ def test_empty_window_says_the_do_something_sentence(logged):
     assert "本周没有告警。可以去看看自选与持仓，或写一条复盘批注。" in page.text
 
 
+def test_the_page_says_test_alerts_are_excluded(logged):
+    """D131 把 `is_test` 挡在复盘之外，而屏幕从不解释：收件箱里躺着两条测试告警、
+    窗口说「本周没有告警」时，读的人只会以为统计坏了——排除规则要写在同一屏上。"""
+    page = logged.client.get("/review")
+    assert "测试告警不计入复盘统计" in page.text
+
+
 def test_annotations_section_lists_this_week_only(logged):
     ctx = logged.context
     uid = _alice(ctx).id

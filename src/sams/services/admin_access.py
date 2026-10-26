@@ -24,6 +24,17 @@ MIN_REASON_CHARS = 4
 MAX_REASON_CHARS = 200
 
 
+def _wait_phrase(secs: int) -> str:
+    """等待时长的念法（spec:342 的那句话是给人读的）：满一分钟就按「分 秒」报。
+    「请等待 3213 秒」要人自己换算出几点能回来，而这一句的正事就是催人离开屏幕。
+    不足一分钟不写「0 分」：那个 0 是废话；也不写「约 1 分钟」：把人支出去多等半分钟，
+    回来还是 429。
+    """
+    if secs < 60:
+        return f"等待 {secs} 秒"
+    return f"等待 {secs // 60} 分 {secs % 60} 秒"
+
+
 class BreakGlassService:
     def __init__(
         self,
@@ -71,7 +82,7 @@ class BreakGlassService:
             wait = ""
             if oldest is not None:
                 secs = math.ceil((oldest + window - now).total_seconds())
-                wait = f"，请等待 {max(0, secs)} 秒后再试"
+                wait = f"，请{_wait_phrase(max(0, secs))}后再试"
             raise TooManyRequests(
                 f"每小时最多 {max_per_hour} 次授权：本小时已授权 {used} 次{wait}——"
                 "批量排查请把问题写成一条批注让作者自己贴出来"

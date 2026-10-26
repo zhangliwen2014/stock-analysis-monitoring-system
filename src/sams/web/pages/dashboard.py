@@ -41,6 +41,22 @@ def _market_open(ctx: ServiceContext, market: str, now: datetime) -> bool:
         return False
 
 
+#: 币种代码 → 现价那一格的单位（§5.4 规则 3：金额类数一律带币种）。
+#: 认不出来的币种原样上屏：写成 `SGD` 至少不撒谎，写成「元」是把两种钱说成一种。
+_CURRENCY_UNITS = {"CNY": "元", "HKD": "港元", "USD": "美元"}
+
+
+def _price_unit(ctx: ServiceContext, market: str) -> str:
+    """这一行现价的单位，取市场的配置币种（`Settings.markets[...].currency`）。
+
+    折算发生在页面这一侧：模板拿到的就是「港元」，不再拿市场代码去猜币种。
+    市场从配置里撤了（自选里留着旧市场的行）时交空串——那一格只剩数字，比编一个单位诚实。
+    """
+    cfg = ctx.settings.markets.get(market)
+    currency = cfg.currency if cfg else ""
+    return _CURRENCY_UNITS.get(currency, currency)
+
+
 def _quote_rows(
     ctx: ServiceContext, core: AppCore, user_id: str, now: datetime
 ) -> list[dict]:
@@ -49,7 +65,7 @@ def _quote_rows(
     rows = []
     for item in ctx.watchlists.list(user_id):
         quote = core.board.get(item.market, item.code)
-        symbol = ctx.symbols.get(item.market, item.code) or {}
+        symbol = ctx.symbols.get(item.market, item.code)
         state = NO_DATA
         if quote is not None:
             state = quote_state(
@@ -58,12 +74,18 @@ def _quote_rows(
                 market_open=_market_open(ctx, item.market, now),
                 stale_s=ctx.settings.quote_stale_s,
             )
+        master = symbol or {}
         rows.append(
             {
                 "market": item.market,
                 "code": item.code,
-                # 主档里的 name 可能是 NULL（新加的代码还没采集过），显示成空串
-                "name": symbol.get("name") or "",
+                # 主档没这一行（采集还没跑过这个市场）时名称交代码而不是空串：空白格
+                # 读起来像页面坏了，而代码本身就在那一列里站着
+                "name": master.get("name") or item.code,
+                # 有没有主档决定这一行肯不肯挂 /symbol 链接：`_require_symbol` 对查无此码
+                # 一律 404（不区分「没这行」与「没这码」是有意的），挂上去就是死路一条
+                "has_master": symbol is not None,
+                "unit": _price_unit(ctx, item.market),
                 "note": item.note or "",
                 "price": quote.price if quote else None,
                 "pct": quote.pct_chg if quote else None,

@@ -5,7 +5,7 @@
 * 默认视野是「有哪些行」而不是「写了什么」：列表行有「私有」徽标与 id，但没有正文串；
   正文、revision 与附件只在 team+策略开、或对**这一条**有未过期授权时才出现；
   被遮蔽的行连 `target_label` 与标签文字都不上屏（spec:340/549——元数据本身会泄密）；
-* 被拒的 break-glass 不许吞状态码：短理由 400、超滑动窗口 429（带等待秒数）、
+* 被拒的 break-glass 不许吞状态码：短理由 400、超滑动窗口 429（带等待时长）、
   墓碑 409，且都回详情页重渲染（人要看见「为什么不能读」的下一句是可用的表单，
   不是错误页一座）；
 * 附件走 admin 自己那条下载路由并有 `Cache-Control: no-store`：私人正文不许进中间缓存；
@@ -162,6 +162,34 @@ def test_policy_rejects_a_stray_value(admin_app):
     assert stored_policy(admin_app.ctx) != "maybe", "被拒的一次不许留下半个写入"
 
 
+def test_policy_off_is_confirmed_before_it_is_sent(admin_app):
+    """spec §6.1（M4-B:341）：「关闭后既有 team 批注对他人隐藏，数据保留」这句必须
+    在浏览器里问出来（二次确认），只写在卡片说明里等于让人提交完才读到后果。
+    开启那一句没有后果要交代，不许跟着一起弹窗。"""
+    page = admin_app.client.get("/admin/annotations")
+    forms = re.findall(r"<form\b.*?</form>", page.text, re.S)
+    off = next(form for form in forms if 'value="off"' in form)
+    assert 'hx-confirm="关闭后既有 team 批注对他人隐藏，数据保留"' in off
+    # 只有 hx-confirm 没有 hx-* 请求属性 = 一个永远不响的对话框（htmx 只接管 htmx 的请求）
+    assert 'hx-post="/admin/annotations/policy"' in off
+    on = next(form for form in forms if 'value="on"' in form)
+    assert "hx-confirm" not in on
+
+
+def test_policy_htmx_post_navigates_the_whole_page(admin_app):
+    """带 `HX-Request` 的那一条答 204 + `HX-Redirect`：303 会被 htmx 跟到底、
+    再把整页 HTML 塞进表单那一格（页面套页面）。跳转交回浏览器，地址栏与提示语都在。"""
+    resp = admin_app.client.post(
+        "/admin/annotations/policy",
+        data={"csrf": admin_app.csrf, "value": "off"},
+        headers={"hx-request": "true"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 204
+    assert unquote(resp.headers["hx-redirect"]) == "/admin/annotations?notice=策略已切到 关"
+    assert stored_policy(admin_app.ctx) == "off"
+
+
 # --- 元数据列表 ----------------------------------------------------------------------------
 
 
@@ -173,6 +201,46 @@ def test_metadata_lists_teammate_without_body(admin_app):
     assert "私有" in page.text
     assert made.id in page.text
     assert "只给自己看的那句话" not in page.text
+
+
+def _row_of(page, annotation_id: str) -> str:
+    """列表里指名那一条的 `<tr>`（按 id 取行：所有者/目标/状态几列都可能撞同一串文字）。"""
+    rows = re.findall(r"<tr>(.*?)</tr>", page.text, re.S)
+    hits = [row for row in rows if annotation_id in row]
+    assert hits, f"列表里没有 {annotation_id} 这一行"
+    return hits[0]
+
+
+def test_detail_shows_the_owner_by_name_not_uuid(admin_app):
+    """详情页的所有者要与列表同一份折法（用户名）：列表写 bob、详情写一串 32 位 id，
+    读的人得自己去对——而那串 id 在屏上没有第二个用处（spec:340 的「谁写了什么」）。"""
+    made = _private_of_bob(admin_app)
+    detail = admin_app.client.get(f"/admin/annotations/{made.id}")
+    assert detail.status_code == 200
+    owner_cell = re.search(r"<th>所有者</th><td>(.*?)</td>", detail.text, re.S).group(1)
+    assert "bob" in owner_cell
+    assert made.user_id not in detail.text
+
+
+def test_masked_rows_are_offered_the_emergency_view(admin_app):
+    """spec:341：被遮蔽的那一行给「紧急查看」而不是「详情」——一眼过去就该知道点下去
+    是要走授权那道闸。可读的行照旧叫「详情」，两者指向的还是同一页（改的是名字不是路由）。"""
+    ctx = admin_app.ctx
+    _seed_symbol(ctx)
+    bob = _bob(ctx)
+    masked = ctx.annotations.create(
+        bob.id, target_type="symbol", target_ref="A:600519", body_md="私有正文"
+    )
+    readable = ctx.annotations.create(
+        bob.id, target_type="symbol", target_ref="A:600519", body_md="团队正文", visibility="team"
+    )
+    page = admin_app.client.get("/admin/annotations")
+    masked_row = _row_of(page, masked.id)
+    assert "紧急查看" in masked_row
+    assert "详情" not in masked_row
+    assert f'href="/admin/annotations/{masked.id}"' in masked_row
+    readable_row = _row_of(page, readable.id)
+    assert "详情" in readable_row and "紧急查看" not in readable_row
 
 
 def test_recent_break_glass_table_shows_reason(admin_app):
@@ -239,7 +307,8 @@ def test_long_reason_is_refused(admin_app):
 
 
 def test_hourly_cap_surfaces(admin_app):
-    """第 6 次是 429 页（spec:342/530）：带「等待」与秒数——「等多久」是这一屏要答的话。"""
+    """第 6 次是 429 页（spec:342/530）：带「等待」与时长——「等多久」是这一屏要答的话，
+    而「等待 3600 秒」要人自己换算成几点，等于没答。"""
     ctx = admin_app.ctx
     _seed_symbol(ctx)
     bob = _bob(ctx)
@@ -261,6 +330,8 @@ def test_hourly_cap_surfaces(admin_app):
     assert resp.status_code == 429
     assert "每小时" in resp.text
     assert "等待" in resp.text, "超限那句必须给出等待时间（spec:342）"
+    assert "等待 60 分" in resp.text, "整一小时要按分念出来"
+    assert "3600 秒" not in resp.text
 
 
 def test_team_body_readable_without_grant(admin_app):

@@ -10,6 +10,9 @@
   <button type="submit">切换</button>
 </form>
 <p class="muted">窗口 {{ since_label }}，按 display_tz 切。</p>
+{# D131 把 `is_test` 挡在复盘之外，而屏幕从不解释这件事：收件箱里躺着两条测试告警、
+   窗口说「本周没有告警」时，读的人只会以为统计坏了。排除规则要写在同一屏上 #}
+<p class="muted">测试告警不计入复盘统计。</p>
 
 {% if empty %}
 <p class="muted">{{ empty_note }}</p>

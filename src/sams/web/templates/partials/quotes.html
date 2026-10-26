@@ -7,9 +7,16 @@
   {% for row in rows %}
   <tr>
     <td>{{ row.market }}</td>
-    <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
+    {# 主档还没这一行时给的是死文字：/symbol 那屏查无此码一律 404，链接只是把人送进死路 #}
+    <td>
+      {% if row.has_master %}
+      <a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a>
+      {% else %}
+      <span title="主档未同步">{{ row.code }}</span>
+      {% endif %}
+    </td>
     <td>{{ row.name }}</td>
-    <td class="num">{{ money(row.price) }}</td>
+    <td class="num">{{ money(row.price, row.unit) }}</td>
     <td class="num {{ row.pct_class }}">{{ pct(row.pct) }}</td>
     <td>{{ row.state }}</td>
     <td class="muted">{{ row.quote_at }}</td>
