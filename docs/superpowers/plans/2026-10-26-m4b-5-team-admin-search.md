@@ -302,6 +302,8 @@ git commit -m "feat(annotations): 团队可见写路径——策略闸、面板�
 
 ## Task 2: break-glass 底座（`AdminAccessRepo` + `BreakGlassService` + 接线）
 
+> **执行记录（评审修正后，2026-10-26）：** 本节代码快照里的 `GRANT_MINUTES`/`MAX_PER_HOUR` 常数已被删除——时长与次数改读 `settings.annotations.break_glass_minutes/break_glass_max_per_hour`（config.py:106-107 的治理参数唯一来源），`BreakGlassService` 构造器因此多了 `settings` 位置参数（bootstrap 传 `cfg`）。`MIN_REASON_CHARS=4` 保留（spec 定死，不可调）。后续任务读到本节旧快照时以本条为准。
+
 **Files:**
 - Create: `src/sams/storage/repos/admin_access.py`
 - Create: `src/sams/services/admin_access.py`
@@ -1513,7 +1515,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
 from sams.core.errors import Conflict, DatabaseLocked, NotFound, SamsError
-from sams.services.admin_access import GRANT_MINUTES, BreakGlassService
 from sams.storage.repos.app_settings import TEAM_SHARING
 from sams.web.auth import audit, csrf_protect, require_admin
 from sams.web.display import moment_label
@@ -1667,6 +1668,8 @@ def break_glass(
     web = request.app.state.web
     ctx = web.contexts.current()
     reason = (data.get("reason") or [""])[0]
+    # 时长是治理参数（settings.annotations.break_glass_minutes）：Task 2 修复轮的单一来源口径
+    minutes = ctx.settings.annotations.break_glass_minutes
     try:
         ctx.break_glass.request_access(admin.id, annotation_id, reason)
     except DatabaseLocked:
@@ -1679,9 +1682,9 @@ def break_glass(
         # （渲染 helper 带 error 形参，成功分支传 ""，被拒分支传 str(exc) 并回 status——见下方括注）
         return annotation_detail(request, annotation_id)
     audit(request, action="admin.break_glass", target=annotation_id, ok=True,
-          detail=f"+{GRANT_MINUTES}min")
+          detail=f"+{minutes}min")
     return RedirectResponse(
-        f"/admin/annotations/{annotation_id}?notice=已授权 {GRANT_MINUTES} 分钟",
+        f"/admin/annotations/{annotation_id}?notice=已授权 {minutes} 分钟",
         status_code=303,
     )
 
