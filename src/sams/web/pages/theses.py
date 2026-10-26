@@ -179,6 +179,8 @@ def theses_create(
         # 业务拒绝（没配的市场、没这个模板、同一只票已有活的论）留在这里说：
         # 那几句点名了能填什么，而 error.html 是一屏没有表单的话
         return _list_page(request, status=400, error=str(exc))
+    # 立论即登记兴趣：主档建行 + 排补数拍（D144），键用的是服务归一后的那一套
+    ctx.symbol_interest.ensure(report.thesis.market, report.thesis.code, actor=user.username)
     return RedirectResponse(f"/theses/{report.thesis.id}", status_code=303)
 
 

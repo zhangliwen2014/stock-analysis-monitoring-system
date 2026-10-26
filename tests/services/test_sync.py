@@ -4,12 +4,14 @@ from datetime import date
 
 import polars as pl
 import pytest
+import support
 
 from sams.core.errors import DatasourceError
 from sams.datasource.registry import EMPTY_BARS, Attempt, FetchResult
 from sams.services.sync import SyncService
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.index_daily import IndexDailyRepo
+from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 from sams.storage.repos.symbols import SymbolRepo
 
 D1, D2 = date(2024, 1, 2), date(2024, 1, 3)
@@ -57,10 +59,17 @@ class StubRegistry:
         return self.result
 
 
-def make_service(db, settings, result) -> tuple[SyncService, StubRegistry, BarRepo, SymbolRepo]:
+def make_service(
+    db, settings, result, *, backfills=None
+) -> tuple[SyncService, StubRegistry, BarRepo, SymbolRepo]:
     registry = StubRegistry(result)
     bars, symbols = BarRepo(db), SymbolRepo(db)
-    return SyncService(registry, bars, symbols, settings.markets), registry, bars, symbols
+    return (
+        SyncService(registry, bars, symbols, settings.markets, backfills=backfills),
+        registry,
+        bars,
+        symbols,
+    )
 
 
 def ok_result(**kw) -> FetchResult:
@@ -234,3 +243,16 @@ def test_sync_index_empty(db, settings):
     svc, _ = make_index_service(db, settings, empty)
     summary = svc.sync_index("A", "sh000001", I1, I3)
     assert summary.empty is True and summary.written == 0
+
+
+# --- 结案钩子：盘后日线任务成功写盘就替补数队列收尾（D144） --------------------------------
+
+
+def test_sync_daily_settles_backfill(db, settings):
+    backfills = SymbolBackfillRepo(db)
+    backfills.enqueue("A", "600519")
+    # 三日帧走 A/600519（support.bars_frame 的形状）：written>0 才会触发结案
+    result = ok_result(market="A", code="600519", frame=support.bars_frame(), source="akshare")
+    svc, _, _, _ = make_service(db, settings, result, backfills=backfills)
+    svc.sync_daily("A", "600519", date(2026, 10, 19), date(2026, 10, 21))
+    assert backfills.open_for("A", "600519") is None  # 盘后任务补上了，队列结清（deferred 的出路）

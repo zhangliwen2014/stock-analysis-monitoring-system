@@ -94,6 +94,8 @@ def test_watchlist_add_remove_roundtrip(logged):
         follow_redirects=False,
     )
     assert response.status_code == 303
+    # 加票即登记兴趣并排补数拍（D144）：库里有它的开放队列行
+    assert logged.context.backfills_store.open_for("A", "600519") is not None
     # 行链接要有主档才挂得出来（没主档点下去是 404 死路），所以先补一行主档再断链接
     _seed_symbol(logged.context)
     # 断言行链接而不是裸代码：表单的 placeholder 里也写着 600519，

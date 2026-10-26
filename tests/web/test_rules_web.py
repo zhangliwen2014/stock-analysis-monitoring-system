@@ -136,6 +136,8 @@ def test_create_bumps_the_rules_version_and_redirects(logged):
     assert rule.params["price"] == 1400.0
     assert rule.cooldown_min == 30
     assert rule.severity == "strong"
+    # 规则挂在票上时也是「有人想看这只票」：一并登记兴趣、排补数拍（D144）
+    assert logged.context.backfills_store.open_for("A", "600519") is not None
     # 没勾的三个开关也是答案的一部分：漏一个键仓库会按「未设置」补 False，
     # 所以这里断的是「勾了的那一个真的进去了」
     assert rule.filters["no_open_alert"] is True

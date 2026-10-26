@@ -99,6 +99,7 @@ def make(
     universe=None,
     calendar=None,
     beat_path=None,
+    backfill=None,
 ):
     clock = clock or FrozenClock(MOMENT)
     heartbeats = HeartbeatRepo(db, clock=clock)
@@ -115,6 +116,7 @@ def make(
         clock=clock,
         sleep=sleep or (lambda seconds: None),
         beat_path=beat_path,
+        backfill=backfill,
     )
     return scheduler, heartbeats, runs
 
@@ -786,3 +788,26 @@ def test_the_scheduler_reports_through_its_own_clock(db, settings):
 
     assert data.heartbeat is not None
     assert data.beat_age_s == 0
+
+
+def test_tick_consumes_backfill_after_manual_requests(db, settings):
+    """补数消费者每拍走一次，拿到的就是这一拍的 moment（D144）。"""
+
+    class RecordingConsumer:
+        def __init__(self):
+            self.moments = []
+
+        def consume(self, moment):
+            self.moments.append(moment)
+            return 0
+
+    consumer = RecordingConsumer()
+    runner = RecordingRunner()
+    scheduler, _, _ = make(
+        db, settings, (job_spec("bars", "A"),), runner, backfill=consumer
+    )
+
+    report = scheduler.tick(as_of=FRIDAY)
+
+    assert consumer.moments == [report.now]  # 那一拍的 moment 原样交出去
+    assert [call[0] for call in runner.calls] == ["bars"]  # 周期 job 照常跑

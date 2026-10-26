@@ -19,6 +19,7 @@ from sams.core.errors import DatasourceError
 from sams.datasource.registry import AdapterRegistry, Attempt
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.index_daily import IndexDailyRepo
+from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 from sams.storage.repos.symbols import SymbolRepo
 
 logger = logging.getLogger("sams.services.sync")
@@ -48,6 +49,7 @@ class SyncService:
         markets: dict[str, MarketCfg],
         *,
         indices: IndexDailyRepo | None = None,
+        backfills: SymbolBackfillRepo | None = None,
     ) -> None:
         self.registry = registry
         self.bars = bars
@@ -55,6 +57,8 @@ class SyncService:
         self.markets = markets
         #: 指数日线仓库：只有大盘条那条链用得到，所以它不跟着 `bars` 必填
         self.indices = indices
+        #: 补数队列：CLI/测试可以不注入，结案钩子在这一步就地跳过
+        self.backfills = backfills
 
     def currency_of(self, market: str, code: str) -> str:
         try:
@@ -85,6 +89,9 @@ class SyncService:
 
         self._ensure_symbol(market, code)
         written = self.bars.upsert(result.frame)
+        if self.backfills is not None and written > 0:
+            # 盘后日线任务替补数队列收尾：deferred 那三条今晚就是被这里结清的
+            self.backfills.mark_done_by_code(market, code)
         return SyncSummary(
             market=market,
             code=code,

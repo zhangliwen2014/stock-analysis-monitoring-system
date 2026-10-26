@@ -154,4 +154,6 @@ def ledger_fill(
         # 业务拒绝（没有那种币的现金、超卖、账户不是你的）留在这里说：那几句是可执行的，
         # 而 error.html 给的是一屏没有表单的话
         return _portfolio_page(request, status=400, error=str(exc))
+    # 成交即登记兴趣：主档建行 + 排补数拍（D144）；表单原样交出去，归一在登记处
+    ctx.symbol_interest.ensure(market, code, actor=user.username)
     return RedirectResponse("/portfolio", status_code=303)

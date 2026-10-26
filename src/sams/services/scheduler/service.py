@@ -147,6 +147,7 @@ class Scheduler:
         sleep: Callable[[float], None] = time.sleep,
         beat_path: Path | None = None,
         requests: RunRequestQueue | None = None,
+        backfill=None,
     ) -> None:
         if settings.scheduler_tick_s >= HEARTBEAT_STALE_S:
             raise ValidationError(
@@ -169,6 +170,8 @@ class Scheduler:
         self.beat_path = beat_path
         #: 手动请求队列：`serve` 里的 Web 线程与本调度线程共用这一个实例
         self.requests = requests if requests is not None else RunRequestQueue()
+        #: 补数消费者（D144）：未接线的场景（CLI tick、测试）留 None，跳过
+        self.backfill = backfill
         self._beat_id: str | None = None
 
     def tick(
@@ -188,6 +191,10 @@ class Scheduler:
         # 也不受 `only_job`/`only_market` 拦：那个筛只挑这一轮的到期 job，带
         # 筛选的 tick 照样把排着的请求做掉
         manual = self._run_requests(self.requests.drain(), universe, moment)
+        # 补数积压排在手动请求之后、周期 job 之前：手动请求是「现在就要」，
+        # 而这一口每拍至多三只票、失败只记账——不该让看板那一拍等它
+        if self.backfill is not None:
+            self.backfill.consume(moment)
         results: list[RunResult] = [result for report in manual for result in report.results]
         waiting: list[str] = []
         errors: list[str] = []

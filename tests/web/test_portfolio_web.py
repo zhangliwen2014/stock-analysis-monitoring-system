@@ -32,6 +32,8 @@ def test_fill_buy_then_sell_roundtrip(logged):
     }
     response = logged.client.post("/ledger/fill", data=data, follow_redirects=False)
     assert response.status_code == 303
+    # 成交录入即登记兴趣并排补数拍（D144）
+    assert logged.context.backfills_store.open_for("A", "600519") is not None
     page = logged.client.get("/portfolio")
     assert "/symbol/A/600519" in page.text
     data["side"] = "sell"

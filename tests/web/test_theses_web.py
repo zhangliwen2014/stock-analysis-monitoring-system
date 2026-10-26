@@ -33,6 +33,8 @@ def test_theses_list_and_create(logged):
     created = [thesis for thesis in ctx.theses.list("alice") if thesis.id not in before]
     assert [thesis.code for thesis in created] == ["600036"]
     assert response.headers["location"] == f"/theses/{created[0].id}"
+    # 立论即登记兴趣并排补数拍（D144）
+    assert logged.context.backfills_store.open_for("A", "600036") is not None
 
     detail = logged.client.get(response.headers["location"])
     assert detail.status_code == 200

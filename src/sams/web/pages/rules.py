@@ -301,6 +301,10 @@ def rule_create(
             status=400,
             ticks=many(data, "channel_ids"),
         )
+    # 规则挂在票上也算「想看这只票」：主档 + 补数拍（D144）；引用带市场前缀才拆得出两截
+    if target_type == "symbol" and "/" in target_ref:
+        ref_market, _, ref_code = target_ref.partition("/")
+        ctx.symbol_interest.ensure(ref_market, ref_code, actor=user.username)
     return RedirectResponse("/rules", status_code=303)
 
 

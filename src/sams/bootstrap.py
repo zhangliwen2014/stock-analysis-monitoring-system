@@ -57,6 +57,7 @@ from sams.services.rules.recheck import Rechecker
 from sams.services.rules.snapshot import RuleData
 from sams.services.runtime import Runtime
 from sams.services.scheduler.alarms import SystemAlerter
+from sams.services.scheduler.backfill import BackfillConsumer
 from sams.services.scheduler.beatfile import beat_path
 from sams.services.scheduler.jobs import build_jobs
 from sams.services.scheduler.report import ScheduleData, collect
@@ -66,6 +67,7 @@ from sams.services.scheduler.types import JobDeps, JobSpec
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.services.screen import ScreenService
 from sams.services.sources import SourceAdminService
+from sams.services.symbol_interest import SymbolInterest
 from sams.services.symbol_master import SymbolMasterSyncService
 from sams.services.sync import SyncService
 from sams.services.theses import ThesisService
@@ -93,6 +95,7 @@ from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.source_health import SourceHealthRepo
+from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
 from sams.storage.repos.symbols import SymbolRepo
 from sams.storage.repos.task_runs import HeartbeatRepo, TaskRunRepo
@@ -176,6 +179,10 @@ class ServiceContext:
     symbol_list_store: SymbolListRepo
     #: 指数日线（D145）：大盘条读它，写入只有 `sync_index` 那一条
     index_daily_store: IndexDailyRepo
+    #: 新票补数排队簿（D144）：入口经 `symbol_interest` 排，消费在每拍的 BackfillConsumer
+    backfills_store: SymbolBackfillRepo
+    #: 「有人想看这只票」的登记处（D144）：Web 四个入口的成功路径各挂一次
+    symbol_interest: SymbolInterest
     bars: BarRepo
     corp_actions: CorpActionRepo
     corp_actions_coverage: CorpActionsCoverageRepo
@@ -583,7 +590,22 @@ def _context_on(
     # 仓库排在消费方之前：`sync` 的 `indices` 槽位与代码表同步吃的就是这两个对象
     symbol_list_store = SymbolListRepo(database)
     index_daily_store = IndexDailyRepo(database)
-    sync = SyncService(registry, bars, symbols, cfg.markets, indices=index_daily_store)
+    backfills_store = SymbolBackfillRepo(database)
+    sync = SyncService(
+        registry,
+        bars,
+        symbols,
+        cfg.markets,
+        indices=index_daily_store,
+        backfills=backfills_store,
+    )
+    symbol_interest = SymbolInterest(
+        symbols=symbols,
+        bars=bars,
+        symbol_list=symbol_list_store,
+        backfills=backfills_store,
+        markets=cfg.markets,
+    )
     symbol_master_sync = SymbolMasterSyncService(registry, symbol_list_store, cfg.markets)
     corp_action_sync = CorpActionSyncService(
         registry, corp_actions, corp_actions_coverage, clock=clock
@@ -649,6 +671,8 @@ def _context_on(
         beat_path=beat_path(database.path),
         # 所有上下文共用同一只队列：只有调度线程跑循环，但谁都能往里放请求
         requests=core.requests,
+        # 补数队列的每拍消费者（D144）：四入口排的行由调度线程按拍吃掉
+        backfill=BackfillConsumer(sync, backfills_store, cfg),
     )
 
     return ServiceContext(
@@ -661,6 +685,8 @@ def _context_on(
         symbols=symbols,
         symbol_list_store=symbol_list_store,
         index_daily_store=index_daily_store,
+        backfills_store=backfills_store,
+        symbol_interest=symbol_interest,
         bars=bars,
         corp_actions=corp_actions,
         corp_actions_coverage=corp_actions_coverage,
