@@ -30,6 +30,7 @@ from sams.services.scheduler.jobs import (
     run_financials,
     run_flow,
     run_indices,
+    run_symbol_master,
     run_valuation,
 )
 from sams.services.scheduler.types import JobContext, JobDeps
@@ -448,6 +449,25 @@ def test_build_jobs_registers_symbol_master_only_with_service_and_capability(db,
     assert ("symbol_master", "A") in titles(
         replace(listing, symbol_master=SimpleNamespace())
     )
+
+
+def test_symbol_master_failure_is_one_market_named_error(db, settings):
+    """代码表的失败单元是整个市场：一条 `SamsError` 换一条带市场名的 `errors`。
+
+    `run_bars` 的失败按只隔离，这一枚拆不开——清单是一次市场级请求，炸了不能只说
+    「源不行」，还得说清是哪个市场的代码表没回来，健康页与日志全靠这一句认市场。
+    """
+
+    class BoomMaster:
+        def sync(self, market):
+            raise RateLimited("akshare", "502")
+
+    outcome = run_symbol_master(
+        replace(deps(db, settings), symbol_master=BoomMaster()), ctx()
+    )
+    assert len(outcome.errors) == 1 and "A" in outcome.errors[0]
+    assert outcome.ok is False
+    assert "失败" in outcome.note
 
 
 def test_build_jobs_registers_indices_only_with_repo_and_capability(db, settings):

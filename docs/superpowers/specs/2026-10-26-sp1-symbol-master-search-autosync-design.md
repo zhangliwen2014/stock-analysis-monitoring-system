@@ -21,7 +21,7 @@
 | D142 | 候选排序钉死：**代码精确 > 首字母精确 > 全拼精确 > 前缀（首字母/全拼/代码）> 片段（代码/中文名）**，同级按代码升序；上限 10 条。每条候选显示 市场徽标/代码/名称/**昨收**（昨收只读本地 `bars_daily`，没同步过显示「—」，一次批量查询、零网络） | 可预期 > 聪明。热度/市值排序等 SP3 快照有数后再升级，接口留权重钩子 |
 | D143 | 交互：自选页加票框改为搜了再加——htmx 防抖（300ms）拉 `/api/symbol-search?q=`；**点候选行=直接加入自选**（加票页里的点击意图明确，免二次确认）；查无提示「没找到与 X 匹配的 A股/港股：换个写法，或直接按代码登记」；「直接登记」对**不在代码表**的代码照收（新上市/表未更新），随后走自动补数 | 顶流惯例是搜索→个股页→关注两步；我们是列表加票场景，一步到位。直登入口保住「代码表不是存在的裁判」这一条：表是加速器不是门槛 |
 | D144 | 自动补数：加自选、录成交、建规则、立论点**四个入口**统一调 `SymbolInterest.ensure(market, code, actor)`——它建主档行（代码表有名字就带名字）、查 `bars_daily` 无该股日线则写一行 `symbol_backfills(market, code, tries, last_error, created_at, done_at)`。调度器每拍（10s）消费**至多 3 条** pending：走现有 `sync.sync_daily`（顺带补主档、公司行为按既有链）；同票累计失败 3 次 ⇒ 置 `deferred`，个股页提示「今晚会随盘后任务再试」，次日盘后链成功即清账 | 「今天加票明天才有数」是试用者的头号困惑；每拍限 3 条防止一次导入打满源；失败停手与源冷却语义一致。写表而非直调调度器：layering 不破（服务层不 import scheduler，bootstrap 只给表两侧开门） |
-| D145 | 指数独立表 `index_daily(market, index_code, date, open, high, low, close, prev_close, change_pct, source)`：键 `sh000001` 这类带市场前缀的指数代码，**不进 `bars_daily`**（000001 撞车）。清单配置驱动：`[indices]` 默认 9 个——A：上证指数 sh000001、深证成指 sz399001、创业板指 sz399006、沪深300 sh000300；HK：恒生 hkHSI、国企 hkHSCEI；US：标普500 usSPX、纳斯达克 usIXIC、道指 usDJI。数据源给 **腾讯/新浪** 加 `index_daily` 能力（method 走 `chain_for`/`_walk`，窗口型），盘后随市场每日链更新 | 顶流行情页第一屏就是指数；休市显示最近交易日收盘+涨跌幅，正是用户要的「大盘基本情况」 |
+| D145 | 指数独立表 `index_daily(market, index_code, date, open, high, low, close, prev_close, change_pct, source)`：键 `sh000001` 这类带市场前缀的指数代码，**不进 `bars_daily`**（000001 撞车）。清单配置驱动：`[indices]` 默认 9 个——A：上证指数 sh000001、深证成指 sz399001、创业板指 sz399006；HK：恒生 hkHSI、恒生科技 hkHSTECH、H股指数 hkHSCEI；US：标普500 usSPX、纳斯达克 usIXIC、道指 usDJI。数据源给 **腾讯/新浪** 加 `index_daily` 能力（method 走 `chain_for`/`_walk`，窗口型），盘后随市场每日链更新 | 顶流行情页第一屏就是指数；休市显示最近交易日收盘+涨跌幅，正是用户要的「大盘基本情况」 |
 | D146 | 个股页可达性：`/symbol/{market}/{code}` 对**代码表内**任何票可进（进页时主档缺失即由代码表兜底建行）；无日线时不再 404，渲染空态「该股数据待同步」+「立即排一拍」按钮（= `SymbolInterest.ensure`）。自选与持仓的行内代码统一链到个股页（上轮 N4 就此了结）；代码表也查无的票保留 404 | 空态和 404 说的是两件不同的事：「有这只票、数还没来」vs「不认识这串代码」 |
 | D147 | 代码表周同步语义：整批 upsert；本批缺失的旧行不删，置 `is_active=false`（退市/摘牌：搜索与候选不再出，但已挂自选/告警的行仍可渲染名称）。同步失败沿用旧表并在源健康记账——「代码表拿不到」绝不能把搜索变成错误页 | 代码表是显示层地基，宁可旧不可空 |
 | D148 | 源层新增两个能力，全走 `capabilities.py` 单一清单：**`symbol_list`**（市场级、无代码无窗口，仿 `fx_rate` 不走 `_walk`，akshare 实现 A/港两张清单）与 **`index_daily`**（`_walk` 窗口型，tencent+sina 实现）。新迁移 `0021_symbols_and_indices.sql`：`symbol_master`、`index_daily`、`symbol_backfills` 三表 | 加一种数据只改一处是 capability 表存在的原理由（D38 一脉） |
@@ -65,9 +65,9 @@ partial unique index（`... WHERE status IN ('pending','deferred')` 那句直接
 
 ### 2.2 组件与数据流
 
-- **`SymbolListRepo` / `IndexDailyRepo` / `SymbolBackfillRepo`**：新增于 `storage/repos/`，各自薄测（upsert 幂等、唯一部分索引防重）。
+- **`SymbolListRepo` / `IndexDailyRepo` / `SymbolBackfillRepo`**：新增于 `storage/repos/`，各自薄测（upsert 幂等、`open_key` 唯一索引防重）。
 - **`SymbolMasterSync`（services）**：调 `registry.fetch_symbol_list(market)` → pypinyin 两列 → upsert + 缺席置 `is_active=false`。每周调度项：新 `JobSpec("symbol_master", WEEKLY, market, …)`，A/HK 各一。
-- **`SymbolInterest`（services）**：`ensure(market, code, actor) -> EnsureReport`。四入口（dashboard 加自选、ledger 成交、rules 创建、theses 创建）在各自写成功后调用；它只做三件事：建主档（查代码表取名字）、判 `bars_daily` 空、上表插 pending（部分唯一索引保证幂等）。
+- **`SymbolInterest`（services）**：`ensure(market, code, actor) -> EnsureReport`。四入口（dashboard 加自选、ledger 成交、rules 创建、theses 创建）在各自写成功后调用；它只做三件事：建主档（查代码表取名字）、判 `bars_daily` 空、上表插 pending（`open_key` 唯一索引保证幂等，见 §2.1）。
 - **backfill 消费**：调度器 tick 里 `requests.drain()` 之后新增一步——取 `status=pending ORDER BY created_at LIMIT 3`，逐条 `sync.sync_daily(market, code, as_of-INITIAL_SYNC_DAYS, as_of)`；成功 → `done`；`SamsError` → `tries+1,last_error`，`tries≥3` 转 `deferred`。deferred 不再每拍碰；盘后链按 universe 自然重试，成功后把该股 backfill 清账（`sync_daily` 出口挂一步清账，避免同一票空转）。
 - **搜索**：`GET /api/symbol-search?q=`（登录用户，htmx partial）。归一（D141）→ 单条 SQL 按 D142 分档取候选（`LIMIT 10`，`is_active=true`）→ 批量昨收 → 渲染候选行；候选行的加票按钮 POST 现有 `/watchlist/add`（服务端解析 market+code，前端传来的只有候选 id，不接受自由文本注入）。
 - **大盘条**：看板模板顶部 partial `/api/partials/indices`：每市场读 `index_daily` 最近两日（收盘+涨跌幅+日期）；盘中若有指数即时报价（见下）以快照优先。休市文案示例：「上证 3,890.11 +0.42%（10-24 收盘）」。
@@ -84,18 +84,18 @@ partial unique index（`... WHERE status IN ('pending','deferred')` 那句直接
 
 ```toml
 [indices.A]
-codes = ["sh000001", "sz399001", "sz399006", "sh000300"]
+codes = ["sh000001", "sz399001", "sz399006"]
 [indices.HK]
-codes = ["hkHSI", "hkHSCEI"]
+codes = ["hkHSI", "hkHSTECH", "hkHSCEI"]
 [indices.US]
 codes = ["usSPX", "usIXIC", "usDJI"]
 [indices.labels]
 sh000001 = "上证指数"
 sz399001 = "深证成指"
 sz399006 = "创业板指"
-sh000300 = "沪深300"
 hkHSI = "恒生指数"
-hkHSCEI = "国企指数"
+hkHSTECH = "恒生科技指数"
+hkHSCEI = "H股指数"
 usSPX = "标普500"
 usIXIC = "纳斯达克"
 usDJI = "道琼斯"
