@@ -207,6 +207,39 @@ class AnnotationService:
             viewer_id, mine_only=True, limit=limit, offset=offset
         )
 
+    def search(
+        self,
+        viewer_id: str,
+        *,
+        q: str | None = None,
+        tag: str | None = None,
+        target_type: str | None = None,
+        scope: str = "mine",
+        team_sharing: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[Annotation], int]:
+        """`/annotations` 搜索页的读用例：`scope` 折成仓库的两面旗子，返回（本页，总数）。
+
+        `filters` 一份字典两处展开：分页的分母与分子若各问各的条件，
+        第 2 页就会数出第 1 页的分母——野范围在这里 raise 掉，端点先兜住才轮不到它。
+        """
+        if scope not in ("mine", "team"):
+            raise ValidationError(f"scope 只有 mine/team（收到 {scope!r}）")
+        filters = dict(
+            team_sharing=team_sharing,
+            mine_only=scope == "mine",
+            team_only=scope == "team",
+            target_type=target_type,
+            target_ref=None,
+            q=q,
+            tag=tag,
+            since=None,
+        )
+        rows = self.annotations.list_visible(viewer_id, limit=limit, offset=offset, **filters)
+        total = self.annotations.count_visible(viewer_id, **filters)
+        return rows, total
+
     def revisions(self, user_id: str, annotation_id: str):
         made = self.annotations.get(annotation_id)
         if made is None or made.user_id != user_id:

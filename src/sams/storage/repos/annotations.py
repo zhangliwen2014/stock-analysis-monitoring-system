@@ -321,6 +321,7 @@ class AnnotationRepo:
         *,
         team_sharing: bool = False,
         mine_only: bool = False,
+        team_only: bool = False,
         target_type: str | None = None,
         target_ref: str | None = None,
         q: str | None = None,
@@ -330,20 +331,106 @@ class AnnotationRepo:
         offset: int = 0,
     ) -> list[Annotation]:
         _require_user(viewer_id)
+        self._require_known_target_type(target_type)
+        if limit <= 0:
+            raise ValidationError("limit 必须为正数")
+        clauses, params = self._visibility_clauses(
+            viewer_id,
+            team_sharing=team_sharing,
+            mine_only=mine_only,
+            team_only=team_only,
+            target_type=target_type,
+            target_ref=target_ref,
+            q=q,
+            tag=tag,
+            since=since,
+        )
+        sql = (
+            f"SELECT {_ANNOTATION_COLUMNS} FROM annotations"
+            f" WHERE {' AND '.join(clauses)}"
+            " ORDER BY pinned DESC, created_at DESC, id DESC LIMIT ? OFFSET ?"
+        )
+        params += [int(limit), int(offset)]
+        return [self._to_annotation(row) for row in self.db.query(sql, params).to_dicts()]
+
+    def count_visible(
+        self,
+        viewer_id: str,
+        *,
+        team_sharing: bool = False,
+        mine_only: bool = False,
+        team_only: bool = False,
+        target_type: str | None = None,
+        target_ref: str | None = None,
+        q: str | None = None,
+        tag: str | None = None,
+        since: datetime | None = None,
+    ) -> int:
+        """与 `list_visible` 同一份 clause 构造器的总数：分页的分母必须与分子同源。
+
+        具名参数而不是 `**filters`：limit/offset 混进来会悄悄把「总数」折成「本页数」，
+        分页就永远算不满一页。
+        """
+        _require_user(viewer_id)
+        self._require_known_target_type(target_type)
+        clauses, params = self._visibility_clauses(
+            viewer_id,
+            team_sharing=team_sharing,
+            mine_only=mine_only,
+            team_only=team_only,
+            target_type=target_type,
+            target_ref=target_ref,
+            q=q,
+            tag=tag,
+            since=since,
+        )
+        return int(
+            self.db.scalar(
+                f"SELECT count(*) FROM annotations WHERE {' AND '.join(clauses)}",
+                params,
+            )
+            or 0
+        )
+
+    def _require_known_target_type(self, target_type: str | None) -> None:
         if target_type is not None and target_type not in TARGET_TYPES:
             raise ValidationError(
                 f"未知批注目标 target_type={target_type!r}：只有 {list(TARGET_TYPES)}"
             )
-        if limit <= 0:
-            raise ValidationError("limit 必须为正数")
+
+    def _visibility_clauses(
+        self,
+        viewer_id: str,
+        *,
+        team_sharing: bool,
+        mine_only: bool,
+        team_only: bool,
+        target_type: str | None,
+        target_ref: str | None,
+        q: str | None,
+        tag: str | None,
+        since: datetime | None,
+    ) -> tuple[list[str], list[object]]:
+        """可见性 + 过滤的唯一规则源：列表与计数共用，两处分叉迟早漏一条私有行。"""
+        if mine_only and team_only:
+            raise ValidationError("mine_only 与 team_only 只能选一：两个范围同时给等于没筛")
         clauses = ["deleted_at IS NULL", "purged_at IS NULL"]
         params: list[object] = []
-        if mine_only or not team_sharing:
+        if mine_only:
             clauses.append("user_id = ?")
             params.append(viewer_id)
-        else:
-            # team 只对 symbol 生效：别的目标上一条 team 批注等于泄露「这个对象存在」
+        elif team_only:
+            # team 只对 symbol 生效是写侧闸（D121）；读侧不重复——写得进来的形态已经过了那道闸
+            if team_sharing:
+                clauses.append("visibility = 'team'")
+            else:
+                clauses.append("(visibility = 'team' AND user_id = ?)")
+                params.append(viewer_id)
+        elif team_sharing:
             clauses.append("(user_id = ? OR (visibility = 'team' AND target_type = 'symbol'))")
+            params.append(viewer_id)
+        else:
+            clauses.append("user_id = ?")
             params.append(viewer_id)
         if target_type is not None:
             clauses.append("target_type = ?")
@@ -360,13 +447,7 @@ class AnnotationRepo:
         if since is not None:
             clauses.append("created_at >= ?")
             params.append(since)
-        sql = (
-            f"SELECT {_ANNOTATION_COLUMNS} FROM annotations"
-            f" WHERE {' AND '.join(clauses)}"
-            " ORDER BY pinned DESC, created_at DESC, id DESC LIMIT ? OFFSET ?"
-        )
-        params += [int(limit), int(offset)]
-        return [self._to_annotation(row) for row in self.db.query(sql, params).to_dicts()]
+        return clauses, params
 
     def revisions(self, annotation_id: str) -> list[Revision]:
         rows = self.db.query(

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>批注搜索</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+<form method="get" action="/annotations" class="inline-form">
+  <input name="q" value="{{ q }}" placeholder="正文关键词">
+  <input name="tag" value="{{ tag }}" placeholder="标签">
+  <select name="type">
+    {% for value, label in type_choices %}
+    <option value="{{ value }}"{% if value == type %} selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <select name="scope">
+    <option value="mine"{% if scope == "mine" %} selected{% endif %}>我的</option>
+    <option value="team"{% if scope == "team" %} selected{% endif %}>团队</option>
+  </select>
+  <button type="submit">搜索</button>
+</form>
+<p class="muted">共 {{ total }} 条 · 第 {{ page }}/{{ pages }} 页</p>
+{% for row in rows %}
+{# 行上带 annotation id：测试与将来的「跳到那条批注」都要它，正文里未必出现 id 串 #}
+<article class="ann-row" data-annotation-id="{{ row.id }}">
+  <header>
+    <span class="ann-avatar">{{ row.author[0]|upper }}</span>
+    <strong>{{ row.author }}</strong>
+    <span class="muted">{{ row.at }}</span>
+    <span class="badge">{{ row.visibility }}</span>
+    {% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+    {% if row.target_gone %}<span class="badge">目标已删除</span>{% endif %}
+  </header>
+  <p class="muted">挂在：<a href="{{ row.target_url }}">{{ row.target_label }}</a></p>
+  <div class="md-body">{{ row.body_html | safe }}</div>
+</article>
+{% else %}
+<p class="muted">{{ empty_note }}</p>
+{% endfor %}
+<nav class="ann-pager">
+  {% if prev_url %}<a href="{{ prev_url }}">上一页</a>{% endif %}
+  {% if next_url %}<a href="{{ next_url }}">下一页</a>{% endif %}
+</nav>
+{% endblock %}

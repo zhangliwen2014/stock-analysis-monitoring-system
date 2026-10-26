@@ -466,3 +466,92 @@ def test_team_row_sharing_closed_says_so(logged):
     )
     assert "团队共享当前已关闭" in page.text
     assert made.id in page.text  # §4.2：作者仍可见自己那条
+
+
+# --- /annotations 全局搜索页（§4.5）----------------------------------------------------------
+
+
+def _create_sym(ctx, user, body, **kw):
+    return ctx.annotations.create(
+        user.id, target_type="symbol", target_ref="A:600519", body_md=body, **kw
+    )
+
+
+def test_search_requires_login(web_app):
+    resp = web_app.client.get("/annotations", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/login"
+
+
+def test_search_default_scope_is_mine_and_hides_teammates(logged):
+    ctx = logged.context
+    alice = _alice(ctx)
+    mine = _create_sym(ctx, alice, "我的私有笔记")
+    bob = ctx.users.create("bob", "correct-horse-battery")
+    theirs = _create_sym(ctx, bob, "bob 的团队逻辑", visibility="team")
+    page = logged.client.get("/annotations")
+    assert page.status_code == 200
+    assert mine.id in page.text and "我的私有笔记" in page.text
+    assert theirs.id not in page.text and "bob 的团队逻辑" not in page.text
+    # 导航入口：批注页从顶栏可达（base.html 插在复盘与设置之间）
+    assert '<a href="/annotations">批注</a>' in page.text
+
+
+def test_search_team_scope_shows_teammates_when_shared(logged):
+    ctx = logged.context
+    bob = ctx.users.create("bob", "correct-horse-battery")
+    theirs = _create_sym(ctx, bob, "bob 的团队逻辑", visibility="team")
+    page = logged.client.get("/annotations", params={"scope": "team"})
+    assert theirs.id in page.text and "bob 的团队逻辑" in page.text
+
+
+def test_search_team_scope_hides_teammate_when_policy_off(logged):
+    ctx = logged.context
+    alice = _alice(ctx)
+    bob = ctx.users.create("bob", "correct-horse-battery")
+    mine_team = _create_sym(ctx, alice, "我的团队条", visibility="team")
+    theirs = _create_sym(ctx, bob, "bob 的团队条", visibility="team")
+    ctx.app_settings.set("annotations.team_sharing", "off")
+    page = logged.client.get("/annotations", params={"scope": "team"})
+    assert mine_team.id in page.text
+    assert theirs.id not in page.text and "bob 的团队条" not in page.text
+
+
+def test_search_query_does_not_leak_private(logged):
+    ctx = logged.context
+    bob = ctx.users.create("bob", "correct-horse-battery")
+    _create_sym(ctx, bob, "茅台提价")
+    page = logged.client.get("/annotations", params={"q": "提价"})
+    assert "茅台提价" not in page.text
+    assert "共 0 条" in page.text
+
+
+def test_search_type_bad_value_says_so(logged):
+    """下拉之外的值说明有人在改 URL：悄悄吞掉会教人以为筛到了，要报错但不崩。"""
+    page = logged.client.get("/annotations", params={"type": "planet"})
+    assert page.status_code == 200
+    assert "未知批注目标" in page.text
+
+
+def test_search_pagination_second_page(logged):
+    ctx = logged.context
+    alice = _alice(ctx)
+    for n in range(25):
+        _create_sym(ctx, alice, f"第 {n} 条")
+    page = logged.client.get("/annotations", params={"page": "2"})
+    assert page.text.count('class="ann-row"') == 5
+    assert "共 25 条" in page.text
+    # 地址栏手滑不判 400：page=abc 回第 1 页、scope 野值回 mine
+    bad = logged.client.get("/annotations", params={"page": "abc", "scope": "galaxy"})
+    assert bad.status_code == 200
+    assert bad.text.count('class="ann-row"') == 20
+
+
+def test_search_tag_filter_is_case_insensitive(logged):
+    ctx = logged.context
+    alice = _alice(ctx)
+    made = _create_sym(ctx, alice, "逻辑在线", tags=["logic"])
+    page = logged.client.get("/annotations", params={"tag": "LOGIC"})
+    assert made.id in page.text and "逻辑在线" in page.text
+    miss = logged.client.get("/annotations", params={"tag": "other"})
+    assert made.id not in miss.text

@@ -252,3 +252,30 @@ def test_list_visible_since_cuts_the_older_rows(repo, clock):
     recent = add(repo, body_md="本周的")
     rows = repo.list_visible(OWNER, since=NOW + timedelta(days=1))
     assert [row.id for row in rows] == [recent.id]
+
+
+def test_team_only_scope_is_teams_only(repo):
+    """`team_only` 是搜索页「团队」档的范围闸：只看 team 行，不再附带自己的私有行。"""
+    mine_team = add(repo, OWNER, visibility="team")
+    mine_private = add(repo, OWNER, body_md="只给自己")
+    theirs_team = add(repo, OTHER, visibility="team")
+    add(repo, OTHER, body_md="只给作者")
+    rows = repo.list_visible(OWNER, team_sharing=True, team_only=True)
+    assert {r.id for r in rows} == {mine_team.id, theirs_team.id}
+    off = repo.list_visible(OWNER, team_sharing=False, team_only=True)
+    assert {r.id for r in off} == {mine_team.id}
+    # 两条 scope 旗子不能同真：同给等于没说
+    with pytest.raises(Exception, match="只能选一"):
+        repo.list_visible(OWNER, mine_only=True, team_only=True)
+    assert mine_private.id and theirs_team.id  # 防 IDE 清 import
+
+
+def test_count_visible_matches_page(repo):
+    """分页的分母与分子必须同源：同一份过滤条件下，总数与逐页取回的并集要相等。"""
+    for n in range(25):
+        add(repo, OWNER, body_md=f"第 {n} 条")
+    rows = repo.list_visible(OWNER, limit=20, offset=0)
+    total = repo.count_visible(OWNER)
+    assert len(rows) == 20 and total == 25
+    rows2 = repo.list_visible(OWNER, limit=20, offset=20)
+    assert len(rows2) == 5

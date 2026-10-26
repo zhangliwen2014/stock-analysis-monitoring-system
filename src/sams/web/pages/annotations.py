@@ -21,12 +21,22 @@ import threading
 from datetime import datetime
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 
 from sams.core.errors import Conflict, DatabaseLocked, NotFound, SamsError
 from sams.services.attachments import MB
 from sams.services.markdown import render_markdown
-from sams.storage.repos.annotations import TARGET_TYPES
+from sams.storage.repos.annotations import ORDER, TARGET_TYPES
 from sams.web.auth import audit, csrf_protect, require_user
 from sams.web.display import moment_label
 
@@ -34,6 +44,18 @@ router = APIRouter()
 
 #: 面板一屏 20 条：它是「看几条 + 写一条」的地方，不是归档柜；更多去 /annotations（计划 5）
 PANEL_LIMIT = 20
+
+#: 搜索页一页 20 条：与面板同宽，人在两个页面之间不用重新适应行距
+PAGE_SIZE = 20
+
+#: 搜索页下拉的中文标签：与告警详情页的引用文案同一批词
+TARGET_TYPE_LABELS = {
+    "symbol": "标的",
+    "thesis": "观点",
+    "rule": "规则",
+    "alert": "告警",
+    "order": "成交",
+}
 
 #: 面板一屏最多给 3 张缩略图：它是「看几条 + 写一条」的地方，不是图片墙；
 #: 更多走下载链接或计划 5 的详情页
@@ -144,6 +166,144 @@ def annotations_panel(request: Request):
             detail="批注面板要知道挂在哪个目标：target_type 与 target_ref 都必填",
         )
     return _render_panel(request, user=user, target_type=target_type, target_ref=target_ref)
+
+
+# --- 全局搜索页（§4.5）------------------------------------------------------------------
+
+
+def _target_url(made) -> str:
+    """把批注链回宿主面板那一页：目标页上有全文与附件，搜索页只给正文。"""
+    if made.target_type == "symbol":
+        market, _, code = made.target_ref.partition(":")
+        return f"/symbol/{market}/{code}"
+    if made.target_type == "thesis":
+        return f"/theses/{made.target_ref}"
+    if made.target_type == "rule":
+        return f"/rules/{made.target_ref}/edit"
+    if made.target_type == "alert":
+        return f"/alerts/{made.target_ref}"
+    return "/portfolio"
+
+
+def _target_gone(ctx, user_id: str, made, *, accounts) -> bool:
+    """§4.5「目标已删但批注可见」：拿写侧同一个仓库 get 问一句还在不在。
+
+    标的永不「已删」（主档只增）；成交挂在账户下，`accounts` 由调用方按页取一次。
+    """
+    if made.target_type == "symbol":
+        return False
+    if made.target_type == "thesis":
+        return ctx.theses_store.get(user_id, made.target_ref) is None
+    if made.target_type == "rule":
+        return ctx.rules_store.get(made.target_ref, user_id=user_id) is None
+    if made.target_type == "alert":
+        return ctx.alerts_store.get(made.target_ref, user_id=user_id) is None
+    if made.target_type == "order":
+        return all(
+            ctx.sim_ledger.order(account.id, made.target_ref) is None
+            for account in (accounts or [])
+        )
+    return False
+
+
+def _search_url(q: str, tag: str, type_: str, scope: str, page: int) -> str:
+    """上一页/下一页的链接要带着当前条件：翻页丢筛选等于把人踢回默认视图。"""
+    pairs = [("scope", scope)]
+    if q:
+        pairs.append(("q", q))
+    if tag:
+        pairs.append(("tag", tag))
+    if type_:
+        pairs.append(("type", type_))
+    if page != 1:
+        pairs.append(("page", str(page)))
+    return "/annotations?" + "&".join(f"{quote(k, safe='')}={quote(v, safe='')}" for k, v in pairs)
+
+
+@router.get("/annotations")
+def annotations_search(
+    request: Request,
+    q: str = Query(""),
+    tag: str = Query(""),
+    type: str = Query(""),
+    scope: str = Query("mine"),
+    page: str = Query("1"),
+):
+    """全局搜索（§4.5）：`q` 是正文子串、`tag` 精确、`type` 白名单、`scope` 两档。
+
+    地址栏里的手滑不判 400：`page=abc` 回到第 1 页、`scope` 野值回 `mine`——
+    这两样的「正确答案」对用户不可见，报错只是把人挡在门外；`type` 野值**要**报错，
+    因为下拉之外的值说明有人在改 URL，悄悄吞掉会教人以为筛到了。
+    """
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    try:
+        page_no = max(1, int(page))
+    except ValueError:
+        page_no = 1
+    scope_key = scope.strip() if scope.strip() in ("mine", "team") else "mine"
+    error = ""
+    rows_read: list = []
+    total = 0
+    type_key = type.strip()
+    if type_key and type_key not in TARGET_TYPES:
+        error = f"未知批注目标 {type_key!r}：只有 {', '.join(sorted(TARGET_TYPES))}"
+        type_key = ""
+    if not error:
+        try:
+            rows_read, total = ctx.annotations.search(
+                user.id,
+                q=q.strip() or None,
+                tag=tag.strip() or None,
+                target_type=type_key or None,
+                scope=scope_key,
+                team_sharing=ctx.app_settings.team_sharing(),
+                limit=PAGE_SIZE,
+                offset=(page_no - 1) * PAGE_SIZE,
+            )
+        except DatabaseLocked:
+            raise
+        except SamsError as exc:
+            error, rows_read, total = str(exc), [], 0
+    tz = ctx.settings.server.display_tz
+    accounts = None  # 成交目标的存在性检查要账户列表；按页取一次，N+1 到此为止
+    rows = []
+    for made in rows_read:
+        if made.target_type == ORDER and accounts is None:
+            accounts = ctx.sim_accounts.list_for(user.id)
+        rows.append(
+            {
+                "id": made.id,
+                "at": moment_label(made.created_at, tz),
+                "author": _author_label(ctx, made, user.id),
+                "visibility": "团队" if made.visibility == "team" else "私有",
+                "tags": made.tags,
+                "target_label": made.target_label,
+                "target_url": _target_url(made),
+                "target_gone": _target_gone(ctx, user.id, made, accounts=accounts),
+                "body_html": render_markdown(made.body_md),
+            }
+        )
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    return web.render(
+        request,
+        "annotations.html",
+        title="批注搜索",
+        rows=rows,
+        total=total,
+        page=page_no,
+        pages=pages,
+        q=q,
+        tag=tag,
+        type=type_key,
+        scope=scope_key,
+        error=error,
+        type_choices=[("", "全部目标"), *[(t, TARGET_TYPE_LABELS[t]) for t in TARGET_TYPES]],
+        prev_url=_search_url(q, tag, type_key, scope_key, page_no - 1) if page_no > 1 else "",
+        next_url=_search_url(q, tag, type_key, scope_key, page_no + 1) if page_no < pages else "",
+        empty_note="没有命中：换个关键词，或把范围切到「团队」。",
+    )
 
 
 # --- 写路（§6.2/§10）------------------------------------------------------------------

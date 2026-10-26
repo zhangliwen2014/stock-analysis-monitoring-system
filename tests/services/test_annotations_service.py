@@ -369,3 +369,61 @@ def test_edit_may_keep_existing_team_row_when_off(world):
         world.user.id, made.id, body_md="改一个字", visibility="team"
     )
     assert kept.visibility == "team"
+
+
+# --- /annotations 搜索用例（§4.5）------------------------------------------------------------
+
+
+def test_search_pairs_page_with_total_from_one_filter_set(world):
+    """`search` 返回（本页，总数）：总数与分页必须问同一份过滤条件。"""
+    for n in range(25):
+        world.service.create(
+            world.user.id, target_type="symbol", target_ref="A:600519", body_md=f"第 {n} 条"
+        )
+    rows, total = world.service.search(world.user.id)
+    assert len(rows) == 20 and total == 25
+    rows2, total2 = world.service.search(world.user.id, offset=20)
+    assert len(rows2) == 5 and total2 == 25
+
+
+def test_search_rejects_unknown_scope(world):
+    with pytest.raises(ValidationError, match="scope"):
+        world.service.search(world.user.id, scope="all")
+
+
+def test_search_scopes_team_rows_by_policy(world):
+    """team 档只看 team 行；策略关着就只剩自己的——私有行永不进他人的搜索结果。"""
+    mine_team = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519",
+        body_md="我的团队", visibility="team",
+    )
+    mine_private = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519", body_md="我的私有"
+    )
+    theirs_team = world.service.create(
+        world.other.id, target_type="symbol", target_ref="A:600519",
+        body_md="他的团队", visibility="team",
+    )
+    world.service.create(
+        world.other.id, target_type="symbol", target_ref="A:600519", body_md="他的私有"
+    )
+    rows, total = world.service.search(world.user.id, scope="team", team_sharing=True)
+    assert {r.id for r in rows} == {mine_team.id, theirs_team.id} and total == 2
+    rows_off, total_off = world.service.search(world.user.id, scope="team", team_sharing=False)
+    assert {r.id for r in rows_off} == {mine_team.id} and total_off == 1
+    rows_mine, total_mine = world.service.search(world.user.id, scope="mine", team_sharing=True)
+    assert {r.id for r in rows_mine} == {mine_team.id, mine_private.id} and total_mine == 2
+
+
+def test_search_q_and_tag_filters_apply(world):
+    hit = world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519",
+        body_md="渠道库存见底", tags=["logic"],
+    )
+    world.service.create(
+        world.user.id, target_type="symbol", target_ref="A:600519", body_md="另一条"
+    )
+    rows, total = world.service.search(world.user.id, q="库存")
+    assert [r.id for r in rows] == [hit.id] and total == 1
+    rows, total = world.service.search(world.user.id, tag="LOGIC")
+    assert [r.id for r in rows] == [hit.id] and total == 1
