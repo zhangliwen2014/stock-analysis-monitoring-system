@@ -41,7 +41,7 @@ _QUOTA_WHERE = "purged_at IS NULL"
 #: 标签精确匹配、大小写不敏感。`%`/`_` 在这里没有特殊含义——这正是「搜索不是 LIKE」。
 _TAG_MATCH = (
     "list_contains(list_transform("
-    "CAST(from_json(tags_json, '[\"VARCHAR\"]') AS VARCHAR[]), x -> lower(x)), lower(?))"
+    "CAST(from_json(tags_json, '[\"VARCHAR\"]') AS VARCHAR[]), lambda x: lower(x)), lower(?))"
 )
 
 

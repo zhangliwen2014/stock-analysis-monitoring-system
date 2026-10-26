@@ -501,7 +501,10 @@ def test_constraint_violations_are_reported_with_an_actionable_message(bars, db)
                 {"market": ["A"], "code": ["1"], "date": [D1], "close": [1.0], "source": [None]}
             )
         )
-    assert "bars_daily.source" in str(excinfo.value), "至少要说清是哪一列的约束"
+    # duckdb 2.0 起给列名加了引号（`bars_daily."source"`），1.x 是不带引号的点号串——
+    # 「说清哪张表哪一列」才是这条断言的契约，引号形状不钉
+    message = str(excinfo.value)
+    assert "bars_daily" in message and "source" in message, "至少要说清是哪一列的约束"
     assert db.query("SELECT view_name FROM duckdb_views() WHERE internal=false").height == 0, (
         "bars 用了 try/finally，失败路径不泄漏视图"
     )

@@ -63,28 +63,33 @@ class Database:
         那是 DDL 的引导路径，不需要也不该走这里。
         """
         if self._tx_depth == 0:
-            self._run("BEGIN TRANSACTION", None)
+            self.execute("BEGIN TRANSACTION")
         self._tx_depth += 1
         try:
             yield
         except Exception:
             if self._tx_depth == 1:
-                self._run("ROLLBACK", None)
+                self.execute("ROLLBACK")
             raise
         else:
             if self._tx_depth == 1:
-                self._run("COMMIT", None)
+                self.execute("COMMIT")
         finally:
             self._tx_depth -= 1
 
     def execute(self, sql: str, params: list[Any] | None = None) -> None:
-        self._run(sql, params)
+        # duckdb 2.0 收紧了同连接上的「未完成结果」：结果没 drain 就 register/query
+        # 会 ResourceInUse。这里没人读结果，fetchall 就是把空结果排干。
+        self._run(sql, params).fetchall()
 
     def _run(self, sql: str, params: list[Any] | None) -> Any:
         """唯一的 DuckDB ↔ StorageError 转换点。
 
         services 层按 `except StorageError` 兜仓库故障；漏出原始 duckdb 异常的话，
         约束冲突会一路冒到 CLI，运维看到的是一坨栈而不是「哪张表哪条约束」。
+
+        返回的是**未 drain 的结果**：drain 由读方负责（query/scalar/execute 各自
+        在读完后排干）。complete()/fetchall() 若发生在读取之前会让结果失效。
         """
         try:
             return self.conn.execute(sql, params or [])
@@ -92,10 +97,17 @@ class Database:
             raise StorageError(f"SQL 执行失败: {exc}") from exc
 
     def query(self, sql: str, params: list[Any] | None = None) -> pl.DataFrame:
-        return self._run(sql, params).pl()
+        # duckdb 2.0 把 execute 结果上的 `.pl()` 拿掉了（polars 转换挪到 relation）；
+        # `con.sql` 又不收参数化的位置参——所以留在 `_run`（锁错误翻译在那条路上）走 arrow。
+        result = self._run(sql, params)
+        frame = pl.from_arrow(result.to_arrow_table())
+        result.fetchall()
+        return frame
 
     def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
-        row = self._run(sql, params).fetchone()
+        result = self._run(sql, params)
+        row = result.fetchone()
+        result.fetchall()
         return row[0] if row else None
 
     def register(self, name: str, df: pl.DataFrame) -> None:
