@@ -1373,6 +1373,8 @@ git commit -m "feat(annotations): 编辑批注可增删附件——remove 用例
 
 ## Task 5: `/admin/annotations` 页 + 策略开关 + break-glass 路由
 
+> **Task 5 前置小修（Task 2 遗留缺口）：** spec §6.3/D139（M4-B spec:341）规定理由 **4–200 字**，Task 2 只落了 4 字下限。先补 `MAX_REASON_CHARS = 200`（services/admin_access.py），超长走 ValidationError、消息点名上限；红测试加在 tests/services/test_break_glass.py（201 字被拒、200 字放行）。与本任务一起提交。
+
 **Files:**
 - Modify: `src/sams/storage/repos/annotations.py`（`list_metadata`/`count_metadata`）
 - Modify: `src/sams/storage/repos/attachments.py`（`usage_by_user`、`count_by_annotation_map` 可选）
@@ -1760,11 +1762,18 @@ admin 侧（`/admin/annotations` 元数据与用量、团队共享开关、D139 
 
 `grep -n "路由\|页面\|/review\|/alerts" README.md`——若存在页面/路由清单，补 `/annotations 批注搜索` 与 `/admin/annotations 批注管理（admin）` 两行；若无此类清单，README 不动（备份一节计划 4 已写）。
 
+- [ ] **Step 2b: M4-B spec 两处过时句就地同步（评审遗留 Task 4 finding 5）**
+
+`docs/superpowers/specs/2026-10-23-m4b-annotations-review-design.md`：
+1. :249 「列表页只加载前 3 张」→「列表页只加载前 `max_attachments` 张（默认 5，与张数上限同源——编辑器要能勾选到每一张）」。
+2. :341 break-glass 段的「授权 **该条** 15 分钟」→「授权 **该条** `break_glass_minutes` 分钟（默认 15，治理参数）」，并在同段确认 4–200 字已落地（上限随 Task 5 前置小修复齐）。
+风格上这是设计文档就地修订，不记验收状态（验收状态在总 spec §14）。
+
 - [ ] **Step 3: Commit**
 
 ```bash
-git add docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md README.md
-git commit -m "docs(specs): 总 spec §14 记 M4-B 验收状态；README 页面清单补搜索与管理页"
+git add docs/superpowers/specs/2026-10-17-stock-analysis-monitoring-system-design.md docs/superpowers/specs/2026-10-23-m4b-annotations-review-design.md README.md
+git commit -m "docs(specs): 总 spec §14 记 M4-B 验收状态；M4-B spec 同步缩略图上限与 break-glass 治理参数；README 补页面清单"
 ```
 
 （若 Step 2 没改 README，从 `git add` 去掉它。）
@@ -1804,7 +1813,7 @@ git commit -m "docs(specs): 总 spec §14 记 M4-B 验收状态；README 页面�
 | §4.3 revision meta 记附件 id | Task 4 `stamp_last_revision_attachments` | 附件增删在 revision 落库之后发生（新 id 传完才知道），故**补写**最新 revision 的 meta 而不是随 update 一起写 |
 | §5.4 附件删除 | Task 4 `AttachmentService.remove` | 行先删、文件后 unlink，崩中间留孤儿给 prune（与新增同一对偶） |
 | §6.2 缩略图 3 张封顶 | Task 4 改 `THUMB_LIMIT` 为配置的 `max_attachments` | 编辑器要能勾选到每一张，封顶与配额同源 |
-| D139 break-glass：单条/15min/5 次/hour/≥4 字/留痕 | Task 2 + Task 5 | 规则在服务层（无 DB 可测）；小时窗按 `created_at` 数行，不做滑动桶 |
+| D139 break-glass：单条/限时/限次/≥4 字/留痕 | Task 2 + Task 5 | 规则在服务层（无 DB 可测）；小时窗按 `created_at` 数行，不做滑动桶；时长与次数**读 settings 治理参数**（评审修正 e132382）；4–200 字的上限随 Task 5 前置小修复齐（spec:341） |
 | D139「附件与 revision 同权」 | Task 5 新路由 `/admin/annotations/{id}/attachments/{att_id}` | spec 路由表没有这条 GET——不加它「同权」只能看缩略图断链；`Cache-Control: no-store` |
 | §6.1 `/admin/annotations` 四路由 | Task 5 | policy 的 `notice` 走 query param（admin 区无 flash 机制） |
 | 总 spec §14 同步 | Task 6 | 全量条数由控制器收尾回填 |
