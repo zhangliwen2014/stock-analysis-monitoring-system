@@ -37,6 +37,14 @@ def test_short_password_rejected(users):
         users.create("zhangsan", "short")
 
 
+def test_six_chars_is_the_floor(users):
+    """下限要说得出数：6 位能用、5 位挡。只测「短的被拒」测不出这条线画在哪。"""
+    users.create("zhangsan", "abcdef")
+    assert users.authenticate("zhangsan", "abcdef") is not None
+    with pytest.raises(ValidationError, match="至少 6 位"):
+        users.create("lisi", "abcde")
+
+
 def test_too_long_password_rejected(users):
     """bcrypt 静默截断到 72 字节——不报错等于「更长密码更弱」的假象。"""
     with pytest.raises(ValidationError, match="72"):

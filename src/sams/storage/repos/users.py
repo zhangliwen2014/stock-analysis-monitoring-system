@@ -13,7 +13,7 @@ from sams.core.errors import ValidationError
 from sams.storage.db import Database
 from sams.storage.ids import new_id
 
-MIN_PASSWORD_LEN = 12
+MIN_PASSWORD_LEN = 6
 _USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{2,31}$")
 BCRYPT_MAX_BYTES = 72
 ACTIVE, DISABLED = "active", "disabled"

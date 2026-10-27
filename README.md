@@ -86,7 +86,7 @@ A 股裸价跳变超过涨跌停上限且对不上这天的记录（多半是漏
 
 ```bash
 uv run sams db migrate
-uv run sams user add --username alice --admin   # 首个管理员，按提示设密码（至少 12 位）
+uv run sams user add --username alice --admin   # 首个管理员，按提示设密码（至少 6 位）
 uv run sams serve                               # http://127.0.0.1:8765
 ```
 

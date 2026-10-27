@@ -233,7 +233,7 @@ def test_a_too_short_new_password_stays_on_the_page(logged):
         logged.client, f"/admin/users/{bob.id}/reset_password", logged.csrf, password="short"
     )
     assert resp.status_code == 400
-    assert "12" in resp.text
+    assert "至少 6 位" in resp.text, "被拒那一屏要说清下限是几位"
     assert ctx.users.authenticate("bob", "short") is None
 
 

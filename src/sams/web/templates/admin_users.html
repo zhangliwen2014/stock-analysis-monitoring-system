@@ -38,7 +38,7 @@
       </form>
       <form method="post" action="/admin/users/{{ user.id }}/reset_password" class="inline-form">
         <input type="hidden" name="csrf" value="{{ csrf }}">
-        <input type="password" name="password" placeholder="新密码（至少 12 位）" required>
+        <input type="password" name="password" placeholder="新密码（至少 6 位）" required>
         <button type="submit">重置密码</button>
       </form>
     </td>
@@ -51,7 +51,7 @@
   <form method="post" action="/admin/users/create" class="inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <input type="text" name="username" placeholder="用户名（小写）" required>
-    <input type="password" name="password" placeholder="密码（至少 12 位）" required>
+    <input type="password" name="password" placeholder="密码（至少 6 位）" required>
     <label class="inline"><input type="checkbox" name="is_admin" value="1"> admin</label>
     <button type="submit">创建</button>
   </form>
