@@ -917,7 +917,7 @@ Task 7 把移除的**位置**搬到了那一行最右边；这一节改的是它
 - Create: `src/sams/storage/migrations/0022_watchlist_hidden.sql`
 - Modify: `src/sams/storage/repos/watchlists.py`、`src/sams/web/pages/dashboard.py`
 - Modify: `src/sams/web/templates/watchlist.html`
-- Test: `tests/storage/test_watchlists.py`、`tests/web/test_dashboard.py`、`tests/storage/test_migrations.py`（若该文件钉了列形状）
+- Test: `tests/storage/test_watchlists.py`、`tests/storage/test_migration_0022.py`（新建，照 `test_migration_0020.py` 的形状）、`tests/web/test_dashboard.py`
 
 - [ ] **Step 1: 写失败测试（仓库层的四种说法）**
 
@@ -974,28 +974,31 @@ Run: `uv run pytest tests/storage/test_watchlists.py -q` → 前四枚 FAIL（`h
 ALTER TABLE watchlists ADD COLUMN removed_at TIMESTAMPTZ;
 ```
 
-`watchlists.py`：`remove()` 的 SQL 换成带条件的 UPDATE，这样「第二次移除」自然返回 False，
-不必先查再写：
+`watchlists.py`：`remove()` 的 SQL 换成带条件的 UPDATE。判据先看「这一行原来可见吗」——
+`contains()` 只认未折起的行，所以它天然就是那个答案，不必先 `SELECT` 再 `UPDATE`：
 
 ```python
     def remove(self, user_id: str, market: str, code: str) -> bool:
-        """折起：从看板与规则展开里消失，但仍在 `list_all()`（= 每日采集清单）里（D169）。"""
+        """折起：从看板与规则展开里消失，但仍在 `list_all()`（= 每日采集清单）里（D169）。
+
+        返回值的含义与硬删除时代一致：「这一行原来是可见的」。第二次折同一只票
+        返回 False——它本来就折着，没有发生任何变化，界面不该报「刚刚移掉了」。
+        """
         market, code = _norm(market, code)
-        before = self.count(user_id)
+        user_id = _require_user(user_id)
+        if not self.contains(user_id, market, code):
+            return False
         self.db.execute(
             "UPDATE watchlists SET removed_at = current_timestamp "
-            "WHERE user_id = ? AND market = ? AND code = ? AND removed_at IS NULL",
-            [_require_user(user_id), market, code],
+            "WHERE user_id = ? AND market = ? AND code = ?",
+            [user_id, market, code],
         )
-        # 行数一条没变，但那一条的 `removed_at` 换了：用「可见条数」判成败会永远为真
-        return not self.contains(user_id, market, code) and before >= self.count(user_id)
+        return True
 ```
 
-（上面那句判据太绕。**照这个写**：先 `visible = self.contains(...)`（`contains` 只看未折起的行），
-`visible` 为假就直接 `return False` 且不发 UPDATE；为真才 UPDATE 并 `return True`。）
-
-新增三个方法（`list()` 的 SQL 加 `WHERE ... AND removed_at IS NULL`；`contains()` 同样加这个条件，
-`codes()` 走 `list()` 所以自动跟着变；`list_all()` **一条 WHERE 都不加**）：
+新增三个方法（`list()` 与 `contains()` 的 SQL 都加 `AND removed_at IS NULL`；`codes()` 走 `list()`
+所以自动跟着变；`count()` **不加**——上限数的是「这只票在不在我的清单里」，折起来不腾出配额；
+`list_all()` **一条 WHERE 都不加**，它就是采集清单的来源）：
 
 ```python
     def hidden(self, user_id: str) -> list[WatchItem]:
@@ -1046,38 +1049,20 @@ def test_purge_asks_first_and_then_really_goes(logged):
     assert confirm.status_code == 200
     assert "彻底删除" in confirm.text
     assert "/watchlist/remove" not in confirm.text, "确认屏上不许再有第二个删除入口"
-    assert logged.client.get("/watchlist/A/600519/purge-confirm").status_code == 404 or True  # 见下注
     logged.client.post("/watchlist/purge", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
     assert "600519" not in logged.client.get("/watchlist").text
     assert logged.client.get("/watchlist/A/600519/purge").status_code == 404
 
 
-def test_hidden_symbol_still_gets_fetched(logged):
-    """这一条是整个决定的落点：折起不等于不再采集。采集清单读 `list_all()`，
-    所以那只票必须还在里面。"""
-    _add_watch(logged, "A", "600519")
-    logged.client.post("/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
-    user = logged.context.users.get_by_username("alice")
-    from sams.services.scheduler.universe import UniverseBuilder  # 按该文件既有 import 姿势
-
-    # 用真实仓库构造，再断这一只在 (market, code) 里
-    assert ("A", "600519") in {item for item in logged.context.watchlists.list_all_pairs()}
-    del user
-```
-
-（最后那枚用例**不要**照上面那段半成品写：`UniverseBuilder` 的装配在这个测试环境里代价大。
-把它换成钉仓库层那一句——`list_all()` 仍返回这一行即可，仓库层的 Step 1 已经钉过一条同义的，
-这一枚改成检查 web 侧「折起的行不再出现在 `/api/partials/quotes`」：
-
-```python
 def test_hidden_symbol_leaves_the_quote_board(logged):
-    """看板（首屏与 10 秒那一刷）都不该再看见折起的行：`manage` 只管要不要按钮。"""
+    """看板（首屏与 10 秒那一刷）都不该再看见折起的行：`manage` 只管要不要按钮。
+    「采集清单继续包含它」那一半已经由 Step 1 的 `list_all()` 用例钉住，屏幕上这一半
+    只需要钉住反向：不在板上。"""
     _add_watch(logged, "A", "600519")
     logged.client.post("/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
     assert "600519" not in logged.client.get("/api/partials/quotes?manage=1").text
     assert "600519" not in logged.client.get("/").text
 ```
-）
 
 Run: `uv run pytest tests/web/test_dashboard.py -q -k "hidden or restore or purge"` → FAIL。
 
