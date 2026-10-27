@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import polars as pl
 
@@ -327,10 +327,11 @@ def volume_ma(series: object, *windows: int) -> pl.DataFrame:
 #: M2-D 的估值合成与 M4 的告警规则将来也吃同一套。
 #: 「同一份实现」（spec §8.1）不只是盘中与盘后：**命令行上看到的 MA20 与规则里判断的
 #: MA20 必须是同一个函数吐的**，否则一次对账就能把整套判断的信用问掉。
-#: 参数写死在这里是有意的：可调的参数属于 `--window` 那种显式入口，不属于一张表的默认值。
-INDICATORS: dict[str, Callable[[AdjustedSeries], pl.DataFrame]] = {
-    "ma": lambda s: ma(s),
-    "ema": lambda s: ema(s),
+#: 这里不再包那一层 lambda：包一层等于把 `*windows` 堵死，`metrics` 传不进参数。
+#: 默认参数仍写在各函数自己的签名里——这张表只负责「按名字调」，不负责记窗口。
+INDICATORS: dict[str, Callable[..., pl.DataFrame]] = {
+    "ma": ma,
+    "ema": ema,
     "macd": macd,
     "rsi": rsi,
     "boll": boll,
@@ -340,7 +341,7 @@ INDICATORS: dict[str, Callable[[AdjustedSeries], pl.DataFrame]] = {
     "cci": cci,
     "wr": wr,
     "obv": obv,
-    "volume_ma": lambda s: volume_ma(s),
+    "volume_ma": volume_ma,
 }
 
 #: 屏幕上默认并排给的那几组。其余的（atr/dmi/cci/wr/obv/ema/volume_ma）要 `--indicators`
@@ -348,11 +349,19 @@ INDICATORS: dict[str, Callable[[AdjustedSeries], pl.DataFrame]] = {
 DEFAULT_INDICATORS: tuple[str, ...] = ("ma", "macd", "rsi", "boll", "kdj")
 
 
-def metrics(series: object, names: Sequence[str] = DEFAULT_INDICATORS) -> pl.DataFrame:
+def metrics(
+    series: object,
+    names: Sequence[str] = DEFAULT_INDICATORS,
+    *,
+    windows: Mapping[str, Sequence[int]] | None = None,
+) -> pl.DataFrame:
     """一次算好几组指标，横向并成一张表：`date` 打头，行序与输入序列一致。
 
     每个函数都从同一条序列取同一列、都经过 `_out`，所以行数与日期天然对齐；
     对齐这件事不需要断言，`_out` 的「保持行数与顺序不变」就是它的保证。
+
+    `windows` 是「均线自己设」的入口（D162）：按指标名给一组窗口，没点名的那些仍走
+    函数自己的默认值——漏一个名字不等于换掉那一个指标那组数，屏幕上没人看得出来。
     """
     unknown = [name for name in names if name not in INDICATORS]
     if unknown:
@@ -362,7 +371,7 @@ def metrics(series: object, names: Sequence[str] = DEFAULT_INDICATORS) -> pl.Dat
     frame, _ = _prices(series, "close_hfq")
     columns: dict[str, list[float | None]] = {}
     for name in names:
-        built = INDICATORS[name](series)
+        built = INDICATORS[name](series, *(windows or {}).get(name, ()))
         for column in built.columns:
             if column == "date":
                 continue

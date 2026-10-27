@@ -21,6 +21,7 @@ from sams.services.analysis import (
     LISTED_ON_FROM_CLI,
     LISTED_ON_FROM_MASTER,
     AnalysisService,
+    parse_period,
 )
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
@@ -341,3 +342,32 @@ def test_a_stock_with_no_master_row_reports_no_listing_date(db):
     service = seeded(db)
     result = service.interval_return("A", CODE, START, END)
     assert (result.listed_on, result.listed_on_source) == (None, None)
+
+
+# --- K 线周期：读的那一档由 `parse_period` 说了算 ---------------------------------------
+
+
+def test_parse_period_splits_the_bar_count_periods():
+    """`5d` 拆成 `("nday", 5)`，其余原样：N 日线吃的是日线根数，与日历无关（D160/D161）。
+
+    不认识的名字一律出声——`weekly`/`0d` 静默按日线算的话，屏幕上那段行情不是任何人
+    请求过的那一段，而它看起来完全正常。
+    """
+    assert parse_period("day") == ("day", None)
+    assert parse_period("quarter") == ("quarter", None)
+    assert parse_period("5d") == ("nday", 5)
+    assert parse_period("10d") == ("nday", 10)
+    with pytest.raises(ValidationError, match="周期只认"):
+        parse_period("weekly")
+    with pytest.raises(ValidationError, match="周期只认"):
+        parse_period("0d")
+
+
+def test_series_can_read_a_five_day_bar(db):
+    """5 日线吃的是库里的日线，不新增数据源（D160）：11 根日线 ⇒ 两根 5 日 K，
+    最后一根只盖了一天 ⇒ 它在 `pending_periods` 里。"""
+    service = seeded(db)
+    read = service.series("A", CODE, start=START, end=END, period="5d", indicators=("ma",))
+    assert read.period == "5d"
+    assert read.table["bars"].to_list() == [5, 5, 1]
+    assert read.pending_periods == [read.table["date"][-1]]

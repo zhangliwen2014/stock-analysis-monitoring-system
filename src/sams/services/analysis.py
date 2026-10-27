@@ -27,7 +27,8 @@ D37 那道闸要的是「这个市场有没有涨跌幅证据」：拼写走不�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Literal
@@ -37,7 +38,7 @@ import polars as pl
 from sams.analysis.adjust import AdjustedSeries, adjusted_series
 from sams.analysis.guard import ConfirmedSpan, is_covered
 from sams.analysis.indicators import DEFAULT_INDICATORS, INDICATORS, metrics
-from sams.analysis.resample import MONTH, WEEK, resample
+from sams.analysis.resample import MONTH, NDAY, QUARTER, WEEK, YEAR, resample
 from sams.analysis.returns import IntervalReturn, interval_return
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
@@ -47,10 +48,30 @@ from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.symbols import SymbolRepo
 
-#: `resample()` 认的两个周期之外的唯一取值：日线不重采样，直接吃闸后那条序列。
+#: 日线及以上的周期名。`5d`/`10d` 这类 N 日线不在名单里，由 `parse_period` 现拆
 #: 公开给命令行做 `--period` 的取值表（`cli` 不许 import 分析层，名单只能从这里转一道）
 _DAY = "day"
-PERIODS: tuple[str, ...] = (_DAY, WEEK, MONTH)
+PERIODS: tuple[str, ...] = (_DAY, WEEK, MONTH, QUARTER, YEAR)
+#: N 日线：1..999 根日线做一根 K。`0d` 那种写法不在里面——它没有对应的东西可算
+_NDAY_RE = re.compile(r"^([1-9][0-9]{0,2})d$")
+
+
+def parse_period(value: str) -> tuple[str, int | None]:
+    """把周期名拆成 (重采样周期, 每几根一组)。
+
+    `5d` 是「5 日线」而不是「5 天」：这一档的分组按**根数**走，与日历无关。
+    不认识的名字一律拒绝，不静默按日线算——那等于给一段不是对方请求的行情。
+    """
+    match = _NDAY_RE.match(value or "")
+    if match:
+        return NDAY, int(match.group(1))
+    if value in PERIODS:
+        return value, None
+    raise ValidationError(
+        f"周期只认 {', '.join(PERIODS)} 或 5d/10d 这样的『N 日线』，收到的是 {value!r}："
+        '写成 "weekly" 静默当成 week 等于让调用方以为自己要的东西被给了'
+    )
+
 
 #: 豁免日期从哪来：命令行 `--listed-on` 传的，还是采集时填进主档的那一格（U18）。
 #: 命令行不许 import 分析层，这两个名字与上面的 `PERIODS` 一样从服务层转一道
@@ -183,6 +204,7 @@ class AnalysisService:
         end: date,
         period: str = _DAY,
         indicators: Sequence[str] | None = None,
+        windows: Mapping[str, Sequence[int]] | None = None,
         listed_on: date | None = None,
     ) -> SeriesRead:
         """一条过闸的复权序列 + 在它上面算好的指标（U20 的那个出口）。
@@ -195,15 +217,15 @@ class AnalysisService:
         之类的东西，而指标层的 `null` 规则（样本不足不给数）会把这种凑出来的值挡在
         请求段之外——前提是请求段之前真的有根。所以这里往回读，**读到覆盖确认允许的地方
         为止**（D36：多读的那几天同样要有答案），再往后就只按请求那段算。
+
+        `windows` 原样透传给 `metrics`（D162：均线组可由调用方给）。`period` 存进
+        `SeriesRead` 的是调用方给的那一串（`"5d"` 而不是拆开的 `nday`）——屏幕上要说的
+        是他点的那一档。
         """
         market = canonical_market(market)
         code = canonical_code(market, code)
         self._require_ordered(start, end)
-        if period not in PERIODS:
-            raise ValidationError(
-                f"周期只认 {', '.join(PERIODS)}，收到的是 {period!r}："
-                "写成一个不认识的名字静默按日线算，等于给你一段不是你请求的行情"
-            )
+        kind, bars_per_group = parse_period(period)
         # 先验指标名，再动库：拼错一个名字不应该让三道闸全部跑完才出声（架构评审第 9 项）。
         # `metrics()` 里同样有这道检查，这里是把它提前——两处口径相同，不在此重新造那套文案。
         names = tuple(dict.fromkeys(indicators)) if indicators else DEFAULT_INDICATORS
@@ -252,8 +274,8 @@ class AnalysisService:
         daily_dates = series.frame["date"].to_list()
         warmup_bars_count = sum(1 for d in daily_dates if d < start)
         anchor = daily_dates[0]
-        if period != _DAY:
-            series = resample(series, period, as_of=today)
+        if kind != _DAY:
+            series = resample(series, kind, n=bars_per_group, as_of=today)
         frame = series.frame
         # 裸价与后复权收盘并排给：读数的人拿裸价那列与行情终端对得上，拿指标列比形态。
         # `first`/`last`/`bars`/`pending` 只有重采样后的周期才有：那一根周 K 到底覆盖了
@@ -263,7 +285,9 @@ class AnalysisService:
             for c in ("close", "close_hfq", "volume", "pending", "first", "last", "bars")
             if c in frame.columns
         ]
-        table = frame.select(["date", *keep]).hstack(metrics(series, names).drop("date"))
+        table = frame.select(["date", *keep]).hstack(
+            metrics(series, names, windows=windows or {}).drop("date")
+        )
         rows = table.filter(pl.col("date") >= start)
         return SeriesRead(
             market=market,

@@ -301,8 +301,9 @@ def add_to(subparsers) -> None:
     ser.add_argument(
         "--period",
         default="day",
-        choices=list(PERIODS),
-        help="K 线周期：周与月由日线现算，不入库（spec §8.2）",
+        # 不给 `choices`：N 日线（`5d`/`10d`）不在写死的名单里，由服务层现拆；
+        # 不认识时屏幕上就是 `parse_period` 那句话，CLI 不另造一份文案
+        help=f"K 线周期：{'/'.join(PERIODS)} 或 5d/10d 这样的 N 日线（都由日线现算，不入库）",
     )
     ser.add_argument(
         "--indicators",

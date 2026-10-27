@@ -22,6 +22,7 @@ import pytest
 
 from sams.analysis.adjust import AdjustedSeries, adjusted_series
 from sams.analysis.indicators import (
+    MA_WINDOWS,
     atr,
     boll,
     cci,
@@ -30,6 +31,7 @@ from sams.analysis.indicators import (
     kdj,
     ma,
     macd,
+    metrics,
     obv,
     rsi,
     volume_ma,
@@ -599,3 +601,18 @@ def test_ratio_indicators_do_not_move_when_the_whole_series_is_scaled(name):
         assert last is not None and 0.0 < last < 100.0, last
     else:
         assert before[f"{name}_k" if name == "kdj" else name].to_list()[-1] is not None
+
+
+# --- 窗口从外面给：均线组不许只有内置那一套 ---------------------------------------------
+
+
+def test_metrics_honours_a_custom_window_per_indicator():
+    """「均线自己设」的落点：窗口从外面进来，列名跟着窗口变（D162）。
+    默认那组（`MA_WINDOWS`）不许受影响——同一条 `metrics(s, ("ma",))` 的出列变了，
+    所有在用它的人会拿到一批对不上号的列名。"""
+    s = series(days=DAYS[:12])
+    default = metrics(s, ("ma",))
+    custom = metrics(s, ("ma",), windows={"ma": (3, 7)})
+    assert [c for c in default.columns if c != "date"] == [f"ma{w}" for w in MA_WINDOWS]
+    assert [c for c in custom.columns if c != "date"] == ["ma3", "ma7"]
+    assert custom["ma3"].to_list()[:2] == [None, None]  # 三根才够第一行，两根不够
