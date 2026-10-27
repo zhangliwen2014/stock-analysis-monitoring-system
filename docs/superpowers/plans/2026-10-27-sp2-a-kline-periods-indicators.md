@@ -22,8 +22,8 @@
 | `src/sams/analysis/indicators.py` | `metrics()` 收每族的窗口（「均线自己设」的落点，D162） |
 | `src/sams/services/analysis.py` | `parse_period()` 把 `5d` 拆成 `("nday", 5)`；`series()` 转发窗口；`PERIODS` 扩名单 |
 | `src/sams/cli/analysis.py` | `--period` 的取值表跟着 `PERIODS` 走（不放宽，只对齐） |
-| `src/sams/web/pages/symbol.py` | `bars_api` 的新参数与新出参（D159/D160/D162/D168） |
-| `src/sams/web/pages/dashboard.py` | chart 局部 + `quotes_partial` 的 `manage` 标志（D158/D166） |
+| `src/sams/web/pages/symbol.py` | `bars_api` 的新参数与新出参（D159/D160/D162/D168）；`/api/partials/chart` 局部（D158） |
+| `src/sams/web/pages/dashboard.py` | `quotes_partial` 的 `manage` 标志（D166） |
 | `src/sams/web/templates/partials/chart.html` | 周期条、指标开关、图注、`<div data-chart-url>` |
 | `src/sams/web/templates/symbol.html` | 用 chart 局部换掉那一块裸 div |
 | `src/sams/web/templates/partials/quotes.html` | `manage` 时的末列移除表单 + 备注并进名称列 |
@@ -602,9 +602,14 @@ git commit -m "feat(web): bars 接口交出蜡烛四档后复权价、周期与�
 
 **Files:**
 - Create: `src/sams/web/templates/partials/chart.html`
-- Modify: `src/sams/web/pages/dashboard.py`（`quotes_partial` 隔壁加一条路由）、`src/sams/web/pages/symbol.py`（个股页改用它）
+- Modify: `src/sams/web/pages/symbol.py`（局部路由与两张常量表都放这里）
 - Modify: `src/sams/web/templates/symbol.html:12-13`
+- Modify: `src/sams/web/static/app.css`
 - Test: `tests/web/test_symbol.py`
+
+（路由为什么落在 `symbol.py` 而不是 `dashboard.py`：`symbol.py` 已经 `from sams.web.pages.dashboard import _market_open`，
+反过来 import `MAIN_INDICATORS`/`SUB_INDICATORS` 会成环。局部与它读的白名单、窗口表同处，
+加一种指标仍只改一个文件。）
 
 - [ ] **Step 1: 写失败测试**
 
@@ -636,8 +641,12 @@ def test_symbol_page_uses_the_chart_partial(logged):
     assert "/api/partials/chart?market=A&amp;code=600519" in page.text or "api/partials/chart" in page.text
 
 
-def test_chart_partial_requires_a_user(logged):
-    assert logged.client.get("/api/partials/chart?market=A&code=600519").status_code in (200, 401, 303)
+def test_chart_partial_requires_a_login(web_app):
+    """未登录拿不到这一块：路由第一行就 `require_user`，别让它先去摸数据库。
+    钉 303 与跳转目的地，不钉 401——本站的未登录姿势是重定向去登录页（`app.py:207`）。"""
+    response = web_app.client.get("/api/partials/chart?market=A&code=600519", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/login")
 ```
 
 - [ ] **Step 2: 跑到红**
@@ -647,35 +656,47 @@ Expected: FAIL —404（局部路由还不存在）
 
 - [ ] **Step 3: 实现**
 
-`src/sams/web/pages/dashboard.py`（与 `quotes_partial` 同一节，同一个 `web.render` 姿势）：
+`src/sams/web/pages/symbol.py`（路由与它读的白名单、窗口表、标签表同处；`web.render` 的姿势照 `dashboard.py` 的 `quotes_partial`）：
 
 ```python
 @router.get("/api/partials/chart")
-def chart_partial(request: Request, market: str, code: str, period: str = "day",
-                  main: str = "ma", sub: str = "vol", ma: str = ""):
+def chart_partial(
+    request: Request, market: str, code: str, period: str = "day",
+    main: str = "ma", sub: str = "vol", ma: str = "",
+):
     """个股页那一块图：周期条 + 指标开关 + 挂着 `data-chart-url` 的那个 div。
 
     为什么在服务端渲染而不是前端自己切：CSP 是 `'self'`（不许内联脚本），
     而「现在选中的是哪一档」这份状态一旦落在前端，换档后屏上说的就可能是上一档的话（D158）。
+
+    周期名要过 `parse_period`：不认识的名字在这里就说 400，而不是悄悄换成日线——
+    那一屏会举着「日」的高亮画一段没人请求过的东西，而 `bars` 接口对同一个写法已经是 400。
     """
     require_user(request)
     web = request.app.state.web
+    kind, _n = parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
+    ctx = web.contexts.current()
+    market = canonical_market(market)
+    code = canonical_code(market, code)
+    if market not in ctx.settings.markets:
+        raise HTTPException(status_code=404)
     return web.render(
         request,
         "partials/chart.html",
-        market=canonical_market(market),
+        market=market,
         code=code,
         periods=CHART_PERIODS,
-        period=period if period in CHART_PERIODS else "day",
+        period=period,
         main=main,
         sub=sub,
         ma=ma,
         mains=MAIN_INDICATORS,
         subs=SUB_INDICATORS,
+        labels=CHART_INDICATOR_LABELS,
     )
 ```
 
-`CHART_PERIODS`（放在 `symbol.py` 或一处共用常量里，值与标签同处，别在模板里写死）：
+`CHART_PERIODS` 与 `CHART_INDICATOR_LABELS`（都放 `symbol.py`，值与标签同处，别在模板里写死）：
 
 ```python
 #: 周期条：(参数值, 屏幕上那几个字)。分钟档在计划 B，那时再来这张表里加行
@@ -683,30 +704,53 @@ CHART_PERIODS: tuple[tuple[str, str], ...] = (
     ("day", "日"), ("week", "周"), ("month", "月"), ("quarter", "季"),
     ("year", "年"), ("5d", "5日"), ("10d", "10日"),
 )
+#: 开关上那几个字。白名单加了名字这里就必须加一行，缺行会在模板上留一个空按钮
+CHART_INDICATOR_LABELS: dict[str, str] = {
+    "ma": "均线", "boll": "布林", "ema": "指数均线",
+    "vol": "成交量", "macd": "MACD", "kdj": "KDJ", "rsi": "RSI", "atr": "ATR",
+    "wr": "威廉", "dmi": "动向", "cci": "CCI", "obv": "OBV",
+}
 ```
 
-`partials/chart.html`（选择器是 `<a hx-get>` 换整块；`aria-current` 给当前档）：
+（`CHART_PERIODS` 里的值必须与 `bars_api` 的 `DEFAULT_WINDOW` 那七个键一致——这一步不自动校验，
+`tests/web/test_symbol.py` 里那条周期用例走的是真实接口，加了档忘了配窗口会当场露出来。）
+
+（要补的 import 只有一行：`from sams.services.analysis import parse_period`。`MAIN_INDICATORS`、
+`SUB_INDICATORS`、`DEFAULT_WINDOW` 是 Task 4 就落在 `symbol.py` 的常量，局部路由读同一份，
+屏幕上能点的档位与接口肯收的档位因此永远是同一份。）
+
+`partials/chart.html`（选择器是 `<a hx-get>` 换整块；`aria-current` 给当前档；
+「在就摘掉、不在就加上」用 Jinja 自带的 `difference` 算，不新增只在模板外面用的 Python helper）：
 
 ```html
+{% set picked_main = main.split(",") %}
+{% set picked_sub = sub.split(",") %}
+{% set base = "/api/partials/chart?market=" ~ market ~ "&code=" ~ code %}
 <div class="chart-box">
   <div class="chart-bar">
     <span class="chart-group" role="group" aria-label="周期">
       {% for value, label in periods %}
-      <a hx-get="/api/partials/chart?market={{ market }}&code={{ code }}&period={{ value }}&main={{ main }}&sub={{ sub }}&ma={{ ma }}"
+      <a hx-get="{{ base }}&period={{ value }}&main={{ main }}&sub={{ sub }}&ma={{ ma }}"
          hx-target=".chart-box" hx-swap="outerHTML" href="?period={{ value }}"
          {% if value == period %}aria-current="true" class="on"{% endif %}>{{ label }}</a>
       {% endfor %}
     </span>
     <span class="chart-group" role="group" aria-label="主图指标">
       {% for name in mains %}
-      <a data-indicator="{{ name }}" hx-get="...&main={{ toggle(main, name) }}&period={{ period }}&sub={{ sub }}&ma={{ ma }}"
+      {% set on = name in picked_main %}
+      {% set next_main = ((picked_main | difference([name])) if on else (picked_main + [name])) | join(",") %}
+      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ next_main }}&sub={{ sub }}&ma={{ ma }}"
          hx-target=".chart-box" hx-swap="outerHTML" href="#"
-         {% if name in main.split(",") %}aria-current="true" class="on"{% endif %}>{{ indicator_label(name) }}</a>
+         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
       {% endfor %}
     </span>
     <span class="chart-group" role="group" aria-label="副图指标">
       {% for name in subs %}
-      ... 同上一条，开关的是 `sub`，超过三个由接口那侧拒（400 的话 htmx 会把错误页换进来，不是静默）
+      {% set on = name in picked_sub %}
+      {% set next_sub = ((picked_sub | difference([name])) if on else (picked_sub + [name])) | join(",") %}
+      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ main }}&sub={{ next_sub }}&ma={{ ma }}"
+         hx-target=".chart-box" hx-swap="outerHTML" href="#"
+         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
       {% endfor %}
     </span>
   </div>
@@ -717,10 +761,9 @@ CHART_PERIODS: tuple[tuple[str, str], ...] = (
 </div>
 ```
 
-`toggle(...)` 与 `indicator_label(...)` 是模板要用的两个小函数：**用 Jinja 内联表达式写
-「在就摘掉、不在就加上」**（`main.split(",")` 那套），不新增 Python helper——一个只在模板里用的
-helper 会让「屏幕上那几个字」比模板本人更难找。`indicator_label` 要的中文名写在
-`CHART_INDICATOR_LABELS`（一张 `{name: 标签}` 常量表，与白名单同处），模板直接 `labels[name]`。
+（`difference` 是 Jinja 自带 filter，结果按左边那份的顺序。副图超过三个不必在模板里拦：
+接口那侧 400，htmx 会把错误页换进来，不会静默。`labels` 缺一个名字会在模板上留一个空按钮，
+所以加指标时白名单与标签表同处改。）
 
 `symbol.html` 的 `:12-13` 那两行换成：
 
@@ -740,7 +783,7 @@ Expected: 全绿
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/sams/web/templates/partials/chart.html src/sams/web/pages/dashboard.py src/sams/web/pages/symbol.py src/sams/web/templates/symbol.html src/sams/web/static/app.css tests/web/test_symbol.py
+git add src/sams/web/templates/partials/chart.html src/sams/web/pages/symbol.py src/sams/web/templates/symbol.html src/sams/web/static/app.css tests/web/test_symbol.py
 git commit -m "feat(web): 个股图换成服务端渲染的 chart 局部——周期条与指标开关（D158/D162）"
 ```
 
