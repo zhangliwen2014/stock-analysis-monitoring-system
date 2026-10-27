@@ -12,11 +12,11 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
 from sams.bootstrap import AppCore, ServiceContext
-from sams.core.codes import currency_override
+from sams.core.codes import canonical_code, canonical_market, currency_override
 from sams.core.errors import SamsError, ValidationError
 from sams.core.quotes import DELAYED, LIVE, NO_DATA, quote_state
 from sams.services.symbol_search import hinted_market, normalize_query
@@ -293,6 +293,8 @@ def _watch_page(request: Request, *, error: str | None = None, status: int = 200
         # 首屏那一眼就得有移除按钮：`{% include %}` 与页面共享上下文，
         # 只在 partial 上收 GET 参数的话按钮要等 10 秒那一刷才出现
         manage=True,
+        # 页底那一栏不进行情板：那里没有报价，摆进去会让人以为「已移除」也在实时刷新
+        hidden=ctx.watchlists.hidden(user.id),
         error=error,
     )
 
@@ -340,10 +342,86 @@ def watchlist_remove(
     market: str = Form(""),
     code: str = Form(""),
 ):
+    """移除 = 折起（D169）：写在一只票上的备注不能因为一次误点就没。"""
     require_user(request)
     ctx = request.app.state.web.contexts.current()
     try:
         ctx.watchlists.remove(request.state.sams_user.id, market.strip().upper(), code.strip())
+    except ValidationError as exc:
+        return _watch_page(request, error=str(exc))
+    return RedirectResponse("/watchlist", status_code=303)
+
+
+@router.post("/watchlist/restore")
+def watchlist_restore(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    market: str = Form(""),
+    code: str = Form(""),
+):
+    """恢复那一句话：折起来的票回到看板，备注还是原来那一条。"""
+    require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    try:
+        ctx.watchlists.restore(request.state.sams_user.id, market.strip().upper(), code.strip())
+    except ValidationError as exc:
+        return _watch_page(request, error=str(exc))
+    return RedirectResponse("/watchlist", status_code=303)
+
+
+def _hidden_row(ctx: ServiceContext, user_id: str, market: str, code: str):
+    """确认屏与真删共用的那一句「这一只确实折着吗」。
+
+    归一在这里做而不是等仓库的 SQL：404 的判断要用归一后的键，否则 `/watchlist/hk/700/purge`
+    查的是 `HK/700` 而库里那行是 `HK/00700`——真有折起的票也会给一张 404。
+    """
+    try:
+        cleaned = canonical_market(market)
+        key = (cleaned, canonical_code(cleaned, code))
+    except (SamsError, ValueError):
+        return None
+    return next(
+        (item for item in ctx.watchlists.hidden(user_id) if (item.market, item.code) == key),
+        None,
+    )
+
+
+@router.get("/watchlist/{market}/{code}/purge")
+def watchlist_purge_page(request: Request, market: str, code: str):
+    """彻底删除前的那一屏确认：那一刀连采集清单一起放手，值得多点一下（D169）。
+
+    进不去的两种（没折起的、库里没有的）都给 404，不给一张空确认屏——
+    屏幕上摆一只查无此票的「删除」按钮，按下去只会让人怀疑自己删错了东西。
+    """
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    row = _hidden_row(ctx, user.id, market, code)
+    if row is None:
+        raise HTTPException(status_code=404, detail="没有折起的这只票")
+    master = ctx.symbols.get(row.market, row.code) or {}
+    # 主档没有这一行时名称交代码，不留空白格：空格读起来像页面坏了
+    # （`symbol_name` 而不是 `name`：`render` 的第二个位置参数就叫 `name`）
+    return web.render(
+        request,
+        "watchlist_purge.html",
+        title="彻底删除这只票",
+        row=row,
+        symbol_name=master.get("name") or row.code,
+    )
+
+
+@router.post("/watchlist/purge")
+def watchlist_purge(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    market: str = Form(""),
+    code: str = Form(""),
+):
+    require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    try:
+        ctx.watchlists.purge(request.state.sams_user.id, market.strip().upper(), code.strip())
     except ValidationError as exc:
         return _watch_page(request, error=str(exc))
     return RedirectResponse("/watchlist", status_code=303)

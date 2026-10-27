@@ -245,6 +245,59 @@ def test_board_unit_follows_currency_override_for_dual_counter(logged):
     assert _quote_cells(logged.client.get("/"), "80700")[3] == "300.00 元"
 
 
+def test_removed_symbol_moves_to_the_hidden_section(logged):
+    """折起之后它不该在行情板里，但要在页底那一栏里带着备注露出来（D169）。"""
+    _add_watch(logged, "A", "600519", note="白酒龙头")
+    logged.client.post(
+        "/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"}
+    )
+    page = logged.client.get("/watchlist").text
+    assert "已移除" in page and "白酒龙头" in page
+    assert "/watchlist/restore" in page
+
+
+def test_restore_puts_the_symbol_back_on_the_board(logged):
+    _add_watch(logged, "A", "600519")
+    logged.client.post(
+        "/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"}
+    )
+    resp = logged.client.post(
+        "/watchlist/restore",
+        data={"csrf": logged.csrf, "market": "A", "code": "600519"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert "600519" in logged.client.get("/watchlist").text
+
+
+def test_purge_asks_first_and_then_really_goes(logged):
+    """真删之前要有一屏确认：那一刀会连采集清单一起放手，值得多点一下（D169）。"""
+    _add_watch(logged, "A", "600519")
+    logged.client.post(
+        "/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"}
+    )
+    confirm = logged.client.get("/watchlist/A/600519/purge")
+    assert confirm.status_code == 200
+    assert "彻底删除" in confirm.text
+    assert "/watchlist/remove" not in confirm.text, "确认屏上不许再有第二个删除入口"
+    logged.client.post(
+        "/watchlist/purge", data={"csrf": logged.csrf, "market": "A", "code": "600519"}
+    )
+    assert "600519" not in logged.client.get("/watchlist").text
+    assert logged.client.get("/watchlist/A/600519/purge").status_code == 404
+
+
+def test_hidden_symbol_leaves_the_quote_board(logged):
+    """看板（首屏与 10 秒那一刷）都不该再看见折起的行：`manage` 只管要不要按钮。
+    「采集清单继续包含它」那一半已由仓库层那条用例钉住，屏幕上这一半只钉反向：不在板上。"""
+    _add_watch(logged, "A", "600519")
+    logged.client.post(
+        "/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"}
+    )
+    assert "600519" not in logged.client.get("/api/partials/quotes?manage=1").text
+    assert "600519" not in logged.client.get("/").text
+
+
 def test_watchlist_search_input_includes_only_the_market_select(logged):
     """搜索框只带上市场下拉：整表单入 GET 查询串会把 csrf 和备注写进 URL 与日志。"""
     page = logged.client.get("/watchlist")

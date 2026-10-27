@@ -106,3 +106,54 @@ def test_a_lowercase_market_lands_on_the_canonical_key(repo):
     assert repo.contains(A_ID, "A", "601088") is True
     assert [item.market for item in repo.list(A_ID)] == ["A"]
     assert repo.remove(A_ID, "A", "601088") is True
+
+
+def test_remove_hides_the_row_but_keeps_it_for_the_sync_universe(repo):
+    """折起只影响「看得到」，不影响「还要不要采」：`list_all()` 是采集清单的来源，
+    它必须继续看见这一行，否则恢复那天起的历史就断了（D169）。"""
+    repo.add(A_ID, "A", "600519", note="白酒龙头")
+    assert repo.remove(A_ID, "A", "600519") is True
+    assert repo.list(A_ID) == []
+    assert repo.codes(A_ID) == []
+    assert {(i.user_id, i.code) for i in repo.list_all()} == {(A_ID, "600519")}
+    assert {(i.user_id, i.code) for i in repo.hidden(A_ID)} == {(A_ID, "600519")}
+
+
+def test_restore_puts_it_back_with_the_note_it_had(repo):
+    """一句话放回去：备注是用户写的那一条，不是恢复时新给的一个空串。"""
+    repo.add(A_ID, "A", "600519", note="拿长线")
+    repo.remove(A_ID, "A", "600519")
+    assert repo.restore(A_ID, "A", "600519") is True
+    assert repo.restore(A_ID, "A", "600519") is False, "没折起的行不叫恢复成功"
+    assert repo.list(A_ID)[0].note == "拿长线"
+
+
+def test_purge_really_deletes_the_row(repo):
+    """`purge` 才是那一刀：折起的行继续占采集配额没意义，人明确要求删就得真删。"""
+    repo.add(A_ID, "A", "600519")
+    repo.remove(A_ID, "A", "600519")
+    assert repo.purge(A_ID, "A", "600519") is True
+    assert repo.purge(A_ID, "A", "600519") is False
+    assert repo.list_all() == []
+
+
+def test_adding_a_hidden_symbol_brings_it_back_with_the_new_note(repo):
+    """重新加一只折起的票 ⇒ 回到看板并换备注，且不产生第二行（`INSERT OR REPLACE` 顺带把
+    `removed_at` 抹回 NULL）。"""
+    repo.add(A_ID, "A", "600519", note="旧备注")
+    repo.remove(A_ID, "A", "600519")
+    repo.add(A_ID, "A", "600519", note="新备注")
+    assert repo.count(A_ID) == 1
+    assert [(i.code, i.note) for i in repo.list(A_ID)] == [("600519", "新备注")]
+    assert repo.hidden(A_ID) == []
+
+
+def test_a_hidden_row_still_counts_against_the_per_user_cap(repo):
+    """上限数的是「这只票在不在我的清单里」，折起来不腾出配额：
+    所以 `count()` 不滤 `removed_at`，否则「折起 500 只再加 500 只」就成了绕闸门的后门。"""
+    repo.add(A_ID, "A", "600519")
+    repo.add(A_ID, "A", "601088")
+    repo.remove(A_ID, "A", "600519")
+    assert repo.count(A_ID) == 2
+    assert [i.code for i in repo.list(A_ID)] == ["601088"]
+

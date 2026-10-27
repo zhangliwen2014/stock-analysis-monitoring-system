@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>彻底删除这只票？</h1>
+  <table>
+    <tr><th>标的</th><td>{{ row.market }}/{{ row.code }} · {{ symbol_name }}</td></tr>
+    <tr><th>备注</th><td>{{ row.note or "—" }}</td></tr>
+  </table>
+  {# 这一屏只说三件事：删的是哪只、你给它写过什么、删掉之后没了什么 #}
+  <p>
+    <strong>彻底删除之后：它离开每日采集清单</strong>，本地已存的日线与批注、论点都不动。
+  </p>
+  <p class="muted">只想从看板上收起来就用「移除」——折起的都在页底那一栏里，随时能恢复。</p>
+  <form method="post" action="/watchlist/purge" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="market" value="{{ row.market }}">
+    <input type="hidden" name="code" value="{{ row.code }}">
+    <button type="submit">彻底删除</button>
+  </form>
+  <p><a href="/watchlist">先不删，回自选</a></p>
+</section>
+{% endblock %}

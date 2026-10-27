@@ -19,5 +19,30 @@
   <div id="quote-board" hx-get="/api/partials/quotes?manage=1" hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "partials/quotes.html" %}
   </div>
+  {% if hidden %}
+  {# 折起的那几行（D169）：写在一只票上的内容不因为一次误点就没，所以「移除」只收起来。 #}
+  {# 这一栏不进 10 秒那一刷：它没有报价，实时刷新只会显得它也在盯盘。 #}
+  <h2>已移除（{{ hidden | length }}）</h2>
+  <table>
+    <tr><th>市场</th><th>代码</th><th>备注</th><th></th></tr>
+    {% for row in hidden %}
+    <tr>
+      <td>{{ row.market }}</td>
+      {# 代码格不挂 /symbol 链接：这一栏是清账用的，不是浏览入口 #}
+      <td>{{ row.code }}</td>
+      <td>{{ row.note or "—" }}</td>
+      <td>
+        <form method="post" action="/watchlist/restore" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="market" value="{{ row.market }}">
+          <input type="hidden" name="code" value="{{ row.code }}">
+          <button type="submit" class="link">恢复</button>
+        </form>
+        <a href="/watchlist/{{ row.market }}/{{ row.code }}/purge">彻底删除</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
 </section>
 {% endblock %}
