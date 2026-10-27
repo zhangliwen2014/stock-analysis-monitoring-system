@@ -165,6 +165,37 @@ def test_quarters_split_across_a_year_boundary():
     assert out.frame["date"].to_list() == [date(2023, 12, 31), date(2024, 3, 31)]
 
 
+def test_nday_counts_bars_from_the_first_one_and_labels_each_group_by_its_last_day():
+    """N 日线没有日历收市日可言（D161 的例外）：从首根起每 n 根一组，名字是组内最后一个交易日。"""
+    days = WEEKDAYS[:12]
+    out = resample(daily(days), "nday", as_of=END, n=5)
+    assert out.frame["date"].to_list() == [days[4], days[9], days[11]]
+    assert out.frame["bars"].to_list() == [5, 5, 2]
+
+
+def test_a_short_nday_group_is_pending():
+    """最后一组只盖了两天 ⇒ 这根 5 日线没走完。不足就是不足，不冒充一根完整的。"""
+    out = resample(daily(WEEKDAYS[:12]), "nday", as_of=END, n=5)
+    assert out.frame["pending"].to_list() == [False, False, True]
+
+
+def test_nday_needs_a_bar_count():
+    with pytest.raises(ValidationError, match="n"):
+        resample(daily(WEEKDAYS[:12]), "nday", as_of=END)
+
+
+def test_nday_refuses_a_non_positive_bar_count():
+    for bad in (0, -3):
+        with pytest.raises(ValidationError, match="正整数"):
+            resample(daily(WEEKDAYS[:12]), "nday", as_of=END, n=bad)
+
+
+def test_a_calendar_period_refuses_a_bar_count():
+    """`period="month", n=5` 问的是「每五根算一个日历月」：没有这档东西，给数就是说不通。"""
+    with pytest.raises(ValidationError, match="只在"):
+        resample(daily(WEEKDAYS[:12]), "month", as_of=END, n=5)
+
+
 # --- 聚合口径 -----------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""周线、月线、季线与年线由日线现算（spec §8.2）。只聚合，不重新复权、不落库。
+"""周线、月线、季线、年线与 N 日线由日线现算（spec §8.2）。只聚合，不重新复权、不落库。
 
 三条口径：
 
@@ -6,10 +6,13 @@
    最后一根 K 线。** 周五休市那一周仍然叫那个周五——否则「本周」会随长假、停电漂移，
    而周线指标吃的正是「第 N 周」。实际最后一根另存 `last` 列，两者不一致就说明那一周
    提前收市（这正是 `tests/cli` 那条「锚点移动」的诚实写法在周期上的版本）。
+   **N 日线在这一条上是例外（D161）**：它没有日历收市日可言，那一根的名字就是组内最后
+   一个交易日——「5 日线」的边界本来就不挂在日历上。
 2. **没走完的那一周不冒充收盘周 K**（`pending` 列，判据是周期收市日在 `as_of` 之后）。
    少了这个标记，周线 MA5 里会混进一根只走了三天的 K 线，而它在图上与一根完整周 K
    完全同形。给标记而不是拒绝：读数的人常常就是要看本周走到哪了，但屏幕必须知道它
-   还没走完。
+   还没走完。N 日线同样要这个标记，但判据换成「**这一组不足 n 根**」——它没有收市日
+   可以跟时钟比。
 3. **入口与出口都是 `AdjustedSeries`**。因子已在日线乘好（`adjusted_series()` 是唯一的
    放行入口，D42），重采样只是把已定型的日 K 聚合成周/月 K。自己「先聚合再乘因子」
    的写法有两种，两种在一周中间除权时给出不同的数，而两种都在图上完全正常。
@@ -54,9 +57,10 @@ WEEK = "week"
 MONTH = "month"
 QUARTER = "quarter"
 YEAR = "year"
+NDAY = "nday"
 #: `resample()` 能处理的周期名名单；`services` 层组装 `PERIODS` 取值表时引用这一份，
 #: 不重新写字符串——两处各管一份会在有人只改一处的时候静默漂移
-RESAMPLE_PERIODS: tuple[str, ...] = (WEEK, MONTH, QUARTER, YEAR)
+RESAMPLE_PERIODS: tuple[str, ...] = (WEEK, MONTH, QUARTER, YEAR, NDAY)
 
 
 def _require_series(series: object) -> AdjustedSeries:
@@ -105,7 +109,9 @@ def _year_group(day: date) -> date:
 
 
 #: 每个周期的分组键，形状统一是「该周期第一天」：同周期的日线必须落进同一个键，
-#: 而键本身不参与输出（名字由 `_period_end` 从日历上算）
+#: 而键本身不参与输出（名字由 `_period_end` 从日历上算）。
+#: 这四个是**单日函数**（拿一根日线问它属于哪个周期）；`nday` 不在这张表里，
+#: 它的分组要看「这是第几根」，见 `_nday_labels`。
 _GROUP_OF = {
     WEEK: _week_group,
     MONTH: _month_start,
@@ -114,22 +120,41 @@ _GROUP_OF = {
 }
 
 
-def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
-    """把一条已过闸的日线序列聚成周线、月线、季线或年线，返回同一种类型（指标层可直接吃）。
+def _nday_labels(days: list[date], n: int) -> list[date]:
+    """每根所属那一组的标签（组内最后一个交易日）。"""
+    total = len(days)
+    return [days[min((index // n) * n + n - 1, total - 1)] for index in range(total)]
+
+
+def resample(series: object, period: str, *, as_of: date, n: int | None = None) -> AdjustedSeries:
+    """把一条已过闸的日线序列聚成周线、月线、季线、年线或 N 日线，返回同一种类型（指标层可直接吃）。
 
     输出的列与日线那套同名（`open/high/low/close`、`*_hfq`、`volume`、`amount`），
     外加五个周期才有的字段：
 
-    * `date` —— 周期的日历收市日（口径 1）
+    * `date` —— 周期的日历收市日（口径 1）；`nday` 是组内最后一个交易日
     * `first` / `last` —— 这一周期里第一根与最后一根日线
     * `bars` —— 聚进来几根日线（一根周 K 只有一根日线，通常是停牌或长假）
-    * `pending` —— 周期收市日还在 `as_of` 之后（口径 2）
+    * `pending` —— 这一周期还没走完（口径 2）：日历周期比收市日与 `as_of`，
+      `nday` 比组内根数与 `n`
+
+    `nday` 的分组**从送进来的这条序列的第一根起往后数**，每 `n` 根一组，所以边界会随
+    读取窗口的首根移动：换个窗口，每一组整体挪一位，同一天的 K 线可能落在不同的组里。
+    这一档本来就没有日历锚可依附，说清楚比假装它稳定好（D161）。
     """
     if period not in RESAMPLE_PERIODS:
         raise ValidationError(
             f"重采样周期只认 {'、'.join(f'`{p}`' for p in RESAMPLE_PERIODS)}，"
             f"收到的是 {period!r}："
             "写成 \"weekly\" 静默当成 week 等于让调用方以为自己要的东西被给了"
+        )
+    if period == NDAY:
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValidationError(f"`nday` 要一个正整数 `n`（每几根日线一根 K），收到的是 {n!r}")
+    elif n is not None:
+        raise ValidationError(
+            f"`n={n!r}` 只在 `period='nday'` 时说得通：`{period}` 的分组在日历上，"
+            "两个都给等于问「每几根算一个日历月」，那不是任何一档要的东西"
         )
     source = _require_series(series)
     frame = source.frame
@@ -138,7 +163,12 @@ def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
 
     ordered = frame.sort("date")
     days = ordered["date"].to_list()
-    group_of = _GROUP_OF[period]
+    if period == NDAY:
+        # 两种周期的键来源形状不同：日历那四个逐日可算，`nday` 要拿到整条序列数根数
+        groups = _nday_labels(days, n)
+    else:
+        group_of = _GROUP_OF[period]
+        groups = [group_of(day) for day in days]
     columns = list(ordered.columns)
     aggregates = []
     for column in columns:
@@ -147,7 +177,7 @@ def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
         how = _aggregation_for(column)
         aggregates.append(getattr(pl.col(column), how)().alias(column))
     grouped = (
-        ordered.with_columns(pl.Series("_group", [group_of(d) for d in days], dtype=pl.Date))
+        ordered.with_columns(pl.Series("_group", groups, dtype=pl.Date))
         .group_by("_group")
         .agg(
             [
@@ -159,10 +189,16 @@ def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
         )
         .sort("_group")
     )
-    ends = [_period_end(g, period) for g in grouped["_group"].to_list()]
+    if period == NDAY:
+        # 键本身就是标签日期（`_nday_labels` 已经取过组内最后一根），且「没走完」只看根数
+        ends = grouped["_group"].to_list()
+        pending = [count < n for count in grouped["bars"].to_list()]
+    else:
+        ends = [_period_end(g, period) for g in grouped["_group"].to_list()]
+        pending = [end > as_of for end in ends]
     out = grouped.with_columns(
         pl.Series("date", ends, dtype=pl.Date),
-        pl.Series("pending", [end > as_of for end in ends], dtype=pl.Boolean),
+        pl.Series("pending", pending, dtype=pl.Boolean),
     ).drop("_group")
     keep = ["date"] + [c for c in columns if c != "date"] + ["first", "last", "bars", "pending"]
     return AdjustedSeries(

@@ -98,7 +98,8 @@ def _period_end(day: date, period: str) -> date:
     if period == WEEK:
         return day + timedelta(days=4 - day.weekday())
     if period == QUARTER:
-        return _month_end(day.replace(month=(day.month // 3) * 3))
+        # 该季最后一个月：(month-1)//3*3+3 —— 直接 `month//3*3` 在 1/4/7/10 月会算出月份 0
+        return _month_end(day.replace(month=((day.month - 1) // 3) * 3 + 3))
     if period == YEAR:
         return date(day.year, 12, 31)
     return _month_end(day)
@@ -467,6 +468,10 @@ DEFAULT_WINDOW: dict[str, int] = {
     "month": 1825,
     "quarter": 2000,
     "year": 2000,
+    # N 日线要看的是「这些年」：一根 5 日 K 只盖五个工作日，180 天窗口只剩三十来根，
+    # 形态读不出来（同一档窗口在季/年那一行也是为这个才给到上限的）
+    "5d": 2000,
+    "10d": 2000,
 }
 #: 副图最多三格：再多就不是看图而是刷屏（D162）
 MAX_SUB_PANES = 3
