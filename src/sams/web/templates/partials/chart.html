@@ -14,18 +14,18 @@
       {% for name in mains %}
       {% set on = name in picked_main %}
       {% set next_main = ((picked_main | reject("equalto", name)) if on else (picked_main + [name])) | join(",") %}
-      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ next_main }}&sub={{ sub }}&ma={{ ma }}"
+      <a role="button" data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ next_main }}&sub={{ sub }}&ma={{ ma }}"
          hx-target=".chart-box" hx-swap="outerHTML" href="#"
-         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
+         aria-pressed="{{ 'true' if on else 'false' }}" {% if on %}class="on"{% endif %}>{{ labels[name] }}</a>
       {% endfor %}
     </span>
     <span class="chart-group" role="group" aria-label="副图指标">
       {% for name in subs %}
       {% set on = name in picked_sub %}
       {% set next_sub = ((picked_sub | reject("equalto", name)) if on else (picked_sub + [name])) | join(",") %}
-      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ main }}&sub={{ next_sub }}&ma={{ ma }}"
+      <a role="button" data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ main }}&sub={{ next_sub }}&ma={{ ma }}"
          hx-target=".chart-box" hx-swap="outerHTML" href="#"
-         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
+         aria-pressed="{{ 'true' if on else 'false' }}" {% if on %}class="on"{% endif %}>{{ labels[name] }}</a>
       {% endfor %}
     </span>
   </div>

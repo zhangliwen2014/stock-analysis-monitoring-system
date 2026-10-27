@@ -386,7 +386,7 @@ def chart_partial(
     """
     require_user(request)
     web = request.app.state.web
-    kind, _n = parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
+    parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
     ctx = web.contexts.current()
     market = canonical_market(market)
     code = canonical_code(market, code)
