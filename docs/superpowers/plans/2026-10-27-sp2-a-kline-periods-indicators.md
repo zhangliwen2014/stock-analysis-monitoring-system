@@ -627,6 +627,7 @@ def test_chart_partial_marks_the_current_period(logged):
     assert 'data-chart-url="/api/symbol/A/600519/bars?period=week' in week.text
     day = logged.client.get("/api/partials/chart?market=A&code=600519&period=day")
     assert day.text.count('aria-current="true"') == 1
+    assert day.text.count('aria-pressed="true"') == 2  # 默认那组：主图均线 + 副图成交量
 
 
 def test_chart_partial_lists_the_indicator_switches_from_the_server_names(logged):
@@ -741,7 +742,12 @@ CHART_INDICATOR_LABELS: dict[str, str] = {
 屏幕上能点的档位与接口肯收的档位因此永远是同一份。）
 
 `partials/chart.html`（选择器是 `<a hx-get>` 换整块；`aria-current` 给当前档；
-「在就摘掉、不在就加上」用 Jinja 自带的 `difference` 算，不新增只在模板外面用的 Python helper）：
+「在就摘掉、不在就加上」用 Jinja 的 `reject("equalto", name)` 算，不新增只在模板外面用的
+Python helper。**实现时订正**：Jinja **没有** `difference` 这个 filter（它是 Python 集合的方法），
+照抄会当场 `TemplateRuntimeError: No filter named 'difference'`。
+当前档与按下态是两件事：周期条用 `aria-current`（「现在在哪」），指标开关用
+`role="button" + aria-pressed`（「按下/松开」）——一排 `aria-current` 会被读屏念成
+「这里有七个『当前』，请选一个」，而它们其实是七个复选框。）：
 
 ```html
 {% set picked_main = main.split(",") %}
@@ -759,19 +765,19 @@ CHART_INDICATOR_LABELS: dict[str, str] = {
     <span class="chart-group" role="group" aria-label="主图指标">
       {% for name in mains %}
       {% set on = name in picked_main %}
-      {% set next_main = ((picked_main | difference([name])) if on else (picked_main + [name])) | join(",") %}
-      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ next_main }}&sub={{ sub }}&ma={{ ma }}"
+      {% set next_main = ((picked_main | reject("equalto", name)) if on else (picked_main + [name])) | join(",") %}
+      <a role="button" data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ next_main }}&sub={{ sub }}&ma={{ ma }}"
          hx-target=".chart-box" hx-swap="outerHTML" href="#"
-         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
+         aria-pressed="{{ 'true' if on else 'false' }}" {% if on %}class="on"{% endif %}>{{ labels[name] }}</a>
       {% endfor %}
     </span>
     <span class="chart-group" role="group" aria-label="副图指标">
       {% for name in subs %}
       {% set on = name in picked_sub %}
-      {% set next_sub = ((picked_sub | difference([name])) if on else (picked_sub + [name])) | join(",") %}
-      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ main }}&sub={{ next_sub }}&ma={{ ma }}"
+      {% set next_sub = ((picked_sub | reject("equalto", name)) if on else (picked_sub + [name])) | join(",") %}
+      <a role="button" data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ main }}&sub={{ next_sub }}&ma={{ ma }}"
          hx-target=".chart-box" hx-swap="outerHTML" href="#"
-         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
+         aria-pressed="{{ 'true' if on else 'false' }}" {% if on %}class="on"{% endif %}>{{ labels[name] }}</a>
       {% endfor %}
     </span>
   </div>
@@ -782,7 +788,7 @@ CHART_INDICATOR_LABELS: dict[str, str] = {
 </div>
 ```
 
-（`difference` 是 Jinja 自带 filter，结果按左边那份的顺序。副图超过三个不必在模板里拦：
+（`reject` 的结果按左边那份的顺序。副图超过三个不必在模板里拦：
 接口那侧 400，htmx 会把错误页换进来，不会静默。`labels` 缺一个名字会在模板上留一个空按钮，
 所以加指标时白名单与标签表同处改。）
 
@@ -799,7 +805,14 @@ CHART_INDICATOR_LABELS: dict[str, str] = {
 - [ ] **Step 4: 跑到绿**
 
 Run: `uv run pytest tests/web/test_symbol.py tests/web/test_dashboard.py -q`
-Expected: 全绿
+Expected: 全绿。
+
+（**实现时订正**：`test_symbol_page_shows_quote_bars_rules_and_theses` 里那句
+`"/api/symbol/A/600519/bars" in page.text` 在这一改之后必然失效——bars 的 URL 搬进了按需加载的
+局部，而 `TestClient` 不执行 JS。那一行改成断言首屏含 `/api/partials/chart?market=A&code=600519`，
+它钉的仍然是「这一屏把图挂上了」，只是从此经由局部去挂。
+`app.css` 这一次还顺带补了 `.link`：`e22243f` 与 `4b1b65e` 的「移除/恢复」按钮挂着这个 class
+而它没定义，在表格里渲染成一块灰砖、把行高撑坏。）
 
 - [ ] **Step 5: 提交**
 
