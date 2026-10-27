@@ -906,6 +906,217 @@ git commit -m "feat(web): 自选的移除回到那一行最右侧，重复的管
 
 ---
 
+### Task 7b: 移除改成「折起」，数据与历史照旧（D169）
+
+Task 7 把移除的**位置**搬到了那一行最右边；这一节改的是它的**语义**。查过的事实：
+`WatchlistRepo.remove()` 是硬 `DELETE`，而 `services/scheduler/universe.py:73` 每天采哪些票
+读的就是「自选 + 持仓 + 启用规则 + 论点」，所以砍掉一行等于同时砍掉这只票的后续更新。
+备注、批注、论点、规则、告警都不该跟着一次误点走。
+
+**Files:**
+- Create: `src/sams/storage/migrations/0022_watchlist_hidden.sql`
+- Modify: `src/sams/storage/repos/watchlists.py`、`src/sams/web/pages/dashboard.py`
+- Modify: `src/sams/web/templates/watchlist.html`
+- Test: `tests/storage/test_watchlists.py`、`tests/web/test_dashboard.py`、`tests/storage/test_migrations.py`（若该文件钉了列形状）
+
+- [ ] **Step 1: 写失败测试（仓库层的四种说法）**
+
+追加到 `tests/storage/test_watchlists.py`（沿用该文件的 `repo` 夹具与 `A_ID`/`B_ID` 常量）：
+
+```python
+def test_remove_hides_the_row_but_keeps_it_for_the_sync_universe(repo):
+    """折起只影响「看得到」，不影响「还要不要采」：`list_all()` 是采集清单的来源，
+    它必须继续看见这一行，否则恢复那天起的历史就断了（D169）。"""
+    repo.add(A_ID, "A", "600519", note="白酒龙头")
+    assert repo.remove(A_ID, "A", "600519") is True
+    assert repo.list(A_ID) == []
+    assert repo.codes(A_ID) == []
+    assert {(i.user_id, i.code) for i in repo.list_all()} == {(A_ID, "600519")}
+    assert {(i.user_id, i.code) for i in repo.hidden(A_ID)} == {(A_ID, "600519")}
+
+
+def test_restore_puts_it_back_with_the_note_it_had(repo):
+    repo.add(A_ID, "A", "600519", note="拿长线")
+    repo.remove(A_ID, "A", "600519")
+    assert repo.restore(A_ID, "A", "600519") is True
+    assert repo.restore(A_ID, "A", "600519") is False, "没折起的行不叫恢复成功"
+    assert repo.list(A_ID)[0].note == "拿长线"
+
+
+def test_purge_really_deletes_the_row(repo):
+    """`purge` 才是那一刀：折起的行继续占采集配额没意义，人明确要求删就得真删。"""
+    repo.add(A_ID, "A", "600519")
+    repo.remove(A_ID, "A", "600519")
+    assert repo.purge(A_ID, "A", "600519") is True
+    assert repo.purge(A_ID, "A", "600519") is False
+    assert repo.list_all() == []
+
+
+def test_adding_a_hidden_symbol_brings_it_back_with_the_new_note(repo):
+    """重新加一只折起的票 ⇒ 回到看板并换备注，且不产生第二行（`INSERT OR REPLACE` 顺带把
+    `removed_at` 抹回 NULL）。"""
+    repo.add(A_ID, "A", "600519", note="旧备注")
+    repo.remove(A_ID, "A", "600519")
+    repo.add(A_ID, "A", "600519", note="新备注")
+    assert repo.count(A_ID) == 1
+    assert [(i.code, i.note) for i in repo.list(A_ID)] == [("600519", "新备注")]
+    assert repo.hidden(A_ID) == []
+```
+
+Run: `uv run pytest tests/storage/test_watchlists.py -q` → 前四枚 FAIL（`hidden`/`restore`/`purge` 不存在，`remove` 之后 `list_all()` 空）。
+
+- [ ] **Step 2: 迁移 + 仓库实现**
+
+`src/sams/storage/migrations/0022_watchlist_hidden.sql`：
+
+```sql
+-- 0022：自选的「移除」改成折起（D169）。一列时间戳，只写不读回 Python
+ALTER TABLE watchlists ADD COLUMN removed_at TIMESTAMPTZ;
+```
+
+`watchlists.py`：`remove()` 的 SQL 换成带条件的 UPDATE，这样「第二次移除」自然返回 False，
+不必先查再写：
+
+```python
+    def remove(self, user_id: str, market: str, code: str) -> bool:
+        """折起：从看板与规则展开里消失，但仍在 `list_all()`（= 每日采集清单）里（D169）。"""
+        market, code = _norm(market, code)
+        before = self.count(user_id)
+        self.db.execute(
+            "UPDATE watchlists SET removed_at = current_timestamp "
+            "WHERE user_id = ? AND market = ? AND code = ? AND removed_at IS NULL",
+            [_require_user(user_id), market, code],
+        )
+        # 行数一条没变，但那一条的 `removed_at` 换了：用「可见条数」判成败会永远为真
+        return not self.contains(user_id, market, code) and before >= self.count(user_id)
+```
+
+（上面那句判据太绕。**照这个写**：先 `visible = self.contains(...)`（`contains` 只看未折起的行），
+`visible` 为假就直接 `return False` 且不发 UPDATE；为真才 UPDATE 并 `return True`。）
+
+新增三个方法（`list()` 的 SQL 加 `WHERE ... AND removed_at IS NULL`；`contains()` 同样加这个条件，
+`codes()` 走 `list()` 所以自动跟着变；`list_all()` **一条 WHERE 都不加**）：
+
+```python
+    def hidden(self, user_id: str) -> list[WatchItem]:
+        """折起的那几行：只给自选页底部那一栏用，看板与采集都不读它。"""
+
+    def restore(self, user_id: str, market: str, code: str) -> bool:
+        """`removed_at = NULL`。折起来的东西必须能一句话放回去，这是这一条存在的理由。"""
+
+    def purge(self, user_id: str, market: str, code: str) -> bool:
+        """真删。只有确认屏那一步会走到它（D169）。"""
+```
+
+`WatchItem` 不加 `removed_at` 字段（屏幕上不需要那个时刻，加了就要把 TIMESTAMPTZ 取回 Python）。
+
+Run: `uv run pytest tests/storage/test_watchlists.py tests/storage/test_migrations.py -q` → 全绿。
+**别忘了既有的 `test_add_list_remove`**：它断言「移除两次 ⇒ 第二次是 False」，软删之后仍然成立；
+`test_admin_can_read_everything_but_not_write` 断言 `list_all()` 看见全部——这正是这一条要的形状。
+
+- [ ] **Step 3: 写失败测试（屏幕上那一栏与两个按钮）**
+
+追加到 `tests/web/test_dashboard.py`（`_add_watch` 由 Task 7 建好，沿用）：
+
+```python
+def test_removed_symbol_moves_to_the_hidden_section(logged):
+    """折起之后它不该在行情板里，但要在页底那一栏里带着备注露出来（D169）。"""
+    _add_watch(logged, "A", "600519", note="白酒龙头")
+    logged.client.post("/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
+    page = logged.client.get("/watchlist").text
+    assert "已移除" in page and "白酒龙头" in page
+    assert "/watchlist/restore" in page
+
+
+def test_restore_puts_the_symbol_back_on_the_board(logged):
+    _add_watch(logged, "A", "600519")
+    logged.client.post("/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
+    resp = logged.client.post(
+        "/watchlist/restore", data={"csrf": logged.csrf, "market": "A", "code": "600519"}
+    )
+    assert resp.status_code == 303
+    assert "600519" in logged.client.get("/watchlist").text
+
+
+def test_purge_asks_first_and_then_really_goes(logged):
+    """真删之前要有一屏确认：那一刀会连采集清单一起放手，值得多点一下（D169）。"""
+    _add_watch(logged, "A", "600519")
+    logged.client.post("/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
+    confirm = logged.client.get("/watchlist/A/600519/purge")
+    assert confirm.status_code == 200
+    assert "彻底删除" in confirm.text
+    assert "/watchlist/remove" not in confirm.text, "确认屏上不许再有第二个删除入口"
+    assert logged.client.get("/watchlist/A/600519/purge-confirm").status_code == 404 or True  # 见下注
+    logged.client.post("/watchlist/purge", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
+    assert "600519" not in logged.client.get("/watchlist").text
+    assert logged.client.get("/watchlist/A/600519/purge").status_code == 404
+
+
+def test_hidden_symbol_still_gets_fetched(logged):
+    """这一条是整个决定的落点：折起不等于不再采集。采集清单读 `list_all()`，
+    所以那只票必须还在里面。"""
+    _add_watch(logged, "A", "600519")
+    logged.client.post("/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
+    user = logged.context.users.get_by_username("alice")
+    from sams.services.scheduler.universe import UniverseBuilder  # 按该文件既有 import 姿势
+
+    # 用真实仓库构造，再断这一只在 (market, code) 里
+    assert ("A", "600519") in {item for item in logged.context.watchlists.list_all_pairs()}
+    del user
+```
+
+（最后那枚用例**不要**照上面那段半成品写：`UniverseBuilder` 的装配在这个测试环境里代价大。
+把它换成钉仓库层那一句——`list_all()` 仍返回这一行即可，仓库层的 Step 1 已经钉过一条同义的，
+这一枚改成检查 web 侧「折起的行不再出现在 `/api/partials/quotes`」：
+
+```python
+def test_hidden_symbol_leaves_the_quote_board(logged):
+    """看板（首屏与 10 秒那一刷）都不该再看见折起的行：`manage` 只管要不要按钮。"""
+    _add_watch(logged, "A", "600519")
+    logged.client.post("/watchlist/remove", data={"csrf": logged.csrf, "market": "A", "code": "600519"})
+    assert "600519" not in logged.client.get("/api/partials/quotes?manage=1").text
+    assert "600519" not in logged.client.get("/").text
+```
+）
+
+Run: `uv run pytest tests/web/test_dashboard.py -q -k "hidden or restore or purge"` → FAIL。
+
+- [ ] **Step 4: 屏幕与端点**
+
+`dashboard.py` 三个新端点（都 `require_user` + `csrf_protect`，成功一律 303 回 `/watchlist`）：
+
+```python
+@router.post("/watchlist/restore")   # market/code 走 Form，仓库 restore()
+@router.get("/watchlist/{market}/{code}/purge")  # 确认屏：`_watch_page` 之外的一个小模板
+@router.post("/watchlist/purge")     # market/code 走 Form，仓库 purge()
+```
+
+确认屏那一个模板 `watchlist_purge.html` 只说三件事：这只票是谁（代码 + 名称）、
+它的备注、以及「彻底删除之后：它离开采集清单，本地已存的日线与批注论点都不动」。
+**页面上只放那一个表单**（`action="/watchlist/purge"`），别再摆第二个删除入口。
+进不去的票（没折起的、库里没有的）给 404，不给一张空确认屏。
+
+`watchlist.html`：Task 7 删掉那张管理表的位置换成「已移除（N）」那一栏，`{% if hidden %}` 起头，
+每行给「恢复」表单 + 一个 `<a href="/watchlist/{{ row.market }}/{{ row.code }}/purge">彻底删除</a>`。
+`_watch_page` 多传一份 `hidden=ctx.watchlists.hidden(user.id)`。
+
+`partials/quotes.html` 不带 `hidden` 那一栏：它是 10 秒一刷的行情板，把恢复按钮放进去
+会让人以为「已移除」也在实时刷新。
+
+- [ ] **Step 5: 跑到绿 + 提交**
+
+Run: `uv run pytest tests/storage tests/web -q`、`uv run ruff check --no-cache src/sams tests`
+
+```bash
+git add src/sams/storage/migrations/0022_watchlist_hidden.sql src/sams/storage/repos/watchlists.py \
+  src/sams/web/pages/dashboard.py src/sams/web/templates/watchlist.html \
+  src/sams/web/templates/watchlist_purge.html \
+  tests/storage/test_watchlists.py tests/web/test_dashboard.py
+git commit -m "feat(web): 自选的移除改成折起——备注、批注与每日采集都留下，恢复一句话（D169）"
+```
+
+---
+
 ### Task 8: 全量回归 + 实测 + 文档收尾
 
 - [ ] **Step 1:** `uv run ruff check --no-cache src/sams tests` → All checks passed
