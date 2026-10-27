@@ -52,6 +52,44 @@ def _seed_symbol(ctx, market="A", code="600519"):
     )
 
 
+def _add_watch(logged, market: str, code: str, note: str | None = None) -> None:
+    """加一只票进自选：走真实端点，不直接写仓库——补数登记那条 Side effect 也在路上。"""
+    data = {"csrf": logged.csrf, "market": market, "code": code}
+    if note is not None:
+        data["note"] = note
+    logged.client.post("/watchlist/add", data=data)
+
+
+def test_watchlist_page_carries_the_remove_button_on_the_row_itself(logged):
+    """移除在那一行最右侧，不再另开一张表（D166）：
+    同一只票在同一屏上出现两遍的日子到此为止。"""
+    _add_watch(logged, "A", "600519")
+    page = logged.client.get("/watchlist")
+    assert page.text.count("/watchlist/remove") == 1
+    assert "600519" in page.text
+
+
+def test_watchlist_remove_survives_the_ten_second_refresh(logged):
+    """局部刷新会把 `#quote-board` 整块换掉：移除表单必须活过这一次替换，
+    所以 `manage` 是那个 GET 的参数，不是只写在页面里的一段静态表格。"""
+    _add_watch(logged, "A", "600519")
+    partial = logged.client.get("/api/partials/quotes?manage=1")
+    assert "/watchlist/remove" in partial.text
+
+
+def test_overview_board_has_no_remove_buttons(logged):
+    """看板那一屏不带 `manage`：看板上摆一排删除按钮是要人误点的（D166）。"""
+    _add_watch(logged, "A", "600519")
+    assert "/watchlist/remove" not in logged.client.get("/api/partials/quotes").text
+    assert "/watchlist/remove" not in logged.client.get("/").text
+
+
+def test_watchlist_page_shows_the_note_inline(logged):
+    """备注并进名称那一列：删掉那张管理表不能顺手把「为什么加这只票」删了。"""
+    _add_watch(logged, "A", "600519", note="拿长线")
+    assert "拿长线" in logged.client.get("/watchlist").text
+
+
 def test_overview_requires_login(web_app):
     response = web_app.client.get("/", follow_redirects=False)
     assert response.status_code == 303
@@ -135,8 +173,9 @@ def test_symbol_name_comes_from_the_master(logged):
 def _quote_row(page, code: str, table_marker: str | None = None) -> str:
     """页面某张表里某个代码的那一行（`<tr>…</tr>` 原样）。
 
-    自选页有两张表都含代码，用 `table_marker`（如「/watchlist/remove」）挑出要的那张；
-    单位/链接/名称三件事都要按「交易员看到的那一行」来钉。
+    自选页里含代码的表不止一张（行情板与页底「已移除」那一栏），用 `table_marker`
+    （如「/watchlist/remove」）挑出要的那张；单位/链接/名称三件事都要按
+    「交易员看到的那一行」来钉。
     """
     rows = re.findall(r"<tr>(.*?)</tr>", page.text, re.S)
     if table_marker is not None:
@@ -166,7 +205,7 @@ def test_watchlist_row_without_master_symbol_links_anyway(logged):
 
 
 def test_watchlist_management_table_links_code(logged):
-    """自选页管理那张表（带「移除」按钮的）也挂链接：同一个代码，两个入口都得能进个股页。"""
+    """那一行最右侧同时是移除入口：代码链接和「移除」在同一行里（D166 之后不再有第二张表）。"""
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "US", "AAPL")
     page = logged.client.get("/watchlist")

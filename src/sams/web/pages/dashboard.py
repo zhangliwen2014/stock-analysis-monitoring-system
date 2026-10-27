@@ -165,13 +165,18 @@ def overview(request: Request):
 
 
 @router.get("/api/partials/quotes")
-def quotes_partial(request: Request):
+def quotes_partial(request: Request, manage: int = 0):
+    """行情板 fragment：`manage` 只决定那一行最右侧带不带移除表单（D166）——
+    看板不带、自选页带，同一段折法在两处复用，10 秒那一刷之后按钮还在。"""
     user = require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
     now = web.core.clock.now_utc()
     return web.render(
-        request, "partials/quotes.html", rows=_quote_rows(ctx, web.core, user.id, now)
+        request,
+        "partials/quotes.html",
+        rows=_quote_rows(ctx, web.core, user.id, now),
+        manage=bool(manage),
     )
 
 
@@ -285,6 +290,9 @@ def _watch_page(request: Request, *, error: str | None = None, status: int = 200
         title="自选",
         markets=sorted(ctx.settings.markets),
         rows=_quote_rows(ctx, web.core, user.id, now),
+        # 首屏那一眼就得有移除按钮：`{% include %}` 与页面共享上下文，
+        # 只在 partial 上收 GET 参数的话按钮要等 10 秒那一刷才出现
+        manage=True,
         error=error,
     )
 

@@ -16,28 +16,8 @@
     <button type="submit">加入</button>
   </form>
   <div id="wl-candidates"></div>
-  <div id="quote-board" hx-get="/api/partials/quotes" hx-trigger="every 10s" hx-swap="innerHTML">
+  <div id="quote-board" hx-get="/api/partials/quotes?manage=1" hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "partials/quotes.html" %}
   </div>
-  {% if rows %}
-  <table>
-    <tr><th>市场</th><th>代码</th><th>备注</th><th></th></tr>
-    {% for row in rows %}
-    <tr>
-      <td>{{ row.market }}</td>
-      <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
-      <td>{{ row.note }}</td>
-      <td>
-        <form method="post" action="/watchlist/remove" class="inline-form">
-          <input type="hidden" name="csrf" value="{{ csrf }}">
-          <input type="hidden" name="market" value="{{ row.market }}">
-          <input type="hidden" name="code" value="{{ row.code }}">
-          <button type="submit">移除</button>
-        </form>
-      </td>
-    </tr>
-    {% endfor %}
-  </table>
-  {% endif %}
 </section>
 {% endblock %}

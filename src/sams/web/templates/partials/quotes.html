@@ -3,17 +3,30 @@
   <tr>
     <th>市场</th><th>代码</th><th>名称</th><th class="num">现价</th>
     <th class="num">涨跌</th><th>状态</th><th>报价时刻</th>
+    {# 管理那一格只在自选页出现（`manage`）：看板上摆一排删除按钮是要人误点的（D166） #}
+    {% if manage %}<th></th>{% endif %}
   </tr>
   {% for row in rows %}
   <tr>
     <td>{{ row.market }}</td>
     {# 链接统一（D146）：个股页对代码表内的票兜底建行，「主档未同步」的死文字从此绝迹 #}
     <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
-    <td>{{ row.name }}</td>
+    {# 备注并进名称那一列：这张板就是「为什么加这只票」唯一露脸的地方 #}
+    <td>{{ row.name }}{% if manage and row.note %} <span class="muted">{{ row.note }}</span>{% endif %}</td>
     <td class="num">{{ money(row.price, row.unit) }}</td>
     <td class="num {{ row.pct_class }}">{{ pct(row.pct) }}</td>
     <td>{{ row.state }}</td>
     <td class="muted">{{ row.quote_at }}</td>
+    {% if manage %}
+    <td class="num">
+      <form method="post" action="/watchlist/remove" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="market" value="{{ row.market }}">
+        <input type="hidden" name="code" value="{{ row.code }}">
+        <button type="submit" class="link">移除</button>
+      </form>
+    </td>
+    {% endif %}
   </tr>
   {% endfor %}
 </table>
