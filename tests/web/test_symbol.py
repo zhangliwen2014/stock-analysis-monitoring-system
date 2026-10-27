@@ -376,7 +376,7 @@ def test_bars_api_plots_the_close_on_the_basis_the_mas_use(logged):
     _seed_dividend(logged)
     payload = logged.client.get("/api/symbol/A/600519/bars?days=120").json()
     assert len(payload["dates"]) == len(payload["close_hfq"])
-    assert payload["close_hfq"][-1] == pytest.approx(payload["ma20"][-1], rel=0.01)
+    assert payload["close_hfq"][-1] == pytest.approx(payload["main"]["ma"]["ma20"][-1], rel=0.01)
 
 
 def test_bars_api_without_bars_returns_a_note_not_a_500(logged):
@@ -386,3 +386,64 @@ def test_bars_api_without_bars_returns_a_note_not_a_500(logged):
     payload = logged.client.get("/api/symbol/A/600036/bars?days=120").json()
     assert payload["dates"] == []
     assert payload["note"]
+
+
+def test_bars_api_gives_the_four_candle_prices_on_the_adjusted_basis(logged):
+    """蜡烛要四档，而四档都得在与均线同一基上（D159）。
+    复权之后 `high ≥ max(open, close)`、`low ≤ min(open, close)` 仍要成立，
+    否则画出来的是一根实体穿过影线的假蜡烛。"""
+    _seed(logged)
+    payload = logged.client.get("/api/symbol/A/600519/bars?days=120").json()
+    for column in ("open", "high", "low", "close"):
+        assert payload[column], f"{column} 该有数"
+        assert len(payload[column]) == len(payload["dates"])
+    last = -1
+    assert payload["high"][last] >= max(payload["open"][last], payload["close"][last])
+    assert payload["low"][last] <= min(payload["open"][last], payload["close"][last])
+    assert payload["close"] == payload["close_hfq"], "图上那一档收价就是后复权那一档"
+
+
+def test_bars_api_5d_resamples_from_the_daily_bars(logged):
+    """5 日线吃的是库里的日线，不新增数据源（D160）：三根日线 ⇒ 一根没走完的 5 日 K。
+
+    这里点 `5d` 而不是 `week`：`_seed` 写的是「今天 -6/-5/-4 天」这连续三日，周五和周六
+    那两天它会跨进两个自然周，`period=week` 的断言就会跟着跑测试的那天星期几漂移。
+    N 日线按根数分组，与星期几无关，因此能钉死。
+    """
+    _seed(logged, code="600520")
+    payload = logged.client.get("/api/symbol/A/600520/bars?days=120&period=5d").json()
+    assert payload["bars"] == [3]
+    assert payload["pending"], "只盖了三根的 5 日 K 不许冒充走完的那一根"
+
+
+def test_bars_api_period_week_groups_the_same_daily_bars(logged):
+    """周线那一档也要证明它只是聚合：几根 K 线加起来必须正好是三根日线。"""
+    _seed(logged, code="600521")
+    payload = logged.client.get("/api/symbol/A/600521/bars?days=120&period=week").json()
+    assert sum(payload["bars"]) == 3
+
+
+def test_bars_api_rejects_an_unknown_period_with_400(logged):
+    _seed(logged)
+    assert logged.client.get("/api/symbol/A/600519/bars?period=weekly").status_code == 400
+
+
+def test_bars_api_rejects_an_unknown_indicator_with_400_and_names_the_options(logged):
+    """拼错一个指标名不该让人去看 500 的空白页：分析层那句「可选的是 …」要上屏（D162）。"""
+    _seed(logged)
+    resp = logged.client.get("/api/symbol/A/600519/bars?sub=macdd")
+    assert resp.status_code == 400
+    assert "可选的是" in resp.text
+
+
+def test_bars_api_refuses_more_than_three_sub_panes(logged):
+    """副图最多三格（D162）：第四格不是看图，是刷屏。"""
+    _seed(logged)
+    assert logged.client.get("/api/symbol/A/600519/bars?sub=macd,kdj,rsi,atr").status_code == 400
+
+
+def test_bars_api_main_group_carries_every_window_the_ma_family_gives(logged):
+    """均线族出几列由 `ma=` 说了算，前端不自己记名单（D162）。"""
+    _seed(logged)
+    payload = logged.client.get("/api/symbol/A/600519/bars?ma=5,20").json()
+    assert sorted(payload["main"]["ma"]) == ["ma20", "ma5"]

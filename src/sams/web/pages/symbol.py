@@ -15,11 +15,12 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import polars as pl
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from sams.core.codes import canonical_code, canonical_market, looks_like_index_code
-from sams.core.errors import NotAdjustable
+from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.quotes import NO_DATA, quote_state
 from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
@@ -163,32 +164,196 @@ def symbol_page(request: Request, market: str, code: str):
     )
 
 
+#: 主图与副图各自能挂哪些指标。这份名单同时是屏幕上那排开关的来源，
+#: 加一种指标只改这里（前端读局部给出的名字，不自己记一份）
+MAIN_INDICATORS: tuple[str, ...] = ("ma", "boll", "ema")
+SUB_INDICATORS: tuple[str, ...] = (
+    "vol", "macd", "kdj", "rsi", "atr", "wr", "dmi", "cci", "obv",
+)
+#: 每档周期的默认窗口（日历日）：周线月线要看的是「这几年」，日线看的是「这半年」（D160）
+DEFAULT_WINDOW: dict[str, int] = {
+    "day": 180,
+    "week": 730,
+    "month": 1825,
+    "quarter": 2000,
+    "year": 2000,
+    # N 日线要看的是「这些年」：一根 5 日 K 只盖五个工作日，180 天窗口只剩三十来根，
+    # 形态读不出来（同一档窗口在季/年那一行也是为这个才给到上限的）
+    "5d": 2000,
+    "10d": 2000,
+}
+#: 副图最多三格：再多就不是看图而是刷屏（D162）
+MAX_SUB_PANES = 3
+#: `vol` 不是 `INDICATORS` 里的名字：那一格画的是裸量柱（量不复权，`indicators` 模块第 3 条）
+_VOLUME_COLUMN = "volume"
+#: 族名 → 列名前缀。`dmi` 的三列是 `pdi/mdi/adx`，前缀不等于族名，所以只能列全名字
+_INDICATOR_PREFIX = {
+    "ma": "ma", "boll": "boll_", "ema": "ema", "macd": "macd", "kdj": "kdj_",
+    "rsi": "rsi", "atr": "atr", "wr": "wr", "dmi": "", "cci": "cci", "obv": "obv",
+}
+#: `dmi` 那一族的前缀是空的，只能把三列名字列全（见上）
+_EXPLICIT_COLUMNS = {"dmi": ("pdi", "mdi", "adx")}
+
+
+def _split_names(
+    raw: str, allowed: tuple[str, ...], *, limit: int | None = None
+) -> tuple[str, ...]:
+    """把 `ma,boll` 这样的串切成白名单里的名字：重复的合并，不在名单里的当场拒。
+
+    拒的那句要报出可选的是哪些：屏幕上打错一个字母的人不该只看到「400」。
+    """
+    given = [item.strip().lower() for item in (raw or "").split(",")]
+    picked = tuple(dict.fromkeys(item for item in given if item))
+    unknown = [item for item in picked if item not in allowed]
+    if unknown:
+        raise ValidationError(f"不认识的指标 {', '.join(unknown)}：可选的是 {', '.join(allowed)}")
+    if limit is not None and len(picked) > limit:
+        raise ValidationError(f"副图最多同时 {limit} 个，收到的是 {len(picked)} 个")
+    return picked
+
+
+def _windows(raw: str) -> tuple[int, ...]:
+    """`5,10,20,60` → `(5, 10, 20, 60)`；留空 = 用指标自己的那一组。
+
+    句子里带「最多六条」与「1..500」是因为这三类填错（非数字、0 或负数、堆十几条）
+    在同一个人手里会反复出现：`int()` 抛的 `ValueError` 不折成 `ValidationError`
+    就越过全局处理器，换回一屏 500。
+    """
+    message = "均线窗口要 1..500 之间的正整数，最多六条"
+    picked: list[int] = []
+    for item in (raw or "").split(","):
+        text = item.strip()
+        if not text:
+            continue
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValidationError(message) from exc
+        if not 1 <= value <= 500:
+            raise ValidationError(message)
+        picked.append(value)
+    deduped = tuple(dict.fromkeys(picked))
+    if len(deduped) > 6:
+        raise ValidationError(message)
+    return deduped
+
+
+def _columns_of(table: pl.DataFrame, name: str) -> list[str]:
+    if name in _EXPLICIT_COLUMNS:
+        return [column for column in _EXPLICIT_COLUMNS[name] if column in table.columns]
+    prefix = _INDICATOR_PREFIX[name]
+    # 前缀短的族会吞掉前缀长的邻居（`ma` 把 `macd*` 也认下来，而它俩不在同一格）：
+    # 长的先排除，一族内的列才只属于这一族
+    longer = [other for other in _INDICATOR_PREFIX.values() if len(other) > len(prefix)]
+    return [
+        column
+        for column in table.columns
+        if column.startswith(prefix) and not any(column.startswith(other) for other in longer)
+    ]
+
+
+def _group(table: pl.DataFrame, name: str) -> dict[str, list]:
+    """某一族在表上的那几列：`{列名: 值列表}`，没有对应列就给空字典。
+
+    空字典而不是 KeyError，也不是 `None` 数组：那一格没数与「有数但都是空」在屏幕上
+    是两件事，前者该让前端把格子收起来。
+    """
+    if name == "vol":
+        if _VOLUME_COLUMN not in table.columns:
+            return {}
+        return {_VOLUME_COLUMN: table[_VOLUME_COLUMN].to_list()}
+    return {column: table[column].to_list() for column in _columns_of(table, name)}
+
+
+def _column(frame: pl.DataFrame, name: str) -> list:
+    """序列上的一档：源没给那一列（比如某档日线没有 high）就给空数组，而不是 500。"""
+    return frame[name].to_list() if name in frame.columns else []
+
+
 @router.get("/api/symbol/{market}/{code}/bars")
-def bars_api(request: Request, market: str, code: str, days: int = 120):
+def bars_api(
+    request: Request,
+    market: str,
+    code: str,
+    days: int = 0,
+    period: str = "day",
+    main: str = "ma",
+    sub: str = "vol",
+    ma: str = "",
+):
     user = require_user(request)
     web = request.app.state.web
     ctx, market, code, _symbol = _require_symbol(request, user, market, code)
+    # 三道白名单检查在读库之前：拼错的指标名与乱填的窗口不该让三道闸全跑完才出声。
+    # 抛 `ValidationError` 就够——全局处理器把它渲染成 400，端点自己不再拼状态码
+    mains = _split_names(main, MAIN_INDICATORS)
+    subs = _split_names(sub, SUB_INDICATORS, limit=MAX_SUB_PANES)
+    ma_windows = _windows(ma)
     end = web.core.clock.now_utc().date()
-    start = end - timedelta(days=max(1, min(days, 2000)))
+    window = days or DEFAULT_WINDOW.get(period, DEFAULT_WINDOW["day"])
+    start = end - timedelta(days=max(1, min(window, 2000)))
+    # `vol` 不在 `INDICATORS` 里（那一格画的是裸量柱），而 `asked` 为空时仍给 ("ma",)：
+    # `metrics(series, ())` 会产出一张只有 `date` 的表，那条空 hstack 路径不该走进来
+    asked = tuple(name for name in (*mains, *(name for name in subs if name != "vol")))
     try:
-        read = ctx.analysis.series(market, code, start=start, end=end, indicators=("ma",))
+        read = ctx.analysis.series(
+            market,
+            code,
+            start=start,
+            end=end,
+            period=period,
+            indicators=asked or ("ma",),
+            # `ma=` 只改主图那一族：其余族走函数自己的默认窗口
+            windows={"ma": ma_windows} if "ma" in mains and ma_windows else None,
+        )
     except NotAdjustable as exc:
         # 序列读不出来（没日线、覆盖没确认过）不是接口故障：图空着，把那句话说给前端。
         # 只认这一种：`DatabaseLocked` 是库被调度线程握着，那句话要留给 503 去说——
         # 把它写成「没采集，去跑 sams sync daily」会让人反复重跑一条本来好好的命令
+        # 空态也给**与新形状同形**的键：前端拿到缺键的 JSON 会在画图之前先崩，
+        # 而那正是这一条用例要防的 500
         return JSONResponse(
-            {"dates": [], "close_hfq": [], "ma20": [], "ma60": [], "note": str(exc)}
+            {
+                "dates": [],
+                "period": period,
+                "open": [],
+                "high": [],
+                "low": [],
+                "close": [],
+                "close_hfq": [],
+                "volume": [],
+                "main": {},
+                "sub": {},
+                "bars": [],
+                "pending": [],
+                "anchored_on": "",
+                "warmup_floor": None,
+                "note": str(exc),
+            }
         )
     table = read.table
+    frame = read.series.frame.filter(pl.col("date") >= start)
     return JSONResponse(
         {
             "dates": [str(value) for value in table["date"].to_list()],
-            # 图上那根收盘价必须与均线同基：`metrics()` 里 MA 全部算在 `close_hfq` 上
-            # （indicators.ma → _prices(series, "close_hfq")），给裸 close 就等于把
-            # 均线画到价格线上方，那一段里每一次分红都算成「还没收复」
-            "close_hfq": table["close_hfq"].to_list(),
-            "ma20": table["ma20"].to_list(),
-            "ma60": table["ma60"].to_list(),
+            "period": read.period,
+            # 蜡烛四档取 `frame` 的 `*_hfq`：`read.table` 那张表只给终端打印（`keep` 白名单），
+            # 没有开/高/低三档。图上那一档与均线同基（`metrics()` 里 MA 全算在 `close_hfq` 上），
+            # 给裸价就等于把均线画到价格线上方——那一段里每一次分红都算成「还没收复」
+            "open": _column(frame, "open_hfq"),
+            "high": _column(frame, "high_hfq"),
+            "low": _column(frame, "low_hfq"),
+            "close": _column(frame, "close_hfq"),
+            "close_hfq": _column(frame, "close_hfq"),
+            "volume": _column(frame, _VOLUME_COLUMN),
+            "main": {name: _group(table, name) for name in mains},
+            "sub": {name: _group(table, name) for name in subs},
+            # `bars`/`pending` 只有重采样出来的周期才有：一根周 K 只盖了一天还是没走完，
+            # 是它在屏幕上唯一能自证的地方
+            "bars": table["bars"].to_list() if "bars" in table.columns else [],
+            "pending": [str(day) for day in read.pending_periods],
+            "anchored_on": str(read.anchored_on),
+            "warmup_floor": str(read.warmup_floor) if read.warmup_floor else None,
             "note": None,
         }
     )
