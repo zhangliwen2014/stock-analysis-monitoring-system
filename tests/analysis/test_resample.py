@@ -180,7 +180,7 @@ def test_a_short_nday_group_is_pending():
 
 
 def test_nday_needs_a_bar_count():
-    """断言认「正整数」那句话，不认 `n`：`n` 在陌生的周期名报错里也出现，松到能命中别人的话就不算数。"""
+    """断言认「正整数」那句话，不认 `n`：后者在陌生周期名的报错里也出现，松到能命中就不算数。"""
     with pytest.raises(ValidationError, match="正整数"):
         resample(daily(WEEKDAYS[:12]), "nday", as_of=END)
 
