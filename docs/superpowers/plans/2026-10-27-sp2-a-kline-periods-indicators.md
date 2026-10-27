@@ -565,7 +565,7 @@ def bars_api(
         "close_hfq": column("close_hfq"),
         "volume": column(_VOLUME_COLUMN) if _VOLUME_COLUMN in frame.columns else [],
         "main": {name: _group(table, name) for name in mains},
-        "sub": {name: _group(table, name) for name in subs if name != "vol"},
+        "sub": {name: _group(table, name) for name in subs},
         "bars": table["bars"].to_list() if "bars" in table.columns else [],
         "pending": [str(value) for value in read.pending_periods],
         # 口径行（D168）：锚与预热被截断的那一格，屏幕上第一次用到这两个字段
@@ -574,6 +574,9 @@ def bars_api(
         "note": None,
     }
 ```
+
+`vol` 也留在 `sub` 里（不从这里筛掉）：那一格的量柱是前端按「该根涨跌」上色的，
+它需要 `sub.vol.volume` 这一份数；筛掉它换来的只是前端少一格可画的格子。
 
 `_group(table, name)`：把该指标族的那几列挑出来（族名 → 列名前缀的映射写成一个模块常量，
 `{"ma": "ma", "boll": "boll_", "ema": "ema", "macd": "macd", "kdj": "kdj_", "rsi": "rsi", "atr": "atr", "wr": "wr", "dmi": "", "cci": "cci", "obv": "obv"}`——
