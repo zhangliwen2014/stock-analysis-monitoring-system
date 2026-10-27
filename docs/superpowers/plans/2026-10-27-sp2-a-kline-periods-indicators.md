@@ -424,12 +424,24 @@ def test_bars_api_gives_the_four_candle_prices_on_the_adjusted_basis(logged):
     assert payload["close"] == payload["close_hfq"], "图上那一档收价就是后复权那一档"
 
 
-def test_bars_api_period_week_resamples_from_the_daily_bars(logged):
-    """周线不新增数据源（D160）：三根挨着的日线聚成一根周 K。"""
-    _seed(logged, code="600520")  # `_seed` 写的是 last-6/5/4 天：同一周内的三根
-    payload = logged.client.get("/api/symbol/A/600520/bars?days=120&period=week").json()
-    assert len(payload["dates"]) == 1
+def test_bars_api_5d_resamples_from_the_daily_bars(logged):
+    """5 日线吃的是库里的日线，不新增数据源（D160）：三根日线 ⇒ 一根没走完的 5 日 K。
+
+    这里点 `5d` 而不是 `week`：`_seed` 写的是「今天 -6/-5/-4 天」这连续三日，周五和周六
+    那两天它会跨进两个自然周，`period=week` 的断言就会跟着跑测试的那天星期几漂移。
+    N 日线按根数分组，与星期几无关，因此能钉死。
+    """
+    _seed(logged, code="600520")
+    payload = logged.client.get("/api/symbol/A/600520/bars?days=120&period=5d").json()
     assert payload["bars"] == [3]
+    assert payload["pending"], "只盖了三根的 5 日 K 不许冒充走完的那一根"
+
+
+def test_bars_api_period_week_groups_the_same_daily_bars(logged):
+    """周线那一档也要证明它只是聚合：几根 K 线加起来必须正好是三根日线。"""
+    _seed(logged, code="600521")
+    payload = logged.client.get("/api/symbol/A/600521/bars?days=120&period=week").json()
+    assert sum(payload["bars"]) == 3
 
 
 def test_bars_api_rejects_an_unknown_period_with_400(logged):
@@ -573,7 +585,9 @@ def bars_api(
 - [ ] **Step 4: 跑到绿**
 
 Run: `uv run pytest tests/web/test_symbol.py -q`
-Expected: 全绿（`test_bars_api_plots_the_close_on_the_basis_the_mas_use` 那枚既有的不许改）
+Expected: 全绿。`test_bars_api_plots_the_close_on_the_basis_the_mas_use` 那枚钉的是**口径**（图上收价与均线同基），不是 JSON 形状：出参改成 `main` 分组后只把取值路径换成 `payload["main"]["ma"]["ma20"]`，断言与文档字符串一字不动。`test_bars_api_returns_dates_and_close` 读的还是 `close_hfq`，不用改。
+
+（另外两处形状必须一起改到：`NotAdjustable` 那条空响应现在要带上 `open/high/low/close/bars/main/sub/period`，前端在空态也要能拿到同形的 JSON；`asked` 为空时传 `("ma",)` 给 `series()`，避免走进 `metrics(series, ())` 那张只有 `date` 的空表。）
 
 - [ ] **Step 5: 提交**
 
