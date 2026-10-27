@@ -1031,7 +1031,7 @@ pkill -f "sams serve" || true
 SAMS_SECRET_KEY="$(cat tmp/.sams_secret)" nohup uv run sams serve > tmp/serve.log 2>&1 &
 sleep 6; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/login
 ```
-浏览器（或 `run`/`verify` skill）逐档验：日/周/月/季/年/5日/10日 六档都有蜡烛、
+浏览器（或 `run`/`verify` skill）逐档验：日/周/月/季/年/5日/10日 七档都有蜡烛、
 `ma`+`boll` 同开时主图两条族都在、副图开 `macd,kdj,vol` 时三格都在且能拖动缩放；
 `period=5d` 那一档最后一根若不足 5 根，图注要说它只走了几天。**看到的不等于代码写的：
 这一步不许跳过。**
@@ -1346,7 +1346,7 @@ git commit -m "feat(web): 自选的移除改成折起——备注、批注与每
 - [ ] **Step 1:** `uv run ruff check --no-cache src/sams tests` → All checks passed
 - [ ] **Step 2:** 全量套件（控制者跑，不加管道，约 17 分钟）：`uv run pytest -q`
 - [ ] **Step 3:** 起服务实测（同 Task 6 Step 3 的命令），拿平安银行 `A/000001` 逐档走完：
-  六档周期 × 主图 `ma,boll` 同开 × 副图三格；自选项点一次「移除」确认真的那一行没了；
+  七档周期 × 主图 `ma,boll` 同开 × 副图三格；自选项点一次「移除」确认真的那一行没了；
   看板那一屏确认没有移除按钮。
 - [ ] **Step 4:** 规格回写：`docs/superpowers/specs/2026-10-27-chart-...md` 里 D160/D162 若与本计划
   实现出来的名字有差（例如 `sub` 里 `vol` 的特殊地位），以代码为准改文档那一段，不改代码迁就文档。

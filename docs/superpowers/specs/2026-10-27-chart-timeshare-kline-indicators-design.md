@@ -114,12 +114,19 @@ Polars（重采样与指标）、腾讯/新浪行情 HTTP 源。
   这一档本来就没有日历锚可依附，说清楚比假装它稳定好。
   `PERIODS` 与 CLI 的 `choices` 同处改，不认识的名字照旧报错而不是安静按日线算。
 - **D162 指标同时挂多个**：
-  - **主图**（叠加在蜡烛上，共用价格轴）：`MA`（默认 5/10/20/60，窗口可自己设，见 D166）、
-    `BOLL`、`EMA`，三者可同时开，也可全关（只剩蜡烛）。
+  - **主图**（叠加在蜡烛上，共用价格轴）：`MA`（默认窗口按代码是 `MA_WINDOWS` =
+    **5/10/20/60/120/250** 六条，`ma=` 串可从外给，落库成每人一份偏好在计划 C）、
+    `BOLL`（`boll_mid/boll_up/boll_low` 三条）、`EMA`（默认 12/26），三者可同时开，
+    也可全关（只剩蜡烛）。
   - **副图**（各自独立一格、各自一条纵轴，横轴与主图对齐）：`VOL`（默认）、`MACD`、`KDJ`、
     `RSI`、`ATR`、`WR`、`DMI`、`CCI`、`OBV`，最多同时 **3 个**（再多就不是看图而是刷屏）。
-  - 接口只多收两组名字：`main=ma,boll` 与 `sub=macd,kdj,vol`；名字来自 `INDICATORS` 那份注册表，
-    拼错回 **400 + 那句「可选的是 …」**（分析层本来就报这句，web 层要转成 400 而不是 500）。
+  - 接口只多收两组名字：`main=ma,boll` 与 `sub=macd,kdj,vol`；拼错回 **400 + 那句「可选的是 …」**
+    （分析层本来就报这句，web 层要转成 400 而不是 500）。
+    **实现时订正**：白名单不在 `INDICATORS` 上，而是 `symbol.py` 的 `MAIN_INDICATORS` 与
+    `SUB_INDICATORS` 两张——`INDICATORS` 那份注册表不区分主图副图，也**没有 `vol`**：
+    成交量那一格画的是裸量柱（`bars` 表上的 `volume` 列，量不复权），不是算出来的指标，
+    所以它只能由 web 层点名，进不了分析层那张表。副图三格的上限同处落实为
+    `MAX_SUB_PANES`，超出与拼错走同一句 400。
   - 副图那一格的数值口径由分析层保证（量吃裸量、比值类算在 `close_hfq` 上），前端不再算第二遍。
 - **D163 当日分钟两条能力，都不入库**：新增
   `minute_series`（分时线：每分钟价 + 累计量额 + 昨收，腾讯）与
@@ -147,6 +154,12 @@ Polars（重采样与指标）、腾讯/新浪行情 HTTP 源。
   「后复权 · 锚在 `SeriesRead.anchored_on` · 预热被覆盖确认截在 `warmup_floor`（若有）」——
   这两个字段分析层已经给了，屏幕上第一次要用它。跨那次除权之前的因子不在窗口里，
   这条曲线的绝对价位只在锚以下可比（`SeriesRead` 的 docstring 早就写了这句）。
+  **实现时订正**：这一行分两半落在两处，各司各的——模板里那句静态的
+  「后复权 · 均线算在同一基上」是**口径**（不随数据变，服务端就写死了），
+  `app.js` 的 `caption()` 随 payload 追加的是**现场**：有 `pending` 才说
+  「最后一根〈周|5日〉只走到 `pending[0]`，还没走完」，有 `warmup_floor` 才说
+  「均线从 `warmup_floor` 起才有数」，有 `anchored_on` 才说「序列自 `anchored_on` 起（含预热）」；
+  三项都空就一个字都不加。空的图注比硬凑一句「锚在 1970-01-01」诚实。
 - **D169 自选的「移除」是折起，不是删除**（用户口径：「移除是否为标记一下，因为如果有人在
   自选股上写了一下内容，移除是否就看不到数据了？」）。查过之后的事实先摆出来：
   `WatchlistRepo.remove()` 是硬 `DELETE`，丢掉的是那一格**备注**；更要紧的是
@@ -198,9 +211,25 @@ Polars（重采样与指标）、腾讯/新浪行情 HTTP 源。
 
 | 方法 | 路径 | 参数 | 出参 |
 | --- | --- | --- | --- |
-| GET | `/api/symbol/{m}/{c}/bars` | `days`、`period`、`main`（逗号分隔指标名）、`sub`（同上，≤3）、`ma`（窗口串 `5,10,20,60`） | `dates`、`open/high/low/close`（后复权）、`main:{name:[cols]}`、`sub:{name:[cols]}`、`pending`、`anchored_on`、`warmup_floor`、`note` |
-| GET | `/api/symbol/{m}/{c}/minute` | 无 | `date`、`times`、`price`、`avg`、`volume`、`prev_close`、`note` |
-| GET | `/api/partials/chart` | `market`、`code`、`view`(`time`/`kline`)、`period`、`main`、`sub`、`ma` | 选择器 + `<div data-chart-url>` 的整块局部 |
+| GET | `/api/symbol/{m}/{c}/bars` | `days`、`period`、`main`（逗号分隔指标名）、`sub`（同上，≤3）、`ma`（窗口串 `5,10,20,60`） | `dates`、`period`、`period_label`、`open/high/low/close`（四档都是后复权）、`close_hfq`、`volume`（裸量，量不复权）、`main:{name:{col:[…]}}`、`sub:{name:{col:[…]}}`、`bars`（每根 K 盖了几根日线）、`pending`、`anchored_on`、`warmup_floor`、`note` |
+| GET | `/api/symbol/{m}/{c}/minute` | 无 | `date`、`times`、`price`、`avg`、`volume`、`prev_close`、`note`（计划 B） |
+| GET | `/api/partials/chart` | `market`、`code`、`period`、`main`、`sub`、`ma` | 选择器 + `<div data-chart-url>` 的整块局部 |
+
+**实现时订正**（计划 A 落地后以代码为准）：
+
+- `main`/`sub` 的出参是**两层** `{族名: {列名: 值数组}}`，不是一层 `{name:[cols]}`：一族常有
+  几条线（`boll` 三条、`dmi` 三条），一层的形状在屏幕上说不清哪条是哪条，图例也就拼不出来。
+  某一族没数时给**空字典**而不是 KeyError 或缺键——「这一格该收起来」与「这一格有数但全空」
+  在屏幕上是两件事。
+- `period_label` 是后来补的一键：屏幕上点的是「周」，而 `period` 是 `week`，图注那句
+  「最后一根__只走到」若直接念 `period` 就成了「最后一根week」。表的来源是
+  `CHART_PERIODS` 那一份，表里没有的自填档（`20d`）原样说。
+- `NotAdjustable` 那条空态返回**同一套键**（数组为空、`main`/`sub` 为空字典、`note` 有那句话）：
+  前端在画图之前就读键，缺键会在 `fetch` 之后崩成一片白，而这一条用例要防的正是那一片白。
+- `/api/partials/chart` 这一版**没有 `view` 参数**：`分时 | K线` 那条切换是 D158 的目标，
+  属计划 B；计划 A 的这一块 div 只带 `data-chart-kind="kline"`，样式留着，等分时那条路来填。
+- `days=0` 不是「看 0 天」：落在 `DEFAULT_WINDOW[period]` 上，日 180 / 周 730 / 月 1825 /
+  季·年·5日·10日 2000（D160 那张表就是这份 dict）。
 
 `bars_api` 从 `read.series.frame` 取 OHLC（D3 事实 1），不放宽 `analysis.py` 的 `keep` 白名单
 ——那张表是给命令行屏幕的，宽了会把 20 列推给终端；图的出口是序列本身。
@@ -209,11 +238,18 @@ Polars（重采样与指标）、腾讯/新浪行情 HTTP 源。
 
 - `app.js` 的 `samsChart(el)` 按 `el.dataset.chartKind` 分两条渲染路径：
   `kline`（蜡烛 + N 个 grid）与 `time`（分时双线 + 量柱 + 昨收基准线）。
+  **实现时订正**：计划 A 只落了 `kline` 那一条，`data-chart-kind` 已经写在 div 上但 `app.js`
+  还没读它——分档是计划 B 拿到 `/minute` 那条数据才有意义，现在读它只能写一条恒等分支。
 - 一个 ECharts 实例吃 `grid` 数组：`[主图, 副图1, 副图2, 副图3]`（少一个就少一格），
   `xAxis` 全部 `grid_index` 对齐、`axisLabel` 只在最下面那格显示；`dataZoom` 同时控制所有轴
   （拖动缩放是这条页的基本动作）。
-- 周期条与指标选择器是 `<a hx-get>` 的普通链接（当前档加 `aria-current="true"` 与高亮样式），
-  换档 = htmx 换整块 → `htmx:afterSwap` 触发 `boot()` 重画，沿用 D146 那套既有机制。
+- 周期条与指标选择器是 `<a hx-get>` 的普通链接（换档 = htmx 换整块 → `htmx:afterSwap`
+  触发 `boot()` 重画，沿用 D146 那套既有机制）。
+  **实现时订正**：两类链接的 ARIA 属性不是一回事——周期条是「一组里哪一档是当前档」，
+  用 `aria-current="true"`（一组只该有一个）；指标开关是「各自按下了没有」，可同时有几个，
+  用 `aria-pressed`（每个链接都带，`true`/`false`），`.on` 高亮两处都用 class 表达。
+  早期计划让两者都挂 `aria-current`，一屏里就会出现五个「当前」，那条「看得出来现在选中的
+  是哪档」的钉因此没法只数一个。
 
 ## 6. 测试钉（用例先红后绿，一条行为一枚）
 
@@ -232,8 +268,9 @@ Polars（重采样与指标）、腾讯/新浪行情 HTTP 源。
    来源不可用时给 `note` 与空数组，不 500（与 `bars` 那条 `NotAdjustable` 同一姿势）。
 8. HK/US 的分钟 K 在来源拒绝时：接口 200 + `note` 说清「两个源都不答」，
    周期条那一档仍在（置灰）——不许画成「这只票没数据」。
-9. `chart` 局部里当前视图/当前周期/当前指标带 `aria-current`，换档后旧档不再带——
-   钉的是「看得出来现在看的是哪档」。
+9. `chart` 局部里**当前周期**带 `aria-current`（一块屏只许一个），**指标开关**各自带
+   `aria-pressed`（开着的 `true`、关着的 `false`，数量等于开关总数），换档后旧档不再带——
+   钉的是「看得出来现在看的是哪档、开着哪几个」。两种属性不能混用，见 §5.3。
 10. `/watchlist` 的票那一行末列有移除表单（`?manage=1` 的局部里也有，10 秒刷新后还得在）；
     看板那一屏（不带 `manage`）不含任何移除表单。
 11. 自选页不再有第二张票列表：同一页上 `600519` 只出现在一行里（D166 的直接验收）。
