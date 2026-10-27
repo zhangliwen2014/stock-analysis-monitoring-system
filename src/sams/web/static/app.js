@@ -7,7 +7,7 @@
   var UP = "#b42318";
   var DOWN = "#067647";
   var TOP = 14; // legend 占的那一条
-  var BAND = 74; // legend 之下、dataZoom 滑块之上可用的百分比
+  var BAND = 70; // legend 之下、日期那一行与 dataZoom 滑块之上可用的百分比
   var SUB = 11; // 每格副图的高
   var GAP = 2; // 格与格之间
   var live = null; // 只留一张活的图：换档是整块重画，旧的不 dispose 会把 resize 挂满
@@ -63,6 +63,14 @@
     return out;
   }
 
+  function wan(value) {
+    // 量轴上写 "1,000,000,000" 没人读得出来：那一格要说的是「这天放没放量」，亿/万 才是它的单位
+    var abs = Math.abs(value);
+    if (abs >= 1e8) return (value / 1e8).toFixed(1) + "亿";
+    if (abs >= 1e4) return (value / 1e4).toFixed(0) + "万";
+    return String(value);
+  }
+
   function caption(payload) {
     var bits = [];
     if (payload.pending && payload.pending.length) {
@@ -104,16 +112,31 @@
         var xAxes = [];
         var yAxes = [];
         var indices = [];
+        var volAt = subNames.indexOf("vol");
+        var volPane = volAt < 0 ? -1 : volAt + 1; // 没有量那一格时不许把价格轴也格式化成「亿」
         grids.forEach(function (_grid, p) {
           var last = p === grids.length - 1;
           // 日期只在最下面那一格写一次：四格各写一遍会把画布挤成只剩字
           xAxes.push({
             gridIndex: p, type: "category", data: dates, boundaryGap: true,
-            axisLabel: { show: last }, axisTick: { show: false }, axisLine: { show: last },
+            // 日期与最后一格的下沿刻度会撞在同一行上（那一格的 -50 就压在轴线上）：
+            // 给日期一行留出 margin，而不是把格子的数字删掉
+            axisLabel: { show: last, margin: 10 },
+            axisTick: { show: false }, axisLine: { show: last },
           });
           yAxes.push({
             gridIndex: p, type: "value", scale: true,
-            axisLabel: { show: p === 0 }, splitLine: { show: p === 0 },
+            // 每一格都要有刻度：副图没有数字就读不出「MACD 在零轴上还是下」，而那是
+            // 那一格唯一要说的事。格子只有 11% 高，所以副图只切两段、字号压小
+            splitNumber: p === 0 ? 5 : 2,
+            axisLabel: {
+              show: true, fontSize: p === 0 ? 12 : 10,
+              // 格子矮，刻度是 ECharts 自己挑的（splitNumber 只是建议），挤不下就自己藏：
+              // 叠成一团的数字比少一个数字更难看，也读不出「在零轴上还是下」
+              hideOverlap: true,
+              formatter: p === volPane ? wan : undefined,
+            },
+            splitLine: { show: p === 0 },
           });
           indices.push(p);
         });
