@@ -1168,8 +1168,9 @@ def test_purge_really_deletes_the_row(repo):
 
 
 def test_adding_a_hidden_symbol_brings_it_back_with_the_new_note(repo):
-    """重新加一只折起的票 ⇒ 回到看板并换备注，且不产生第二行（`INSERT OR REPLACE` 顺带把
-    `removed_at` 抹回 NULL）。"""
+    """重新加一只折起的票 ⇒ 回到看板并换备注，且不产生第二行。
+    **实测订正**：DuckDB 的 `INSERT OR REPLACE` 保留语句里没提到的列的旧值，
+    所以 `add()` 必须把 `removed_at` 显式写成 NULL——不写的话屏幕上说「加好了」，看板里没有那一行。"""
     repo.add(A_ID, "A", "600519", note="旧备注")
     repo.remove(A_ID, "A", "600519")
     repo.add(A_ID, "A", "600519", note="新备注")
