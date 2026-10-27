@@ -56,7 +56,7 @@
         out.push({
           name: column, type: "line", data: data,
           xAxisIndex: pane, yAxisIndex: pane,
-          showSymbol: false, lineWidth: 1,
+          showSymbol: false, lineStyle: { width: 1 },
         });
       }
     });
@@ -66,7 +66,7 @@
   function caption(payload) {
     var bits = [];
     if (payload.pending && payload.pending.length) {
-      bits.push("最后一根" + (payload.period || "") + "只走到 " + payload.pending[0] + "，还没走完");
+      bits.push("最后一根" + (payload.period_label || payload.period || "") + "只走到 " + payload.pending[0] + "，还没走完");
     }
     if (payload.warmup_floor) bits.push("均线从 " + payload.warmup_floor + " 起才有数");
     if (payload.anchored_on) bits.push("序列自 " + payload.anchored_on + " 起（含预热）");

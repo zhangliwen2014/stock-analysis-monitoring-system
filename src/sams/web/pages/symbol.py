@@ -328,6 +328,7 @@ def bars_api(
             {
                 "dates": [],
                 "period": period,
+                "period_label": _period_label(period),
                 "open": [],
                 "high": [],
                 "low": [],
@@ -349,6 +350,7 @@ def bars_api(
         {
             "dates": [str(value) for value in table["date"].to_list()],
             "period": read.period,
+            "period_label": _period_label(read.period),
             # 蜡烛四档取 `frame` 的 `*_hfq`：`read.table` 那张表只给终端打印（`keep` 白名单），
             # 没有开/高/低三档。图上那一档与均线同基（`metrics()` 里 MA 全算在 `close_hfq` 上），
             # 给裸价就等于把均线画到价格线上方——那一段里每一次分红都算成「还没收复」
@@ -369,6 +371,15 @@ def bars_api(
             "note": None,
         }
     )
+
+
+#: 图注里那句「最后一根__只走到」要说屏幕上那几个字：档名只有 `CHART_PERIODS` 这一份表
+_PERIOD_LABEL = dict(CHART_PERIODS)
+
+
+def _period_label(period: str) -> str:
+    """表里有的照表，自己填的档（`20d`）原样说——屏幕上点不出它，不值得再造一层。"""
+    return _PERIOD_LABEL.get(period) or period
 
 
 @router.get("/api/partials/chart")

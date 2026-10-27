@@ -371,6 +371,19 @@ def test_bars_api_returns_dates_and_close(logged):
     assert payload["close_hfq"]
 
 
+def test_bars_api_says_the_period_in_the_words_the_screen_uses(logged):
+    """图注要说「最后一根**周**只走到 …」而不是「最后一根 week 只走到」（D168/D158）。
+    档名的中文表只有一份（`CHART_PERIODS`），接口把它跟着数据一起交出去——
+    前端自己记一份的话，这里早晚会说出一句屏幕上没有的话。"""
+    _seed(logged)
+    assert logged.client.get(
+        "/api/symbol/A/600519/bars?period=week"
+    ).json()["period_label"] == "周"
+    assert logged.client.get(
+        "/api/symbol/A/600519/bars?period=5d"
+    ).json()["period_label"] == "5日"
+
+
 def test_bars_api_plots_the_close_on_the_basis_the_mas_use(logged):
     """`metrics()` 的 MA 全算在 `close_hfq` 上（indicators.ma → _prices("close_hfq")）：
     图上那根收盘价若是裸价，一次分红就把两条均线顶到价格线上方，看上去像永远破不了支撑。"""
@@ -387,6 +400,18 @@ def test_bars_api_without_bars_returns_a_note_not_a_500(logged):
     payload = logged.client.get("/api/symbol/A/600036/bars?days=120").json()
     assert payload["dates"] == []
     assert payload["note"]
+
+
+def test_bars_api_empty_state_is_the_same_shape_as_a_real_read(logged):
+    """空态（没日线的那只票）必须与有数时**同一套键**：前端读键不设防，
+    少一个键就是画图之前先崩在 `undefined.length` 上（Task 4 立的那条规矩）。"""
+    logged.context.symbols.upsert(
+        pl.DataFrame({"market": ["A"], "code": ["600036"], "name": ["招行"], "currency": ["CNY"]})
+    )
+    empty = logged.client.get("/api/symbol/A/600036/bars").json()
+    _seed(logged)
+    full = logged.client.get("/api/symbol/A/600519/bars").json()
+    assert set(empty) == set(full)
 
 
 def test_bars_api_gives_the_four_candle_prices_on_the_adjusted_basis(logged):
