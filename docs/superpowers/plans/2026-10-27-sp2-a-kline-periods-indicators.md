@@ -39,7 +39,7 @@
 - Modify: `src/sams/analysis/resample.py`（常量在 `:55`，`_period_end` 在 `:69`，`resample` 在 `:83`）
 - Test: `tests/analysis/test_resample.py`
 
-- [ ] **Step 1: 写失败测试**（追加到「分组口径」那一节末尾，紧邻 `test_a_month_bar_is_named_after_the_last_day_of_that_month`）
+- [x] **Step 1: 写失败测试**（追加到「分组口径」那一节末尾，紧邻 `test_a_month_bar_is_named_after_the_last_day_of_that_month`）
 
 ```python
 def test_a_quarter_bar_is_named_after_the_last_day_of_that_quarter():
@@ -65,12 +65,12 @@ def test_quarters_split_across_a_year_boundary():
     assert out.frame["date"].to_list() == [date(2023, 12, 31), date(2024, 3, 31)]
 ```
 
-- [ ] **Step 2: 跑到红**
+- [x] **Step 2: 跑到红**
 
 Run: `uv run pytest tests/analysis/test_resample.py -q -k "quarter or year"`
 Expected: FAIL —`ValidationError: 重采样周期只认 \`week\` 与 \`month\``（红的原因必须是周期名不认识）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `resample.py` 里把常量与两个分支补齐：
 
@@ -134,12 +134,12 @@ _GROUP_OF = {WEEK: _week_group, MONTH: _month_start, QUARTER: _quarter_group, YE
 
 （`MONTH` 原本用内联 `lambda day: day.replace(day=1)`，现在提出来叫 `_month_start`，四个键同一形状。）
 
-- [ ] **Step 4: 跑到绿**
+- [x] **Step 4: 跑到绿**
 
 Run: `uv run pytest tests/analysis/test_resample.py -q`
 Expected: 全绿（既有的周月用例一枚不许改）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/analysis/resample.py tests/analysis/test_resample.py
@@ -154,7 +154,7 @@ git commit -m "feat(analysis): 重采样认得季线与年线，日历收市日�
 - Modify: `src/sams/analysis/resample.py`
 - Test: `tests/analysis/test_resample.py`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_nday_counts_bars_from_the_first_one_and_labels_each_group_by_its_last_day():
@@ -183,12 +183,12 @@ def test_nday_refuses_a_non_positive_bar_count():
             resample(daily(WEEKDAYS[:12]), "nday", as_of=END, n=bad)
 ```
 
-- [ ] **Step 2: 跑到红**
+- [x] **Step 2: 跑到红**
 
 Run: `uv run pytest tests/analysis/test_resample.py -q -k nday`
 Expected: FAIL —`TypeError: resample() got an unexpected keyword argument 'n'`（红在「这一档还不存在」）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 签名加 `n`，`NDAY = "nday"` 常量（不进 `RESAMPLE_PERIODS` 的那个「周期名」语义？进——它是 `resample` 能处理的周期，只是还要一个 `n`；`RESAMPLE_PERIODS` 加它，校验分支单独要 `n`）：
 
@@ -237,12 +237,12 @@ def _nday_labels(days: list[date], n: int) -> list[date]:
 
 docstring 补一句 nday 的口径（不足 n 根 ⇒ `pending`，边界随窗口首根移动）。
 
-- [ ] **Step 4: 跑到绿**
+- [x] **Step 4: 跑到绿**
 
 Run: `uv run pytest tests/analysis/test_resample.py tests/analysis/test_indicators.py -q`
 Expected: 全绿
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/analysis/resample.py tests/analysis/test_resample.py
@@ -259,7 +259,7 @@ git commit -m "feat(analysis): N 日线（5d/10d）按根数分组，不足 n �
 - Modify: `src/sams/cli/analysis.py:304`（`--period` 的 `choices`）
 - Test: `tests/analysis/test_indicators.py`、`tests/services/test_analysis.py`
 
-- [ ] **Step 1: 写失败测试（指标窗口）**
+- [x] **Step 1: 写失败测试（指标窗口）**
 
 ```python
 def test_metrics_honours_a_custom_window_per_indicator():
@@ -276,7 +276,7 @@ def test_metrics_honours_a_custom_window_per_indicator():
 
 Run: `uv run pytest tests/analysis/test_indicators.py -q -k custom_window` → FAIL（`metrics()` 没有 `windows` 参数）
 
-- [ ] **Step 2: 实现 `metrics(..., windows=)`**
+- [x] **Step 2: 实现 `metrics(..., windows=)`**
 
 `INDICATORS` 里那三个包一层的 lambda 换成函数本身（`ma`/`ema`/`volume_ma` 本来就收 `*windows`，
 包一层只是让 `metrics` 没法传参）：
@@ -307,7 +307,7 @@ def metrics(
 （`tests/analysis/test_indicators.py` 里已经 import 了 `MA_WINDOWS` 与 `metrics` 就用那两个名字；
 没 import 的话补上，不改别的用例。）
 
-- [ ] **Step 3: 写失败测试（服务层的周期）**
+- [x] **Step 3: 写失败测试（服务层的周期）**
 
 追加到 `tests/services/test_analysis.py`（沿用该文件既有的 `service`/种子函数，不新造夹具）：
 
@@ -336,7 +336,7 @@ def test_series_can_read_a_five_day_bar(service):
 
 Run: `uv run pytest tests/services/test_analysis.py -q -k "parse_period or five_day"` → FAIL
 
-- [ ] **Step 4: 实现服务层**
+- [x] **Step 4: 实现服务层**
 
 `src/sams/services/analysis.py`：
 
@@ -386,12 +386,12 @@ def parse_period(value: str) -> tuple[str, int | None]:
 `src/sams/cli/analysis.py:304` 的 `choices=list(PERIODS)` 去掉 `choices`，`help` 里写清
 「`day/week/month/quarter/year` 或 `5d`/`10d` 这样的 N 日线」；不认识时服务层那句报错就是屏幕上那句话（CLI 不许自己再拼一份文案）。
 
-- [ ] **Step 5: 跑到绿**
+- [x] **Step 5: 跑到绿**
 
 Run: `uv run pytest tests/services/test_analysis.py tests/analysis tests/cli -q`
 Expected: 全绿。若某条既有 CLI 用例钉了 `--period` 的 `choices` 报错文案，把它对准 `parse_period` 那句改一处，别加第二份文案。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add src/sams/analysis/indicators.py src/sams/services/analysis.py src/sams/cli/analysis.py tests/analysis/test_indicators.py tests/services/test_analysis.py tests/cli
@@ -406,7 +406,7 @@ git commit -m "feat(analysis): 周期扩到季/年/N 日线，指标窗口可从
 - Modify: `src/sams/web/pages/symbol.py:162`（`bars_api`）
 - Test: `tests/web/test_symbol.py`
 
-- [ ] **Step 1: 写失败测试（OHLC 四档 + 周期）**
+- [x] **Step 1: 写失败测试（OHLC 四档 + 周期）**
 
 ```python
 def test_bars_api_gives_the_four_candle_prices_on_the_adjusted_basis(logged):
@@ -457,12 +457,12 @@ def test_bars_api_rejects_an_unknown_indicator_with_400_and_names_the_options(lo
     assert "可选的是" in resp.text
 ```
 
-- [ ] **Step 2: 跑到红**
+- [x] **Step 2: 跑到红**
 
 Run: `uv run pytest tests/web/test_symbol.py -q -k "candle_prices or resamples or unknown_period or unknown_indicator"`
 Expected: FAIL — 出参里没有 `open`/`high`/`low`（红在「接口还没给」）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `bars_api` 的新形状（**OHLC 从 `read.series.frame` 取**，不放宽 `services/analysis.py` 里那张给终端的 `keep` 白名单——图的出口是序列本身）：
 
@@ -585,14 +585,14 @@ def bars_api(
 `_windows(raw)`：`"5,10,20,60"` → `(5,10,20,60)`；空串 → `()`（用默认那组）；
 非正整数或超过 6 个窗口 ⇒ `ValidationError("均线窗口要 1..500 之间的正整数，最多六条")`。
 
-- [ ] **Step 4: 跑到绿**
+- [x] **Step 4: 跑到绿**
 
 Run: `uv run pytest tests/web/test_symbol.py -q`
 Expected: 全绿。`test_bars_api_plots_the_close_on_the_basis_the_mas_use` 那枚钉的是**口径**（图上收价与均线同基），不是 JSON 形状：出参改成 `main` 分组后只把取值路径换成 `payload["main"]["ma"]["ma20"]`，断言与文档字符串一字不动。`test_bars_api_returns_dates_and_close` 读的还是 `close_hfq`，不用改。
 
 （另外两处形状必须一起改到：`NotAdjustable` 那条空响应现在要带上 `open/high/low/close/bars/main/sub/period`，前端在空态也要能拿到同形的 JSON；`asked` 为空时传 `("ma",)` 给 `series()`，避免走进 `metrics(series, ())` 那张只有 `date` 的空表。）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/web/pages/symbol.py tests/web/test_symbol.py
@@ -614,7 +614,7 @@ git commit -m "feat(web): bars 接口交出蜡烛四档后复权价、周期与�
 反过来 import `MAIN_INDICATORS`/`SUB_INDICATORS` 会成环。局部与它读的白名单、窗口表同处，
 加一种指标仍只改一个文件。）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_chart_partial_marks_the_current_period(logged):
@@ -669,14 +669,14 @@ def test_chart_partial_requires_a_login(web_app):
     assert response.headers["location"].startswith("/login")
 ```
 
-- [ ] **Step 2: 跑到红**
+- [x] **Step 2: 跑到红**
 
 Run: `uv run pytest tests/web/test_symbol.py -q -k "chart or dmi"`
 Expected: 那四条 chart 用例 FAIL —404（局部路由还不存在）。
 `test_bars_api_dmi_group_holds_only_its_three_lines` **是绿的**（它钉 Task 4 已有的行为，
 上面那条变异检查就是它这一趟的「红」）——别为了凑红去改它的断言。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `src/sams/web/pages/symbol.py`（路由与它读的白名单、窗口表、标签表同处；`web.render` 的姿势照 `dashboard.py` 的 `quotes_partial`）：
 
@@ -802,7 +802,7 @@ Python helper。**实现时订正**：Jinja **没有** `difference` 这个 filte
 `app.css` 补三条：`.chart-bar` flex+wrap、`.chart-group` gap、`a.on`（或 `[aria-current="true"]`）
 加底色与描边——当前档要一眼看出。
 
-- [ ] **Step 4: 跑到绿**
+- [x] **Step 4: 跑到绿**
 
 Run: `uv run pytest tests/web/test_symbol.py tests/web/test_dashboard.py -q`
 Expected: 全绿。
@@ -814,7 +814,7 @@ Expected: 全绿。
 `app.css` 这一次还顺带补了 `.link`：`e22243f` 与 `4b1b65e` 的「移除/恢复」按钮挂着这个 class
 而它没定义，在表格里渲染成一块灰砖、把行高撑坏。）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/web/templates/partials/chart.html src/sams/web/pages/symbol.py src/sams/web/templates/symbol.html src/sams/web/static/app.css tests/web/test_symbol.py
@@ -831,7 +831,7 @@ git commit -m "feat(web): 个股图换成服务端渲染的 chart 局部——�
 这一步没有 JS 单测可用（站内没有前端测试夹具），验收是**跑起来看**：
 `uv run sams serve` 之后开 `http://127.0.0.1:8765/symbol/A/000001`，逐档点周期与指标。
 
-- [ ] **Step 1: 把 `app.js` 整个换成下面这份**
+- [x] **Step 1: 把 `app.js` 整个换成下面这份**
 
 站内没有前端测试夹具，这一步的验收是 Step 3 的**跑起来看**（不许跳过）。整份文件如下——
 它同时修掉 Task 4 留下的那条临时缺口：出参的均线已经从 `payload.ma20` 搬进
@@ -1019,12 +1019,12 @@ git commit -m "feat(web): 个股图换成服务端渲染的 chart 局部——�
 `pending`/`warmup_floor`/`anchored_on` 是接口给的数，只有拿到 JSON 才知道怎么说（D168）。
 换档时整块 `.chart-box` 被 htmx 换掉，节点是新的，那句静态话不会被越拼越长。）
 
-- [ ] **Step 2: 空态与 note**
+- [x] **Step 2: 空态与 note**
 
 `payload.note` 有话（`NotAdjustable` 那条）时不画图、把那句话说进图注；
 接口在空态给的是**与新形状同形的空 JSON**（Task 4 已钉），所以这里不必再防缺键。
 
-- [ ] **Step 3: 跑起来看**
+- [x] **Step 3: 跑起来看**
 
 ```bash
 pkill -f "sams serve" || true
@@ -1036,7 +1036,7 @@ sleep 6; curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/login
 `period=5d` 那一档最后一根若不足 5 根，图注要说它只走了几天。**看到的不等于代码写的：
 这一步不许跳过。**
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add src/sams/web/static/app.js
@@ -1051,7 +1051,7 @@ git commit -m "feat(web): 个股图画标准蜡烛 + 主图多族与最多三格
 - Modify: `src/sams/web/templates/partials/quotes.html`、`src/sams/web/templates/watchlist.html`、`src/sams/web/pages/dashboard.py`（`quotes_partial`）
 - Test: `tests/web/test_dashboard.py`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_watchlist_page_carries_the_remove_button_on_the_row_itself(logged):
@@ -1087,12 +1087,12 @@ def test_watchlist_page_shows_the_note_inline(logged):
 （`_add_watch` 这个夹具函数若 `tests/web/test_dashboard.py` 里已有同名/同义的加自选 helper，
 沿用它，别再造一份；没有就按该文件既有的 `logged.client.post("/watchlist/add", ...)` 姿势写一个。）
 
-- [ ] **Step 2: 跑到红**
+- [x] **Step 2: 跑到红**
 
 Run: `uv run pytest tests/web/test_dashboard.py -q -k "remove or note_inline"`
 Expected: FAIL —`count("/watchlist/remove") == 2`（页面既有板下表 + 表单）或 0（局部里没有）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `quotes_partial` 收 `manage`：
 
@@ -1130,12 +1130,12 @@ def quotes_partial(request: Request, manage: int = 0):
 `/watchlist` 页面本身的 `rows` 若只为那张表而传，一并从 `_watch_page` 的 render 参数里去掉——
 留着没人读的那一份查询是白付的。
 
-- [ ] **Step 4: 跑到绿**
+- [x] **Step 4: 跑到绿**
 
 Run: `uv run pytest tests/web -q`
 Expected: 全绿
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add src/sams/web/templates/partials/quotes.html src/sams/web/templates/watchlist.html src/sams/web/pages/dashboard.py tests/web/test_dashboard.py
@@ -1157,7 +1157,7 @@ Task 7 把移除的**位置**搬到了那一行最右边；这一节改的是它
 - Modify: `src/sams/web/templates/watchlist.html`
 - Test: `tests/storage/test_watchlists.py`、`tests/storage/test_migration_0022.py`（新建，照 `test_migration_0020.py` 的形状）、`tests/web/test_dashboard.py`
 
-- [ ] **Step 1: 写失败测试（仓库层的四种说法）**
+- [x] **Step 1: 写失败测试（仓库层的四种说法）**
 
 追加到 `tests/storage/test_watchlists.py`（沿用该文件的 `repo` 夹具与 `A_ID`/`B_ID` 常量）：
 
@@ -1204,7 +1204,7 @@ def test_adding_a_hidden_symbol_brings_it_back_with_the_new_note(repo):
 
 Run: `uv run pytest tests/storage/test_watchlists.py -q` → 前四枚 FAIL（`hidden`/`restore`/`purge` 不存在，`remove` 之后 `list_all()` 空）。
 
-- [ ] **Step 2: 迁移 + 仓库实现**
+- [x] **Step 2: 迁移 + 仓库实现**
 
 `src/sams/storage/migrations/0022_watchlist_hidden.sql`：
 
@@ -1256,7 +1256,7 @@ Run: `uv run pytest tests/storage/test_watchlists.py tests/storage/test_migratio
 **别忘了既有的 `test_add_list_remove`**：它断言「移除两次 ⇒ 第二次是 False」，软删之后仍然成立；
 `test_admin_can_read_everything_but_not_write` 断言 `list_all()` 看见全部——这正是这一条要的形状。
 
-- [ ] **Step 3: 写失败测试（屏幕上那一栏与两个按钮）**
+- [x] **Step 3: 写失败测试（屏幕上那一栏与两个按钮）**
 
 追加到 `tests/web/test_dashboard.py`（`_add_watch` 由 Task 7 建好，沿用）：
 
@@ -1305,7 +1305,7 @@ def test_hidden_symbol_leaves_the_quote_board(logged):
 
 Run: `uv run pytest tests/web/test_dashboard.py -q -k "hidden or restore or purge"` → FAIL。
 
-- [ ] **Step 4: 屏幕与端点**
+- [x] **Step 4: 屏幕与端点**
 
 `dashboard.py` 三个新端点（都 `require_user` + `csrf_protect`，成功一律 303 回 `/watchlist`）：
 
@@ -1327,7 +1327,7 @@ Run: `uv run pytest tests/web/test_dashboard.py -q -k "hidden or restore or purg
 `partials/quotes.html` 不带 `hidden` 那一栏：它是 10 秒一刷的行情板，把恢复按钮放进去
 会让人以为「已移除」也在实时刷新。
 
-- [ ] **Step 5: 跑到绿 + 提交**
+- [x] **Step 5: 跑到绿 + 提交**
 
 Run: `uv run pytest tests/storage tests/web -q`、`uv run ruff check --no-cache src/sams tests`
 
@@ -1343,14 +1343,14 @@ git commit -m "feat(web): 自选的移除改成折起——备注、批注与每
 
 ### Task 8: 全量回归 + 实测 + 文档收尾
 
-- [ ] **Step 1:** `uv run ruff check --no-cache src/sams tests` → All checks passed
-- [ ] **Step 2:** 全量套件（控制者跑，不加管道，约 17 分钟）：`uv run pytest -q`
-- [ ] **Step 3:** 起服务实测（同 Task 6 Step 3 的命令），拿平安银行 `A/000001` 逐档走完：
+- [x] **Step 1:** `uv run ruff check --no-cache src/sams tests` → All checks passed
+- [x] **Step 2:** 全量套件（控制者跑，不加管道，约 17 分钟）：`uv run pytest -q`
+- [x] **Step 3:** 起服务实测（同 Task 6 Step 3 的命令），拿平安银行 `A/000001` 逐档走完：
   七档周期 × 主图 `ma,boll` 同开 × 副图三格；自选项点一次「移除」确认真的那一行没了；
   看板那一屏确认没有移除按钮。
-- [ ] **Step 4:** 规格回写：`docs/superpowers/specs/2026-10-27-chart-...md` 里 D160/D162 若与本计划
+- [x] **Step 4:** 规格回写：`docs/superpowers/specs/2026-10-27-chart-...md` 里 D160/D162 若与本计划
   实现出来的名字有差（例如 `sub` 里 `vol` 的特殊地位），以代码为准改文档那一段，不改代码迁就文档。
-- [ ] **Step 5:** `git add docs/superpowers/specs/... && git commit -m "docs(specs): 计划 A 落地的名字与实现对齐"`
+- [x] **Step 5:** `git add docs/superpowers/specs/... && git commit -m "docs(specs): 计划 A 落地的名字与实现对齐"`
 
 ---
 
