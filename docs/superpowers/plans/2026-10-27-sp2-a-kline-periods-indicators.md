@@ -635,6 +635,22 @@ def test_chart_partial_lists_the_indicator_switches_from_the_server_names(logged
         assert f"data-indicator=\"{name}\"" in text
 
 
+def test_bars_api_dmi_group_holds_only_its_three_lines(logged):
+    """`dmi` 那三列的名字不是 `dmi*`（是 `pdi/mdi/adx`），族名当 prefix 会把
+    `date/close/bars` 一起拖进那一格，前端就照着日期字符串画一条线。
+    这枚钉的是「一族只装这一族的列」，不是 `dmi` 的算法。"""
+    _seed(logged)
+    payload = logged.client.get(
+        "/api/symbol/A/600519/bars?sub=dmi&main=ma"
+    ).json()
+    assert sorted(payload["sub"]["dmi"]) == ["adx", "mdi", "pdi"]
+```
+
+（这条用例现在写下去就是绿的——它钉的是 Task 4 已经做对的那件事。补它时要做一次
+**变异检查**：临时把 `symbol.py` 的 `_EXPLICIT_COLUMNS` 那两行注释掉，跑一遍必须看见它红，
+并且红在 `date` 这类列上；然后原样恢复。看不见红就说明这枚钉不住任何东西，别留。）
+
+```python
 def test_symbol_page_uses_the_chart_partial(logged):
     _seed(logged)
     page = logged.client.get("/symbol/A/600519")
@@ -651,8 +667,10 @@ def test_chart_partial_requires_a_login(web_app):
 
 - [ ] **Step 2: 跑到红**
 
-Run: `uv run pytest tests/web/test_symbol.py -q -k chart`
-Expected: FAIL —404（局部路由还不存在）
+Run: `uv run pytest tests/web/test_symbol.py -q -k "chart or dmi"`
+Expected: 那四条 chart 用例 FAIL —404（局部路由还不存在）。
+`test_bars_api_dmi_group_holds_only_its_three_lines` **是绿的**（它钉 Task 4 已有的行为，
+上面那条变异检查就是它这一趟的「红」）——别为了凑红去改它的断言。
 
 - [ ] **Step 3: 实现**
 
@@ -757,7 +775,7 @@ CHART_INDICATOR_LABELS: dict[str, str] = {
   <div id="chart" style="width:100%;height:480px" data-chart-kind="kline"
        data-chart-period="{{ period }}"
        data-chart-url="/api/symbol/{{ market }}/{{ code }}/bars?period={{ period }}&main={{ main }}&sub={{ sub }}&ma={{ ma }}"></div>
-  <p class="muted chart-caption">后复权 · 均线算在同一基上；最后一根若没走完会在图注里说</p>
+  <p class="muted chart-caption">后复权 · 均线算在同一基上</p>
 </div>
 ```
 
@@ -797,37 +815,188 @@ git commit -m "feat(web): 个股图换成服务端渲染的 chart 局部——�
 这一步没有 JS 单测可用（站内没有前端测试夹具），验收是**跑起来看**：
 `uv run sams serve` 之后开 `http://127.0.0.1:8765/symbol/A/000001`，逐档点周期与指标。
 
-- [ ] **Step 1: 实现 `samsChart` 的 kline 路径**
+- [ ] **Step 1: 把 `app.js` 整个换成下面这份**
 
-要点（全部落在 `app.js` 一处，CSP 不许内联）：
+站内没有前端测试夹具，这一步的验收是 Step 3 的**跑起来看**（不许跳过）。整份文件如下——
+它同时修掉 Task 4 留下的那条临时缺口：出参的均线已经从 `payload.ma20` 搬进
+`payload.main.ma.ma20`，旧脚本读的是搬走之前的键，所以此刻屏幕上的两条均线是空的。
 
 ```javascript
-  // 红涨绿跌：与 app.css 的 .up=--danger / .down=--ok 同一对颜色
-  var UP = "#b42318", DOWN = "#067647";
+/* 页面脚本：K 线图与局部刷新后的再初始化。
+   CSP 是 'self'：本文件不许引用任何外部 URL，图表库在 vendor/ 里。 */
+(function () {
+  "use strict";
 
-  function candleSeries(payload) {
-    var rows = payload.dates.map(function (d, i) {
+  // 红涨绿跌：与 app.css 的 .up=--danger / .down=--ok 同一对颜色
+  var UP = "#b42318";
+  var DOWN = "#067647";
+  var TOP = 14; // legend 占的那一条
+  var BAND = 74; // legend 之下、dataZoom 滑块之上可用的百分比
+  var SUB = 11; // 每格副图的高
+  var GAP = 2; // 格与格之间
+  var live = null; // 只留一张活的图：换档是整块重画，旧的不 dispose 会把 resize 挂满
+
+  window.addEventListener("resize", function () {
+    if (live) live.resize();
+  });
+
+  function candlestick(payload, dates) {
+    // ECharts 的 candlestick 数据顺序是 [open, close, low, high]，不是 OHLC：
+    // 写反会得到实体与影线互相穿过的假蜡烛
+    var rows = dates.map(function (_date, i) {
       return [payload.open[i], payload.close[i], payload.low[i], payload.high[i]];
     });
-    return { name: "K线", type: "candlestick", data: rows,
-             itemStyle: { color: UP, color0: DOWN, borderColor: UP, borderColor0: DOWN } };
+    return {
+      name: "K线", type: "candlestick", data: rows,
+      xAxisIndex: 0, yAxisIndex: 0,
+      itemStyle: { color: UP, color0: DOWN, borderColor: UP, borderColor0: DOWN },
+    };
   }
+
+  function paneSeries(group, pane, payload) {
+    var out = [];
+    Object.keys(group).forEach(function (column) {
+      var data = group[column];
+      if (!data || !data.length) return;
+      if (column === "volume") {
+        out.push({
+          name: "成交量", type: "bar", data: data,
+          xAxisIndex: pane, yAxisIndex: pane,
+          // 量柱跟着那根的涨跌上色：看量要看的是「放量那天是涨是跌」
+          itemStyle: {
+            color: function (params) {
+              return payload.close[params.dataIndex] >= payload.open[params.dataIndex]
+                ? UP : DOWN;
+            },
+          },
+        });
+      } else if (column === "macd_hist") {
+        out.push({
+          name: "MACD柱", type: "bar", data: data,
+          xAxisIndex: pane, yAxisIndex: pane,
+          itemStyle: { color: UP, color0: DOWN },
+        });
+      } else {
+        out.push({
+          name: column, type: "line", data: data,
+          xAxisIndex: pane, yAxisIndex: pane,
+          showSymbol: false, lineWidth: 1,
+        });
+      }
+    });
+    return out;
+  }
+
+  function caption(payload) {
+    var bits = [];
+    if (payload.pending && payload.pending.length) {
+      bits.push("最后一根" + (payload.period || "") + "只走到 " + payload.pending[0] + "，还没走完");
+    }
+    if (payload.warmup_floor) bits.push("均线从 " + payload.warmup_floor + " 起才有数");
+    if (payload.anchored_on) bits.push("序列自 " + payload.anchored_on + " 起（含预热）");
+    return bits.length ? "：" + bits.join("；") : "";
+  }
+
+  function samsChart(el) {
+    if (typeof echarts === "undefined" || el.dataset.samsChart === "on") return;
+    var url = el.dataset.chartUrl;
+    if (!url) return;
+    el.dataset.samsChart = "on";
+    fetch(url)
+      .then(function (resp) { return resp.json(); })
+      .then(function (payload) {
+        var box = el.parentNode;
+        var note = box && box.querySelector(".chart-caption");
+        if (payload.note) {
+          if (note) note.textContent = payload.note;
+          el.textContent = "";
+          return;
+        }
+        var dates = payload.dates || [];
+        if (!dates.length) {
+          if (note) note.textContent = "这一段没有数可画。";
+          return;
+        }
+        var subNames = Object.keys(payload.sub || {});
+        var mainHeight = BAND - subNames.length * (SUB + GAP);
+        var grids = [{ top: TOP + "%", height: mainHeight + "%" }];
+        var top = TOP + mainHeight + GAP;
+        subNames.forEach(function () {
+          grids.push({ top: top + "%", height: SUB + "%" });
+          top += SUB + GAP;
+        });
+        var xAxes = [];
+        var yAxes = [];
+        var indices = [];
+        grids.forEach(function (_grid, p) {
+          var last = p === grids.length - 1;
+          // 日期只在最下面那一格写一次：四格各写一遍会把画布挤成只剩字
+          xAxes.push({
+            gridIndex: p, type: "category", data: dates, boundaryGap: true,
+            axisLabel: { show: last }, axisTick: { show: false }, axisLine: { show: last },
+          });
+          yAxes.push({
+            gridIndex: p, type: "value", scale: true,
+            axisLabel: { show: p === 0 }, splitLine: { show: p === 0 },
+          });
+          indices.push(p);
+        });
+        var series = [];
+        if (payload.open && payload.open.length) series.push(candlestick(payload, dates));
+        Object.keys(payload.main || {}).forEach(function (family) {
+          series = series.concat(paneSeries(payload.main[family], 0, payload));
+        });
+        subNames.forEach(function (family, i) {
+          series = series.concat(paneSeries(payload.sub[family], i + 1, payload));
+        });
+        if (live) live.dispose();
+        var chart = echarts.init(el);
+        live = chart;
+        chart.setOption({
+          // legend 不给 data：ECharts 自己按 series 的名字铺，加一种指标不必回来改这里
+          legend: { type: "scroll", top: 0 },
+          tooltip: { trigger: "axis", axisPointer: { type: "cross" } },
+          axisPointer: { link: [{ xAxisIndex: "all" }] },
+          grid: grids,
+          xAxis: xAxes,
+          yAxis: yAxes,
+          dataZoom: [
+            { type: "inside", xAxisIndex: indices },
+            { type: "slider", xAxisIndex: indices, height: 18, bottom: 2 },
+          ],
+          series: series,
+        });
+        if (note) note.textContent = note.textContent + caption(payload);
+      })
+      .catch(function () {
+        el.textContent = "行情序列读不出来。";
+      });
+  }
+
+  function boot(root) {
+    (root || document).querySelectorAll("[data-chart-url]").forEach(samsChart);
+  }
+
+  document.addEventListener("DOMContentLoaded", function () { boot(document); });
+  // htmx:afterSwap 会冒泡到 document，挂在 document 上就不依赖脚本排在 head 还是 body 末尾。
+  document.addEventListener("htmx:afterSwap", function (event) {
+    boot(event.target);
+  });
+})();
 ```
 
-（ECharts 的 `candlestick` 数据顺序是 **[open, close, low, high]**，不是 OHLC——写反会得到
-一根实体与影线互相穿过的假蜡烛。）
+（副图那一族的画法不用列清单：`macd` 的柱认列名 `macd_hist`、`vol` 那格认 `volume`，
+其余一律折线——列名来自分析层那张表，屏幕上能选的族与画出来的线永远是同一份，
+加一种指标只改 `symbol.py` 的白名单与标签表。）
 
-网格与轴按「1 个主图 + N 个副图」动态生成：`grids`、`xAxis`（同一份 `dates`，
-`axisLabel` 只在最后一格显示）、`yAxis`（主图 `scale:true`，副图各自 `scale:true`）、
-`dataZoom: [{type:"inside"}, {type:"slider"}]` 带 `xAxisIndex: 全部`。
-副图那一族的画法：`vol` ⇒ 柱（按该根涨跌上色）；`macd` ⇒ `macd_hist` 柱 + `macd`/`macd_signal` 两条线；
-`kdj`/`rsi`/`dmi` ⇒ 各自那几条线；`atr`/`wr`/`cci`/`obv` ⇒ 单线。
+（图注那一行由脚本负责收尾：模板只写静态那句「后复权 · 均线算在同一基上」，
+`pending`/`warmup_floor`/`anchored_on` 是接口给的数，只有拿到 JSON 才知道怎么说（D168）。
+换档时整块 `.chart-box` 被 htmx 换掉，节点是新的，那句静态话不会被越拼越长。）
 
-- [ ] **Step 2: pending 与口径行**
+- [ ] **Step 2: 空态与 note**
 
-拿到 `payload.pending` 非空时，把 `payload.dates` 里那几个（最后一根）在图注里点名：
-「最后一根 {period} 只走到 {dates[-1]}」。`payload.anchored_on` 与 `warmup_floor` 拼进
-`chart-caption` 那一行（D168）。`payload.note` 有话时仍走既有那条插入 `<p>` 的路。
+`payload.note` 有话（`NotAdjustable` 那条）时不画图、把那句话说进图注；
+接口在空态给的是**与新形状同形的空 JSON**（Task 4 已钉），所以这里不必再防缺键。
 
 - [ ] **Step 3: 跑起来看**
 
