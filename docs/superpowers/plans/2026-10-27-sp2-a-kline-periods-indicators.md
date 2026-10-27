@@ -896,7 +896,7 @@ git commit -m "feat(web): 个股图换成服务端渲染的 chart 局部——�
         out.push({
           name: column, type: "line", data: data,
           xAxisIndex: pane, yAxisIndex: pane,
-          showSymbol: false, lineWidth: 1,
+          showSymbol: false, lineStyle: { width: 1 },
         });
       }
     });
@@ -906,7 +906,9 @@ git commit -m "feat(web): 个股图换成服务端渲染的 chart 局部——�
   function caption(payload) {
     var bits = [];
     if (payload.pending && payload.pending.length) {
-      bits.push("最后一根" + (payload.period || "") + "只走到 " + payload.pending[0] + "，还没走完");
+      bits.push(
+        "最后一根" + (payload.period_label || payload.period || "") + "只走到 " + payload.pending[0] + "，还没走完"
+      );
     }
     if (payload.warmup_floor) bits.push("均线从 " + payload.warmup_floor + " 起才有数");
     if (payload.anchored_on) bits.push("序列自 " + payload.anchored_on + " 起（含预热）");
@@ -1004,6 +1006,14 @@ git commit -m "feat(web): 个股图换成服务端渲染的 chart 局部——�
 （副图那一族的画法不用列清单：`macd` 的柱认列名 `macd_hist`、`vol` 那格认 `volume`，
 其余一律折线——列名来自分析层那张表，屏幕上能选的族与画出来的线永远是同一份，
 加一种指标只改 `symbol.py` 的白名单与标签表。）
+
+**实现时订正两处**：① `lineWidth: 1` 不是 ECharts 5.6 的系列属性（会被忽略，指标线仍是默认 2px），
+落到 `lineStyle: { width: 1 }`；② 图注那句要说**屏幕上那几个字**——照原文拼 `payload.period` 会念出
+「最后一根 week 只走到 2026-10-30」，而周期条上那个档写着「周」。所以 `bars_api` 跟着数据一起交出
+`period_label`（`_period_label()`，读的还是 `CHART_PERIODS` 那一份表，不新造名单），前端优先用它。
+补这两处时先写了 `test_bars_api_says_the_period_in_the_words_the_screen_uses` 与
+`test_bars_api_empty_state_is_the_same_shape_as_a_real_read`（后者钉「空态与有数同一套键」：
+前端读键不设防，少一键就崩在画图之前）。
 
 （图注那一行由脚本负责收尾：模板只写静态那句「后复权 · 均线算在同一基上」，
 `pending`/`warmup_floor`/`anchored_on` 是接口给的数，只有拿到 JSON 才知道怎么说（D168）。
