@@ -22,9 +22,12 @@
     <span class="chart-group" role="group" aria-label="副图指标">
       {% for name in subs %}
       {% set on = name in picked_sub %}
+      {% set blocked = sub_full and not on %}
       {% set next_sub = ((picked_sub | reject("equalto", name)) if on else (picked_sub + [name])) | join(",") %}
-      <a role="button" data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ main }}&sub={{ next_sub }}&ma={{ ma }}"
-         hx-target=".chart-box" hx-swap="outerHTML" href="#"
+      {% set link = base ~ "&period=" ~ period ~ "&main=" ~ main ~ "&sub=" ~ next_sub ~ "&ma=" ~ ma %}
+      <a role="button" data-indicator="{{ name }}"{% if blocked %} aria-disabled="true"
+         title="副图最多 {{ sub_limit }} 个，先关掉一个再开这个"{% else %}
+         hx-get="{{ link }}" hx-target=".chart-box" hx-swap="outerHTML" href="#"{% endif %}
          aria-pressed="{{ 'true' if on else 'false' }}" {% if on %}class="on"{% endif %}>{{ labels[name] }}</a>
       {% endfor %}
     </span>

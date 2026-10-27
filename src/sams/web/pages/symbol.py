@@ -394,10 +394,15 @@ def chart_partial(
 
     周期名要过 `parse_period`：不认识的名字在这里就说 400，而不是悄悄换成日线——
     那一屏会举着「日」的高亮画一段没人请求过的东西，而 `bars` 接口对同一个写法已经是 400。
+    指标串同理：局部渲染出去的那条 `data-chart-url` 若注定 400，屏幕上说的是
+    「行情序列读不出来。」而不是「副图最多三格」——宁可不画，不说错话。
     """
     require_user(request)
     web = request.app.state.web
     parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
+    _split_names(main, MAIN_INDICATORS)
+    picked_sub = _split_names(sub, SUB_INDICATORS, limit=MAX_SUB_PANES)
+    _windows(ma)
     ctx = web.contexts.current()
     market = canonical_market(market)
     code = canonical_code(market, code)
@@ -416,6 +421,9 @@ def chart_partial(
         mains=MAIN_INDICATORS,
         subs=SUB_INDICATORS,
         labels=CHART_INDICATOR_LABELS,
+        # 三格满了就把点不出来的那几个置灰：让人撞上一条 400 不如先让他看见规矩
+        sub_full=len(picked_sub) >= MAX_SUB_PANES,
+        sub_limit=MAX_SUB_PANES,
     )
 
 

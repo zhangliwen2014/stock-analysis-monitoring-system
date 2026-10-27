@@ -516,6 +516,28 @@ def test_symbol_page_uses_the_chart_partial(logged):
     assert hit or "api/partials/chart" in page.text
 
 
+def test_chart_partial_refuses_a_fourth_sub_pane(logged):
+    """局部不许渲染一条注定 400 的 URL：那样屏幕上出现的是「行情序列读不出来。」，
+    而真正的原因是「副图最多三格」——说错话比说慢话糟。`bars` 接口对同一个写法已经是 400，
+    这里跟着 400，两个端点对同一个 URL 才是同一句话（与 `parse_period` 那一条同一理由）。"""
+    _seed(logged)
+    response = logged.client.get(
+        "/api/partials/chart?market=A&code=600519&sub=vol,macd,kdj,rsi"
+    )
+    assert response.status_code == 400
+
+
+def test_chart_partial_greys_out_the_switch_that_would_overfill_the_sub_panels(logged):
+    """三格已满时，屏幕上点不出第四格：点得出来就会走进上面那条 400。
+    置灰而不是消失——消失会让人以为只剩这三个指标，而它们只是这一屏不能同时都开。"""
+    _seed(logged)
+    text = logged.client.get(
+        "/api/partials/chart?market=A&code=600519&sub=vol,macd,kdj"
+    ).text
+    assert 'data-indicator="rsi" aria-disabled="true"' in text
+    assert 'data-indicator="macd" aria-disabled="true"' not in text
+
+
 def test_chart_partial_requires_a_login(web_app):
     """未登录拿不到这一块：路由第一行就 `require_user`，别让它先去摸数据库。
     钉 303 与跳转目的地，不钉 401——本站的未登录姿势是重定向去登录页（`app.py:207`）。"""
