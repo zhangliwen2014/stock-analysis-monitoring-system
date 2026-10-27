@@ -63,3 +63,19 @@ form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
 
 .closure-trade { border-left: 3px solid var(--line, #ddd); padding-left: 10px; margin: 8px 0; }
 .card details summary { cursor: pointer; margin: 6px 0; }
+
+/* chart 局部（D158）：三排开关会随屏幕挤兑，wrap 是唯一的活路 */
+.chart-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.chart-group { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.chart-group a { text-decoration: none; padding: 2px 8px; border: 1px solid transparent;
+                 border-radius: 6px; }
+.chart-group a:hover { border-color: var(--line); }
+/* 当前档要一眼看出：模板同时给 class 与 aria-current，这里按 class 上底色 */
+.chart-group a.on { background: #14141a; color: #f4f4f6; }
+.chart-caption { margin: 6px 0 0; font-size: 13px; }
+
+/* .link：读起来像链接、确实是按钮（要 POST + CSRF）：默认 button 在表格里是块灰砖，
+   行高被它撑坏，「移除/恢复」这种低频动作也不该抢那一列的视觉重量 */
+button.link { border: none; background: none; color: inherit; font: inherit;
+              padding: 0; cursor: pointer; }
+button.link:hover { background: none; text-decoration: underline; }

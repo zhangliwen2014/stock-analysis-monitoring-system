@@ -154,7 +154,8 @@ def test_symbol_page_shows_quote_bars_rules_and_theses(logged):
     assert "1,500.00" in page.text
     assert "茅台止损" in page.text
     assert "高端酒景气" in page.text
-    assert "/api/symbol/A/600519/bars" in page.text
+    # 图本体改由 chart 局部按需拉（D158）：首屏里从此是局部的 URL，bars 的 URL 在局部渲染时才出现
+    assert "/api/partials/chart?market=A&code=600519" in page.text
     assert moment_label(triggered, logged.context.settings.server.display_tz) in page.text
 
 
@@ -447,3 +448,53 @@ def test_bars_api_main_group_carries_every_window_the_ma_family_gives(logged):
     _seed(logged)
     payload = logged.client.get("/api/symbol/A/600519/bars?ma=5,20").json()
     assert sorted(payload["main"]["ma"]) == ["ma20", "ma5"]
+
+
+def test_chart_partial_marks_the_current_period(logged):
+    """当前档必须看得出来（D158）：换档之后旧档不再带 `aria-current`。
+    钉属性而不是钉整段文本——文案改了这枚用例不该跟着红。"""
+    _seed(logged)
+    week = logged.client.get("/api/partials/chart?market=A&code=600519&period=week")
+    assert week.status_code == 200
+    assert 'aria-current="true"' in week.text
+    assert 'data-chart-url="/api/symbol/A/600519/bars?period=week' in week.text
+    day = logged.client.get(
+        "/api/partials/chart?market=A&code=600519&period=day&main=&sub="
+    )
+    # 主/副图留空：开关那一排默认也带 aria-current，这里要数的是「周期条里恰好一档被钉住」
+    assert day.text.count('aria-current="true"') == 1
+
+
+def test_chart_partial_lists_the_indicator_switches_from_the_server_names(logged):
+    """开关上的名字来自服务端那份白名单（D162）：前端不自己记一份，
+    否则分析层加一个指标，屏幕上永远少一个。"""
+    _seed(logged)
+    text = logged.client.get("/api/partials/chart?market=A&code=600519").text
+    for name in ("ma", "boll", "macd", "kdj", "rsi", "vol"):
+        assert f'data-indicator="{name}"' in text
+
+
+def test_bars_api_dmi_group_holds_only_its_three_lines(logged):
+    """`dmi` 那三列的名字不是 `dmi*`（是 `pdi/mdi/adx`），族名当 prefix 会把
+    `date/close/bars` 一起拖进那一格，前端就照着日期字符串画一条线。
+    这枚钉的是「一族只装这一族的列」，不是 `dmi` 的算法。"""
+    _seed(logged)
+    payload = logged.client.get("/api/symbol/A/600519/bars?sub=dmi&main=ma").json()
+    assert sorted(payload["sub"]["dmi"]) == ["adx", "mdi", "pdi"]
+
+
+def test_symbol_page_uses_the_chart_partial(logged):
+    _seed(logged)
+    page = logged.client.get("/symbol/A/600519")
+    hit = "/api/partials/chart?market=A&amp;code=600519" in page.text
+    assert hit or "api/partials/chart" in page.text
+
+
+def test_chart_partial_requires_a_login(web_app):
+    """未登录拿不到这一块：路由第一行就 `require_user`，别让它先去摸数据库。
+    钉 303 与跳转目的地，不钉 401——本站的未登录姿势是重定向去登录页（`app.py:207`）。"""
+    response = web_app.client.get(
+        "/api/partials/chart?market=A&code=600519", follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/login")

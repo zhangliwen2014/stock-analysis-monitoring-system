@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from sams.core.codes import canonical_code, canonical_market, looks_like_index_code
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.quotes import NO_DATA, quote_state
+from sams.services.analysis import parse_period
 from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import hms, moment_label, pct_class, state_label
@@ -184,6 +185,17 @@ DEFAULT_WINDOW: dict[str, int] = {
 }
 #: 副图最多三格：再多就不是看图而是刷屏（D162）
 MAX_SUB_PANES = 3
+#: 周期条：(参数值, 屏幕上那几个字)。分钟档在计划 B，那时再来这张表里加行
+CHART_PERIODS: tuple[tuple[str, str], ...] = (
+    ("day", "日"), ("week", "周"), ("month", "月"), ("quarter", "季"),
+    ("year", "年"), ("5d", "5日"), ("10d", "10日"),
+)
+#: 开关上那几个字。白名单加了名字这里就必须加一行，缺行会在模板上留一个空按钮
+CHART_INDICATOR_LABELS: dict[str, str] = {
+    "ma": "均线", "boll": "布林", "ema": "指数均线",
+    "vol": "成交量", "macd": "MACD", "kdj": "KDJ", "rsi": "RSI", "atr": "ATR",
+    "wr": "威廉", "dmi": "动向", "cci": "CCI", "obv": "OBV",
+}
 #: `vol` 不是 `INDICATORS` 里的名字：那一格画的是裸量柱（量不复权，`indicators` 模块第 3 条）
 _VOLUME_COLUMN = "volume"
 #: 族名 → 列名前缀。`dmi` 的三列是 `pdi/mdi/adx`，前缀不等于族名，所以只能列全名字
@@ -356,6 +368,43 @@ def bars_api(
             "warmup_floor": str(read.warmup_floor) if read.warmup_floor else None,
             "note": None,
         }
+    )
+
+
+@router.get("/api/partials/chart")
+def chart_partial(
+    request: Request, market: str, code: str, period: str = "day",
+    main: str = "ma", sub: str = "vol", ma: str = "",
+):
+    """个股页那一块图：周期条 + 指标开关 + 挂着 `data-chart-url` 的那个 div。
+
+    为什么在服务端渲染而不是前端自己切：CSP 是 `'self'`（不许内联脚本），
+    而「现在选中的是哪一档」这份状态一旦落在前端，换档后屏上说的就可能是上一档的话（D158）。
+
+    周期名要过 `parse_period`：不认识的名字在这里就说 400，而不是悄悄换成日线——
+    那一屏会举着「日」的高亮画一段没人请求过的东西，而 `bars` 接口对同一个写法已经是 400。
+    """
+    require_user(request)
+    web = request.app.state.web
+    kind, _n = parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
+    ctx = web.contexts.current()
+    market = canonical_market(market)
+    code = canonical_code(market, code)
+    if market not in ctx.settings.markets:
+        raise HTTPException(status_code=404)
+    return web.render(
+        request,
+        "partials/chart.html",
+        market=market,
+        code=code,
+        periods=CHART_PERIODS,
+        period=period,
+        main=main,
+        sub=sub,
+        ma=ma,
+        mains=MAIN_INDICATORS,
+        subs=SUB_INDICATORS,
+        labels=CHART_INDICATOR_LABELS,
     )
 
 

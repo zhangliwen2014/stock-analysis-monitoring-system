@@ -9,8 +9,8 @@
     <span class="badge">{{ state }}</span>
     <span class="muted">{{ quote_at }}</span>
   </p>
-  <div id="chart" style="width:100%;height:420px"
-       data-chart-url="/api/symbol/{{ market }}/{{ code }}/bars?days=180"></div>
+  <div hx-get="/api/partials/chart?market={{ market }}&code={{ code }}" hx-trigger="load"
+       hx-swap="outerHTML"><p class="muted">图加载中…</p></div>
 </section>
 
 {% if no_bars %}{# 空态与 404 说两件不同的事：这里是「有这只票、数还没来」（D146） #}

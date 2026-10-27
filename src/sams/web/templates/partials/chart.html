@@ -1,0 +1,36 @@
+{% set picked_main = main.split(",") %}
+{% set picked_sub = sub.split(",") %}
+{% set base = "/api/partials/chart?market=" ~ market ~ "&code=" ~ code %}
+<div class="chart-box">
+  <div class="chart-bar">
+    <span class="chart-group" role="group" aria-label="周期">
+      {% for value, label in periods %}
+      <a hx-get="{{ base }}&period={{ value }}&main={{ main }}&sub={{ sub }}&ma={{ ma }}"
+         hx-target=".chart-box" hx-swap="outerHTML" href="?period={{ value }}"
+         {% if value == period %}aria-current="true" class="on"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </span>
+    <span class="chart-group" role="group" aria-label="主图指标">
+      {% for name in mains %}
+      {% set on = name in picked_main %}
+      {% set next_main = ((picked_main | reject("equalto", name)) if on else (picked_main + [name])) | join(",") %}
+      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ next_main }}&sub={{ sub }}&ma={{ ma }}"
+         hx-target=".chart-box" hx-swap="outerHTML" href="#"
+         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
+      {% endfor %}
+    </span>
+    <span class="chart-group" role="group" aria-label="副图指标">
+      {% for name in subs %}
+      {% set on = name in picked_sub %}
+      {% set next_sub = ((picked_sub | reject("equalto", name)) if on else (picked_sub + [name])) | join(",") %}
+      <a data-indicator="{{ name }}" hx-get="{{ base }}&period={{ period }}&main={{ main }}&sub={{ next_sub }}&ma={{ ma }}"
+         hx-target=".chart-box" hx-swap="outerHTML" href="#"
+         {% if on %}aria-current="true" class="on"{% endif %}>{{ labels[name] }}</a>
+      {% endfor %}
+    </span>
+  </div>
+  <div id="chart" style="width:100%;height:480px" data-chart-kind="kline"
+       data-chart-period="{{ period }}"
+       data-chart-url="/api/symbol/{{ market }}/{{ code }}/bars?period={{ period }}&main={{ main }}&sub={{ sub }}&ma={{ ma }}"></div>
+  <p class="muted chart-caption">后复权 · 均线算在同一基上</p>
+</div>
