@@ -136,6 +136,35 @@ def test_a_month_bar_is_named_after_the_last_day_of_that_month():
     assert out.frame["last"].to_list() == [date(2024, 1, 31)]
 
 
+def test_a_quarter_bar_is_named_after_the_last_day_of_that_quarter():
+    """季线沿用周月那条口径 1：名字是日历季末日，实际最后一根在 `last` 里。
+    3-29 提前收市那一季仍然叫 3-31，否则「本季」会随长假漂移。
+
+    整组日期比设计稿往前挪一年：`daily()` 那条覆盖区间止于 `END`（2024-02-23），
+    2024 年 3 月那根日线过不了复权闸，出不了数。
+    """
+    days = [date(2023, 1, 3), date(2023, 2, 15), date(2023, 3, 28)]
+    out = resample(daily(days), "quarter", as_of=END)
+    assert out.frame["date"].to_list() == [date(2023, 3, 31)]
+    assert out.frame["first"].to_list() == [date(2023, 1, 3)]
+    assert out.frame["last"].to_list() == [date(2023, 3, 28)]
+
+
+def test_a_year_bar_collects_every_quarter_of_that_year():
+    """一年十二个月的日线聚成一根年 K，名字是 12-31（日期挪年的理由同上）。"""
+    days = [date(2023, month, 15) for month in range(1, 13)]
+    out = resample(daily(days), "year", as_of=END)
+    assert out.frame["date"].to_list() == [date(2023, 12, 31)]
+    assert out.frame["bars"].to_list() == [12]
+
+
+def test_quarters_split_across_a_year_boundary():
+    """跨年那一组分成的不是同一季：两根季 K，各自叫自己那季的日历末日。"""
+    days = [date(2023, 12, 15), date(2024, 1, 15), date(2024, 2, 15)]
+    out = resample(daily(days), "quarter", as_of=END)
+    assert out.frame["date"].to_list() == [date(2023, 12, 31), date(2024, 3, 31)]
+
+
 # --- 聚合口径 -----------------------------------------------------------------------
 
 

@@ -1,8 +1,8 @@
-"""周线与月线由日线现算（spec §8.2）。只聚合，不重新复权、不落库。
+"""周线、月线、季线与年线由日线现算（spec §8.2）。只聚合，不重新复权、不落库。
 
 三条口径：
 
-1. **一根周 K 的名字是那个周期在日历上的收市日（周五 / 月末最后一天），不是这段里
+1. **一根周期 K 的名字是那个周期在日历上的收市日（周五 / 月末 / 季末 / 年末），不是这段里
    最后一根 K 线。** 周五休市那一周仍然叫那个周五——否则「本周」会随长假、停电漂移，
    而周线指标吃的正是「第 N 周」。实际最后一根另存 `last` 列，两者不一致就说明那一周
    提前收市（这正是 `tests/cli` 那条「锚点移动」的诚实写法在周期上的版本）。
@@ -50,10 +50,13 @@ _AGG = {
     "adjust": "first",  # 读路径按 `adjust = 'raw'` 过滤，这是常数
     "updated_at": "last",  # 最后一根是谁在什么时候写的，与 `source` 同一口径
 }
-#: `resample()` 能处理的两个周期名；`services` 层组装 `PERIODS` 取值表时引用这两个，
-#: 不重新写字符串——两处各管一份会在有人只改一处的时候静默漂移
 WEEK = "week"
 MONTH = "month"
+QUARTER = "quarter"
+YEAR = "year"
+#: `resample()` 能处理的周期名名单；`services` 层组装 `PERIODS` 取值表时引用这一份，
+#: 不重新写字符串——两处各管一份会在有人只改一处的时候静默漂移
+RESAMPLE_PERIODS: tuple[str, ...] = (WEEK, MONTH, QUARTER, YEAR)
 
 
 def _require_series(series: object) -> AdjustedSeries:
@@ -66,12 +69,20 @@ def _require_series(series: object) -> AdjustedSeries:
     return series
 
 
-def _period_end(day: date, period: str) -> date:
-    """该日所在周期的**日历收市日**：周五（周）或该月最后一天（月）。"""
-    if period == WEEK:
-        return day + timedelta(days=4 - day.weekday())
+def _month_end(day: date) -> date:
     following = (day.replace(day=28) + timedelta(days=4)).replace(day=1)
     return following - timedelta(days=1)
+
+
+def _period_end(day: date, period: str) -> date:
+    """该日所在周期的**日历收市日**：周五（周）、该季/该年的日历末日、该月最后一天。"""
+    if period == WEEK:
+        return day + timedelta(days=4 - day.weekday())
+    if period == QUARTER:
+        return _month_end(day.replace(month=((day.month - 1) // 3) * 3 + 3))
+    if period == YEAR:
+        return date(day.year, 12, 31)
+    return _month_end(day)
 
 
 def _week_group(day: date) -> date:
@@ -80,8 +91,31 @@ def _week_group(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
 
+def _month_start(day: date) -> date:
+    return day.replace(day=1)
+
+
+def _quarter_group(day: date) -> date:
+    """所在季的 1 号（1/4/7/10 月）：季是三个自然月一组，不做「滚动三个月」。"""
+    return day.replace(month=((day.month - 1) // 3) * 3 + 1, day=1)
+
+
+def _year_group(day: date) -> date:
+    return date(day.year, 1, 1)
+
+
+#: 每个周期的分组键，形状统一是「该周期第一天」：同周期的日线必须落进同一个键，
+#: 而键本身不参与输出（名字由 `_period_end` 从日历上算）
+_GROUP_OF = {
+    WEEK: _week_group,
+    MONTH: _month_start,
+    QUARTER: _quarter_group,
+    YEAR: _year_group,
+}
+
+
 def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
-    """把一条已过闸的日线序列聚成周线或月线，返回同一种类型（指标层可直接吃）。
+    """把一条已过闸的日线序列聚成周线、月线、季线或年线，返回同一种类型（指标层可直接吃）。
 
     输出的列与日线那套同名（`open/high/low/close`、`*_hfq`、`volume`、`amount`），
     外加五个周期才有的字段：
@@ -91,9 +125,10 @@ def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
     * `bars` —— 聚进来几根日线（一根周 K 只有一根日线，通常是停牌或长假）
     * `pending` —— 周期收市日还在 `as_of` 之后（口径 2）
     """
-    if period not in (WEEK, MONTH):
+    if period not in RESAMPLE_PERIODS:
         raise ValidationError(
-            f"重采样周期只认 `week` 与 `month`，收到的是 {period!r}："
+            f"重采样周期只认 {'、'.join(f'`{p}`' for p in RESAMPLE_PERIODS)}，"
+            f"收到的是 {period!r}："
             "写成 \"weekly\" 静默当成 week 等于让调用方以为自己要的东西被给了"
         )
     source = _require_series(series)
@@ -103,9 +138,7 @@ def resample(series: object, period: str, *, as_of: date) -> AdjustedSeries:
 
     ordered = frame.sort("date")
     days = ordered["date"].to_list()
-    group_of = (
-        (lambda day: _week_group(day)) if period == WEEK else (lambda day: day.replace(day=1))
-    )
+    group_of = _GROUP_OF[period]
     columns = list(ordered.columns)
     aggregates = []
     for column in columns:
