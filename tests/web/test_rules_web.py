@@ -218,6 +218,25 @@ def test_a_blank_cooldown_and_severity_fall_back_to_the_configured_ones(logged):
     assert rule.severity == "strong"
 
 
+def test_a_rule_on_a_thesis_names_the_thesis_it_watches(logged):
+    """对象那一列对论点类规则也要报名字：`ctx.theses` 是服务不是仓库，读错一个名字
+    就是整张列表 500（线上 2026-10-28 真发生过一次，只有这一种对象会走到）。"""
+    ctx = logged.context
+    alice_id = _alice_id(logged)
+    thesis = ctx.theses_store.create(
+        user_id=alice_id, market="A", code="600519", style="value",
+        actor_id=alice_id, now=logged.core.clock.now_utc(),
+    )
+    _add(
+        logged, kind="thesis.odds_below", name="赔率不够", target_type="thesis",
+        target_ref=thesis.id, thesis_id=thesis.id, params={"threshold": 1.5},
+    )
+
+    page = logged.client.get("/rules")
+    assert page.status_code == 200
+    assert "论点 A/600519" in page.text
+
+
 def test_a_non_numeric_cooldown_is_refused_by_name(logged):
     """`int("一千")` 抛的是 `ValueError`，不是 `SamsError`：不自己折一下就是一屏 500。"""
     response = logged.client.post(

@@ -130,7 +130,8 @@ def _target_text(ctx, rule: Rule) -> str:
         whose = account.name if account is not None else rule.account_id or "全部"
         return f"持仓（账户 {whose}）"
     if rule.target_type == "thesis":
-        thesis = ctx.theses.get(rule.user_id, rule.thesis_id or rule.target_ref)
+        # 仓库带 `_store`：`ctx.theses` 是那个读取用例，没有按 id 取一条的接口
+        thesis = ctx.theses_store.get(rule.user_id, rule.thesis_id or rule.target_ref)
         if thesis is not None:
             return f"论点 {thesis.market}/{thesis.code}"
         return f"论点 {rule.target_ref[:12]}"
