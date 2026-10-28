@@ -58,21 +58,45 @@
 {% endfor %}
 <p>命中 {{ total }} 只</p>
 
-<table>
-  <tr><th>代码</th><th>名称</th>{% for item in labels %}<th class="num">{{ item.label }}</th>{% endfor %}<th class="num">现价</th></tr>
-  {% for row in view %}
-  <tr>
-    <td>{{ row.code }}</td>
-    <td>{{ row.name }}</td>
-    {% for cell in row.cells %}<td class="num">{{ cell }}</td>{% endfor %}
-    <td class="num">{{ row.price }}</td>
-  </tr>
-  {% endfor %}
-</table>
-<p class="muted">第 {{ page }} / {{ pages }} 页
-  {% if pager.prev %}<a href="{{ pager.prev }}">上一页</a>{% endif %}
-  {% if pager.next %}<a href="{{ pager.next }}">下一页</a>{% endif %}
-</p>
+{% if plan %}
+<p class="flash-ok">全部 {{ plan.total }} 只里有 {{ plan.already }} 只已在自选：这次会加入 {{ plan.will_add }} 只{% if plan.capped %}，另有 {{ plan.capped }} 只因自选上限 {{ plan.max }} 只没加{% endif %}。</p>
+<form method="post" action="/screen/watchlist" class="inline-form">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="market" value="{{ market }}">
+  {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
+  <input type="hidden" name="action" value="all">
+  <input type="hidden" name="confirm" value="yes">
+  <button type="submit">确认加入 {{ plan.will_add }} 只</button>
+</form>
+{% endif %}
+
+{# 整张结果表是一个表单：「全部」「勾选」「单行」是同一表单里 value 不同的提交按钮（CSP 禁内联脚本） #}
+<form method="post" action="/screen/watchlist">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <input type="hidden" name="market" value="{{ market }}">
+  {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
+  <p>
+    <button type="submit" name="action" value="all">全部 {{ total }} 只加自选</button>
+    <button type="submit" name="action" value="checked">勾选的加自选</button>
+  </p>
+  <table>
+    <tr><th></th><th>代码</th><th>名称</th>{% for item in labels %}<th class="num">{{ item.label }}</th>{% endfor %}<th class="num">现价</th><th></th></tr>
+    {% for row in view %}
+    <tr>
+      <td><input type="checkbox" name="codes" value="{{ row.code }}"></td>
+      <td>{{ row.code }}</td>
+      <td>{{ row.name }}</td>
+      {% for cell in row.cells %}<td class="num">{{ cell }}</td>{% endfor %}
+      <td class="num">{{ row.price }}</td>
+      <td>{% if row.held %}<span class="badge">已在自选</span>{% else %}<button type="submit" name="action" value="one:{{ row.code }}">加自选</button>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">第 {{ page }} / {{ pages }} 页
+    {% if pager.prev %}<a href="{{ pager.prev }}">上一页</a>{% endif %}
+    {% if pager.next %}<a href="{{ pager.next }}">下一页</a>{% endif %}
+  </p>
+</form>
 
 {% if missing %}
 <section class="card">

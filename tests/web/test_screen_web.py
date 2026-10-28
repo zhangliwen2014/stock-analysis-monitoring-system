@@ -191,3 +191,94 @@ def test_a_page_number_past_the_end_lands_on_the_last_page(logged_screen):
         "/screen", params=_condition_params() + [("page", "99")]
     )
     assert "第 1 / 1 页" in response.text and "600519" in response.text
+
+
+def _alice(logged_screen):
+    return logged_screen.context.users.get_by_username("alice").id
+
+
+def test_one_row_adds_through_the_watchlist_write_point(logged_screen):
+    default_seed(logged_screen)
+    response = logged_screen.client.post(
+        "/screen/watchlist",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "f": "pr_now",
+            "o": "<=",
+            "v": "0.5",
+            "action": "one:600519",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert logged_screen.context.watchlists.contains(_alice(logged_screen), "A", "600519")
+
+
+def test_checked_codes_are_added_and_unticked_ones_are_not(logged_screen):
+    default_seed(logged_screen)
+    logged_screen.client.post(
+        "/screen/watchlist",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "f": "pr_now",
+            "o": "<=",
+            "v": "0.5",
+            "action": "checked",
+            "codes": ["600519", "000001"],
+        },
+        follow_redirects=False,
+    )
+    context = logged_screen.context
+    alice = _alice(logged_screen)
+    assert context.watchlists.contains(alice, "A", "600519")
+    assert context.watchlists.contains(alice, "A", "000001")
+    assert not context.watchlists.contains(alice, "A", "300750")
+
+
+def test_add_all_first_shows_a_dry_run_and_writes_nothing(logged_screen):
+    default_seed(logged_screen)
+    context = logged_screen.context
+    alice = _alice(logged_screen)
+    context.watchlists.add(alice, "A", "600519")
+    preview = logged_screen.client.post(
+        "/screen/watchlist",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "f": "pr_now",
+            "o": "<=",
+            "v": "0.5",
+            "action": "all",
+        },
+        follow_redirects=False,
+    )
+    assert preview.status_code == 303 and "confirm=all" in preview.headers["location"]
+    page = logged_screen.client.get(preview.headers["location"])
+    assert "全部 2 只里有 1 只已在自选" in page.text
+    assert "这次会加入 1 只" in page.text
+    assert not context.watchlists.contains(alice, "A", "000001")
+
+
+def test_add_all_confirmed_re_runs_the_conditions_on_the_server(logged_screen):
+    default_seed(logged_screen)
+    response = logged_screen.client.post(
+        "/screen/watchlist",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "f": "pr_now",
+            "o": "<=",
+            "v": "0.5",
+            "action": "all",
+            "confirm": "yes",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    context = logged_screen.context
+    alice = _alice(logged_screen)
+    assert context.watchlists.contains(alice, "A", "600519")
+    assert context.watchlists.contains(alice, "A", "000001")
+    assert not context.watchlists.contains(alice, "A", "300750")

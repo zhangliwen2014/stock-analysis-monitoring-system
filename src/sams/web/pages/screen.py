@@ -14,9 +14,10 @@ from fastapi.responses import RedirectResponse
 
 from sams.core.errors import ValidationError
 from sams.core.screener_fields import FIELDS, OP_LABELS, OPS, Condition, fields_for
+from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import moment_label
-from sams.web.forms import form_data, one
+from sams.web.forms import form_data, many, one
 
 router = APIRouter()
 
@@ -123,6 +124,17 @@ def _render(
     page = min(max(page, 1), pages)
     shown = hits[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
     held = {code for item_market, code in ctx.watchlists.codes(user.id) if item_market == market}
+    plan = None
+    if confirm_all and result is not None:
+        already = sum(1 for hit in hits if hit.code in held)
+        quota = max(0, MAX_ITEMS_PER_USER - ctx.watchlists.count(user.id))
+        plan = {
+            "total": len(hits),
+            "already": already,
+            "will_add": min(len(hits) - already, quota),
+            "capped": max(0, len(hits) - already - quota),
+            "max": MAX_ITEMS_PER_USER,
+        }
     view = [_hit_row(hit, conditions, held) for hit in shown]
     counts_view = (
         [
@@ -172,6 +184,8 @@ def _render(
         error=error,
         notice=notice,
         page=page,
+        plan=plan,
+        confirm_all=confirm_all,
     )
 
 
@@ -275,6 +289,16 @@ def _notice(query) -> str:
     kind = query.get("notice") or ""
     if kind == "queued":
         return "已把全市场快照排进下一拍：跑完刷新这一页"
+    if kind == "added":
+        added = _count(query.get("added"))
+        already = _count(query.get("already"))
+        capped = _count(query.get("capped"))
+        parts = [f"加入自选 {added} 只"]
+        if already:
+            parts.append(f"{already} 只原本就在")
+        if capped:
+            parts.append(f"{capped} 只因自选上限 {MAX_ITEMS_PER_USER} 只没加")
+        return "；".join(parts)
     return ""
 
 
@@ -313,3 +337,63 @@ def _hit_row(hit, conditions: tuple[Condition, ...], held: set[str]) -> dict:
         "price": "—" if hit.values.get("price") is None else f"{hit.values['price']:g}",
         "held": hit.code in held,
     }
+
+
+@router.post("/screen/watchlist")
+def add_to_watchlist(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _FORM_BODY,
+):
+    """三个入口最后都落在 `watchlists.add`（D184）：单行、勾选、全部。
+
+    「全部」越过分页：服务端按这组条件重跑，不把屏幕上那 50 行提交回来。
+    先一次 dry-run 页（`confirm=all`），按下去才真写。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    market = one(data, "market").strip().upper()
+    rows = _posted_rows(data)
+    action = one(data, "action")
+    if action == "all":
+        if one(data, "confirm") != "yes":
+            return RedirectResponse(_url(market, rows, confirm=True), status_code=303)
+        try:
+            result = ctx.screener.run(market, _conditions(rows))
+        except ValidationError as exc:
+            return _render(request, user, market=market, preset=None, rows=rows, error=str(exc))
+        codes = [hit.code for hit in result.hits]
+    elif action == "checked":
+        codes = [code.strip() for code in many(data, "codes") if code.strip()]
+    elif action.startswith("one:"):
+        codes = [action.partition(":")[2].strip()]
+    else:
+        raise HTTPException(status_code=400, detail="不认识的加自选动作")
+    added = already = capped = 0
+    for code in dict.fromkeys(codes):
+        if ctx.watchlists.contains(user.id, market, code):
+            already += 1
+            continue
+        try:
+            ctx.watchlists.add(user.id, market, code)
+        except ValidationError:
+            capped += 1
+            continue
+        ctx.symbol_interest.ensure(market, code, actor=user.username)
+        added += 1
+    return RedirectResponse(
+        _url(
+            market,
+            rows,
+            notice="added",
+            extra={"added": added, "already": already, "capped": capped},
+        ),
+        status_code=303,
+    )
+
+
+def _count(text) -> int:
+    try:
+        return max(0, int(text or 0))
+    except ValueError:
+        return 0
