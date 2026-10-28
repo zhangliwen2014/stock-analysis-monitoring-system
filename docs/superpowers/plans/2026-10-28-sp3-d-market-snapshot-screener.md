@@ -540,8 +540,14 @@ def test_a_short_row_is_field_drift_not_a_row_of_nulls():
 
 
 def test_a_response_without_any_match_is_empty_not_a_frame_of_zeros():
+    # 行键与行内回显都是 600000，请求的是 600519：按回显匹配，一行都对不上
     with pytest.raises(EmptyResponse):
-        parse_spot(line("sh600000", cells()), market="A", codes=["600519"], zone=ZONE)
+        parse_spot(
+            line("sh600000", cells(code="600000", name="浦发银行")),
+            market="A",
+            codes=["600519"],
+            zone=ZONE,
+        )
     with pytest.raises(EmptyResponse):
         parse_spot("", market="A", codes=["600519"], zone=ZONE)
 
@@ -605,7 +611,6 @@ Expected: `ModuleNotFoundError: No module named 'sams.datasource.spot'`。
 from __future__ import annotations
 
 import re
-from datetime import date
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -777,7 +782,7 @@ def parse_spot(
 - [ ] **Step 4: 跑测试，确认解析器绿、适配器仍红**
 
 Run: `uv run pytest tests/datasource/test_spot.py -q -m "not live"`
-Expected: 解析器 4 条 PASS；`test_adapter_*` 两条 FAIL（`TencentAdapter` 没有
+Expected: 解析器 5 条 PASS；`test_adapter_*` 两条 FAIL（`TencentAdapter` 没有
 `market_snapshot`，`AttributeError`）。
 
 - [ ] **Step 5: 在腾讯适配器上加方法与意愿表**
