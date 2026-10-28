@@ -32,3 +32,15 @@ def test_templates_reference_no_external_urls():
         text = path.read_text()
         assert "http://" not in text, path
         assert "https://" not in text, path
+
+
+def test_app_js_dispatches_on_the_chart_kind_the_template_writes():
+    """`data-chart-kind` 不再是写了没人读的装饰（§5.3 的实现时订正）。
+
+    这一条只钉「脚本按 kind 分了两条路」这个事实：分时的画法对不对，
+    由 `tmp/harness` 那条无头渲染断言看像素，不靠文本匹配假装看过图。
+    """
+    text = (WEB / "static" / "app.js").read_text()
+    assert "dataset.chartKind" in text
+    assert "function timeChart" in text
+    assert "function klineChart" in text

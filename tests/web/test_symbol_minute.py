@@ -175,3 +175,13 @@ def test_the_time_tab_is_greyed_when_no_source_answers_series(logged_minute):
     views = _group(html, "视图")
     assert 'class="dim"' in views
     assert "分时" in views
+
+
+def test_the_time_view_carries_the_kind_the_script_switches_on(logged_minute):
+    """局部里那个 div 的 kind 必须是 `time`：脚本按它选画法，写错就是拿蜡烛的键去读分时。"""
+    _seed(logged_minute)
+    html = logged_minute.client.get(
+        "/api/partials/chart?market=A&code=600519&view=time"
+    ).text
+    assert 'data-chart-kind="time"' in html
+    assert 'data-chart-period="day"' in html  # 分时不看周期：那一个属性留着旧值就说明没换视图
