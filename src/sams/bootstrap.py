@@ -87,6 +87,7 @@ from sams.storage.repos.attachments import AttachmentRepo
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.channels import ChannelRepo
+from sams.storage.repos.chart_prefs import ChartPrefRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
@@ -204,6 +205,8 @@ class ServiceContext:
     snapshot_store: SnapshotRepo
     #: 筛选方案（D182）：条件与名字都在这一张表，页面六个动作只经它
     screener_presets: ScreenerPresetRepo
+    #: 图表偏好（D193）：周期条顺序与均线窗口，一行一人
+    chart_prefs: ChartPrefRepo
     #: 快照同步用例（D174）：票池、取数、定日、点名缺答都在它那一头
     snapshots: MarketSnapshotService
     watchlists: WatchlistRepo
@@ -464,6 +467,7 @@ def _context_on(
     scan_store = ScanResultRepo(database)
     snapshot_store = SnapshotRepo(database)
     screener_presets = ScreenerPresetRepo(database, clock=clock)
+    chart_prefs = ChartPrefRepo(database, clock=clock)
     theses_store = ThesisRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
@@ -723,6 +727,7 @@ def _context_on(
         scan_store=scan_store,
         snapshot_store=snapshot_store,
         screener_presets=screener_presets,
+        chart_prefs=chart_prefs,
         snapshots=market_snapshot_sync,
         theses_store=theses_store,
         watchlists=watchlists,
