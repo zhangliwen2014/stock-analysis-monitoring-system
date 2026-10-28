@@ -139,14 +139,14 @@ class ScreenerService:
         universe = self._with_financials(
             market, universe, snapshot_day, wanted=set(specs.values())
         )
-        reasons: dict[str, str] = {}
+        kinds: dict[str, str] = {}
         if "pr_now" in specs:
             values = []
             for code, pe_dyn, pb in universe.select("code", "pe_dyn", "pb").iter_rows():
                 outcome = pr_now(pe_dyn, pb)
                 values.append(outcome.value)
                 if outcome.value is None:
-                    reasons[code] = outcome.reason or ""
+                    kinds[code] = outcome.kind or "现值 PR 没有数"
             universe = universe.with_columns(
                 pl.Series("pr_now", values, dtype=pl.Float64)
             )
@@ -198,7 +198,7 @@ class ScreenerService:
             hits=hits,
             total_hits=total,
             truncated=total - limited.height,
-            missing=_missing_groups(universe, checked, specs, hit_codes, reasons, market),
+            missing=_missing_groups(universe, checked, specs, hit_codes, kinds, market),
         )
 
     def _with_financials(
@@ -253,10 +253,14 @@ def _missing_groups(
     checked: tuple[Condition, ...],
     specs: dict[str, Field],
     hit_codes: set[str],
-    reasons: dict[str, str],
+    kinds: dict[str, str],
     market: str,
 ) -> tuple[MissingGroup, ...]:
-    """一只票只记**第一条**让它出局的条件：同一个缺口记两次会让「无数 N 只」重复计人。"""
+    """一只票只记**第一条**让它出局的条件：同一个缺口记两次会让「无数 N 只」重复计人。
+
+    pr_now 的组键用 `kind`（亏损 / 净资产为负 / …），不用逐票的 reason：后者带着
+    这只票自己的 PE 或 PB，真实快照上 1459 只无数票会散成 1394 组。
+    """
     grouped: dict[tuple[str, str], list[str]] = {}
     for row in universe.iter_rows(named=True):
         if row["code"] in hit_codes:
@@ -265,7 +269,7 @@ def _missing_groups(
             value = row[specs[cond.field].column]
             if value is None or (isinstance(value, float) and isnan(value)):
                 if cond.field == "pr_now":
-                    reason = reasons.get(row["code"], "现值 PR 没有数")
+                    reason = kinds.get(row["code"], "现值 PR 没有数")
                 elif specs[cond.field].source == "financials":
                     reason = (
                         f"没有已披露年报里的{specs[cond.field].label}："

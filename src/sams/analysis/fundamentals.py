@@ -158,10 +158,16 @@ def pr(
 
 @dataclass(frozen=True)
 class PriceProfitRatio:
-    """现值 PR 的出数或拒算理由：两个字段恰好有一个是 None。"""
+    """现值 PR 的出数或拒算理由。
+
+    `reason` 带着这只票自己的数（「PE(动)=-8 不为正」），单只票的页面读得懂；
+    `kind` 是同一件事的**类**。选股页把上千只票归组靠 kind——逐票拼出来的 reason
+    在真实快照上炸成 1394 组（D180）。
+    """
 
     value: float | None
     reason: str | None = None
+    kind: str | None = None
 
 
 def pr_now(pe_dyn: float | None, pb: float | None) -> PriceProfitRatio:
@@ -175,17 +181,26 @@ def pr_now(pe_dyn: float | None, pb: float | None) -> PriceProfitRatio:
     的那条上界，不另写一份判断。
     """
     if pe_dyn is None:
-        return PriceProfitRatio(None, "PE(动) 缺失（快照没给这一列）")
+        return PriceProfitRatio(None, "PE(动) 缺失（快照没给这一列）", "PE(动) 缺失")
     if pe_dyn <= 0:
-        return PriceProfitRatio(None, f"PE(动)={pe_dyn:g} 不为正（亏损），平方后会变成假便宜")
+        return PriceProfitRatio(
+            None,
+            f"PE(动)={pe_dyn:g} 不为正（亏损），平方后会变成假便宜",
+            "亏损（PE(动) ≤ 0）",
+        )
     if pb is None:
-        return PriceProfitRatio(None, "PB 缺失（快照没给这一列）")
+        return PriceProfitRatio(None, "PB 缺失（快照没给这一列）", "PB 缺失")
     if pb <= 0:
-        return PriceProfitRatio(None, f"PB={pb:g} 不为正（净资产为负），PR 的方向会反过来")
+        return PriceProfitRatio(
+            None,
+            f"PB={pb:g} 不为正（净资产为负），PR 的方向会反过来",
+            "净资产为负（PB ≤ 0）",
+        )
     implied = pb / pe_dyn
     if out_of_caliber("roe", implied):
         return PriceProfitRatio(
             None,
             f"PE(动) 与 PB 推出的 ROE={implied:.3g} 达到口径上界（|ROE| ≥ 1），这个数不可信",
+            "推出来的 ROE 过界（|ROE| ≥ 1）",
         )
     return PriceProfitRatio(pe_dyn**2 / (100.0 * pb), None)

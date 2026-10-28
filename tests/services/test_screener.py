@@ -103,6 +103,25 @@ def test_missing_codes_are_grouped_with_a_reason_and_a_next_step(db):
     assert "亏损" in group.reason
 
 
+def test_loss_makers_with_different_pe_share_one_group(db):
+    """无数原因按**类**归组，不按每只票的数：1386 只亏损票各写一路 PE 值，页面就成了 1386 组。"""
+    seed(
+        db,
+        snap("600519", pe_dyn=5.0, pb=1.0),
+        snap("000001", pe_dyn=-8.0, pb=1.0),
+        snap("300750", pe_dyn=-2.0, pb=1.0),
+        snap("600000", pe_dyn=-40.0, pb=1.0),
+        snap("600476", pe_dyn=12.0, pb=-3.82),
+        codes=("600519", "000001", "300750", "600000", "600476"),
+    )
+    result = service(db).run("A", [Condition("pr_now", "<=", 0.5)])
+    by_reason = {group.reason: group.codes for group in result.missing}
+    assert len(by_reason) == 2
+    assert by_reason["亏损（PE(动) ≤ 0）"] == ("000001", "300750", "600000")
+    assert by_reason["净资产为负（PB ≤ 0）"] == ("600476",)
+    assert result.fields[0].missing == 4
+
+
 def test_financial_fields_join_as_of_the_snapshot_day_and_report_the_gap(db):
     seed(db, snap("600519"), snap("000001"), codes=("600519", "000001"))
     # support_valuation.financial_rows 的签名是 (*, market="A", code=CODE)，FY23 的 ROE=0.20
