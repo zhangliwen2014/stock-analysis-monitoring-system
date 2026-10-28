@@ -13,9 +13,10 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from support import FrozenClock, StubAdapter, sample_bars
 
-from sams.core.errors import DatasourceError, EmptyResponse, RateLimited, TransientError
+from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited, TransientError
+from sams.datasource.minute import MINUTE_BARS_COLUMNS
 from sams.datasource.registry import AdapterRegistry
-from sams.datasource.sina import MAX_BARS, SinaAdapter, parse_sina_daily
+from sams.datasource.sina import MAX_BARS, SinaAdapter, parse_sina_daily, parse_sina_minute
 
 TODAY = date(2026, 10, 17)
 #: 右端固定：接口给的是「最近 N 根到今天」，不冻住时钟就没法断言根数
@@ -231,3 +232,102 @@ def test_live_sina_returns_the_recent_window():
     days = frame["date"].to_list()
     assert min(days) >= since and max(days) <= today, "窗口外的根数不该混进来"
     assert min(frame["volume"].to_list()) > 0, "真实成交的那几根不该带 0 量"
+
+
+# --- 分钟K（Task 5）：`day` 带秒，拆成 date + clock ------------------------------------
+
+D28 = date(2026, 10, 28)
+D27 = date(2026, 10, 27)
+#: 分钟档不看时钟，但适配器一律要注入：冻在与样本同一天，断言就不依赖墙钟
+CLOCK_D28 = FrozenClock(datetime(2026, 10, 28, 4, 0, tzinfo=UTC))
+
+
+class RecordingGet:
+    """记下整份 params：`scale=15` 有没有真的传下去，只有从参数上能证。"""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def __call__(self, url, params, *, timeout=15):
+        self.calls.append((url, dict(params)))
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        return self.payload
+
+
+def minute_rows():
+    return [
+        {
+            "day": "2026-10-27 15:00:00",
+            "open": "1356.000",
+            "high": "1357.000",
+            "low": "1352.720",
+            "close": "1355.900",
+            "volume": "1194508",
+            "amount": "1619962803.8680",
+        },
+        {
+            "day": "2026-10-28 10:30:00",
+            "open": "1354.980",
+            "high": "1354.980",
+            "low": "1333.000",
+            "close": "1340.950",
+            "volume": "1440368",
+            "amount": "1936196723.9883",
+        },
+        {
+            "day": "2026-10-28 11:05:00",
+            "open": "1331.350",
+            "high": "1331.430",
+            "low": "1331.280",
+            "close": "1331.410",
+            "volume": "11000",
+            "amount": "14644871.9688",
+        },
+    ]
+
+
+def test_parse_sina_minute_splits_day_into_date_and_clock_and_trims_the_window():
+    """`day` 带秒：拆成 `date` + `clock`，并按请求区间裁掉区间外那根。"""
+    frame = parse_sina_minute(minute_rows(), code="600519", start=D28, end=D28)
+    assert frame.columns == MINUTE_BARS_COLUMNS
+    assert frame["date"].to_list() == [D28, D28]
+    assert frame["clock"].to_list() == ["10:30", "11:05"]
+    # 新浪的量本来就是股、额是元：与日线同一口径，不做换算
+    assert frame["volume"].to_list() == [1440368.0, 11000.0]
+    assert frame["amount"].to_list()[1] == pytest.approx(14644871.9688)
+
+
+def test_minute_bars_asks_for_the_requested_scale_and_count():
+    get = RecordingGet(minute_rows())
+    SinaAdapter(get=get, clock=CLOCK_D28).minute_bars("A", "600519", D28, D28, scale=15, count=48)
+    _url, params = get.calls[0]
+    assert params["scale"] == "15"
+    assert params["datalen"] == "48"
+    assert params["symbol"] == "sh600519"
+
+
+def test_minute_bars_refuses_other_markets_without_a_network_call():
+    get = RecordingGet(minute_rows())
+    with pytest.raises(EmptyResponse, match="只供"):
+        SinaAdapter(get=get, clock=CLOCK_D28).minute_bars(
+            "HK", "00700", D28, D28, scale=5, count=240
+        )
+    assert get.calls == []
+
+
+def test_minute_bars_answers_no_data_when_the_window_is_older_than_the_rows():
+    """请求够了、区间内一根没有：那是「这段没数据」，交 `EmptyResponse` 让链问下一个源。"""
+    get = RecordingGet(minute_rows()[:1])
+    with pytest.raises(EmptyResponse, match="0 根"):
+        SinaAdapter(get=get, clock=CLOCK_D28).minute_bars(
+            "A", "600519", D28, D28, scale=5, count=240
+        )
+
+
+def test_parse_sina_minute_rejects_a_row_without_a_time_part():
+    with pytest.raises((FieldDrift, EmptyResponse)):
+        parse_sina_minute(
+            [{"day": "2026-10-28", "close": "1.0"}], code="600519", start=D28, end=D28
+        )

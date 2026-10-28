@@ -22,7 +22,7 @@ from datetime import date
 import polars as pl
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.errors import DatasourceError, EmptyResponse, RateLimited
+from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.datasource.base import a_share_symbol, classify_error, normalize_bars
 from sams.datasource.sources import source
 
@@ -74,6 +74,53 @@ def parse_sina_daily(payload: object, *, code: str, start: date, end: date) -> p
     return out.filter(pl.col("date").is_between(start, end))
 
 
+def parse_sina_minute(payload: object, *, code: str, start: date, end: date) -> pl.DataFrame:
+    """纯解析：新浪分钟 JSON → `MINUTE_BARS_COLUMNS`，按 `[start, end]` 裁剪。
+
+    `day` 在这一档是 `"2026-10-28 11:05:00"`（带秒），比日线多一段时间；拆成
+    `date` + `clock` 是因为 `normalize_bars` 会按 `date` 去重——一分钟一根，
+    整场交易会被它压成一根 K，而那看起来像「这个源只给了一天」。
+    """
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, list):
+        raise DatasourceError(
+            "sina", f"分钟响应不是数组: {type(payload).__name__}；原文 {str(payload)[:120]}"
+        )
+    if not payload:
+        raise EmptyResponse("sina", f"{code} 分钟区间 0 根（响应为空数组）")
+    rows = [item for item in payload if isinstance(item, dict)]
+    if len(rows) != len(payload):
+        raise DatasourceError("sina", "分钟响应里混入非对象元素，字段形态已变")
+
+    moments = [str(item.get("day") or "") for item in rows]
+    bad = [value for value in moments if len(value) < 16]
+    if bad:
+        raise FieldDrift("sina", f"分钟行的 `day` 形态不对: {bad[0]!r}")
+
+    frame = pl.DataFrame(
+        {
+            "market": ["A"] * len(rows),
+            "code": [code] * len(rows),
+            "date": [value[:10] for value in moments],
+            "clock": [value[11:16] for value in moments],
+            "open": [item.get("open") for item in rows],
+            "high": [item.get("high") for item in rows],
+            "low": [item.get("low") for item in rows],
+            "close": [item.get("close") for item in rows],
+            "volume": [item.get("volume") for item in rows],
+            "amount": [item.get("amount") for item in rows],
+            "source": ["sina"] * len(rows),
+        }
+    )
+    numeric = ("open", "high", "low", "close", "volume", "amount")
+    frame = frame.with_columns(
+        pl.col("date").str.to_date("%Y-%m-%d"),
+        *[pl.col(name).cast(pl.Float64) for name in numeric],
+    )
+    return frame.sort(["date", "clock"]).filter(pl.col("date").is_between(start, end))
+
+
 def http_get(url: str, params: dict[str, str], *, timeout: int = 15) -> object:
     import requests
 
@@ -89,6 +136,8 @@ def http_get(url: str, params: dict[str, str], *, timeout: int = 15) -> object:
 class SinaAdapter:
     name = "sina"
     markets = frozenset({"A"})
+    #: 分钟 K 只有 A 股：新浪这一路本来就没有港美股
+    minute_bars_markets = frozenset({"A"})
 
     def __init__(
         self,
@@ -177,7 +226,37 @@ class SinaAdapter:
         # normalize_bars 把 code 归一个股形态，而指数表的键要源形态（sh000001 ≠ 平安银行，D145）
         return frame.with_columns(pl.lit(code).alias("code"))
 
+    def minute_bars(
+        self, market: str, code: str, start: date, end: date, *, scale: int, count: int
+    ) -> pl.DataFrame:
+        if market not in self.minute_bars_markets:
+            raise EmptyResponse(
+                "sina", f"新浪分钟K只供 {sorted(self.minute_bars_markets)}，收到 {market}"
+            )
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        params = {
+            "symbol": a_share_symbol(code),
+            # `scale` 就是分钟数；`datalen` 真被 honor，所以这里不需要任何「每档上限」表
+            "scale": str(scale),
+            "ma": "no",
+            "datalen": str(count),
+        }
+        try:
+            payload = self._get(KLINE_URL, params, timeout=self._timeout)
+        except Exception as exc:  # noqa: BLE001 — 只包网络这一跳
+            raise classify_error(self.name, exc) from exc
+        frame = parse_sina_minute(payload, code=code, start=start, end=end)
+        if frame.is_empty():
+            # 参数里 `scale` 填错时接口只回 `[]`：那是「这个源没答」，不是「这只票没数据」
+            raise EmptyResponse(
+                "sina", f"{code} 的 {scale} 分钟K 在 {start}~{end} 内 0 根（已请求 {count} 根）"
+            )
+        return frame
+
 
 source(
-    "sina", options=("timeout",), note="新浪 A 股日线 + 指数日线，只有最近约 1023 根"
+    "sina",
+    options=("timeout",),
+    note="新浪 A 股日线 + 指数日线 + 分钟K，日线只覆盖最近约 1023 根",
 )(SinaAdapter)
