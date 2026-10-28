@@ -192,7 +192,7 @@ class BarRepo:
         return self.db.query(" ".join(sql) + " ORDER BY code, date", params)
 
     def last_closes(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], float]:
-        """一批 (市场, 代码) 的库内最后收盘：搜索面板的「昨收」列（D142）。
+        """一批 (市场, 代码) 的库内最后收盘：搜索面板的「最近收盘」列（D142）。
 
         一次 `arg_max` 聚合问完，不按票循环——候选十条就是十次查询的旧路，
         面板是每敲一个字都要重画的。键按读侧同一条规则归一（与 `load`/`latest_date` 一致）。

@@ -54,14 +54,30 @@ class WatchlistRepo:
         self.db = db
 
     def add(self, user_id: str, market: str, code: str, *, note: str | None = None) -> None:
+        """重复添加是更新，不是重写整行：没带新批注就留下旧的（D169）。
+
+        「移除」只是折起，之后在搜索框/选股页再点一次加自选很常见；`INSERT OR REPLACE`
+        会把 `note` 写成 NULL，把用户写过的内容连同那一行的位置一起抹掉。`added_at`
+        由 UPDATE 天然保住，顺序也就保住了。
+        """
         user_id = _require_user(user_id)
         market, code = _norm(market, code)
         if self.count(user_id) >= MAX_ITEMS_PER_USER and not self.contains(user_id, market, code):
             raise ValidationError(f"自选股数量上限 {MAX_ITEMS_PER_USER}")
-        # `removed_at` 必须显式写 NULL：DuckDB 的 `INSERT OR REPLACE` 保留没提到的列的旧值，
-        # 不写这一列的话「把折起的票重新加回自选」会静默失败——屏幕上说加好了，看板里没有
+        existing = self.db.query(
+            "SELECT note FROM watchlists WHERE user_id = ? AND market = ? AND code = ?",
+            [user_id, market, code],
+        )
+        if existing.height:
+            kept = note if note is not None else existing["note"][0]
+            self.db.execute(
+                "UPDATE watchlists SET note = ?, removed_at = NULL "
+                "WHERE user_id = ? AND market = ? AND code = ?",
+                [kept, user_id, market, code],
+            )
+            return
         self.db.execute(
-            "INSERT OR REPLACE INTO watchlists (user_id, market, code, note, removed_at)"
+            "INSERT INTO watchlists (user_id, market, code, note, removed_at)"
             " VALUES (?, ?, ?, ?, NULL)",
             [user_id, market, code, note],
         )

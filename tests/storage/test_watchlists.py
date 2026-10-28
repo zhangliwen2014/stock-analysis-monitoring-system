@@ -148,6 +148,22 @@ def test_adding_a_hidden_symbol_brings_it_back_with_the_new_note(repo):
     assert repo.hidden(A_ID) == []
 
 
+def test_re_adding_without_a_note_keeps_the_note_written_earlier(repo):
+    """「移除」只是折起：再点一次加自选不该把用户写过的批注抹掉（D169）。"""
+    repo.add(A_ID, "A", "600519", note="等季报")
+    repo.remove(A_ID, "A", "600519")
+    repo.add(A_ID, "A", "600519")
+    assert [(i.code, i.note) for i in repo.list(A_ID)] == [("600519", "等季报")]
+
+
+def test_re_adding_puts_the_symbol_back_where_it_was(repo):
+    repo.add(A_ID, "A", "600519")
+    repo.add(A_ID, "A", "601088")
+    repo.remove(A_ID, "A", "600519")
+    repo.add(A_ID, "A", "600519")
+    assert [i.code for i in repo.list(A_ID)] == ["600519", "601088"]
+
+
 def test_a_hidden_row_still_counts_against_the_per_user_cap(repo):
     """上限数的是「这只票在不在我的清单里」，折起来不腾出配额：
     所以 `count()` 不滤 `removed_at`，否则「折起 500 只再加 500 只」就成了绕闸门的后门。"""

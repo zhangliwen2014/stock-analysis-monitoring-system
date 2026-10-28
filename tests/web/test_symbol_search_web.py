@@ -125,6 +125,14 @@ def test_last_close_column_two_states(logged):
     assert "—" in body, "库里没行时写「—」：空位是真话，0 是假话"
 
 
+def test_the_price_column_is_named_for_what_it_is(logged):
+    """那一格取的是库里最后一根日线，可能停在几天前：叫「昨收」是把旧数说成昨天的。"""
+    _seed(logged.context)
+    body = logged.client.get("/api/symbol-search?code=payh").text
+    assert "最近收盘" in body
+    assert "昨收" not in body
+
+
 def test_unit_follows_currency_override(logged):
     """双柜台 80700 报人民币：单位跟着标的走，不跟着市场默认走。"""
     ctx = logged.context
