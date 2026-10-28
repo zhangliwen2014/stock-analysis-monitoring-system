@@ -102,22 +102,57 @@ DuckDB（两张新表）、FastAPI + Jinja + htmx（CSP `'self'`，条件构建�
   让采集 job 失败并写告警，**绝不**把缺的列读成 null——那等于全市场该列无一例外变成「无数」，
   而屏幕上写的是「这一条没票通过」。
 
+### 3.1 开工前的实测修正（2026-10-28）
+
+设计写完就量了源。四条实测把 §4 的源、签名、字段与市场范围改掉了：
+
+- **D186 快照的源换成腾讯批量报价，东财三个 `*_spot_em` 在本机全不通。** 实测：
+  `ak.stock_zh_a_spot_em` / `stock_hk_spot_em` / `stock_us_spot_em` 一律
+  `ConnectionError: RemoteDisconnected`，`curl https://push2.eastmoney.com/api/qt/clist/get`
+  连 curl 都回 000。而仓库里已有现成通道：`tencent.QUOTE_URL` 的批量报价是 GBK 的
+  JS 赋值语句（`quote_get` 早就按 GBK 解码），实测一条请求能带 **880 个代码**
+  （URL 7941 字符），**1000 个回 414**（URL 9021 字符）。于是 `spot.py` 走腾讯，
+  `SPOT_BATCH = 800`：全 A 5577 只七批、每批约 0.4 秒。
+  字段位置是按四只票（茅台、平安银行、腾讯、苹果）交叉核对过的：A 股 1 名称、
+  3 现价、30 时间、32 涨跌幅、35 复合「价/量/额」、38 换手、39 PE(TTM)、43 振幅、
+  44 流通市值、45 总市值、46 PB、49 量比、52 PE(动)；全在 A 股这一种行里。
+- **D187 能力签名是 `market_snapshot(market, codes)`，票池由服务层给。** 适配器不读库
+  （与全仓「适配器只认代码」一致）；服务层从 `symbol_master` 取活跃代码——「这个市场
+  有哪些票」仍然只有一个出处。源答不出的代码由服务层点名，不静默过滤。
+- **D188 本期快照只供 A 股。** 腾讯港股行的 PE/PB 位置与 A 股不同，且无法交叉验证
+  （47 位在四只票上是 1.37/4.34/1.00/6.94，与 PB、派息率都对不上；58/65/72 三个候选
+  也逐个对不上已知财报）；美股行更短，46 位是英文名。拿不准的口径不注册：
+  `SpotAdapter.spot_markets = frozenset({"A"})`，HK/US 在注册表那层写「不供」，
+  页面置灰与 note 共用它。要港美股，先补一次与年报交叉核对的实测。
+- **D189 快照列去掉 `chg_60d / chg_ytd / listed_hint`（本期）。** 那几格（62/63/64/65/66/
+  74/75）的实测值找不到可交叉验证的语义；把猜出来的列写进库，等于给「60 日涨跌」
+  这个条件一个假数。需要就日后拿日线自算。
+- **D190 现值 PR 的有效区三件事：`PE(动) > 0`、`PB > 0`、推出来的 ROE 不过口径上界。**
+  亏损票 PE 为负、平方后变正，`PE² ÷ (100×PB)` 会给出一个「便宜」的假数；PB 为负
+  （资不抵债）同理。任一条不成立时 `pr_now` 记空并在「无数」里点名，原因分句
+  （亏损 / 净资产为负 / ROE 推出超过 |1|），口径闸仍走 D59 的 `out_of_caliber`。
+- **D191 v1 词表 = 快照列 + `pr_now` + 三只财务列（`roe`/`revenue_yoy`/`profit_yoy`）。**
+  年报口径的 `pr`（`ScreenService.pr_max` 那条）**不进**词表：它自带两支公式与一套
+  PIT 闸门，进通用引擎等于写第二份 PR 实现，而财务票池今天只有 3 只——没有数据能把它
+  跑对。注册表已预留 `basket` 字段，将来加它时用同一条校验拦混选（D59）。
+- **实测票池：`symbol_master` 里 A 股 5577 只活跃**（含北交所 `920xxx` 353 只，
+  腾讯要 `bj` 前缀；公共的 `a_share_symbol` 会把它们发成 `sz`，静默缺 353 只——
+  所以 `spot.py` 自带前缀规则，不动日线那条公共件）。
+
 ## 4. 数据层
 
 ```
-能力：market_snapshot(market) -> 该市场当日快照（几千行）
+能力：market_snapshot(market, codes) -> 该市场当日的横截面（只含 codes 里源答得出的）
 适配器：src/sams/datasource/spot.py
-        A   → ak.stock_zh_a_spot_em()      （东财全 A 实时快照）
-        HK  → ak.stock_hk_spot_em()
-        US  → ak.stock_us_spot_em()
-意愿表：spot_markets 类属性（照 D163/D165 那一条 `<method>_markets` 的规矩），
-        答不了的市场在注册表那一层就写「不供」，页面上的置灰与 note 共用它。
-落库：  0024_market_snapshot.sql → snapshot_daily(market, day, taken_at, code, name,
-        price, pct_chg, amount, turnover_rate, volume_ratio, amplitude, pe_ttm, pb,
-        market_cap, float_cap, chg_60d, chg_ytd, is_st, listed_hint)
-        主键 (market, day, code)；一列对应一个源列，映射表只写在适配器一处。
-调度：  不进逐票的 `_DATA_JOBS`（那条是按票池 fan-out 的），单列一个 market 级 job；
-        手动补采与自动跑同一条函数，只是 caller 不同（照 `admin.py:391-413` 的排队姿势）。
+        A → 腾讯批量报价 https://qt.gtimg.cn/q（GBK；每批 SPOT_BATCH=800，实测 880 可、1000 回 414）
+意愿表：spot_markets = frozenset({"A"})（D188）
+落库：  0023_market_snapshot.sql → snapshot_daily(market, day, taken_at, code, name,
+        price, pct_chg, amount, turnover_rate, volume_ratio, amplitude,
+        pe_ttm, pe_dyn, pb, market_cap, float_cap, is_st, source)
+        主键 (market, day, code)；一列对应一个源列，映射表只写在适配器一处；
+        day = 这一批报价里最多的那个交易日期（停牌票的旧时刻不改写这一天）
+调度：  不进逐票的 `_DATA_JOBS`（那条是按票池 fan-out 的），单列市场级 `spot` job；
+        手动补采 `sams sync spot` 与自动跑同一条服务函数，只是 caller 不同
 ```
 
 字段随数据到齐才能筛：快照列先落，注册表里那些「来源是财务表」的字段（`roe`、`revenue_yoy`、
@@ -167,9 +202,11 @@ truncated: 命中超过 limit 时给出「还有 N 只未列」，不让一屏�
 
 ### 7.1 迁移
 
-- `0024_market_snapshot.sql` — `snapshot_daily`。
-- `0025_screener_presets.sql` — `screener_presets`。
-- 0023 留给 SP2 计划 C；若计划 C 未先跑，则这两张表顺位为 0023/0024，**以实际执行时 `storage/migrations/` 里的最大编号为准**（这条写在计划里，不在 spec 里钉死）。
+- `0023_market_snapshot.sql` — `snapshot_daily`（2026-10-28 实测时 `storage/migrations/`
+  最大是 0022，计划 C 尚未跑，所以计划 D 取 0023；计划 E 顺位 0024）。
+- `0024_screener_presets.sql` — `screener_presets`（计划 E）。
+- 计划 C（每用户图表偏好）晚于计划 E 时取 0025；编号以实际执行时的最大值为准，
+  **不用「预留」占位**（占位会在两个计划并行时撞号）。
 
 ### 7.2 表结构
 
@@ -233,6 +270,11 @@ screener_presets(
 10. 范围行在任何结果之前出现在 HTML 里（这一条钉的是文案顺序，不是数字）。
 11. live 标记一条真接口冒烟：A 股快照确实拿得到几千行且关键列齐（这条默认在全量之外，
     验收时单独跑并点头）。
+12. 批大小是常量：800 个代码一条请求，改到 1000 就是全市场 414（实测边界 880/1000）。
+13. 北交所 `920xxx` 用 `bj` 前缀；用公共的 `a_share_symbol` 会发成 `sz`、静默缺 353 只。
+14. `pr_now` 在 `PE(动) ≤ 0`、`PB ≤ 0`、推出来的 ROE `|x| ≥ 1` 上是「无数」，不参与比较
+    （负 PE 平方后会把亏损票筛成「便宜」）。
+15. 快照响应按 GBK 解码；按 utf-8 读会在第 14 个字节崩在首行票名上。
 
 ## 10. 拆成两个计划
 
