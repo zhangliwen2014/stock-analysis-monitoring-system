@@ -22,6 +22,7 @@ from sams.datasource.index_daily import has_index_daily
 from sams.datasource.listed_date import has_listed_date
 from sams.datasource.minute import has_minute_bars, has_minute_series
 from sams.datasource.quote import has_quotes
+from sams.datasource.spot import has_market_snapshot
 from sams.datasource.symbol_list import has_symbol_list
 
 
@@ -57,6 +58,11 @@ CAPABILITIES: dict[str, Capability] = {
     # 分钟粒度：都不落库（spec D163），所以这两条链没有写入方，只有读端
     "minute_series": Capability(label="分时", lacking="不提供分时", probe=has_minute_series),
     "minute_bars": Capability(label="分钟 K", lacking="不提供分钟K", probe=has_minute_bars),
+    # 横截面：一次答一个市场，不按票路由；仍登记在这里，好让「这个市场有没有快照」
+    # 与「这条链有没有源」共用一个答案（D173）
+    "market_snapshot": Capability(
+        label="全市场快照", lacking="不提供全市场快照", probe=has_market_snapshot
+    ),
 }
 
 

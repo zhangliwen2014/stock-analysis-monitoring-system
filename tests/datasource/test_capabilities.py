@@ -34,6 +34,7 @@ def test_the_kind_name_is_the_adapter_method_name():
         "index_daily",
         "minute_series",
         "minute_bars",
+        "market_snapshot",
     }
 
 
@@ -69,6 +70,7 @@ def test_the_lacking_reason_is_per_kind_and_states_the_capability():
         "index_daily",
         "minute_series",
         "minute_bars",
+        "market_snapshot",
     )
 
 
@@ -96,3 +98,23 @@ def test_the_new_probes_answer_on_method_presence_only():
     assert capability("index_daily").probe(WithBoth())
     assert not capability("symbol_list").probe(WithNeither())
     assert not capability("index_daily").probe(WithNeither())
+
+
+# --- SP3-D 新增全市场快照（D173） ---------------------------------------------------
+
+
+def test_market_snapshot_is_registered_under_its_method_name():
+    cap = capability("market_snapshot")
+    assert cap.label == "全市场快照"
+    assert "快照" in cap.lacking
+    assert "market_snapshot" in CAPABILITIES
+
+
+def test_tencent_answers_market_snapshot_only_for_a():
+    from sams.datasource.minute import answers
+    from sams.datasource.tencent import TencentAdapter
+
+    adapter = TencentAdapter(quote_fetch=lambda *a, **k: "")
+    assert "market_snapshot" in provided_by(TencentAdapter)
+    assert answers(adapter, "market_snapshot", "A") is True
+    assert answers(adapter, "market_snapshot", "HK") is False
