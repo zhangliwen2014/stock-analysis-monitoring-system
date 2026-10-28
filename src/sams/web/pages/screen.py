@@ -117,6 +117,31 @@ def _render(
         }
         for item in FIELDS
     ]
+    hits = result.hits if result is not None else ()
+    total = len(hits)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(max(page, 1), pages)
+    shown = hits[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]
+    held = {code for item_market, code in ctx.watchlists.codes(user.id) if item_market == market}
+    view = [_hit_row(hit, conditions, held) for hit in shown]
+    counts_view = (
+        [
+            {
+                "label": specs[item.field].label,
+                "unit": specs[item.field].unit,
+                "passed": item.passed,
+                "failed": item.failed,
+                "missing": item.missing,
+            }
+            for item in result.fields
+        ]
+        if result is not None
+        else []
+    )
+    pager = {
+        "prev": _url(market, rows, preset=preset, page=page - 1) if page > 1 else "",
+        "next": _url(market, rows, preset=preset, page=page + 1) if page < pages else "",
+    }
     add_url = _url(market, [*rows, _draft()])
     remove_urls = [_url(market, rows[:i] + rows[i + 1 :]) for i in range(len(rows))]
     if not rows:
@@ -133,7 +158,14 @@ def _render(
         field_options=field_options,
         ops=[(op, OP_LABELS.get(op, op)) for op in OPS],
         result=result,
-        labels=[specs[item.field] for item in conditions],
+        labels=[specs[item.field] for item in conditions] if result is not None else [],
+        counts_view=counts_view,
+        view=view,
+        total=total,
+        pages=pages,
+        pager=pager,
+        missing=result.missing if result is not None else (),
+        missing_codes=MISSING_CODES,
         snapshot=snapshot,
         stale=stale,
         stale_days=STALE_DAYS,
@@ -268,3 +300,16 @@ def recollect(
             error=str(exc),
         )
     return RedirectResponse(_url(market, rows, notice="queued"), status_code=303)
+
+
+def _hit_row(hit, conditions: tuple[Condition, ...], held: set[str]) -> dict:
+    return {
+        "code": hit.code,
+        "name": hit.name or "—",
+        "cells": [
+            "—" if hit.values.get(item.field) is None else f"{hit.values[item.field]:g}"
+            for item in conditions
+        ],
+        "price": "—" if hit.values.get("price") is None else f"{hit.values['price']:g}",
+        "held": hit.code in held,
+    }

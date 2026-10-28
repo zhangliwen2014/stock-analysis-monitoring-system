@@ -112,3 +112,57 @@ def test_recollect_queues_the_spot_job_and_says_so(logged_screen):
     page = logged_screen.client.get(response.headers["location"])
     assert "排进下一拍" in page.text
     assert logged_screen.context.scheduler.pending_requests == 1
+
+
+def _condition_params(**extra):
+    pairs = [
+        ("market", "A"),
+        ("f", "pr_now"),
+        ("o", "<="),
+        ("v", "0.5"),
+    ]
+    pairs.extend(extra.items())
+    return pairs
+
+
+def test_every_condition_reports_passed_failed_missing_and_the_hits(logged_screen):
+    default_seed(logged_screen)
+    response = logged_screen.client.get("/screen", params=_condition_params())
+    assert response.status_code == 200
+    assert "通过 2 / 不通过 1 / 无数 1" in response.text
+    assert "600519" in response.text and "000001" in response.text
+    assert "300750" not in response.text
+
+
+def test_two_conditions_are_anded_and_the_table_carries_both_values(logged_screen):
+    default_seed(logged_screen)
+    params = _condition_params() + [("f", "turnover_rate"), ("o", ">="), ("v", "2")]
+    response = logged_screen.client.get("/screen", params=params)
+    assert "000001" in response.text
+    assert "600519" not in response.text
+
+
+def test_a_bad_value_keeps_the_draft_instead_of_losing_what_was_typed(logged_screen):
+    response = logged_screen.client.get(
+        "/screen",
+        params=[("market", "A"), ("f", "pr_now"), ("o", "<="), ("v", "abc")],
+    )
+    assert response.status_code == 200
+    assert "的值要一个数" in response.text
+    assert 'value="abc"' in response.text
+
+
+def test_an_unknown_field_is_refused_with_the_vocabulary(logged_screen):
+    response = logged_screen.client.get(
+        "/screen",
+        params=[("market", "A"), ("f", "nope"), ("o", "<="), ("v", "1")],
+    )
+    assert response.status_code == 200
+    assert "不认识的字段" in response.text and "可选的是" in response.text
+
+
+def test_missing_codes_are_named_with_their_class(logged_screen):
+    default_seed(logged_screen)
+    response = logged_screen.client.get("/screen", params=_condition_params())
+    assert "无数 1 只 · pr_now：亏损（PE(动) ≤ 0）" in response.text
+    assert "600000" in response.text

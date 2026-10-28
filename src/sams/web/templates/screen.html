@@ -49,6 +49,42 @@
   <p><button type="submit">筛选</button> <a href="{{ add_url }}">再加一条</a></p>
 </form>
 
+{% if result %}
+<p class="muted">
+  {% for item in labels %}{{ item.label }}（{{ item.unit }}）{% if not loop.last %}；{% endif %}{% endfor %}
+</p>
+{% for counts in counts_view %}
+<p>条件 {{ counts.label }}：通过 {{ counts.passed }} / 不通过 {{ counts.failed }} / 无数 {{ counts.missing }}</p>
+{% endfor %}
+<p>命中 {{ total }} 只</p>
+
+<table>
+  <tr><th>代码</th><th>名称</th>{% for item in labels %}<th class="num">{{ item.label }}</th>{% endfor %}<th class="num">现价</th></tr>
+  {% for row in view %}
+  <tr>
+    <td>{{ row.code }}</td>
+    <td>{{ row.name }}</td>
+    {% for cell in row.cells %}<td class="num">{{ cell }}</td>{% endfor %}
+    <td class="num">{{ row.price }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">第 {{ page }} / {{ pages }} 页
+  {% if pager.prev %}<a href="{{ pager.prev }}">上一页</a>{% endif %}
+  {% if pager.next %}<a href="{{ pager.next }}">下一页</a>{% endif %}
+</p>
+
+{% if missing %}
+<section class="card">
+  <h2>无数出局的票</h2>
+  {% for group in missing %}
+  <p>无数 {{ group.codes|length }} 只 · {{ group.field }}：{{ group.reason }}</p>
+  <p class="muted">{{ group.codes[:missing_codes]|join("、") }}{% if group.codes|length > missing_codes %}…（{{ group.codes|length - missing_codes }} 只未列）{% endif %}</p>
+  {% endfor %}
+</section>
+{% endif %}
+{% endif %}
+
 {% if not rows or not rows[0].field %}
 <p class="muted">加一条条件，按「筛选」。</p>
 {% endif %}
