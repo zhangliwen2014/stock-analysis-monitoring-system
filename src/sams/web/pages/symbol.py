@@ -23,6 +23,7 @@ from sams.core.codes import canonical_code, canonical_market, looks_like_index_c
 from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.quotes import NO_DATA, quote_state
 from sams.services.analysis import parse_period
+from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
 from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import hms, moment_label, pct_class, state_label
@@ -185,8 +186,10 @@ DEFAULT_WINDOW: dict[str, int] = {
 }
 #: 副图最多三格：再多就不是看图而是刷屏（D162）
 MAX_SUB_PANES = 3
-#: 周期条：(参数值, 屏幕上那几个字)。分钟档在计划 B，那时再来这张表里加行
+#: 周期条：(参数值, 屏幕上那几个字)。分时那一格是视图切换，不在这张表里
 CHART_PERIODS: tuple[tuple[str, str], ...] = (
+    ("m1", "1分"), ("m5", "5分"), ("m15", "15分"),
+    ("m30", "30分"), ("m60", "60分"), ("m120", "120分"),
     ("day", "日"), ("week", "周"), ("month", "月"), ("quarter", "季"),
     ("year", "年"), ("5d", "5日"), ("10d", "10日"),
 )
@@ -277,6 +280,41 @@ def _group(table: pl.DataFrame, name: str) -> dict[str, list]:
     return {column: table[column].to_list() for column in _columns_of(table, name)}
 
 
+#: 图注里那句「最后一根__只走到」要说屏幕上那几个字：档名只有 `CHART_PERIODS` 这一份表
+_PERIOD_LABEL = dict(CHART_PERIODS)
+
+
+def _period_label(period: str) -> str:
+    """表里有的照表，自己填的档（`20d`）原样说——屏幕上点不出它，不值得再造一层。"""
+    return _PERIOD_LABEL.get(period) or period
+
+
+def _empty_payload(period: str, note: str | None) -> dict:
+    """空态与真数据**同形**的 16 个键。
+
+    前端在画图之前就读键，缺键会在 `fetch` 之后崩成一片白；这一份现在有两个出口
+    （`NotAdjustable` 与分钟档的拒答），所以它只能有一处写法。
+    """
+    return {
+        "dates": [],
+        "period": period,
+        "period_label": _period_label(period),
+        "open": [],
+        "high": [],
+        "low": [],
+        "close": [],
+        "close_hfq": [],
+        "volume": [],
+        "main": {},
+        "sub": {},
+        "bars": [],
+        "pending": [],
+        "anchored_on": "",
+        "warmup_floor": None,
+        "note": note,
+    }
+
+
 def _column(frame: pl.DataFrame, name: str) -> list:
     """序列上的一档：源没给那一列（比如某档日线没有 high）就给空数组，而不是 500。"""
     return frame[name].to_list() if name in frame.columns else []
@@ -302,6 +340,9 @@ def bars_api(
     subs = _split_names(sub, SUB_INDICATORS, limit=MAX_SUB_PANES)
     ma_windows = _windows(ma)
     end = web.core.clock.now_utc().date()
+    if period in MINUTE_SCALES:
+        # 分钟档不进 `parse_period`：它认的是日历周期，`m5` 到那儿只会得到 400
+        return _minute_bars_payload(ctx, market, code, period, end, mains, subs, ma_windows)
     window = days or DEFAULT_WINDOW.get(period, DEFAULT_WINDOW["day"])
     start = end - timedelta(days=max(1, min(window, 2000)))
     # `vol` 不在 `INDICATORS` 里（那一格画的是裸量柱），而 `asked` 为空时仍给 ("ma",)：
@@ -324,26 +365,7 @@ def bars_api(
         # 把它写成「没采集，去跑 sams sync daily」会让人反复重跑一条本来好好的命令
         # 空态也给**与新形状同形**的键：前端拿到缺键的 JSON 会在画图之前先崩，
         # 而那正是这一条用例要防的 500
-        return JSONResponse(
-            {
-                "dates": [],
-                "period": period,
-                "period_label": _period_label(period),
-                "open": [],
-                "high": [],
-                "low": [],
-                "close": [],
-                "close_hfq": [],
-                "volume": [],
-                "main": {},
-                "sub": {},
-                "bars": [],
-                "pending": [],
-                "anchored_on": "",
-                "warmup_floor": None,
-                "note": str(exc),
-            }
-        )
+        return JSONResponse(_empty_payload(period, str(exc)))
     table = read.table
     frame = read.series.frame.filter(pl.col("date") >= start)
     return JSONResponse(
@@ -373,6 +395,48 @@ def bars_api(
     )
 
 
+def _minute_bars_payload(ctx, market, code, period, end, mains, subs, ma_windows):
+    """分钟 K 那一档的 `bars` 出参：与日线那份同一套键，只有口径与日期标签不同。"""
+    asked = tuple(name for name in (*mains, *(name for name in subs if name != "vol")))
+    read = ctx.minute.bars(
+        market,
+        code,
+        period=period,
+        start=end - timedelta(days=MINUTE_LOOKBACK_DAYS),
+        end=end,
+        indicators=asked or ("ma",),
+        windows={"ma": ma_windows} if "ma" in mains and ma_windows else None,
+    )
+    if read.note or read.series is None:
+        return JSONResponse(_empty_payload(period, read.note))
+    table = read.table
+    frame = read.series.frame
+    return JSONResponse(
+        {
+            # 分钟那一档的横轴要带时刻：同一天的三根只写「10-28」在屏幕上分不出谁是谁
+            "dates": [value.strftime("%m-%d %H:%M") for value in table["date"].to_list()],
+            "period": read.period,
+            "period_label": _period_label(read.period),
+            # 因子恒为 1（D164），所以 `*_hfq` 与裸价逐字相等：键名照旧给，
+            # 前端不必知道这一档没有复权这回事，图注那句才是给人看的口径
+            "open": _column(frame, "open_hfq"),
+            "high": _column(frame, "high_hfq"),
+            "low": _column(frame, "low_hfq"),
+            "close": _column(frame, "close_hfq"),
+            "close_hfq": _column(frame, "close_hfq"),
+            "volume": _column(frame, _VOLUME_COLUMN),
+            "main": {name: _group(table, name) for name in mains},
+            "sub": {name: _group(table, name) for name in subs},
+            # 这四键在这一档没有意义：分钟不重采样、不锚日线、预热按分钟根数自己走
+            "bars": [],
+            "pending": [],
+            "anchored_on": "",
+            "warmup_floor": None,
+            "note": None,
+        }
+    )
+
+
 @router.get("/api/symbol/{market}/{code}/minute")
 def minute_api(request: Request, market: str, code: str):
     """分时：一次只答一天，参数一个都不接（spec §5.2）。
@@ -395,15 +459,6 @@ def minute_api(request: Request, market: str, code: str):
             "note": share.note,
         }
     )
-
-
-#: 图注里那句「最后一根__只走到」要说屏幕上那几个字：档名只有 `CHART_PERIODS` 这一份表
-_PERIOD_LABEL = dict(CHART_PERIODS)
-
-
-def _period_label(period: str) -> str:
-    """表里有的照表，自己填的档（`20d`）原样说——屏幕上点不出它，不值得再造一层。"""
-    return _PERIOD_LABEL.get(period) or period
 
 
 @router.get("/api/partials/chart")
