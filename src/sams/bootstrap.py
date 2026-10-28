@@ -44,6 +44,7 @@ from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
 from sams.services.intraday import IntradayMonitor
 from sams.services.ledger import LedgerService
+from sams.services.minute import MinuteService
 from sams.services.portfolio import PortfolioService
 from sams.services.prune import PruneReport, PruneService
 from sams.services.quotes import QuoteBoard, QuoteService
@@ -216,6 +217,8 @@ class ServiceContext:
     fundamentals: FundamentalService
     screen: ScreenService
     analysis: AnalysisService
+    #: 分钟粒度（计划 B）：只读、不落库，所以没有 sync 那条写侧
+    minute: MinuteService
     #: 估值合成（spec §8.3）：它吃上面那两个读数用例，不是并列的第三路取数
     valuation: ValuationService
     #: 观点的生命周期：它吃上面那个仓库与那份估值读数（spec §9.1）
@@ -468,6 +471,7 @@ def _context_on(
     calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
     fundamentals = FundamentalService(financials_store, valuation_store, clock=clock)
     analysis = AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock)
+    minute = MinuteService(registry, calendar, clock=clock)
     valuation = ValuationService(
         fundamentals, analysis, financials_store, valuation_store, flow_store, clock=clock
     )
@@ -720,6 +724,7 @@ def _context_on(
             financials_store, valuation_store, symbols, scan_store, clock=clock
         ),
         analysis=analysis,
+        minute=minute,
         valuation=valuation,
         # `settings` 是那个「已知市场」的出处：一个没配的市场立不出 thesis，
         # 因为那条链上每一栏都读不到数（D84）

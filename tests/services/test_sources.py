@@ -14,11 +14,12 @@ from dataclasses import replace
 from datetime import date
 
 import pytest
-from support import sample_bars
+from support import StubAdapter, StubMinuteAdapter, sample_bars
 
 from sams.core.errors import ValidationError
+from sams.datasource.registry import AdapterRegistry
 from sams.datasource.sina import SinaAdapter
-from sams.services.sources import SourceAdminService
+from sams.services.sources import SourceAdminService, capability_labels
 from sams.storage.repos.data_sources import DataSourceRepo
 
 START, END = date(2024, 1, 2), date(2024, 1, 5)
@@ -295,3 +296,26 @@ def test_sample_bars_still_describes_the_standard_frame():
     """上面的用例不碰它，但它是全项目共用的样本：形态变了要在这里红。"""
     frame = sample_bars()
     assert frame.height == 2 and "source" in frame.columns
+
+
+@pytest.fixture
+def registry_with_minute() -> AdapterRegistry:
+    """三市场链上都是同一个腾讯替身（分钟两档按市场关着）+ 一个只有日线的 akshare。"""
+    tencent = StubMinuteAdapter("tencent", ["A", "HK", "US"])
+    akshare = StubAdapter("akshare", ["A"], sample_bars())
+    return AdapterRegistry(
+        adapters={tencent.name: tencent, akshare.name: akshare},
+        market_sources={"A": ("tencent", "akshare"), "HK": ("tencent",), "US": ("tencent",)},
+        sleep=lambda seconds: None,
+    )
+
+
+def test_capability_labels_respect_the_per_market_willingness_table(registry_with_minute):
+    """US 那一行不许写着「分时、分钟 K」：腾讯有这两个方法，但美股一个都不答。
+
+    探针只答「有没有这个方法」，市场维在 `answers` 那张表里——健康页此前只问了前者。
+    """
+    labels = capability_labels(registry_with_minute, "US", "tencent")
+    assert "分时" not in labels and "分钟 K" not in labels
+    assert "分钟 K" in capability_labels(registry_with_minute, "A", "tencent")
+    assert "分时" in capability_labels(registry_with_minute, "HK", "tencent")

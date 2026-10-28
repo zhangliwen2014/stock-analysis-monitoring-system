@@ -29,6 +29,7 @@ from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import DatasourceError, SamsError, StorageError, ValidationError
 from sams.datasource.capabilities import CAPABILITIES
+from sams.datasource.minute import answers
 from sams.datasource.sources import SourceEntry, build, catalog, known
 from sams.storage.repos.data_sources import DataSourceRepo, SourceRow
 
@@ -41,13 +42,16 @@ logger = logging.getLogger("sams.services.sources")
 def capability_labels(registry: AdapterRegistry, market: str, name: str) -> tuple[str, ...]:
     """链上某个源在本市场提供的能力标签（日线除外）：health 页的「仅…」标注取这一份。
 
-    探针只看方法在不在，不打网络；cli 层不许 import datasource（分层守卫），
-    这个换算只能住在 services。
+    探针（方法在不在）与意愿表（答不答这个市场）都不打网络；cli 层不许 import
+    datasource（分层守卫），这个换算只能住在 services。
     """
     return tuple(
         cap.label
         for key, cap in CAPABILITIES.items()
-        if key != "daily_bars" and name in registry.chain_for(market, key)
+        if key != "daily_bars"
+        and name in registry.chain_for(market, key)
+        # 有这个方法 ≠ 答这个市场：腾讯的分钟两档都是按市场关着的，健康页要跟着关
+        and answers(registry.adapter(name), key, market)
     )
 
 

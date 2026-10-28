@@ -327,6 +327,17 @@ def test_the_container_carries_the_prune_service(container):
     assert isinstance(built.prune, PruneService)
 
 
+def test_the_container_carries_a_minute_reader(container):
+    """分钟服务住 `ServiceContext`：一条线程一份，与 `analysis` 同一侧（D163）。
+
+    这里只钉标签不钉 `ok`：`stub_adapters()` 那三个替身没有分钟方法，
+    可用性当场就是 False，而装配错了时红的是「没有 minute 这一格」。
+    """
+    built, _clock = container
+    assert built.minute.availability("A").bars.label == "分钟 K"
+    assert built.minute.availability("A").series.label == "分时"
+
+
 def test_contexts_get_their_own_connection_but_share_the_core(migrated):
     """DuckDB 同进程多连接共享同一个库；连接、事务深度、注册视图都不得跨线程。
 
