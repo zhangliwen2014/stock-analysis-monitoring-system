@@ -163,3 +163,11 @@ def test_deactivate_missing_counts(repo):
     assert repo.count("A") == 1
     assert repo.count() == 2
     assert repo.deactivate_missing("A", ["000001", "600519", "600001"]) == 0
+
+
+def test_active_codes_returns_the_ordered_live_list(repo):
+    assert repo.active_codes("A") == ["000001", "600001", "600519"]
+    # 传的是「这一轮仍在市」的清单：不在清单里的 600519 被关停
+    repo.deactivate_missing("A", ["000001", "600001"])
+    assert repo.active_codes("A") == ["000001", "600001"]
+    assert repo.active_codes("HK") == ["00700"]

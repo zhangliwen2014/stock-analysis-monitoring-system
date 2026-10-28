@@ -114,6 +114,14 @@ class SymbolListRepo:
         )
         return rows.to_dicts()
 
+    def active_codes(self, market: str) -> list[str]:
+        """在市的全部代码，按代码升序：选股票池与快照请求都用这一份。"""
+        frame = self.db.query(
+            "SELECT code FROM symbol_master WHERE market = ? AND is_active ORDER BY code",
+            [market],
+        )
+        return frame["code"].to_list()
+
     def count(self, market: str | None = None) -> int:
         if market is None:
             return int(self.db.scalar("SELECT count(*) FROM symbol_master WHERE is_active", []))

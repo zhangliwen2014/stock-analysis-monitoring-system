@@ -785,3 +785,80 @@ def test_empty_minute_result_carries_the_daily_shaped_frame():
     result = registry(empty).fetch_minute_series("A", "600519", D1)
     assert result.empty_everywhere is True
     assert result.frame.columns == list(BAR_COLUMNS)
+
+
+# --- 全市场快照链：按市场路由、一次答一屏（D173） -----------------------------------
+
+
+class SnapshotStub:
+    """只有快照能力的源：与腾讯同签名，答哪一批由 `answers` 决定。"""
+
+    name = "snap"
+    markets = frozenset({"A"})
+    market_snapshot_markets = frozenset({"A"})
+
+    def __init__(self, rows=None, outcome=None):
+        self.rows = rows if rows is not None else spot_rows()
+        self.outcome = outcome
+        self.calls = 0
+
+    def market_snapshot(self, market, codes):
+        self.calls += 1
+        if self.outcome is not None:
+            raise self.outcome
+        return self.rows
+
+
+def spot_rows(codes=("600519",)):
+    import polars as pl
+
+    from sams.datasource.spot import SPOT_SCHEMA
+
+    return pl.DataFrame(
+        {
+            "market": ["A"] * len(codes),
+            "code": list(codes),
+            "name": ["票"] * len(codes),
+            "quoted_on": [date(2026, 10, 28)] * len(codes),
+            "price": [10.0] * len(codes),
+            "pct_chg": [1.0] * len(codes),
+            "amount": [1.0e8] * len(codes),
+            "turnover_rate": [1.0] * len(codes),
+            "volume_ratio": [1.0] * len(codes),
+            "amplitude": [1.0] * len(codes),
+            "pe_ttm": [10.0] * len(codes),
+            "pe_dyn": [9.0] * len(codes),
+            "pb": [1.2] * len(codes),
+            "market_cap": [100.0] * len(codes),
+            "float_cap": [90.0] * len(codes),
+            "is_st": [False] * len(codes),
+            "source": ["tencent"] * len(codes),
+        },
+        schema=SPOT_SCHEMA,
+    )
+
+
+def test_market_snapshot_skips_sources_without_the_capability():
+    # 复用文件里已有的 `registry(...)` 与 `FakeAdapter`：本文件没有 `StubAdapter`
+    stub = SnapshotStub()
+    plain = FakeAdapter("akshare", ["A"], frame("akshare"))
+    reg = registry(plain, stub)
+    result = reg.fetch_market_snapshot("A", ["600519"])
+    assert result.source == "snap"
+    assert ("akshare", "不提供全市场快照") in result.skipped
+
+
+def test_market_snapshot_respects_the_willingness_table():
+    # 链上只有这一个源、它不愿答 A：这属于「配错了链」，当场出声并把跳过原因写进话来
+    stub = SnapshotStub()
+    stub.market_snapshot_markets = frozenset({"HK"})
+    reg = registry(stub)
+    with pytest.raises(DatasourceError, match="不供A"):
+        reg.fetch_market_snapshot("A", ["600519"])
+
+
+def test_market_snapshot_fails_loudly_when_every_source_fails():
+    stub = SnapshotStub(outcome=DatasourceError("snap", "boom"))
+    reg = registry(stub)
+    with pytest.raises(DatasourceError, match="快照"):
+        reg.fetch_market_snapshot("A", ["600519"])

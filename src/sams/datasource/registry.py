@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date
+from math import ceil
 
 import polars as pl
 
@@ -29,9 +30,11 @@ from sams.datasource.fundamentals import (
     empty_valuation,
 )
 from sams.datasource.fx import empty_fx, has_fx
+from sams.datasource.minute import answers
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
 from sams.datasource.sources import known
+from sams.datasource.spot import SPOT_BATCH, empty_snapshot, has_market_snapshot
 from sams.datasource.symbol_list import empty_symbol_list, has_symbol_list
 
 logger = logging.getLogger("sams.datasource.registry")
@@ -240,6 +243,21 @@ class SymbolListResult:
     @property
     def degraded(self) -> bool:
         return len(self.attempts) > 1
+
+
+@dataclass(frozen=True)
+class MarketSnapshotResult:
+    """全市场快照链的返回：按市场路由、一次答一屏，既有 `code` 也没有窗口。
+
+    缺答的代码不在这里点名——那要看「服务层问了哪些」，所以由服务层拿请求清单去比。
+    """
+
+    market: str
+    source: str
+    frame: pl.DataFrame
+    attempts: tuple[Attempt, ...] = ()
+    skipped: tuple[tuple[str, str], ...] = ()
+    empty_everywhere: bool = False
 
 
 @dataclass
@@ -785,6 +803,65 @@ class AdapterRegistry:
         causes = [cause for _, _, cause in failed]
         raise _terminal_error(f"{market} 所有源均取代码表失败 → {detail}", causes)
 
+    def fetch_market_snapshot(self, market: str, codes: list[str]) -> MarketSnapshotResult:
+        """快照链：一次答一个市场，按市场路由、不按票重试（D173）。
+
+        「这个源答不答这个市场」看意愿表（`answers`），与目录、置灰共用同一份判据
+        （D165）——链上挂着 `market_snapshot` 方法不代表它愿意答港美股。
+        """
+        cap = capability("market_snapshot")
+        attempts: list[Attempt] = []
+        skipped: list[tuple[str, str]] = []
+        empties: list[str] = []
+        failed: list[tuple[str, str, Exception | None]] = []
+        for name in self.sources_for(market):
+            adapter = self.adapter(name)
+            if not has_market_snapshot(adapter):
+                logger.info("快照 跳过 %s（%s 链上没有这个能力）", name, market)
+                skipped.append((name, cap.lacking))
+                continue
+            if not answers(adapter, "market_snapshot", market):
+                logger.info("快照 跳过 %s（不供 %s）", name, market)
+                skipped.append((name, f"不供{market}"))
+                continue
+            try:
+                frame = self._call_market_snapshot(name, market, codes)
+            except _SourceFailed as exc:
+                attempts.append(Attempt(name, False, exc.tries, exc.error))
+                failed.append((name, exc.error, exc.cause))
+                continue
+            except EmptyResponse as exc:
+                attempts.append(Attempt(name, True, 1, f"无数据: {exc}"))
+                empties.append(name)
+                logger.info("快照 %s 说 %s 这张表是空的，换源", name, market)
+                continue
+            self._mark_ok(name)
+            attempts.append(Attempt(name, True))
+            return MarketSnapshotResult(market, name, frame, tuple(attempts), tuple(skipped))
+
+        if empties and not failed:
+            return MarketSnapshotResult(
+                market,
+                empties[0],
+                empty_snapshot(),
+                tuple(attempts),
+                tuple(skipped),
+                empty_everywhere=True,
+            )
+
+        detail = "；".join(f"{name}: {error}" for name, error, _ in failed) or "（无）"
+        if not attempts:
+            # 把每个源的跳过原因写进话里：只报「链上没有」会让人以为是配错了源名，
+            # 而实际可能是腾讯不愿答这个市场（D165/D188）
+            why = "；".join(f"{name}: {reason}" for name, reason in skipped) or "（无）"
+            raise DatasourceError(
+                "registry",
+                f"{market} 没有能取全市场快照的源：链 {list(self.sources_for(market))}；"
+                f"跳过 {why}",
+            )
+        causes = [cause for _, _, cause in failed]
+        raise _terminal_error(f"{market} 所有源均取快照失败 → {detail}", causes)
+
     def _call_symbol_list(self, name: str, market: str) -> pl.DataFrame:
         """对单个源的一次代码表取数：限速、退避、归类，逐行照抄 `_call_fx`，只删日期裁剪。"""
         adapter = self.adapter(name)
@@ -818,6 +895,45 @@ class AdapterRegistry:
         if out.is_empty():
             # 一个 0 行的帧与一次 `EmptyResponse` 是同一句话：这张表没内容，继续问下一个源
             raise EmptyResponse(name, f"{market} 代码表返回 0 行")
+        return out
+
+    def _call_market_snapshot(self, name: str, market: str, codes: list[str]) -> pl.DataFrame:
+        """对单个源的一次快照取数：限速、退避、归类，与 `_call_symbol_list` 同一形状。
+
+        一次方法内部会切成多片 HTTP 请求（批大小是接口的硬边界），所以限速桶按片数
+        领令牌——只领一次等于把真实请求量报小了一个数量级。
+        """
+        adapter = self.adapter(name)
+        if self.bucket is not None:
+            for _ in range(max(1, ceil(len(codes) / SPOT_BATCH))):
+                self.bucket.acquire()
+        calls = 0
+
+        def invoke() -> pl.DataFrame:
+            nonlocal calls
+            calls += 1
+            return adapter.market_snapshot(market, codes)
+
+        try:
+            frame = call_with_backoff(
+                invoke,
+                attempts=self.attempts_per_source,
+                retryable=RETRYABLE,
+                sleep=self.sleep,
+                label=f"{name}:market_snapshot {market}",
+            )
+        except EmptyResponse:
+            raise
+        except DatasourceError as exc:
+            self._mark_failure(name, exc)
+            raise _SourceFailed(name, calls, str(exc), exc) from exc
+        except Exception as exc:  # noqa: BLE001
+            wrapped = DatasourceError(name, f"{type(exc).__name__}: {exc}")
+            self._mark_failure(name, wrapped)
+            raise _SourceFailed(name, calls, str(wrapped), exc) from exc
+        out = frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
+        if out.is_empty():
+            raise EmptyResponse(name, f"{market} 快照返回 0 行")
         return out
 
     def _call_fx(self, name: str, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
