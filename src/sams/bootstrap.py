@@ -44,6 +44,7 @@ from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
 from sams.services.intraday import IntradayMonitor
 from sams.services.ledger import LedgerService
+from sams.services.market_snapshot import MarketSnapshotService
 from sams.services.minute import MinuteService
 from sams.services.portfolio import PortfolioService
 from sams.services.prune import PruneReport, PruneService
@@ -96,6 +97,7 @@ from sams.storage.repos.quotes import QuoteHealthRepo, QuoteRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.scan_results import ScanResultRepo
 from sams.storage.repos.sessions import SessionRepo
+from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.source_health import SourceHealthRepo
 from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
@@ -196,6 +198,10 @@ class ServiceContext:
     valuation_store: ValuationRepo
     flow_store: FundingFlowRepo
     scan_store: ScanResultRepo
+    #: 全市场快照（D175）：盘后 `spot` job 整日覆盖写，选股屏读最近一天
+    snapshot_store: SnapshotRepo
+    #: 快照同步用例（D174）：票池、取数、定日、点名缺答都在它那一头
+    snapshots: MarketSnapshotService
     watchlists: WatchlistRepo
     #: 汇率仓库：`fx` 这个名字留给服务（M3-A 的 `sams sync fx`），带 `_store` 是为了不误用
     fx_store: FxRepo
@@ -451,6 +457,7 @@ def _context_on(
     valuation_store = ValuationRepo(database)
     flow_store = FundingFlowRepo(database)
     scan_store = ScanResultRepo(database)
+    snapshot_store = SnapshotRepo(database)
     theses_store = ThesisRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
@@ -615,6 +622,9 @@ def _context_on(
     )
     symbol_search = SymbolSearchService(symbol_list_store, bars)
     symbol_master_sync = SymbolMasterSyncService(registry, symbol_list_store, cfg.markets)
+    market_snapshot_sync = MarketSnapshotService(
+        registry, symbol_list_store, snapshot_store, clock=clock
+    )
     corp_action_sync = CorpActionSyncService(
         registry, corp_actions, corp_actions_coverage, clock=clock
     )
@@ -664,6 +674,7 @@ def _context_on(
         users=users,
         versions=versions,
         symbol_master=symbol_master_sync,
+        snapshots=market_snapshot_sync,
     )
     scheduler = Scheduler(
         cfg,
@@ -704,6 +715,8 @@ def _context_on(
         valuation_store=valuation_store,
         flow_store=flow_store,
         scan_store=scan_store,
+        snapshot_store=snapshot_store,
+        snapshots=market_snapshot_sync,
         theses_store=theses_store,
         watchlists=watchlists,
         fx_store=fx_store,

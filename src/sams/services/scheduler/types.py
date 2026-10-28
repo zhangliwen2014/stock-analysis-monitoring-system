@@ -18,6 +18,7 @@ from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalSyncService
 from sams.services.fx import FxSyncService
+from sams.services.market_snapshot import MarketSnapshotService
 from sams.services.rules.engine import RuleEngine
 from sams.services.rules.recheck import Rechecker
 from sams.services.scheduler.universe import Universe
@@ -95,3 +96,5 @@ class JobDeps:
     #: 代码表周同步（D141）：带默认值，所以没装这一层的部署照旧能构造 `JobDeps`——
     #: `build_jobs` 见到 None 就不登记那个 job，而不是起不来
     symbol_master: SymbolMasterSyncService | None = None
+    #: 全市场快照（D174）：带默认值，没装这一层的部署照旧能构造；盘后 `spot` job 用它
+    snapshots: MarketSnapshotService | None = None
