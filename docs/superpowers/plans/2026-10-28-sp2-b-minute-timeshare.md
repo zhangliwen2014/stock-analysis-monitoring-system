@@ -3148,7 +3148,7 @@ lsof -t data/sams.duckdb | xargs -r kill
 - [ ] 真接口跑一遍数据层（这三条只读网络，不写库；离线机器上会红，那就要人点头再跳）
 
 ```bash
-uv run pytest -q -m live tests/datasource/test_minute.py
+uv run pytest -q -m live tests/datasource/test_minute_probe.py
 ```
 
 > `pyproject.toml` 的 `addopts = "-m 'not live'"` 已经把真网络用例挡在全量之外，
