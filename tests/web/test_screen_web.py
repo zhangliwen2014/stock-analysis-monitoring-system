@@ -74,6 +74,31 @@ def test_the_range_line_speaks_before_any_condition_is_chosen(logged_screen):
     assert "加一条条件" in response.text
 
 
+def test_the_preset_card_is_in_the_page_body_not_the_head(logged_screen):
+    """方案卡曾整段落在 `{% block title %}` 里：浏览器把标题后的一切当文本，正文里就没有它。"""
+    response = logged_screen.client.get("/screen", params={"market": "A"})
+    head, _, body = response.text.partition("<body>")
+    assert "筛选方案" not in head
+    assert "筛选方案" in body
+
+
+def test_a_condition_in_the_second_row_alone_still_counts_and_can_be_saved(logged_screen):
+    default_seed(logged_screen)
+    params = [
+        ("market", "A"),
+        ("f", ""),
+        ("o", "<="),
+        ("v", ""),
+        ("f", "pr_now"),
+        ("o", "<="),
+        ("v", "0.5"),
+    ]
+    response = logged_screen.client.get("/screen", params=params)
+    assert "通过 2 / 不通过 1 / 无数 1" in response.text
+    assert "保存当前条件" in response.text
+    assert "先在上面填一条条件" not in response.text
+
+
 def test_a_new_page_has_one_blank_row_and_the_unit_on_every_field(logged_screen):
     response = logged_screen.client.get("/screen", params={"market": "A"})
     assert '<option value="">（选字段）</option>' in response.text

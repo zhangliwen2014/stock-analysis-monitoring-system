@@ -198,6 +198,7 @@ def _render(
         market=market,
         preset=preset,
         rows=rows,
+        has_conditions=bool(conditions),
         add_url=add_url,
         remove_urls=remove_urls,
         field_options=field_options,
