@@ -68,6 +68,7 @@ def test_the_lacking_reason_is_per_kind_and_states_the_capability():
         "quote",
         "index_daily",
         "minute_series",
+        "minute_bars",
     )
 
 

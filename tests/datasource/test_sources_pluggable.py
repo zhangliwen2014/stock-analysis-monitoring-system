@@ -76,6 +76,7 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
         "quote",
         "index_daily",
         "minute_series",
+        "minute_bars",
     )
     assert entries["akshare"].capabilities == (
         "daily_bars",

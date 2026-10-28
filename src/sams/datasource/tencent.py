@@ -51,6 +51,11 @@ QUOTE_URL = "https://qt.gtimg.cn/q"
 MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
 #: 分时一行的四个字段：时刻、价格、**累计**量、**累计**额（腾讯给的就是累计，不是每分钟增量）
 _MINUTE_FIELDS = ("time", "price", "cum_volume", "cum_amount")
+#: 分钟 K 只有这一个端点：`/mkline/get` 与 `web.` 那个 host 实测都拿不到数据
+MINUTE_KLINE_URL = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
+#: 分钟 K 一行八格：时刻、开、**收**、高、低、量、腾讯留的空对象、成交额
+#: 成交额单位对不上（与新浪差五个数量级），所以整列置 null，理由见 `parse_tencent_minute_kline`
+_MINUTE_K_ORDER = ("moment", "open", "close", "high", "low", "volume", "_extra", "turnover")
 _TENCENT_LINE = re.compile(r'v_([^=]+)="([^"]*)"')
 #: 三个市场的时间格式各不相同：同一列 30 的字符串，A 股没有分隔符，港股是斜杠
 _QUOTE_TS_FORMATS = {
@@ -218,6 +223,67 @@ def parse_tencent_minute(payload: object, *, market: str, code: str, symbol: str
     )
 
 
+def minute_kline_param(symbol: str, scale: int, count: int) -> str:
+    """`sh600519,m5,,320`：第三格是复权位，**留空但必须留着那个逗号**。"""
+    return f"{symbol},m{scale},,{count}"
+
+
+def parse_tencent_minute_kline(
+    payload: object, *, market: str, code: str, symbol: str, scale: int
+) -> pl.DataFrame:
+    """纯解析：`mkline` 的 JSON → `MINUTE_BARS_COLUMNS`，量已折成股，`amount` 为 null。"""
+    if not isinstance(payload, dict):
+        raise FieldDrift("tencent", f"分钟K响应不是对象: {type(payload).__name__}")
+    if payload.get("code") not in (0, None):
+        # A 股那边不会走到这里（适配器先按 `minute_bars_markets` 拒了）：
+        # 走到这儿说明符号或参数错了，那句话要说「参数」而不是「这段没数据」
+        raise EmptyResponse("tencent", f"腾讯分钟K拒绝参数: {payload.get('msg') or payload}")
+    data = payload.get("data")
+    body = data.get(symbol) if isinstance(data, dict) else None
+    if not isinstance(body, dict):
+        raise FieldDrift("tencent", f"分钟K的不是 {symbol}，实际是 {sorted(data or {})}")
+    node = f"m{scale}"
+    if node not in body:
+        raise FieldDrift("tencent", f"分钟K响应没有 {node} 节点，实际键 {sorted(body)}")
+    rows = body[node]
+    if not isinstance(rows, list) or not rows:
+        raise EmptyResponse("tencent", f"{market} {code} 的 {node} 是空的")
+
+    records = []
+    dates = []
+    clocks = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < len(_MINUTE_K_ORDER):
+            raise FieldDrift("tencent", f"分钟K行字段不足: {row!r}")
+        moment = str(row[0])
+        if len(moment) != 12 or not moment.isdigit():
+            raise FieldDrift("tencent", f"分钟K的时刻形态变了: {moment!r}")
+        stamps = datetime.strptime(moment, "%Y%m%d%H%M")
+        dates.append(stamps.date())
+        clocks.append(stamps.strftime("%H:%M"))
+        records.append(dict(zip(_MINUTE_K_ORDER, row[: len(_MINUTE_K_ORDER)], strict=True)))
+
+    frame = pl.DataFrame(records)
+    return pl.DataFrame(
+        {
+            "market": [market] * frame.height,
+            "code": [code] * frame.height,
+            "date": dates,
+            "clock": clocks,
+            "open": frame["open"].cast(pl.Float64),
+            "high": frame["high"].cast(pl.Float64),
+            "low": frame["low"].cast(pl.Float64),
+            # 不复权：分钟档不落库，也就没有跨除权可比的问题（D164 的前提在这条链上不成立）
+            "close": frame["close"].cast(pl.Float64),
+            "volume": frame["volume"].cast(pl.Float64)
+            * (LOTS_TO_SHARES if market == "A" else 1.0),
+            # 成交额单位没核准（与新浪差五个数量级）：整列置 null，宁缺勿错
+            "amount": pl.Series("amount", [None] * frame.height, dtype=pl.Float64),
+            "source": ["tencent"] * frame.height,
+        }
+    )
+
+
 def parse_tencent_quotes(
     text: str,
     *,
@@ -359,6 +425,8 @@ class TencentAdapter:
     markets = frozenset({"A", "HK", "US"})
     #: 分时答哪些市场：美股那一格实测给不出日期（见 `minute_series`）
     minute_series_markets = frozenset({"A", "HK"})
+    #: 分钟 K 只答 A 股：港美股那边实测永远 `param error`（D165 置灰就念这一份）
+    minute_bars_markets = frozenset({"A"})
 
     def __init__(
         self,
@@ -467,6 +535,32 @@ class TencentAdapter:
                 "tencent", f"{symbol} 的分时给的是 {session}，不在请求的 {start}~{end} 里"
             )
         return frame
+
+    def minute_bars(
+        self, market: str, code: str, start: date, end: date, *, scale: int, count: int
+    ) -> pl.DataFrame:
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        if market not in self.minute_bars_markets:
+            raise EmptyResponse(
+                "tencent",
+                f"腾讯分钟K只供 {sorted(self.minute_bars_markets)}，收到 {market}",
+            )
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        symbol = tencent_quote_symbol(market, code)
+        params = {"param": minute_kline_param(symbol, scale, count)}
+        try:
+            payload = self._get(MINUTE_KLINE_URL, params, timeout=self._timeout)
+            frame = parse_tencent_minute_kline(
+                payload, market=market, code=code, symbol=symbol, scale=scale
+            )
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+        # 请求的是「最近 N 根」，右端永远是最新一根：按窗口裁掉区间外那些
+        return frame.filter(pl.col("date").is_between(start, end))
 
     def quotes(self, market: str, codes: list[str]) -> QuoteBatch:
         """一次请求的代码清单由调用方按 `QUOTE_BATCH` 分批（service 层负责），本方法不切片。"""

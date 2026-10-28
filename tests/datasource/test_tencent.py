@@ -15,13 +15,15 @@ from support import FrozenClock
 
 from sams.core.errors import EmptyResponse, FieldDrift, RateLimited, TransientError
 from sams.datasource.base import BAR_COLUMNS
-from sams.datasource.minute import MINUTE_SERIES_COLUMNS
+from sams.datasource.minute import MINUTE_BARS_COLUMNS, MINUTE_SERIES_COLUMNS
 from sams.datasource.tencent import (
     TencentAdapter,
     _bars_for,
     kline_param,
+    minute_kline_param,
     parse_tencent_daily,
     parse_tencent_minute,
+    parse_tencent_minute_kline,
     parse_us_hint,
     tencent_symbol,
 )
@@ -445,4 +447,67 @@ def test_minute_series_rejects_a_row_that_is_not_four_fields():
             market="A",
             code="600519",
             symbol="sh600519",
+        )
+
+
+# --- 分钟 K（D165）：`mkline`，收在第二格，成交额单位没核准就置空 ----------------------
+
+
+def minute_k_payload(scale="m5", rows=None, symbol="sh600519"):
+    rows = rows if rows is not None else [
+        ["202610281055", "1331.35", "1335.25", "1335.83", "1331.02", "669.00", {}, "0.8924"],
+        ["202610281100", "1333.10", "1331.41", "1333.10", "1331.00", "902.00", {}, "1.2014"],
+    ]
+    return {
+        "code": 0,
+        "msg": "",
+        "data": {symbol: {scale: rows, "prec": ["1355.90"], "qt": {symbol: ["1"]}}},
+    }
+
+
+def test_minute_kline_param_keeps_the_empty_adjustment_slot():
+    """`sh600519,m5,,320`：那个空复权位少了，接口答 `param error`——那是参数不对，不是没数据。"""
+    assert minute_kline_param("sh600519", 5, 320) == "sh600519,m5,,320"
+
+
+def test_minute_bars_maps_the_row_order_and_trims_to_the_window():
+    """行序是 时刻/开/**收**/高/低/量：与日线那行「收在第三位」不是同一套位置。"""
+    frame = parse_tencent_minute_kline(
+        minute_k_payload(), market="A", code="600519", symbol="sh600519", scale=5
+    )
+    assert frame.columns == MINUTE_BARS_COLUMNS
+    assert frame["clock"].to_list() == ["10:55", "11:00"]
+    assert frame["open"].to_list() == [1331.35, 1333.10]
+    assert frame["close"].to_list() == [1335.25, 1331.41]
+    assert frame["high"].to_list() == [1335.83, 1333.10]
+    assert frame["low"].to_list() == [1331.02, 1331.00]
+    assert frame["volume"].to_list() == [66900.0, 90200.0]
+
+
+def test_minute_bars_leaves_amount_null_because_the_unit_is_unreconciled():
+    """腾讯最后一格那个 `0.8924` 单位没核准（新浪同规模给的是 `14644871.9688` 元）。
+
+    拿一个单位没核清的字段算出来的东西看起来都正常，所以置 null 并钉住它。
+    """
+    frame = parse_tencent_minute_kline(
+        minute_k_payload(), market="A", code="600519", symbol="sh600519", scale=5
+    )
+    assert frame["amount"].null_count() == frame.height
+
+
+def test_minute_bars_refuses_hk_and_us_before_touching_the_network():
+    """实测那两边永远 `{"code":-1,"msg":"param error"}`：那是接口不答这一档，不是这只票没数据。"""
+    get = MinuteGet({})
+    adapter = TencentAdapter(get=get, clock=FrozenClock(DAY))
+    for market in ("HK", "US"):
+        with pytest.raises(EmptyResponse, match="只供"):
+            adapter.minute_bars(market, "00700", DAY, DAY, scale=5, count=240)
+    assert get.calls == []
+
+
+def test_minute_bars_reads_the_node_for_the_requested_scale():
+    """节点键就是档位（实测 `["m5","prec","qt"]`）：档位与节点不一致要出声。"""
+    with pytest.raises(FieldDrift, match="节点"):
+        parse_tencent_minute_kline(
+            minute_k_payload(scale="m15"), market="A", code="600519", symbol="sh600519", scale=5
         )
