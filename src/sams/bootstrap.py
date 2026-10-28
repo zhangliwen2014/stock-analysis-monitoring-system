@@ -68,6 +68,7 @@ from sams.services.scheduler.service import RunRequestQueue, Scheduler
 from sams.services.scheduler.types import JobDeps, JobSpec
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.services.screen import ScreenService
+from sams.services.screener import ScreenerService
 from sams.services.sources import SourceAdminService
 from sams.services.symbol_interest import SymbolInterest
 from sams.services.symbol_master import SymbolMasterSyncService
@@ -222,6 +223,7 @@ class ServiceContext:
     symbol_master_sync: SymbolMasterSyncService
     fundamentals: FundamentalService
     screen: ScreenService
+    screener: ScreenerService
     analysis: AnalysisService
     #: 分钟粒度（计划 B）：只读、不落库，所以没有 sync 那条写侧
     minute: MinuteService
@@ -736,6 +738,7 @@ def _context_on(
         screen=ScreenService(
             financials_store, valuation_store, symbols, scan_store, clock=clock
         ),
+        screener=ScreenerService(snapshot_store, symbol_list_store, financials_store),
         analysis=analysis,
         minute=minute,
         valuation=valuation,
