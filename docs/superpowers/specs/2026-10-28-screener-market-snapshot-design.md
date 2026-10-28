@@ -137,19 +137,26 @@ DuckDB（两张新表）、FastAPI + Jinja + htmx（CSP `'self'`，条件构建�
   跑对。注册表已预留 `basket` 字段，将来加它时用同一条校验拦混选（D59）。
 - **实测票池：`symbol_master` 里 A 股 5577 只活跃**（含北交所 `920xxx` 353 只，
   腾讯要 `bj` 前缀；公共的 `a_share_symbol` 会把它们发成 `sz`，静默缺 353 只——
-  所以 `spot.py` 自带前缀规则，不动日线那条公共件）。
+  所以快照自带前缀规则，不动日线那条公共件）。
+- **D192 `market_snapshot` 挂在腾讯适配器上，`spot.py` 只放纯函数。** 不新起一个源名：
+  腾讯已经在 A 股的降级链里、报价通道（GBK 解码、限速桶、源健康、告警）全是现成的；
+  另立 `spot` 源要再配一次 `data_sources`、再教一遍健康页，而它只是同一家接口的另一种数据。
+  `spot.py` 照 `quote.py`/`minute.py` 的姿势：字段位置、前缀规则、解析器、空帧与探针；
+  适配器上只多一个 `market_snapshot` 方法与 `market_snapshot_markets = {"A"}` 的意愿表。
 
 ## 4. 数据层
 
 ```
 能力：market_snapshot(market, codes) -> 该市场当日的横截面（只含 codes 里源答得出的）
-适配器：src/sams/datasource/spot.py
-        A → 腾讯批量报价 https://qt.gtimg.cn/q（GBK；每批 SPOT_BATCH=800，实测 880 可、1000 回 414）
-意愿表：spot_markets = frozenset({"A"})（D188）
+落点：TencentAdapter.market_snapshot（D192）
+纯函数：src/sams/datasource/spot.py —— 字段位置表、A 股 symbol 前缀、解析器、空帧、探针
+        源：https://qt.gtimg.cn/q（GBK，quote_get 已解码）
+        每批 SPOT_BATCH=800 个代码（实测 880 可、1000 回 414）
+意愿表：TencentAdapter.market_snapshot_markets = frozenset({"A"})（D188）
 落库：  0023_market_snapshot.sql → snapshot_daily(market, day, taken_at, code, name,
         price, pct_chg, amount, turnover_rate, volume_ratio, amplitude,
         pe_ttm, pe_dyn, pb, market_cap, float_cap, is_st, source)
-        主键 (market, day, code)；一列对应一个源列，映射表只写在适配器一处；
+        主键 (market, day, code)；一列对应一个源列，映射表只写在 spot.py 一处；
         day = 这一批报价里最多的那个交易日期（停牌票的旧时刻不改写这一天）
 调度：  不进逐票的 `_DATA_JOBS`（那条是按票池 fan-out 的），单列市场级 `spot` job；
         手动补采 `sams sync spot` 与自动跑同一条服务函数，只是 caller 不同
