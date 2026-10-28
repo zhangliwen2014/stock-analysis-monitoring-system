@@ -2549,7 +2549,7 @@ import json
 from datetime import UTC, date, datetime
 
 import polars as pl
-from support import FrozenClock
+from support import FrozenClock, StubAdapter
 
 import sams.cli as cli
 from sams.bootstrap import build_container
@@ -2559,6 +2559,17 @@ from sams.storage.repos.symbol_list import SymbolListRepo
 
 DAY = date(2026, 10, 28)
 TAKEN = datetime(2026, 10, 28, 8, 41, tzinfo=UTC)
+
+# 夹具的 A 链是 akshare/eastmoney；装配期会校验「配置了就必须注册」（`AdapterRegistry.__post_init__`），
+# 所以 `adapters={}` 会先抛 DatasourceError。选股命令从不调用 registry，桩只需名字与市场对得上
+ADAPTERS = {
+    name: StubAdapter(name, markets, None)
+    for name, markets in (
+        ("akshare", ["A"]),
+        ("eastmoney", ["A"]),
+        ("yfinance", ["HK", "US"]),
+    )
+}
 
 
 def snap(code, *, pe_dyn=10.0, pb=1.0, turnover=1.0):
@@ -2600,7 +2611,7 @@ def container_for(db, settings, *rows):
         settings,
         db=db,
         clock=FrozenClock(datetime(2026, 10, 28, 8, 41, tzinfo=UTC)),
-        adapters={},
+        adapters=ADAPTERS,
     )
     built.registry.sleep = lambda _seconds: None
     return built
@@ -2648,7 +2659,7 @@ def test_no_snapshot_exits_1_with_the_next_command(db, settings, capsys):
         settings,
         db=db,
         clock=FrozenClock(datetime(2026, 10, 28, 8, 41, tzinfo=UTC)),
-        adapters={},
+        adapters=ADAPTERS,
     )
     capsys.readouterr()
     assert run(container, ["screen", "spot", "--market", "A", "--where", "price>=1"]) == 1
@@ -2740,7 +2751,8 @@ from sams.core.screener_fields import Condition, fields_for
     spot.set_defaults(handler=run_spot_screen)
 ```
 
-在 `run_pr` 之后加：
+在 `run_pr` 之后加（循环变量叫 `missing_group`：`group` 是本模块从 `common` 引进来的
+子命令助手，再拿它当循环变量 ruff 会判 F402）：
 
 ```python
 _WHERE = re.compile(r"^\s*([a-z_]+)\s*(>=|<=|==|>|<|=)\s*(.+?)\s*$")
@@ -2833,10 +2845,16 @@ def _print_spot(result, code: int) -> int:
         print(f"  {hit.code}  {hit.name or '–'}  {values}")
     if result.truncated:
         print(f"  …还有 {result.truncated} 只未列（--limit 截的；总数照报）")
-    for group in result.missing:
-        print(f"无数 {len(group.codes)} 只  {group.field}：{group.reason}")
-        shown = group.codes[:20]
-        print(f"  {'、'.join(shown)}" + ("…（--json 拿全表）" if len(group.codes) > 20 else ""))
+    for missing_group in result.missing:
+        print(
+            f"无数 {len(missing_group.codes)} 只  {missing_group.field}："
+            f"{missing_group.reason}"
+        )
+        shown = missing_group.codes[:20]
+        print(
+            f"  {'、'.join(shown)}"
+            + ("…（--json 拿全表）" if len(missing_group.codes) > 20 else "")
+        )
     print(
         "口径：比率列一律小数（0.20 = 20%）；PR 现值 = PE(动)² ÷ (100×PB)，"
         "亏损 / 净资产为负 / 推出来的 ROE 过界都记「无数」，不算落选"
@@ -2887,8 +2905,12 @@ def _spot_payload(result, code: int) -> dict:
         "total_hits": result.total_hits,
         "truncated": result.truncated,
         "missing": [
-            {"field": group.field, "reason": group.reason, "codes": list(group.codes)}
-            for group in result.missing
+            {
+                "field": missing_group.field,
+                "reason": missing_group.reason,
+                "codes": list(missing_group.codes),
+            }
+            for missing_group in result.missing
         ],
         "note": result.note,
     }
