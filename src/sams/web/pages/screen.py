@@ -21,6 +21,7 @@ from sams.core.screener_fields import (
     describe_all,
     fields_for,
 )
+from sams.services.screener import preset_strategy_id
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import moment_label
@@ -161,16 +162,25 @@ def _render(
         "prev": _url(market, rows, preset=preset, page=page - 1) if page > 1 else "",
         "next": _url(market, rows, preset=preset, page=page + 1) if page < pages else "",
     }
-    presets_view = [
-        {
-            "id": item.id,
-            "name": item.name,
-            "market": item.market,
-            "summary": describe_all(item.conditions),
-            "updated": moment_label(item.updated_at, ctx.settings.server.display_tz),
-        }
-        for item in ctx.screener_presets.list(user.id)
-    ]
+    presets_view = []
+    for item in ctx.screener_presets.list(user.id):
+        runs = ctx.scan_store.recent(
+            market=item.market,
+            strategy_id=preset_strategy_id(item.name, item.conditions),
+            limit=1,
+        )
+        presets_view.append(
+            {
+                "id": item.id,
+                "name": item.name,
+                "market": item.market,
+                "summary": describe_all(item.conditions),
+                "updated": moment_label(item.updated_at, ctx.settings.server.display_tz),
+                "last_run": moment_label(runs[0]["created_at"], ctx.settings.server.display_tz)
+                if runs
+                else "",
+            }
+        )
     add_url = _url(market, [*rows, _draft()])
     remove_urls = [_url(market, rows[:i] + rows[i + 1 :]) for i in range(len(rows))]
     if not rows:
@@ -450,11 +460,19 @@ def run_preset(request: Request, preset_id: str, _csrf: None = Depends(csrf_prot
     ctx = request.app.state.web.contexts.current()
     preset = _preset(ctx, user.id, preset_id)
     try:
-        ctx.screener.run(preset.market, list(preset.conditions))
+        result = ctx.screener.run(preset.market, list(preset.conditions))
     except ValidationError as exc:
         rows = [_draft_of(item) for item in preset.conditions]
         return _render(
             request, user, market=preset.market, preset=preset, rows=rows, error=str(exc)
+        )
+    if result.day is not None:
+        ctx.scan_store.record(
+            on=result.day,
+            market=preset.market,
+            strategy_id=preset_strategy_id(preset.name, preset.conditions),
+            universe_size=result.universe_size,
+            hits=[{"code": hit.code, "name": hit.name, **hit.values} for hit in result.hits],
         )
     return RedirectResponse(_url(preset.market, [], preset=preset, notice="ran"), status_code=303)
 

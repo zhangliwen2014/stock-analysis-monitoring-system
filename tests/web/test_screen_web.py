@@ -393,3 +393,35 @@ def test_another_users_preset_is_a_404_without_saying_whose_it_is(logged_screen)
         )
         assert response.status_code == 404
     assert logged_screen.context.screener_presets.list(other.id) != []
+
+
+def test_running_a_preset_records_the_basket_for_that_day(logged_screen):
+    from sams.services.screener import preset_strategy_id
+
+    default_seed(logged_screen)
+    _save(logged_screen)
+    preset = logged_screen.context.screener_presets.list(_alice(logged_screen))[0]
+    logged_screen.client.post(
+        f"/screen/presets/{preset.id}/run",
+        data={"csrf": logged_screen.csrf},
+        follow_redirects=False,
+    )
+    strategy = preset_strategy_id(preset.name, preset.conditions)
+    records = logged_screen.context.scan_store.recent(market="A", strategy_id=strategy, limit=1)
+    assert records and records[0]["date"] == DAY
+    assert {hit["code"] for hit in records[0]["hits"]} == {"600519", "000001"}
+
+
+def test_the_list_says_when_the_current_version_last_ran(logged_screen):
+    default_seed(logged_screen)
+    _save(logged_screen)
+    preset = logged_screen.context.screener_presets.list(_alice(logged_screen))[0]
+    page = logged_screen.client.get("/screen")
+    assert "没跑过" in page.text
+    logged_screen.client.post(
+        f"/screen/presets/{preset.id}/run",
+        data={"csrf": logged_screen.csrf},
+        follow_redirects=False,
+    )
+    page = logged_screen.client.get("/screen")
+    assert "没跑过" not in page.text
