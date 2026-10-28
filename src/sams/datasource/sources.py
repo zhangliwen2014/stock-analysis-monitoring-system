@@ -35,6 +35,7 @@ _NOT_ADAPTERS = frozenset(
         "calendar_providers",
         "actions",
         "capabilities",
+        "minute",
         "fundamentals",
         "listed_date",
         "fx",

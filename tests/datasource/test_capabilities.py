@@ -32,6 +32,8 @@ def test_the_kind_name_is_the_adapter_method_name():
         "quote",
         "symbol_list",
         "index_daily",
+        "minute_series",
+        "minute_bars",
     }
 
 
@@ -57,6 +59,8 @@ def test_the_lacking_reason_is_per_kind_and_states_the_capability():
     """`skipped` 里那句「为什么这个源没被调用」要能被打印，所以它跟着种类走。"""
     assert CAPABILITIES["daily_bars"].lacking == "不提供日线"
     assert CAPABILITIES["corp_actions"].lacking == "不提供公司行为"
+    assert CAPABILITIES["minute_series"].label == "分时"
+    assert CAPABILITIES["minute_bars"].label == "分钟 K"
     assert known()["akshare_hk"].capabilities == ("corp_actions", "symbol_list")
     entries = catalog().by_kind()
     assert entries["tencent"].capabilities == ("daily_bars", "quote", "index_daily")

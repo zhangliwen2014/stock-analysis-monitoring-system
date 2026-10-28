@@ -20,6 +20,7 @@ from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
 from sams.datasource.fx import has_fx
 from sams.datasource.index_daily import has_index_daily
 from sams.datasource.listed_date import has_listed_date
+from sams.datasource.minute import has_minute_bars, has_minute_series
 from sams.datasource.quote import has_quotes
 from sams.datasource.symbol_list import has_symbol_list
 
@@ -53,6 +54,9 @@ CAPABILITIES: dict[str, Capability] = {
     # 代码表没有窗口也没有单个代码：一次答全表，按市场路由（D148）
     "symbol_list": Capability(label="代码表", lacking="不提供代码表", probe=has_symbol_list),
     "index_daily": Capability(label="指数日线", lacking="不提供指数日线", probe=has_index_daily),
+    # 分钟粒度：都不落库（spec D163），所以这两条链没有写入方，只有读端
+    "minute_series": Capability(label="分时", lacking="不提供分时", probe=has_minute_series),
+    "minute_bars": Capability(label="分钟 K", lacking="不提供分钟K", probe=has_minute_bars),
 }
 
 

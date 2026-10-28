@@ -268,6 +268,9 @@ def test_the_three_new_kinds_are_registered_as_capabilities():
         # SP1 两种（D148）：代码表一次答全市场，指数日线与日线同窗不同表
         "代码表",
         "指数日线",
+        # 计划 B 两种：分钟粒度不落库，只有读端（D163）
+        "分时",
+        "分钟 K",
     ]
 
 
