@@ -215,6 +215,12 @@ truncated: 命中超过 limit 时给出「还有 N 只未列」，不让一屏�
    点了不重复插）；表头上方「勾选的加自选」与「全部 N 只加自选」，后者先给 dry-run 数（D184）。
 4. **方案区**：已存方案的列表与六个动作，见 §7.3。
 
+页面尺寸与提交姿势（不留到实现时再定）：结果一页 **50 行**，`PAGE_SIZE+1` 判下一页；
+条件区是一次 GET（可收藏、可刷新），加减行是服务端拼好的链接；整张结果表只是一个
+`<form>`，行内「加自选」与「勾选加」「全部加」是同一表单里 value 不同的提交按钮
+（CSP 禁内联脚本，也不为了按钮去引一段前端状态机）。加自选后 303 回同一组条件，
+结果由服务端按 URL 重跑——与「全部」越过分页的姿势是同一条。
+
 ## 7. 存储与方案维护（D182 的落地）
 
 ### 7.1 迁移
@@ -229,11 +235,11 @@ truncated: 命中超过 limit 时给出「还有 N 只未列」，不让一屏�
 
 ```sql
 screener_presets(
-  id INTEGER PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id),
-  name TEXT NOT NULL,
-  market TEXT NOT NULL,
-  conditions_json TEXT NOT NULL,   -- [{field, op, value}, ...]，条件为空不允许存（见 7.3）
+  id VARCHAR PRIMARY KEY,          -- uuid4 的 hex：与全仓其他表同一种主键（DuckDB 没有自增列）
+  user_id VARCHAR NOT NULL REFERENCES users(id),
+  name VARCHAR NOT NULL,
+  market VARCHAR NOT NULL,
+  conditions_json VARCHAR NOT NULL, -- [{field, op, value}, ...]，条件为空不允许存（见 7.3）
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL,
   UNIQUE (user_id, name)
@@ -248,8 +254,8 @@ screener_presets(
 | 动作 | 端点 | 语义与要说清的边界 |
 | --- | --- | --- |
 | 保存 | `POST /screen/presets` | 存当前条件 + 市场。空条件不许存（那是一条永远为真的筛法，重跑时看起来像「方案坏了」）。同名同用户：给一句「已有同名方案，覆盖还是改名」，不静默覆盖也不静默加 `(2)`。 |
-| 列表 | `GET /screen`（同页） | 按 `updated_at` 倒序，每行显示名字、市场、条件的可读摘要（不是 JSON），与「上次跑」的时间。 |
-| 重跑 | `POST /screen/presets/{id}/run` | 按存下的条件跑**今天**的快照——存的是条件不是结果，所以 PR 口径变了或数据缺了要在结果顶部说出来，而不是默默给一个不同的篮子。 |
+| 列表 | `GET /screen`（同页） | 按 `updated_at` 倒序，每行显示名字、市场、条件的可读摘要（不是 JSON），与「上次跑」的时间（取 `scan_results` 里这个方案当前 `strategy_id` 的最近一条 `created_at`；没跑过写「没跑过」）。 |
+| 重跑 | `POST /screen/presets/{id}/run` | 按存下的条件跑**今天**的快照——存的是条件不是结果，所以 PR 口径变了或数据缺了要在结果顶部说出来，而不是默默给一个不同的篮子。重跑同时写 `scan_results`（`strategy_id = screen:<名字>:<条件哈希前 8 位>`，D183）。 |
 | 改名 | `POST /screen/presets/{id}/rename` | 撞名同样出声。 |
 | 改条件（覆盖） | `POST /screen/presets/{id}` | 覆盖 `conditions_json` 与 `updated_at`；名字不动。 |
 | 删除 | `POST /screen/presets/{id}/delete` | 只删那一行方案。**不动 `scan_results`**：那天的那一篮是发生过的事实，方案没了它照样可查（D183）。已加进自选的票更不会因为删方案而消失——「我删了筛选条件，昨天加进来的票还在」是这个功能唯一的正确行为。 |
