@@ -2080,7 +2080,7 @@ from datetime import UTC, date, datetime
 
 import polars as pl
 import pytest
-from support_fundamentals import financial_rows  # 若签名不同，改用本文件内的 _fin
+from support_valuation import financial_rows
 
 from sams.core.errors import ValidationError
 from sams.core.screener_fields import Condition
@@ -2136,10 +2136,10 @@ def service(db):
 def test_every_condition_reports_passed_failed_missing_that_sum_to_the_universe(db):
     seed(
         db,
-        snap("600519", pe_dyn=10.0, pb=1.0),   # PR 0.10 通过
-        snap("000001", pe_dyn=20.0, pb=1.0),   # PR 0.40 通过
-        snap("300750", pe_dyn=40.0, pb=1.0),   # PR 1.60 不通过
-        snap("600000", pe_dyn=-5.0, pb=1.0),   # 亏损 → 无数
+        snap("600519", pe_dyn=5.0, pb=1.0),   # PR = 25/100 = 0.25 通过
+        snap("000001", pe_dyn=6.0, pb=1.0),   # PR = 36/100 = 0.36 通过
+        snap("300750", pe_dyn=10.0, pb=1.0),  # PR = 100/100 = 1.00 不通过
+        snap("600000", pe_dyn=-5.0, pb=1.0),  # 亏损 → 无数
         codes=("600519", "000001", "300750", "600000"),
     )
     result = service(db).run("A", [Condition("pr_now", "<=", 0.5)])
@@ -2150,9 +2150,9 @@ def test_every_condition_reports_passed_failed_missing_that_sum_to_the_universe(
 
 
 def test_hits_carry_the_values_of_the_condition_that_picked_them(db):
-    seed(db, snap("600519", pe_dyn=10.0, pb=1.0))
+    seed(db, snap("600519", pe_dyn=5.0, pb=1.0))
     hit = service(db).run("A", [Condition("pr_now", "<=", 0.5)]).hits[0]
-    assert hit.values["pr_now"] == pytest.approx(0.1)
+    assert hit.values["pr_now"] == pytest.approx(0.25)
     assert hit.values["price"] == 10.0
 
 
@@ -2172,7 +2172,8 @@ def test_missing_codes_are_grouped_with_a_reason_and_a_next_step(db):
 
 def test_financial_fields_join_as_of_the_snapshot_day_and_report_the_gap(db):
     seed(db, snap("600519"), snap("000001"), codes=("600519", "000001"))
-    FinancialRepo(db).upsert(financial_rows(codes=("600519",), roe=0.2))
+    # support_valuation.financial_rows 的签名是 (*, market="A", code=CODE)，FY23 的 ROE=0.20
+    FinancialRepo(db).upsert(financial_rows(code="600519"))
     result = service(db).run("A", [Condition("roe", ">=", 0.1)])
     assert result.fields[0].passed == 1
     (group,) = result.missing
@@ -2200,18 +2201,8 @@ def test_limit_truncates_but_the_total_stays_visible(db):
     assert len(result.hits) == 2 and result.total_hits == 3 and result.truncated == 1
 
 
-def test_two_pr_fields_are_refused_before_any_query(db):
-    """D59：两条公式的数不能同篮——拦在引擎入口，不是「按其中一条排序」。"""
-    with pytest.raises(ValidationError):
-        service(db).run("A", [Condition("pr_now", "<=", 0.5)])
-        # 注：v1 只有一条 PR 词条，混选由词表校验拦（Task 1 已钉）；
-        # 这一枚留作回归位：将来注册第二条时，这条用例要改成两条同时出现
-```
-
-最后一个用例需要改成真实的混选（v1 只有 pr_now，无法混选）。改为：断言空条件与未知字段在此层被拒（校验前移）：
-
-```python
 def test_validation_happens_before_the_database_is_read(db):
+    """词表不认识的字段在碰库之前就拒：否则拼错的字段会被读成「没有票通过」。"""
     with pytest.raises(ValidationError):
         service(db).run("A", [Condition("unknown", "<=", 0.5)])
 ```
@@ -2253,8 +2244,6 @@ from sams.core.screener_fields import FIELDS, Condition, Field, field, validate
 from sams.storage.repos.financials import FinancialRepo
 from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
-
-_FINANCIAL_COLUMNS = ("roe", "revenue_yoy", "profit_yoy")
 
 
 @dataclass(frozen=True)
@@ -2363,7 +2352,9 @@ class ScreenerService:
                     f"`sams run once --job symbol_master --market {market}`"
                 ),
             )
-        universe = self._with_financials(market, universe, snapshot_day)
+        universe = self._with_financials(
+            market, universe, snapshot_day, wanted=set(specs.values())
+        )
         reasons: dict[str, str] = {}
         if "pr_now" in specs:
             values = []
@@ -2420,10 +2411,21 @@ class ScreenerService:
             missing=_missing_groups(universe, checked, specs, hit_codes, reasons, market),
         )
 
-    def _with_financials(self, market: str, universe: pl.DataFrame, day: date) -> pl.DataFrame:
-        """只用到了财务字段才去问库：一次全市场扫描不该为快照列多付一条 join。"""
-        wanted = {"roe", "revenue_yoy", "profit_yoy"}
-        if not any(column in universe.columns for column in wanted):
+    def _with_financials(
+        self,
+        market: str,
+        universe: pl.DataFrame,
+        day: date,
+        *,
+        wanted: set[Field],
+    ) -> pl.DataFrame:
+        """只看**这次选中的条件**用到哪些财务列：全市场扫描不该为快照列多付一条 join。
+
+        快照帧里没有财务列，所以判据必须是 `Field.source == "financials"`，
+        不是「帧里有没有这一列」——后者永远为假，join 永远不会发生。
+        """
+        columns = sorted({item.column for item in wanted if item.source == "financials"})
+        if not columns:
             return universe
         loaded, _dropped = self.financials.load_as_of(
             market, universe["code"].to_list(), day, basis=ROE_BASIS_ANNUAL
@@ -2436,7 +2438,7 @@ class ScreenerService:
                     [by_code.get(code, {}).get(column) for code in universe["code"]],
                     dtype=pl.Float64,
                 )
-                for column in _FINANCIAL_COLUMNS
+                for column in columns
             ]
         )
 
@@ -2488,26 +2490,6 @@ def _missing_groups(
         for (name, reason), codes in sorted(grouped.items())
     )
 ```
-
-注意：`_with_financials` 的判断要看**选中的条件**用了哪些字段，而不是帧里有没有列
-（快照帧没有财务列，所以这里的 `any(column in universe.columns)` 永远 False）。
-改成由 `run` 传入 `wanted = {spec.column for spec in specs.values()}`：
-
-```python
-        universe = self._with_financials(market, universe, snapshot_day, wanted=set(specs.values()))
-```
-
-```python
-    def _with_financials(
-        self, market: str, universe: pl.DataFrame, day: date, *, wanted: set[Field]
-    ) -> pl.DataFrame:
-        columns = sorted({item.column for item in wanted if item.source == "financials"})
-        if not columns:
-            return universe
-        ...
-        return universe.with_columns([... for column in columns])
-```
-（`_FINANCIAL_COLUMNS` 常量随之删掉。）
 
 - [ ] **Step 4: 装配（bootstrap）**
 
