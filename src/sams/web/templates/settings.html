@@ -59,6 +59,23 @@
 </section>
 
 <section class="card">
+  <h2>图表偏好</h2>
+  <p class="muted">周期条顺序与均线窗口按人存；两格都留空=恢复默认。可选档：{{ chart_keys }}</p>
+  <form method="post" action="/settings/chart">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>周期条顺序
+      <input type="text" name="periods" value="{{ chart.periods }}" size="60"
+        placeholder="{{ chart_keys }}">
+    </label>
+    <label>均线窗口
+      <input type="text" name="ma" value="{{ chart.ma }}" placeholder="5,10,20,60,120,250">
+    </label>
+    <button type="submit">保存</button>
+  </form>
+  <p class="muted">窗口是 1..500 的正整数、最多六条；顺序里每一档都要写、且只写一次。</p>
+</section>
+
+<section class="card">
   <h2>通知通道</h2>
   <table>
     <tr>

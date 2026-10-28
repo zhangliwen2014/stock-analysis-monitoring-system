@@ -40,6 +40,7 @@ from sams.core.errors import DatabaseLocked, SamsError, ValidationError
 from sams.core.notify import KINDS, MID, SYSTEM_MARKET, AlertMessage
 from sams.storage.repos.channels import Channel
 from sams.web.auth import audit, csrf_protect, require_user
+from sams.web.chart_prefs import CHART_PERIODS, parse_periods, parse_windows, windows_text
 from sams.web.display import hhmm, moment_label
 from sams.web.forms import form_data, one
 from sams.web.pages.alerts import INBOX_TEST_ALERT_NOTICE
@@ -124,17 +125,26 @@ def _page(
     probe=None,
     probe_label: str = "",
     dispatch=None,
+    chart: dict[str, str] | None = None,
 ):
     """列表那一屏。`probe`/`dispatch` 不带注解：它们的类住在 `sams.monitor`，
     而 web 不许 import 那一层（同一折法见 `pages/alerts.py` 的 `dispatch`）。
 
     `probe_label` 从端点传进来：`DeliveryReport` 没有 `name` 字段，而屏幕上要能看出
     「刚才探的是哪一条」——那条通道端点已经读过了，不必再读一遍。
+
+    `chart` 同理：被拒的那一屏要还是人刚敲的那份原文，端点把它传回来；平时留空，
+    这一层从偏好仓库读。
     """
     user = request.state.sams_user
     web = request.app.state.web
     ctx = web.contexts.current()
     tz = ctx.settings.server.display_tz
+    pref = ctx.chart_prefs.get(user.id)
+    chart_values = chart or {
+        "periods": ",".join(pref.periods) if pref else "",
+        "ma": windows_text(pref.windows) if pref else "",
+    }
     return web.render(
         request,
         "settings.html",
@@ -147,6 +157,8 @@ def _page(
             "end": hhmm(user.dnd_end),
             "tz": user.dnd_tz or "",
         },
+        chart=chart_values,
+        chart_keys="、".join(f"{label}={name}" for name, label in CHART_PERIODS),
         error=error,
         saved=request.query_params.get("saved") or "",
         probe=probe,
@@ -231,6 +243,38 @@ def save_dnd(
         return _page(request, status_code=400, error=str(exc))
     audit(request, action="settings.dnd", target=user.id, ok=True)
     return RedirectResponse("/settings?saved=dnd", status_code=303)
+
+
+@router.post("/settings/chart")
+def save_chart(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    periods_text = one(data, "periods")
+    ma_text = one(data, "ma")
+    try:
+        # 两格的判据都住在 `chart_prefs`：周期条那头要的是 13 档的一整个排列，
+        # 均线这头与个股图的 `ma=` 共用同一把尺（`parse_windows`）
+        periods = parse_periods(periods_text, tuple(name for name, _label in CHART_PERIODS))
+        windows = parse_windows(ma_text)
+    except ValidationError as exc:
+        # 被拒的那一屏要还是人刚敲的那份：照着重打一遍才叫「改这一行」
+        return _page(
+            request,
+            status_code=400,
+            error=str(exc),
+            chart={"periods": periods_text, "ma": ma_text},
+        )
+    if periods or windows:
+        ctx.chart_prefs.save(user.id, periods, windows)
+    else:
+        # 两格都留空=删掉这一行：没有行就是用默认，这比存一份「等于默认」的副本干净
+        ctx.chart_prefs.clear(user.id)
+    audit(request, action="settings.chart", target=user.id, ok=True)
+    return RedirectResponse("/settings?saved=chart", status_code=303)
 
 
 @router.post("/settings/channels")
