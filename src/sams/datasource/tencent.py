@@ -36,6 +36,7 @@ from sams.datasource.base import (
 )
 from sams.datasource.quote import echo_matches, field_float, parse_moment
 from sams.datasource.sources import source
+from sams.datasource.spot import SPOT_BATCH, parse_spot, spot_symbol
 
 KLINE_PATHS = {
     # A 股走 fqkline（复权位留空 = 不复权）；港美股走 kline/kline
@@ -427,6 +428,8 @@ class TencentAdapter:
     minute_series_markets = frozenset({"A", "HK"})
     #: 分钟 K 只答 A 股：港美股那边实测永远 `param error`（D165 置灰就念这一份）
     minute_bars_markets = frozenset({"A"})
+    #: 全市场快照只答 A 股：港美股行的 PE/PB 位置没法交叉验证（D188）
+    market_snapshot_markets = frozenset({"A"})
 
     def __init__(
         self,
@@ -594,6 +597,40 @@ class TencentAdapter:
             raise
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
+
+    def market_snapshot(self, market: str, codes: list[str]) -> pl.DataFrame:
+        """一个市场的一次横截面（D173）：批大小是接口的硬边界，切片在适配器里做。
+
+        一片失败就是整市场失败——按票重试同一个请求没有意义（D173），让 job 出声、
+        保留上一次那天的数据，比写进一半更像一次采集。
+        """
+        if market not in self.market_snapshot_markets:
+            raise DatasourceError(
+                self.name,
+                f"腾讯快照只供 {sorted(self.market_snapshot_markets)}，收到 {market}",
+            )
+        wanted = list(dict.fromkeys(canonical_code(market, code) for code in codes))
+        if not wanted:
+            raise EmptyResponse(self.name, "快照请求里没有代码")
+        frames: list[pl.DataFrame] = []
+        for start in range(0, len(wanted), SPOT_BATCH):
+            chunk = wanted[start : start + SPOT_BATCH]
+            symbols = [spot_symbol(market, code) for code in chunk]
+            try:
+                text = self._quote_fetch(
+                    QUOTE_URL, {"q": ",".join(symbols)}, timeout=self._timeout
+                )
+                frames.append(
+                    parse_spot(text, market=market, codes=chunk, zone=MARKET_ZONES[market])
+                )
+            except DatasourceError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise classify_error(self.name, exc) from exc
+        frame = pl.concat(frames)
+        if frame.is_empty():
+            raise EmptyResponse(self.name, f"{market} 快照返回 0 行")
+        return frame
 
 
 def kline_param(market: str, symbol: str, start: date, end: date, count: int) -> str:
