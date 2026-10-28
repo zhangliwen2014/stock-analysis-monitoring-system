@@ -202,6 +202,7 @@ def _render(
         add_url=add_url,
         remove_urls=remove_urls,
         field_options=field_options,
+        unavailable_fields=sum(1 for item in field_options if not item["enabled"]),
         ops=[(op, OP_LABELS.get(op, op)) for op in OPS],
         result=result,
         labels=[specs[item.field] for item in conditions] if result is not None else [],

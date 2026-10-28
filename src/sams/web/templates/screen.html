@@ -48,6 +48,9 @@
   </div>
   {% endfor %}
   <p><button type="submit">筛选</button> <a href="{{ add_url }}">再加一条</a></p>
+  {% if unavailable_fields %}
+  <p class="muted">{{ market }} 股有 {{ unavailable_fields }} 个字段没有这一列，所以灰着——灰着不是算出来 0，这一格真的没有数。</p>
+  {% endif %}
 </form>
 
 {% if result %}

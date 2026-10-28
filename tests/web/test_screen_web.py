@@ -127,6 +127,13 @@ def test_a_market_that_has_no_snapshot_says_so_instead_of_showing_an_empty_table
     assert "还没有全市场快照" in response.text
 
 
+def test_a_market_whose_columns_do_not_exist_says_why_the_fields_are_greyed(logged_screen):
+    """灰着的字段本该在屏幕上自证：`disabled title` 只在鼠标悬停时说话，键盘与触屏看不到。"""
+    response = logged_screen.client.get("/screen", params={"market": "HK"})
+    assert "灰着不是算出来 0" in response.text
+    assert "个字段" in response.text
+
+
 def test_recollect_queues_the_spot_job_and_says_so(logged_screen):
     default_seed(logged_screen)
     response = logged_screen.client.post(
