@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import polars as pl
@@ -23,6 +23,7 @@ from sams.core.version import VersionGate
 from sams.datasource.registry import AdapterRegistry
 from sams.services.corp_actions import CorpActionSyncService
 from sams.services.fundamentals import FundamentalSyncService
+from sams.services.market_snapshot import SnapshotSync
 from sams.services.scheduler.jobs import (
     build_jobs,
     run_actions,
@@ -30,6 +31,7 @@ from sams.services.scheduler.jobs import (
     run_financials,
     run_flow,
     run_indices,
+    run_spot,
     run_symbol_master,
     run_valuation,
 )
@@ -505,3 +507,72 @@ def test_build_jobs_registers_indices_only_with_repo_and_capability(db, settings
     assert ("indices", "A") in titles(deps(db, settings, index=StubIndexAdapter()))
     # 链上没有指数源的 HK/US 不登记
     assert ("indices", "HK") not in titles(deps(db, settings, index=StubIndexAdapter()))
+
+
+# --- 盘后快照：市场级单元，两道闸各管一件事 ------------------------------------------------
+
+
+class SnapshotServiceStub:
+    """市场级快照服务的替身：与 `MarketSnapshotService.sync` 同签名。"""
+
+    def __init__(self, report=None, error=None):
+        self.report = report
+        self.error = error
+        self.calls: list[str] = []
+
+    def sync(self, market, *, codes=None, day=None):
+        self.calls.append(market)
+        if self.error is not None:
+            raise self.error
+        return self.report
+
+
+def snapshot_report(**over):
+    base = dict(
+        market="A",
+        day=AS_OF,
+        taken_at=datetime(2024, 10, 25, 8, 30, tzinfo=UTC),
+        rows=5000,
+        universe_size=5100,
+        skipped=("000001",),
+        source="tencent",
+    )
+    base.update(over)
+    return SnapshotSync(**base)
+
+
+def test_spot_job_writes_what_the_service_answers(db, settings):
+    stub = SnapshotServiceStub(snapshot_report())
+    outcome = run_spot(replace(deps(db, settings), snapshots=stub), ctx())
+    assert stub.calls == ["A"]
+    assert outcome.ok and outcome.rows_affected == 5000
+    assert "快照 2024-10-25 5000 行" in outcome.note
+    assert "1 只" in outcome.note
+
+
+def test_spot_job_failure_is_one_market_named_error(db, settings):
+    stub = SnapshotServiceStub(error=RateLimited("tencent", "429"))
+    outcome = run_spot(replace(deps(db, settings), snapshots=stub), ctx())
+    assert not outcome.ok and "A" in outcome.errors[0]
+
+
+def test_spot_job_is_registered_only_when_both_halves_exist(db, settings):
+    plain = deps(db, settings)
+    assert ("spot", "A") not in titles(plain)
+    with_capability = replace(
+        plain,
+        registry=AdapterRegistry(
+            adapters={"akshare": SnapshotCapable()},
+            market_sources={"A": ("akshare",)},
+            sleep=lambda _s: None,
+        ),
+    )
+    assert ("spot", "A") not in titles(with_capability)  # 服务没装
+    assert ("spot", "A") in titles(replace(with_capability, snapshots=SnapshotServiceStub()))
+
+
+class SnapshotCapable(RecordingBarsAdapter):
+    """A 股日线源顺带提供快照：注册表只问「方法在不在」。"""
+
+    def market_snapshot(self, market, codes):
+        raise NotImplementedError

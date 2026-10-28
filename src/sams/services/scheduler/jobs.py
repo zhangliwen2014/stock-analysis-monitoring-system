@@ -185,6 +185,26 @@ def run_symbol_master(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     )
 
 
+def run_spot(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """全市场快照：单元是整个市场的一张横截面（拆不成按只隔离）。
+
+    失败只说一句带市场名的话：job 失败时保留上一次那天的数据，页面照旧能读，
+    只是范围行会写「这是哪天的快照」——**绝不**渲染成「这个市场没有便宜票」。
+    """
+    assert ctx.market is not None
+    assert deps.snapshots is not None  # 登记前查过注入，这里只兜编程错误
+    try:
+        report = deps.snapshots.sync(ctx.market)
+    except SamsError as exc:
+        return JobOutcome(note=f"{ctx.market} 全市场快照失败", errors=(f"{ctx.market}: {exc}",))
+    if report.empty_everywhere:
+        return JobOutcome(note=f"{ctx.market} 快照空答复，保留旧表")
+    note = f"{ctx.market} 快照 {report.day} {report.rows} 行"
+    if report.skipped:
+        note += f"，源没答 {len(report.skipped)} 只"
+    return JobOutcome(rows_affected=report.rows, note=note)
+
+
 def run_indices(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """大盘条那几只指数：窗口按每只各自的库内最新日，与日线同一条规则。
 
@@ -334,6 +354,9 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         for method, name, run in _DATA_JOBS:
             if _has(deps, market, method):
                 jobs.append(JobSpec(name, DAILY, market, partial(run, deps)))
+        # 快照排在数据链之后：它读的是当天收盘价，与日线那批互不依赖，但都在盘后完成
+        if deps.snapshots is not None and _has(deps, market, "market_snapshot"):
+            jobs.append(JobSpec("spot", DAILY, market, partial(run_spot, deps)))
         if deps.sync.indices is not None and _has(deps, market, "index_daily"):
             jobs.append(JobSpec("indices", DAILY, market, partial(run_indices, deps)))
         jobs.append(JobSpec("recheck", WEEKLY, market, partial(run_recheck, deps)))

@@ -34,7 +34,10 @@ def add_to(subparsers) -> None:
     )
     once.add_argument(
         "--job",
-        help="只跑这个 job（bars/actions/financials/valuation/flow/recheck/rules/fx/calendar）",
+        help=(
+            "只跑这个 job（bars/actions/financials/valuation/flow/spot/recheck/rules/fx"
+            "/calendar）"
+        ),
     )
     once.add_argument("--market", help="只跑这个市场（A/HK/US）")
     once.set_defaults(handler=_once)
