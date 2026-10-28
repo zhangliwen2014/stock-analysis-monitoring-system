@@ -559,7 +559,8 @@ def test_adapter_slices_the_code_list_into_batches():
     codes = [f"{600000 + i}" for i in range(SPOT_BATCH + 3)]
     frame = adapter.market_snapshot("A", codes)
     assert [len(chunk) for chunk in requested] == [SPOT_BATCH, 3]
-    assert frame.height == len(codes) - 3  # 第二批只答了第一只（替身行为），正好验合并
+    # 替身每片只答第一只：两片各 1 行，合起来 2 行——这是「两片都解析并拼接」的证据
+    assert frame.height == 2
 
 
 def test_adapter_refuses_hk_and_us():
