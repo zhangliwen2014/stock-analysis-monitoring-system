@@ -52,6 +52,7 @@ EXPECTED_TABLES = {
     "source_health",
     "snapshot_daily",
     "screener_presets",
+    "chart_prefs",
 }
 
 
