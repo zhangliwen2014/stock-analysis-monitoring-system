@@ -56,3 +56,27 @@ def test_clearing_both_fields_goes_back_to_the_defaults(logged):
     response = _save(logged.client, logged.csrf, "", "")
     assert response.status_code == 303
     assert logged.context.chart_prefs.get(_alice(logged).id) is None
+
+
+def _period_bar(html: str) -> str:
+    """周期条那一段：视图链接里也有 `period=`，只能按 aria-label 切。"""
+    return html.split('aria-label="周期"', 1)[1].split("</span>", 1)[0]
+
+
+def test_the_period_bar_follows_the_saved_order(logged):
+    _save(logged.client, logged.csrf, ",".join(reversed(KEYS)), "")
+    bar = _period_bar(logged.client.get("/api/partials/chart?market=A&code=600519").text)
+    assert bar.index(">10日<") < bar.index(">日<") < bar.index(">1分<")
+
+
+def test_the_chart_defaults_to_the_saved_ma_windows(logged):
+    _save(logged.client, logged.csrf, ",".join(KEYS), "5,20")
+    html = logged.client.get("/api/partials/chart?market=A&code=600519").text
+    assert "ma=5,20" in html
+
+
+def test_an_explicit_ma_wins_over_the_preference(logged):
+    _save(logged.client, logged.csrf, ",".join(KEYS), "5,20")
+    html = logged.client.get("/api/partials/chart?market=A&code=600519&ma=3,7").text
+    assert "ma=3,7" in html
+    assert "ma=5,20" not in html

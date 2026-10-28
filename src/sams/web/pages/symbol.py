@@ -26,7 +26,7 @@ from sams.services.analysis import parse_period
 from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
 from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
-from sams.web.chart_prefs import CHART_PERIODS, parse_windows
+from sams.web.chart_prefs import CHART_PERIODS, ordered_periods, parse_windows, windows_text
 from sams.web.display import hms, moment_label, pct_class, state_label
 from sams.web.pages.dashboard import _market_open
 
@@ -456,7 +456,7 @@ def chart_partial(
     指标串同理：局部渲染出去的那条 `data-chart-url` 若注定 400，屏幕上说的是
     「行情序列读不出来。」而不是「副图最多三格」——宁可不画，不说错话。
     """
-    require_user(request)
+    user = require_user(request)
     web = request.app.state.web
     if view not in dict(CHART_VIEWS):
         raise ValidationError(
@@ -468,6 +468,11 @@ def chart_partial(
     picked_sub = _split_names(sub, SUB_INDICATORS, limit=MAX_SUB_PANES)
     parse_windows(ma)
     ctx = web.contexts.current()
+    pref = ctx.chart_prefs.get(user.id)
+    # 偏好是默认值，不是覆盖：URL 里显式给的 `ma=` 永远赢（换指标时人手敲的窗口不该丢）
+    if not ma:
+        ma = windows_text(pref.windows) if pref is not None else ""
+    periods = ordered_periods(CHART_PERIODS, pref.periods if pref is not None else ())
     market = canonical_market(market)
     code = canonical_code(market, code)
     if market not in ctx.settings.markets:
@@ -478,7 +483,7 @@ def chart_partial(
         "partials/chart.html",
         market=market,
         code=code,
-        periods=CHART_PERIODS,
+        periods=periods,
         period=period,
         views=CHART_VIEWS,
         view=view,
