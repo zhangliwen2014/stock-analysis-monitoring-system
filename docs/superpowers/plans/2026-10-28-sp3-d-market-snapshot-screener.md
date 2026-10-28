@@ -978,35 +978,28 @@ def spot_rows(codes=("600519",)):
     )
 
 
-def registry_with(*adapters, market_sources=None):
-    return AdapterRegistry(
-        adapters={a.name: a for a in adapters},
-        market_sources=market_sources or {"A": tuple(a.name for a in adapters)},
-        sleep=lambda _s: None,
-    )
-
-
 def test_market_snapshot_skips_sources_without_the_capability():
+    # 复用文件里已有的 `registry(...)` 与 `FakeAdapter`：本文件没有 `StubAdapter`
     stub = SnapshotStub()
-    plain = StubAdapter("akshare", ["A"], spot_rows())
-    reg = registry_with(stub, plain, market_sources={"A": ("akshare", "snap")})
+    plain = FakeAdapter("akshare", ["A"], frame("akshare"))
+    reg = registry(plain, stub)
     result = reg.fetch_market_snapshot("A", ["600519"])
     assert result.source == "snap"
     assert ("akshare", "不提供全市场快照") in result.skipped
 
 
 def test_market_snapshot_respects_the_willingness_table():
+    # 链上只有这一个源、它不愿答 A：这属于「配错了链」，当场出声并把跳过原因写进话来
     stub = SnapshotStub()
-    reg = registry_with(stub, market_sources={"A": ("snap",)})
     stub.market_snapshot_markets = frozenset({"HK"})
-    result = reg.fetch_market_snapshot("A", ["600519"])
-    assert result.frame.is_empty() or result.empty_everywhere
-    assert result.skipped and "不供" in result.skipped[0][1]
+    reg = registry(stub)
+    with pytest.raises(DatasourceError, match="不供A"):
+        reg.fetch_market_snapshot("A", ["600519"])
 
 
 def test_market_snapshot_fails_loudly_when_every_source_fails():
     stub = SnapshotStub(outcome=DatasourceError("snap", "boom"))
-    reg = registry_with(stub)
+    reg = registry(stub)
     with pytest.raises(DatasourceError, match="快照"):
         reg.fetch_market_snapshot("A", ["600519"])
 ```
@@ -1015,7 +1008,8 @@ def test_market_snapshot_fails_loudly_when_every_source_fails():
 # 追加到 tests/storage/test_symbol_list.py
 def test_active_codes_returns_the_ordered_live_list(repo):
     assert repo.active_codes("A") == ["000001", "600001", "600519"]
-    repo.deactivate_missing("A", ["600519"])
+    # 传的是「这一轮仍在市」的清单：不在清单里的 600519 被关停
+    repo.deactivate_missing("A", ["000001", "600001"])
     assert repo.active_codes("A") == ["000001", "600001"]
     assert repo.active_codes("HK") == ["00700"]
 ```
@@ -1117,9 +1111,13 @@ class MarketSnapshotResult:
 
         detail = "；".join(f"{name}: {error}" for name, error, _ in failed) or "（无）"
         if not attempts:
+            # 把每个源的跳过原因写进话里：只报「链上没有」会让人以为是配错了源名，
+            # 而实际可能是腾讯不愿答这个市场（D165/D188）
+            why = "；".join(f"{name}: {reason}" for name, reason in skipped) or "（无）"
             raise DatasourceError(
                 "registry",
-                f"{market} 没有能取全市场快照的源：链 {list(self.sources_for(market))}",
+                f"{market} 没有能取全市场快照的源：链 {list(self.sources_for(market))}；"
+                f"跳过 {why}",
             )
         causes = [cause for _, _, cause in failed]
         raise _terminal_error(f"{market} 所有源均取快照失败 → {detail}", causes)
