@@ -40,6 +40,7 @@ _NOT_ADAPTERS = frozenset(
         "listed_date",
         "fx",
         "quote",
+        "spot",
         "akshare_actions",
         # SP1 的两个公共件（D148）：与 listed_date/fx 一路——能力由适配器上的方法实现
         "symbol_list",

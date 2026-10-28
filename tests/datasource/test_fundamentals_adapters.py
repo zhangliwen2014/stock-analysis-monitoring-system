@@ -271,6 +271,8 @@ def test_the_three_new_kinds_are_registered_as_capabilities():
         # 计划 B 两种：分钟粒度不落库，只有读端（D163）
         "分时",
         "分钟 K",
+        # 计划 D：一次答一个市场的横截面，不按票走降级链（D173）
+        "全市场快照",
     ]
 
 
