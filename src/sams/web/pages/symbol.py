@@ -26,6 +26,7 @@ from sams.services.analysis import parse_period
 from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
 from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
+from sams.web.chart_prefs import CHART_PERIODS, parse_windows
 from sams.web.display import hms, moment_label, pct_class, state_label
 from sams.web.pages.dashboard import _market_open
 
@@ -186,13 +187,6 @@ DEFAULT_WINDOW: dict[str, int] = {
 }
 #: 副图最多三格：再多就不是看图而是刷屏（D162）
 MAX_SUB_PANES = 3
-#: 周期条：(参数值, 屏幕上那几个字)。分时那一格是视图切换，不在这张表里
-CHART_PERIODS: tuple[tuple[str, str], ...] = (
-    ("m1", "1分"), ("m5", "5分"), ("m15", "15分"),
-    ("m30", "30分"), ("m60", "60分"), ("m120", "120分"),
-    ("day", "日"), ("week", "周"), ("month", "月"), ("quarter", "季"),
-    ("year", "年"), ("5d", "5日"), ("10d", "10日"),
-)
 #: 两种画法（D158）。`time` 那一档没有周期可言——它只答最近一个交易日（Task 3 的区间校验钉着）
 CHART_VIEWS: tuple[tuple[str, str], ...] = (("kline", "K线"), ("time", "分时"))
 #: 开关上那几个字。白名单加了名字这里就必须加一行，缺行会在模板上留一个空按钮
@@ -227,32 +221,6 @@ def _split_names(
     if limit is not None and len(picked) > limit:
         raise ValidationError(f"副图最多同时 {limit} 个，收到的是 {len(picked)} 个")
     return picked
-
-
-def _windows(raw: str) -> tuple[int, ...]:
-    """`5,10,20,60` → `(5, 10, 20, 60)`；留空 = 用指标自己的那一组。
-
-    句子里带「最多六条」与「1..500」是因为这三类填错（非数字、0 或负数、堆十几条）
-    在同一个人手里会反复出现：`int()` 抛的 `ValueError` 不折成 `ValidationError`
-    就越过全局处理器，换回一屏 500。
-    """
-    message = "均线窗口要 1..500 之间的正整数，最多六条"
-    picked: list[int] = []
-    for item in (raw or "").split(","):
-        text = item.strip()
-        if not text:
-            continue
-        try:
-            value = int(text)
-        except ValueError as exc:
-            raise ValidationError(message) from exc
-        if not 1 <= value <= 500:
-            raise ValidationError(message)
-        picked.append(value)
-    deduped = tuple(dict.fromkeys(picked))
-    if len(deduped) > 6:
-        raise ValidationError(message)
-    return deduped
 
 
 def _columns_of(table: pl.DataFrame, name: str) -> list[str]:
@@ -349,7 +317,7 @@ def bars_api(
     # 抛 `ValidationError` 就够——全局处理器把它渲染成 400，端点自己不再拼状态码
     mains = _split_names(main, MAIN_INDICATORS)
     subs = _split_names(sub, SUB_INDICATORS, limit=MAX_SUB_PANES)
-    ma_windows = _windows(ma)
+    ma_windows = parse_windows(ma)
     end = web.core.clock.now_utc().date()
     if period in MINUTE_SCALES:
         # 分钟档不进 `parse_period`：它认的是日历周期，`m5` 到那儿只会得到 400
@@ -498,7 +466,7 @@ def chart_partial(
         parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
     _split_names(main, MAIN_INDICATORS)
     picked_sub = _split_names(sub, SUB_INDICATORS, limit=MAX_SUB_PANES)
-    _windows(ma)
+    parse_windows(ma)
     ctx = web.contexts.current()
     market = canonical_market(market)
     code = canonical_code(market, code)
