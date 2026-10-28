@@ -248,7 +248,7 @@ FIELDS: tuple[Field, ...] = (
         "pr_now",
         _SNAPSHOT_MARKETS,
         note="PE(动)² ÷ (100×PB)：分母是价推出来的 ROE，随价格变，与年报口径的 pr 不同口径",
-        basket="pr_now",
+        basket="pr",  # 与年报口径的 pr 共用一个篮子键：不同口径的两条市赚率不可同篮（D59）
     ),
     Field(
         "roe",
