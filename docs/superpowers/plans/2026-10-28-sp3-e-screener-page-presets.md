@@ -2243,3 +2243,32 @@ git commit -m "docs(screener): 计划 E 页面验收与实测回写"
 - 方案六动作齐备，跨用户 404，撞名出声不静默覆盖；重跑写 `scan_results` 并显示「上次跑」；
 - 「立即重采」只排队，不在请求线程里采；
 - lint 绿、全量绿、真快照页面上数字与 CLI 一致。
+
+## 交付记录（2026-10-28）
+
+- **新增测试 36 条**：`tests/storage/test_screener_presets.py` 9 条、
+  `tests/web/test_screen_web.py` 25 条、`tests/core/test_screener_fields.py` 1 条
+  （`describe_all` 是条件唯一的可读拼法）、`tests/services/test_screener.py` 1 条
+  （`preset_strategy_id` 只在名字或条件动时动）；`tests/storage/test_migrate.py`
+  只多登记 `screener_presets` 一张表。
+- **与计划的偏差**：
+  1. POST 用例的负载一律用 dict，不用计划里的 `data=[("k", "v"), …]`：httpx 把元组串当
+     **流**发，`csrf` 不在表单里，真实结果是 403（`DeprecationWarning` 也指向这一点）。
+     多值字段（`f/o/v`、`codes`）用 list。
+  2. 采集时刻先在 Python 里 `moment_label(…, display_tz)` 成 `taken_label` 再进模板：
+     模板里没有 `display_tz`，时区换算也不该写在模板里。
+  3. 票池读 `ctx.symbol_list_store.active_codes(market)`：计划写的 `ctx.symbols` 是
+     `SymbolRepo`，没有这个方法。
+  4. 范围行在「有结果」时也得给出：实现之初只在 `result is None` 里回库读快照，真页面上
+     有 173 条结果的那一页反而写「还没有全市场快照」。修法见 `ba0c62b`——有结果时直接用
+     引擎读到的那一份（日、`taken_at`、票池），并补一条回归用例
+     `test_the_range_line_survives_a_successful_screen`。
+  5. 「改名 / 覆盖」之后「上次跑」会空：它的键是 `preset_strategy_id(name, conditions)`，
+     名字或条件一换就是另一条策略的历史。这是 D183 的口径，不是 bug。
+- **页面验收实测**（真库，快照 5577 行）：`pr_now ≤ 0.5` 通过 173 / 不通过 3945 /
+  无数 1459（亏损 1451、净资产为负 2、ROE 过界 6），与 CLI 同一组数；「全部加自选」
+  dry-run 173/0/0，确认后实际也是 173/0/0；方案的保存、重跑（写 `scan_results`、列表出现
+  「上次跑」）、改名、覆盖、删除各走一遍；「立即重采」303 回页面并提示已排队。
+- **遗留（不属本期）**：上一台 serve 刚停就重启时，新进程的调度线程可能因旧心跳还新鲜而
+  `SchedulerBusy` 退出且不重试；这段时间里「立即重采」排队后不会被执行。等旧心跳过期再
+  重启一次即恢复，下一步单独修重试。
