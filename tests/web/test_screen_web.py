@@ -126,6 +126,16 @@ def _condition_params(**extra):
     return pairs
 
 
+def test_the_range_line_survives_a_successful_screen(logged_screen):
+    """范围与结果出自同一次采：跑出三个数之后不能反过来宣称「还没有快照」。"""
+    default_seed(logged_screen)
+    response = logged_screen.client.get("/screen", params=_condition_params())
+    assert response.status_code == 200
+    assert "快照 2026-10-28 · 票池 4 只" in response.text
+    assert "采集" in response.text
+    assert "还没有全市场快照" not in response.text
+
+
 def test_every_condition_reports_passed_failed_missing_and_the_hits(logged_screen):
     default_seed(logged_screen)
     response = logged_screen.client.get("/screen", params=_condition_params())

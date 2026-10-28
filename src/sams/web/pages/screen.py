@@ -99,29 +99,25 @@ def _render(
                 result = ctx.screener.run(market, conditions)
         except ValidationError as exc:
             error = str(exc)
-    if result is None:
-        day = ctx.snapshot_store.latest_day(market)
-        if day is not None:
+    # 范围行与结果出自同一次采：有结果时就用引擎读到的那一份，别再回库猜一遍
+    day = result.day if result is not None else ctx.snapshot_store.latest_day(market)
+    if day is not None:
+        if result is not None:
+            taken_at, pool = result.taken_at, result.universe_size
+        else:
             frame = ctx.snapshot_store.load_day(market, day)
-            pool = (
-                result.universe_size
-                if result is not None
-                else len(
-                    set(frame["code"].to_list())
-                    & set(ctx.symbol_list_store.active_codes(market))
-                )
+            taken_at = None if frame.is_empty() else frame["taken_at"].max()
+            pool = len(
+                set(frame["code"].to_list())
+                & set(ctx.symbol_list_store.active_codes(market))
             )
-            snapshot = {
-                "day": day,
-                "day_label": f"{day:%Y-%m-%d}",
-                "taken_label": moment_label(
-                    frame["taken_at"].max() if not frame.is_empty() else None,
-                    ctx.settings.server.display_tz,
-                ),
-                "rows": frame.height,
-                "pool": pool,
-            }
-            stale = (ctx.clock.today() - day).days > STALE_DAYS
+        snapshot = {
+            "day": day,
+            "day_label": f"{day:%Y-%m-%d}",
+            "taken_label": moment_label(taken_at, ctx.settings.server.display_tz),
+            "pool": pool,
+        }
+        stale = (ctx.clock.today() - day).days > STALE_DAYS
 
     enabled = {item.name for item in fields_for(market)}
     field_options = [
