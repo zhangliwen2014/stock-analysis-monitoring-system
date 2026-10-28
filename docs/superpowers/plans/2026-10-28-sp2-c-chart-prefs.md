@@ -228,8 +228,8 @@ def windows_text(windows: tuple[int, ...]) -> str:
 from sams.web.chart_prefs import CHART_PERIODS, parse_windows
 ```
 
-把文件里三处 `_windows(` 调用改成 `parse_windows(`（`bars_api`、`chart_partial` 与
-`chart_partial` 里那次只为止声的调用）。`_PERIOD_LABEL = dict(CHART_PERIODS)` 不动。
+把文件里两处 `_windows(` 调用改成 `parse_windows(`（`bars_api` 的取窗口、
+`chart_partial` 里那次只为止声的校验）。`_PERIOD_LABEL = dict(CHART_PERIODS)` 不动。
 
 - [ ] **Step 5: 跑测试与相关回归**
 
