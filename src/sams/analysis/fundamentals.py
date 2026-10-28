@@ -24,7 +24,15 @@ from sams.core.fundamentals import (
     out_of_caliber,
 )
 
-__all__ = ["BASIS_PB_ESTIMATE", "BASIS_PE", "BASIS_REFUSED", "MarketProfitRatio", "pr"]
+__all__ = [
+    "BASIS_PB_ESTIMATE",
+    "BASIS_PE",
+    "BASIS_REFUSED",
+    "MarketProfitRatio",
+    "PriceProfitRatio",
+    "pr",
+    "pr_now",
+]
 
 
 @dataclass(frozen=True)
@@ -146,3 +154,38 @@ def pr(
         basis=BASIS_PB_ESTIMATE,
         estimated=roe_estimate is not None,
     )
+
+
+@dataclass(frozen=True)
+class PriceProfitRatio:
+    """现值 PR 的出数或拒算理由：两个字段恰好有一个是 None。"""
+
+    value: float | None
+    reason: str | None = None
+
+
+def pr_now(pe_dyn: float | None, pb: float | None) -> PriceProfitRatio:
+    """现值市赚率 `PE(动)² ÷ (100 × PB)`（D177）。
+
+    与 `pr()` 不是同一件事：这一条的分母是价推出来的 ROE（`PB ÷ PE`），随价格变；
+    `pr()` 的分母是已披露那期 ROE，随披露变。两条口径永不混排（D59）。
+
+    亏损票的 PE 为负、平方后变正——不拦的话 `<= 0.5` 会把亏损票筛成「便宜」（D190）。
+    PB 为负同理（净资产为负，PR 的方向会反过来）。推出的 ROE 仍走 `out_of_caliber`
+    的那条上界，不另写一份判断。
+    """
+    if pe_dyn is None:
+        return PriceProfitRatio(None, "PE(动) 缺失（快照没给这一列）")
+    if pe_dyn <= 0:
+        return PriceProfitRatio(None, f"PE(动)={pe_dyn:g} 不为正（亏损），平方后会变成假便宜")
+    if pb is None:
+        return PriceProfitRatio(None, "PB 缺失（快照没给这一列）")
+    if pb <= 0:
+        return PriceProfitRatio(None, f"PB={pb:g} 不为正（净资产为负），PR 的方向会反过来")
+    implied = pb / pe_dyn
+    if out_of_caliber("roe", implied):
+        return PriceProfitRatio(
+            None,
+            f"PE(动) 与 PB 推出的 ROE={implied:.3g} 达到口径上界（|ROE| ≥ 1），这个数不可信",
+        )
+    return PriceProfitRatio(pe_dyn**2 / (100.0 * pb), None)

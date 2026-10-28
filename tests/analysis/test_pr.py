@@ -12,6 +12,7 @@ from sams.analysis.fundamentals import (
     BASIS_PE,
     BASIS_REFUSED,
     pr,
+    pr_now,
 )
 
 
@@ -125,3 +126,31 @@ def test_a_refusal_carries_its_reason_and_no_roe_was_used():
     result = pr()
     assert (result.ok, result.value) == (False, None)
     assert result.reason and result.roe_used is None
+
+
+def test_pr_now_is_pe_squared_over_pb():
+    got = pr_now(18.68, 6.62)
+    assert got.value == pytest.approx(18.68**2 / (100 * 6.62))
+    assert got.reason is None
+
+
+def test_pr_now_refuses_a_loss_maker_because_squaring_would_flip_the_sign():
+    """PE 为负、平方后变正：不拦的话 `<= 0.5` 会把亏损票筛成「便宜」（D190）。"""
+    got = pr_now(-8.0, 1.5)
+    assert got.value is None and "亏损" in got.reason
+
+
+def test_pr_now_refuses_negative_equity():
+    got = pr_now(12.0, -0.3)
+    assert got.value is None and "净资产为负" in got.reason
+
+
+def test_pr_now_refuses_an_implied_roe_beyond_the_caliber_bound():
+    got = pr_now(0.5, 0.9)  # 推出的 ROE = 1.8
+    assert got.value is None and "上界" in got.reason
+
+
+def test_pr_now_says_which_column_is_missing():
+    assert "PE(动)" in pr_now(None, 1.0).reason
+    assert "PB" in pr_now(10.0, None).reason
+
