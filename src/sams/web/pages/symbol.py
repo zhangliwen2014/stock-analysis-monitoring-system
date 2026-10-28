@@ -287,6 +287,7 @@ def _empty_payload(period: str, note: str | None) -> dict:
         "main": {},
         "sub": {},
         "bars": [],
+        "last": [],
         "pending": [],
         "anchored_on": "",
         "warmup_floor": None,
@@ -364,8 +365,10 @@ def bars_api(
             "main": {name: _group(table, name) for name in mains},
             "sub": {name: _group(table, name) for name in subs},
             # `bars`/`pending` 只有重采样出来的周期才有：一根周 K 只盖了一天还是没走完，
-            # 是它在屏幕上唯一能自证的地方
+            # 是它在屏幕上唯一能自证的地方。`last` 是那一组实际最后一根日线——
+            # `dates` 写的是日历收市日，拿它说「只走到」等于把周五说成已经发生
             "bars": table["bars"].to_list() if "bars" in table.columns else [],
+            "last": [str(day) for day in table["last"].to_list()] if "last" in table.columns else [],
             "pending": [str(day) for day in read.pending_periods],
             "anchored_on": str(read.anchored_on),
             "warmup_floor": str(read.warmup_floor) if read.warmup_floor else None,
@@ -408,6 +411,7 @@ def _minute_bars_payload(ctx, market, code, period, end, mains, subs, ma_windows
             "sub": {name: _group(table, name) for name in subs},
             # 这四键在这一档没有意义：分钟不重采样、不锚日线、预热按分钟根数自己走
             "bars": [],
+            "last": [],
             "pending": [],
             "anchored_on": "",
             "warmup_floor": None,

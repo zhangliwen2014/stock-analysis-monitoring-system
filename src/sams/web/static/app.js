@@ -86,7 +86,17 @@
   function caption(payload) {
     var bits = [];
     if (payload.pending && payload.pending.length) {
-      bits.push("最后一根" + (payload.period_label || payload.period || "") + "只走到 " + payload.pending[0] + "，还没走完");
+      // `pending` 那一格是**日历收市日**（周五 / 月末）：说「只走到周五」是把还没发生的一天
+      // 说成已经收进来了。实际盖到哪一天在 `last` 里
+      var end = payload.pending[0];
+      var index = (payload.dates || []).indexOf(end);
+      var at = index >= 0 && payload.last ? payload.last[index] : end;
+      var label = payload.period_label || payload.period || "";
+      bits.push(
+        at === end
+          ? "最后一根" + label + "只走到 " + at + "，还没走完"
+          : "最后一根" + label + "走到 " + at + "，要等 " + end + " 收市才算走完"
+      );
     }
     if (payload.warmup_floor) bits.push("均线从 " + payload.warmup_floor + " 起才有数");
     if (payload.anchored_on) bits.push("序列自 " + payload.anchored_on + " 起（含预热）");

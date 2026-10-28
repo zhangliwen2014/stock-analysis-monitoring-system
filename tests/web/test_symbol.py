@@ -449,6 +449,15 @@ def test_bars_api_period_week_groups_the_same_daily_bars(logged):
     assert sum(payload["bars"]) == 3
 
 
+def test_a_pending_period_carries_the_last_day_it_actually_covers(logged):
+    """周 K 的 `date` 是周五（日历收市日）：提示里说「只走到周五」等于把未来说成已经发生。
+    最后一根一定含最新那根日线，所以 `last` 的末位就是库里最新的日线日。"""
+    _seed(logged, code="600522")
+    payload = logged.client.get("/api/symbol/A/600522/bars?days=120&period=week").json()
+    assert len(payload["last"]) == len(payload["dates"])
+    assert payload["last"][-1] == str(date.today() - timedelta(days=4))
+
+
 def test_bars_api_rejects_an_unknown_period_with_400(logged):
     _seed(logged)
     assert logged.client.get("/api/symbol/A/600519/bars?period=weekly").status_code == 400
