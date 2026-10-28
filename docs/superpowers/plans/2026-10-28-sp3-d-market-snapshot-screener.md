@@ -2990,6 +2990,23 @@ git add docs/superpowers/specs/2026-10-28-screener-market-snapshot-design.md
 git commit -m "docs(screener): 计划 D 验收实测数字"
 ```
 
+**交付记录（2026-10-28，真接口跑出来的两处偏离）**
+
+- **`quote_get` 要保住 URL 里的逗号。** 第一次真采集在 800 只那一批回 HTTP 414：
+  `requests` 的 `params=` 把 `,` 编成 `%2C`，URL 从 7451 涨到约 8.8k（D186 的实测界限是
+  880 只 / 7941 字符）。`quote_get` 改为 `urlencode(params, safe=",", quote_via=quote)` 拼出
+  完整 URL；`tests/datasource/test_spot.py` 先红后绿钉住「不出现 `%2C`、URL < 8192」，
+  live 冒烟用 880 只一批。
+- **无数原因要按类归组，不能逐票拼数。** 真实快照上 1459 只无数票散成 1394 组、137.9 KB
+  （`reason` 里带着每只票的 PE/PB）。`PriceProfitRatio` 增加 `kind`
+  （`亏损（PE(动) ≤ 0）` / `净资产为负（PB ≤ 0）` / `推出来的 ROE 过界（|ROE| ≥ 1）` /
+  `PE(动) 缺失` / `PB 缺失`），`ScreenerService._missing_groups` 拿它当组键；`reason`
+  保留逐票细节。测试：`test_loss_makers_with_different_pe_share_one_group` +
+  `test_pr.py` 五条 kind 断言。
+- 实测：5577 行 / 5577 只；`pr_now <= 0.5` 通过 173、不通过 3945、无数 1459
+  （亏损 1451、净资产为负 2、ROE 过界 6）；加 `turnover_rate >= 1` 命中 103 只；
+  600519 / 300551 / 601318 的 PE(动)、PB、换手、现价与实时报价一致。
+
 ---
 
 ## 完成标准

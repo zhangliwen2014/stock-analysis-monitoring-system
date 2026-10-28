@@ -38,7 +38,7 @@ DuckDB（两张新表）、FastAPI + Jinja + htmx（CSP `'self'`，条件构建�
 | 页面的筛选列表姿势已有先例可抄：GET 表单 + 下拉 + `PAGE_SIZE+1` 判有无下一页 + 把选中值回显 | `web/pages/alerts.py:365-419`、`web/templates/alerts.html:8-64` |
 | 昂贵的外网采集从不在请求线程里做：只排队再 303 跳回 | `web/pages/admin.py:391-413` |
 | `DatabaseLocked` → 503，其余 `SamsError` → 400，由全局处理器统一 | `web/app.py:191-193,207-211` |
-| 现有迁移到 **0022**（`0022_watchlist_hidden.sql`）；**0023 已被 SP2 计划 C 的 `chart_prefs` 预定** | `storage/migrations/` |
+| 现有迁移到 **0022**（`0022_watchlist_hidden.sql`）；本计划取 **0023**（`market_snapshot`），页面计划 E 取 0024，SP2 计划 C 顺延 0025 | `storage/migrations/` |
 | PR 的口径：`PR = PE ÷ ROE ÷ 100`（ROE 是小数口径，`|ROE| ≥ 1` 视为不可信直接拒算）；PE 不为正那一支是 `PB ÷ ROE ÷ ROE ÷ 100`。两支来自两个公式，**不可同篮排序**（D59） | `analysis/fundamentals.py:98-148`、`core/fundamentals.py:132,141` |
 
 ## 3. 决策
@@ -143,6 +143,16 @@ DuckDB（两张新表）、FastAPI + Jinja + htmx（CSP `'self'`，条件构建�
   另立 `spot` 源要再配一次 `data_sources`、再教一遍健康页，而它只是同一家接口的另一种数据。
   `spot.py` 照 `quote.py`/`minute.py` 的姿势：字段位置、前缀规则、解析器、空帧与探针；
   适配器上只多一个 `market_snapshot` 方法与 `market_snapshot_markets = {"A"}` 的意愿表。
+- **2026-10-28 收盘后验收实测（真库）**：代码表 5577 只，采集回 **5577 行**，`taken_at`
+  2026-10-28 10:22:02 UTC（七批 × 800 代码）。`pr_now <= 0.5`：通过 **173** / 不通过 3945 /
+  无数 **1459**（亏损 1451、净资产为负 2、推出的 ROE 过界 6）；再加 `turnover_rate >= 1`
+  后命中 **103** 只。抽核 600519 / 300551 / 601318：快照的 PE(动)、PB、换手、现价与实时
+  报价逐项一致，PR 分别 0.5271 / 0.05351 / 0.27888。两处只有真数据才暴露的修正：
+  - **URL 里的逗号必须按原样发。** `requests` 的 `params=` 把分隔逗号编成 `%2C`，800 只的
+    URL 从 7.2k 涨到 8.8k，正好撞上实测的 414 分界线（D186）；`quote_get` 改用
+    `urlencode(..., safe=",", quote_via=quote)` 后一条请求带满一批。
+  - **无数原因按「类」归组。** 逐票拼出来的理由带着各自的 PE/PB，1459 只散成 **1394 组**
+    （137.9 KB）；`PriceProfitRatio` 因此多一个 `kind` 字段，`reason` 仍留给单只票页面读细节。
 
 ## 4. 数据层
 
