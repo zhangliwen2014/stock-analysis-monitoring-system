@@ -77,3 +77,20 @@ def test_registry_and_page_vocabulary_are_the_same_object():
     names = {f.name for f in fields_for("A")}
     assert {"pr_now", "pe_dyn", "pb", "roe", "turnover_rate"} <= names
     assert "pr_now" not in {f.name for f in fields_for("HK")}
+
+def test_describe_all_is_the_only_readable_spelling_of_a_condition_set():
+    """方案列表要一句人话，不是 JSON；单位也必须在这句里（D58）。"""
+    from sams.core.screener_fields import describe_all
+
+    text = describe_all(
+        [
+            Condition("pr_now", "<=", 0.5),
+            Condition("turnover_rate", ">=", 1.0),
+            Condition("price", "between", (1.0, 5.0)),
+        ]
+    )
+    assert text == (
+        "现值市赚率 PR（小数比值（0.5 = 50%）） ≤ 0.5"
+        " 且 换手率（百分数（0.31 = 0.31%）） ≥ 1"
+        " 且 现价（元） 介于 1..5"
+    )

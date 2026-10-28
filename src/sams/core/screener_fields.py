@@ -18,6 +18,9 @@ from sams.core.errors import ValidationError
 #: 否则命令行、表单、JSON 三处各有一份拼法
 OPS = (">=", ">", "<=", "<", "=", "between")
 
+#: 界面上比较符的中文写法。摘要与下拉都念这一份，屏幕上不会出现两种 `<=`
+OP_LABELS = {">=": "≥", ">": ">", "<=": "≤", "<": "<", "=": "=", "between": "介于"}
+
 
 @dataclass(frozen=True)
 class Field:
@@ -131,11 +134,23 @@ class Condition:
     op: str
     value: float | tuple[float, float]
 
-    def describe(self) -> str:
-        if self.op == "between":
-            low, high = self.value  # type: ignore[misc]
-            return f"{self.field} between {low:g}..{high:g}"
-        return f"{self.field} {self.op} {float(self.value):g}"
+
+def describe(condition: Condition, *, registry: tuple[Field, ...] = FIELDS) -> str:
+    """一条条件的可读写法。单位跟在这一句里：只说 `≤ 0.5` 会让人再猜一次小数还是百分数。"""
+    spec = field(condition.field, registry=registry)
+    if condition.op == "between":
+        low, high = condition.value  # type: ignore[misc]
+        return f"{spec.label}（{spec.unit}） 介于 {low:g}..{high:g}"
+    return (
+        f"{spec.label}（{spec.unit}） "
+        f"{OP_LABELS.get(condition.op, condition.op)} {float(condition.value):g}"
+    )
+
+
+def describe_all(
+    conditions: list[Condition] | tuple[Condition, ...], *, registry: tuple[Field, ...] = FIELDS
+) -> str:
+    return " 且 ".join(describe(item, registry=registry) for item in conditions)
 
 
 def _number(text: object, *, where: str) -> float:

@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from math import isnan
@@ -283,3 +285,17 @@ def _missing_groups(
         MissingGroup(field=name, reason=reason, codes=tuple(sorted(codes)))
         for (name, reason), codes in sorted(grouped.items())
     )
+
+
+def preset_strategy_id(name: str, conditions) -> str:
+    """方案重跑写进 `scan_results` 的键：名字 + 条件哈希（D183）。
+
+    条件一改就是另一句话：旧结果仍按旧哈希查得到，而方案那一行本身不随时间变。
+    """
+    payload = json.dumps(
+        [[item.field, item.op, item.value] for item in conditions],
+        ensure_ascii=False,
+        default=list,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+    return f"screen:{name}:{digest}"

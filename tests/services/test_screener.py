@@ -161,3 +161,16 @@ def test_validation_happens_before_the_database_is_read(db):
     """词表不认识的字段在碰库之前就拒：否则拼错的字段会被读成「没有票通过」。"""
     with pytest.raises(ValidationError):
         service(db).run("A", [Condition("unknown", "<=", 0.5)])
+
+def test_preset_strategy_id_moves_only_when_the_conditions_or_the_name_move():
+    from sams.services.screener import preset_strategy_id
+
+    base = [Condition("pr_now", "<=", 0.5)]
+    assert preset_strategy_id("便宜", base) == preset_strategy_id(
+        "便宜", [Condition("pr_now", "<=", 0.5)]
+    )
+    assert preset_strategy_id("便宜", base) != preset_strategy_id(
+        "便宜", [Condition("pr_now", "<=", 0.4)]
+    )
+    assert preset_strategy_id("便宜", base) != preset_strategy_id("更便宜", base)
+    assert preset_strategy_id("便宜", base).startswith("screen:便宜:")
