@@ -38,12 +38,16 @@ from sams.web.context import ThreadContexts
 from sams.web.display import (
     action_label,
     alert_status,
+    delivery_label,
     dismiss_label,
+    filter_label,
     hms,
     moment_label,
     money,
     pct,
+    severity_label,
     state_label,
+    target_type_label,
 )
 from sams.web.pages import (
     admin,
@@ -76,6 +80,10 @@ def _templates() -> Jinja2Templates:
         action_label=action_label,
         dismiss_label=dismiss_label,
         moment_label=moment_label,
+        severity_label=severity_label,
+        delivery_label=delivery_label,
+        target_type_label=target_type_label,
+        filter_label=filter_label,
     )
     return templates
 

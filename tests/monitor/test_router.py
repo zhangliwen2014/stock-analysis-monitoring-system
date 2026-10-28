@@ -170,6 +170,14 @@ def test_no_channel_at_all_is_written_as_no_channel(world):
     assert row.channel_id is None and row.outcome == NO_CHANNEL
 
 
+def test_no_channel_guidance_points_at_the_settings_page(world):
+    """网页上已经能加通道（`/settings` 的通知通道），而这句话原先只给 CLI 三步、
+    最后一步「在规则里选它」在没有任何通道时压根没有那一格。指向设置页。"""
+    user = world.user()
+    result = world.notify.dispatch(msg(), user_id=user.id, channel_ids=[])
+    assert "设置 → 通知通道" in result.deliveries[0].error
+
+
 def test_a_disabled_rule_channel_does_not_fall_through(world):
     """规则明确指向 A 群而 A 群停用了：不降级到默认。降级会把一条指定给 A 的告警
     发到 B 去，而屏幕上只写着「已发送」。

@@ -46,6 +46,7 @@ from sams.web.display import (
     EVENT_ACTION_LABELS,
     action_label,
     alert_status,
+    delivery_label,
     dismiss_label,
     moment_label,
 )
@@ -171,9 +172,13 @@ def _clean_page(raw: str) -> int:
     return page
 
 
-def _row(alert: Alert, tz: str) -> dict:
+def _row(alert: Alert, tz: str, delivery: str = "") -> dict:
     """列表里那一行。现值/阈值/建议动作不是 `Alert` 的字段，它们在 `payload` 里
-    （措辞改版不动表，见 `repos/alerts.py`），所以在这里取，模板只管印。"""
+    （措辞改版不动表，见 `repos/alerts.py`），所以在这里取，模板只管印。
+
+    `delivery` 是这条告警最后一次投递的结果（`latest_outcomes` 的聚合）：
+    没发出去与发出去过在列表上长得一样，是专家验收时最难查的一处。
+    """
     payload = alert.payload
     return {
         "id": alert.id,
@@ -189,6 +194,7 @@ def _row(alert: Alert, tz: str) -> dict:
         "is_test": alert.is_test,
         # 「你让它稍后提醒」在列表里也要认得出来：稍后不改状态，这一格是它唯一的痕迹
         "deferred": moment_label(alert.deferred_until, tz) if alert.deferred_until else "",
+        "delivery": delivery_label(delivery) if delivery else "",
     }
 
 
@@ -261,7 +267,7 @@ def _detail_page(
             # 那一列到秒：同一条告警的三次尝试只差几秒，只到分钟会印成一模一样的一列
             "at": moment_label(row.ts, tz, seconds=True),
             "channel_id": row.channel_id or "",
-            "outcome": row.outcome,
+            "outcome": delivery_label(row.outcome),
             "attempts": row.attempts,
             "error": row.error,
         }
@@ -391,9 +397,14 @@ def inbox(request: Request):
         offset=(page - 1) * PAGE_SIZE,
     )
     has_more = len(rows) > PAGE_SIZE
+    visible = rows[:PAGE_SIZE]
+    # 一趟聚合取每条的末次投递结果：逐条查是 N 次往返，而这一列只回答「发出去没有」
+    outcomes = ctx.alerts_store.latest_outcomes([alert.id for alert in visible])
     groups: dict[tuple[str, str], list[dict]] = {}
-    for alert in rows[:PAGE_SIZE]:
-        groups.setdefault((alert.market, alert.code), []).append(_row(alert, tz))
+    for alert in visible:
+        groups.setdefault((alert.market, alert.code), []).append(
+            _row(alert, tz, outcomes.get(alert.id, ""))
+        )
     chosen = {
         "status": status,
         "severity": severity,

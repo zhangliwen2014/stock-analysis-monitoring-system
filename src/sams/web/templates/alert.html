@@ -7,7 +7,7 @@
   </h1>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
   <p>
-    <span class="badge">{{ alert.severity }}</span>
+    <span class="badge">{{ severity_label(alert.severity) }}</span>
     {{ alert_status(alert.status) }} ·
     {# 时刻在 Python 里折到 display_tz 并排成字符串：模板拿到的一律不是 datetime #}
     <span class="muted">{{ triggered_at }}</span>
@@ -165,7 +165,7 @@
   <p>本次重发：</p>
   <ul>
     {% for item in dispatch.deliveries %}
-    <li>{{ item.kind or "—" }} → {{ item.outcome }}
+    <li>{{ item.kind or "—" }} → {{ delivery_label(item.outcome) }}
       {%- if item.error %}（{{ item.error }}）{% endif %}</li>
     {% else %}
     <li class="muted">本次重发一条投递都没记下</li>

@@ -144,3 +144,56 @@ def dismiss_label(value: str | None) -> str:
     if not value:
         return "—"
     return DISMISS_LABELS.get(value, value)
+
+
+#: 三档严重级别的中文名。规则列表、规则表单、告警筛选与徽标说的是同一套话：
+#: 一半屏幕叫「档位」、另一半叫「级别」，读的人要先猜它们是不是一件事
+SEVERITY_LABELS = {"strong": "强", "mid": "中", "weak": "弱"}
+
+
+def severity_label(value: str | None) -> str:
+    if not value:
+        return "—"
+    return SEVERITY_LABELS.get(value, value)
+
+
+#: 投递结果（`core.notify.OUTCOMES`）的中文名：列表与详情都念这一个
+DELIVERY_LABELS = {
+    "sent": "已发送",
+    "failed": "发送失败",
+    "suppressed": "被抑制",
+    "no_channel": "未配置通道",
+}
+
+
+def delivery_label(value: str | None) -> str:
+    if not value:
+        return "—"
+    return DELIVERY_LABELS.get(value, value)
+
+
+#: 规则挂载对象的中文名：表单下拉与列表「对象」那一列
+TARGET_TYPE_LABELS = {
+    "symbol": "单只标的",
+    "watchlist": "自选清单",
+    "thesis": "论点",
+    "position": "持仓",
+    "portfolio": "组合",
+}
+
+
+def target_type_label(value: str) -> str:
+    return TARGET_TYPE_LABELS.get(value, value)
+
+
+#: 四个过滤开关的一句话解释（键名留在旁边，高级用户对得上 `--filter`）
+FILTER_LABELS = {
+    "time_window": "开盘前后 5 分钟不推价格类",
+    "data_freshness": "行情超过 3 天不推",
+    "exclude_halt": "停牌时不推",
+    "no_open_alert": "已有未处理告警时不重复推",
+}
+
+
+def filter_label(value: str) -> str:
+    return FILTER_LABELS.get(value, value)

@@ -3,16 +3,19 @@
 {% block content %}
 <section class="card">
   {% if template is none %}
-  <h1>选一种规则</h1>
+  <h1>选一种规则 <a class="muted" href="/rules">返回列表</a></h1>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  {# 分组与中文名都出自 `pages/rules.py`；这一屏不认识任何具体的 kind #}
+  {% for group in kind_groups %}
+  <h2>{{ group.label }}</h2>
   <ul>
-    {# 名单出自 `core.rules.TEMPLATES`：这一屏不认识任何具体的 kind #}
-    {% for kind in kinds %}
-    <li><a href="/rules/new?kind={{ kind }}">{{ kind }}</a></li>
+    {% for item in group.kinds %}
+    <li><a href="/rules/new?kind={{ item.kind }}">{{ item.label }}</a> <span class="muted">{{ item.kind }}</span></li>
     {% endfor %}
   </ul>
+  {% endfor %}
   {% else %}
-  <h1>{{ "改参数" if rule_id else "新建" }}：{{ template.kind }}（{{ template.label }}）</h1>
+  <h1>{{ "改参数" if rule_id else "新建" }}：{{ template.label }}（{{ template.kind }}）</h1>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
   {% if bound %}<p class="muted">挂在 {{ bound }}（要换挂载对象请回列表另建一条）</p>{% endif %}
   <form method="post" action="{{ "/rules/" + rule_id + "/edit" if rule_id else "/rules/new" }}" class="panel">
@@ -20,16 +23,16 @@
     <label>名称 <input name="name" value="{{ values.get("name", "") }}"></label>
     {% if not rule_id %}
     <input type="hidden" name="kind" value="{{ template.kind }}">
-    <label>挂在什么上
+    <label>监控对象
       <select name="target_type">
-        {% for item in targets %}
-        <option value="{{ item }}"{% if values.get("target_type") == item %} selected{% endif %}>{{ item }}</option>
+        {% for value, label in targets %}
+        <option value="{{ value }}"{% if values.get("target_type") == value %} selected{% endif %}>{{ label }}</option>
         {% endfor %}
       </select>
     </label>
     <label>对象引用
       <input name="target_ref" value="{{ values.get("target_ref", "") }}"
-             placeholder="symbol 写 市场/代码（A/600519）；集合类写 *；thesis 写论的 id">
+             placeholder="单只标的写 市场/代码（A/600519）；集合类写 *；论点写论点的 id">
     </label>
     {% if template.needs_position %}
     <label>账户
@@ -56,7 +59,7 @@
     {% endif %}
     {% for spec in template.params %}
     {# 三种 shape 各有各的控件：`tiers` 要的是一个逗号串，把它塞进 <select> 里就存不进去 #}
-    <label>{{ spec.label }}{{ "（必填）" if spec.required else "" }}
+    <label>{{ spec.label }}{% if spec.required and not rule_id %}（必填）{% endif %}
       {% if spec.shape == "number" %}
       <input name="param_{{ spec.name }}" type="number" step="any"
              value="{{ values.get("param_" + spec.name, "") }}">
@@ -86,9 +89,9 @@
       <select name="severity">
         {# 空选择交给服务层落模板自己那个级别：空串进仓库是一句没人认得的级别。
            编辑那一路这句话是假的（空 = 不动这一项），所以措辞按 `rule_id` 分头说 #}
-        <option value="">{{ "（不改这一项）" if rule_id else "（模板默认：" + template.severity + "）" }}</option>
+        <option value="">{{ "（不改这一项）" if rule_id else "（模板默认：" + severity_label(template.severity) + "）" }}</option>
         {% for level in severities %}
-        <option value="{{ level }}"{% if values.get("severity") == level %} selected{% endif %}>{{ level }}</option>
+        <option value="{{ level }}"{% if values.get("severity") == level %} selected{% endif %}>{{ severity_label(level) }}</option>
         {% endfor %}
       </select>
     </label>
@@ -98,10 +101,11 @@
     </label>
     <fieldset>
       <legend>过滤开关</legend>
-      {# 名单出自 `core.rules.FILTER_KEYS`：在这里硬编码一份，加一种开关就要改页面 #}
-      {% for key in filter_keys %}
+      {# 名单与中文说明都出自 `core.rules.FILTER_KEYS` 加 `display.FILTER_LABELS`：
+          在这里硬编码一份，加一种开关就要改页面 #}
+      {% for key, label in filter_keys %}
       <label class="inline">
-        <input type="checkbox" name="filter_{{ key }}"{% if filters.get(key) %} checked{% endif %}> {{ key }}
+        <input type="checkbox" name="filter_{{ key }}"{% if filters.get(key) %} checked{% endif %}> {{ label }}
       </label>
       {% endfor %}
     </fieldset>

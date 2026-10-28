@@ -36,7 +36,10 @@
 </section>
 
 <section class="card">
-  <h2>今日告警 <a class="muted" href="/alerts">{{ alerts_today }} 条</a></h2>
+  <h2>告警</h2>
+  {# 两个数点进各自那一屏：今日新增含已处理，未处理不限今天，链接必须与数同口径 #}
+  <p><a href="/alerts?status=all">今日新增 {{ alerts_today }} 条</a>
+     · <a href="/alerts">未处理 {{ alerts_open }} 条</a></p>
 </section>
 
 <section class="card">

@@ -122,7 +122,7 @@ def _choice(name: str, label: str, choices: tuple[str, ...], default: str) -> Pa
 TEMPLATES: dict[str, Template] = {
     "stop.fixed": Template(
         "stop.fixed", "跌破绝对价即报",
-        (_number("price", "止损价", required=True, minimum=0.0, unit="元"),),
+        (_number("price", "止损价", required=True, minimum=0.01, unit="元"),),
         severity="strong", stages=True, targets=("symbol", "watchlist", "thesis", "position"),
         intraday=True,
     ),
@@ -183,12 +183,12 @@ TEMPLATES: dict[str, Template] = {
     ),
     "price.cross_below": Template(
         "price.cross_below", "下穿指定价",
-        (_number("price", "价位", required=True, minimum=0.0, unit="元"),),
+        (_number("price", "价位", required=True, minimum=0.01, unit="元"),),
         severity="mid", stages=False, intraday=True,
     ),
     "price.cross_above": Template(
         "price.cross_above", "上穿指定价",
-        (_number("price", "价位", required=True, minimum=0.0, unit="元"),),
+        (_number("price", "价位", required=True, minimum=0.01, unit="元"),),
         severity="mid", stages=False, intraday=True,
     ),
     "thesis.odds_below": Template(
@@ -230,22 +230,25 @@ def is_intraday(kind: str) -> bool:
 
 
 def _as_number(param: Param, raw: object) -> float:
+    unit = f" {param.unit}" if param.unit else ""
     try:
         value = float(raw)  # 接受 "8"，不接受 "八"：后者抛 ValueError
     except (TypeError, ValueError):
         raise ValidationError(
-            f"{param.name} 要的是数字（{param.label}），收到 {raw!r}"
+            f"{param.label}（{param.name}）要的是数字，收到 {raw!r}"
         ) from None
     if not math.isfinite(value):
         # nan 与任何阈值比较都是 False ⇒ 那条规则永远不会响，而屏幕上写着「启用」
-        raise ValidationError(f"{param.name} 要的是有限数（{param.label}），收到 {raw!r}")
+        raise ValidationError(
+            f"{param.label}（{param.name}）要的是有限数，收到 {raw!r}"
+        )
     if param.minimum is not None and value < param.minimum:
         raise ValidationError(
-            f"{param.name} 不能低于 {param.minimum:g}{param.unit}（收到 {value:g}）"
+            f"{param.label}（{param.name}）不能低于 {param.minimum:g}{unit}（收到 {value:g}）"
         )
     if param.maximum is not None and value > param.maximum:
         raise ValidationError(
-            f"{param.name} 不能高于 {param.maximum:g}{param.unit}（收到 {value:g}）"
+            f"{param.label}（{param.name}）不能高于 {param.maximum:g}{unit}（收到 {value:g}）"
         )
     return value
 

@@ -8,13 +8,16 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, timedelta
 
+import polars as pl
 import pytest
 
 from sams.core.errors import DatabaseLocked
+from sams.core.quotes import Quote
 from sams.core.rules import FILTER_KEYS
 from sams.storage.repos.rules import RuleRepo
+from sams.web.display import hms, moment_label
 
 
 def _alice_id(logged) -> str:
@@ -78,6 +81,46 @@ def _edit_rule_data(logged, **overrides) -> dict:
     data = {"csrf": logged.csrf, "name": "茅台止损", "severity": "strong", "cooldown_min": "30"}
     data.update(overrides)
     return data
+
+
+def _seed_quote(logged, price: float = 1330.71) -> Quote:
+    """主档 + 行情板各一条：列表上的名称与现价都从这两处读，不查历史日线。"""
+    logged.context.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["600519"],
+                "name": ["贵州茅台"],
+                "currency": ["CNY"],
+            }
+        )
+    )
+    now = logged.core.clock.now_utc()
+    quote = Quote(
+        market="A", code="600519", ts=now - timedelta(seconds=5),
+        price=price, source="tencent",
+    )
+    logged.core.board.update("A", [quote], now=now, error=None)
+    return quote
+
+
+def _seed_alert(logged, rule_id: str):
+    return logged.context.alerts_store.create(
+        _alice_id(logged),
+        rule_id=rule_id,
+        rule_name="茅台止损",
+        account_id=None,
+        account_name="",
+        market="A",
+        code="600519",
+        symbol_name="贵州茅台",
+        severity="strong",
+        stage="close",
+        value_text="1190.00",
+        threshold_text="1200.00",
+        action_note="",
+        triggered_at=logged.core.clock.now_utc(),
+    )
 
 
 def test_the_list_shows_how_many_targets_a_rule_reaches(logged):
@@ -406,17 +449,16 @@ def test_the_form_does_not_read_rosters_the_template_has_no_box_for(logged, monk
     assert logged.client.get("/rules/new?kind=stop.fixed").status_code == 200
 
 
-def test_a_rule_on_an_unconfigured_market_saves_but_queues_no_backfill(logged):
-    """形状闸只认「市场/代码」两截，不认配置：`ZZ/600519` 存得进规则，但补数挂钩若照它
-    排队会在 `SymbolInterest` 的 `self.markets[market]` 上 KeyError——规则已落库、页面却冒
-    500。未配置的市场本就无补数可言（没有日历也没有数据源），挂钩跳过才是对的。"""
+def test_a_rule_on_an_unconfigured_market_is_refused_before_it_is_stored(logged):
+    """`ZZ/600519` 存得进去时，列表显示「启用 / 覆盖 1」，而它读不到任何行情、永远不响；
+    保存那一刻的 400 才是唯一能把它拦在门口的时点。补数挂钩也就不会拿到一个没有配置的市场。"""
     response = logged.client.post(
         "/rules/new", data=_new_rule_data(logged, target_ref="ZZ/600519"),
         follow_redirects=False,
     )
-    assert response.status_code == 303
-    rule = logged.context.rule_service.list(_alice_id(logged))[0].rule
-    assert rule.target_ref == "ZZ/600519"
+    assert response.status_code == 400
+    assert "ZZ" in response.text and "A, HK, US" in response.text
+    assert logged.context.rule_service.list(_alice_id(logged)) == ()
     assert logged.context.backfills_store.open_for("ZZ", "600519") is None
 
 
@@ -576,3 +618,112 @@ def test_database_locked_is_503_on_create(logged, monkeypatch):
 
     monkeypatch.setattr(RuleRepo, "create", locked)
     assert logged.client.post("/rules/new", data=_new_rule_data(logged)).status_code == 503
+
+
+def test_the_list_answers_what_each_rule_is_waiting_for(logged):
+    """列表要能直接读出：标的名称+代码、条件、此刻的价、上次响是什么时候。
+    专家验收时这一屏只有「symbol:A/600519 / 覆盖 1」，600519 现价 1330.71、阈值 1200
+    这件事一个字都没有。"""
+    quote = _seed_quote(logged)
+    rule_id = _add(
+        logged, kind="price.cross_below", name="跌破 1200", params={"price": 1200.0}
+    )
+    alert = _seed_alert(logged, rule_id)
+    _add(logged, name="没响过", target_ref="A/000001", params={"price": 10.0})
+
+    page = logged.client.get("/rules")
+    assert page.status_code == 200
+    text = page.text
+    assert "贵州茅台" in text and "A/600519" in text
+    assert "下穿指定价" in text and "价位 1200 元" in text
+    # 现价、单位、报价时刻：行情板里的那个价，不是另一条日线
+    assert "1,330.71" in text and "元" in text
+    assert hms(quote.ts, logged.context.settings.server.display_tz) in text
+    # 上次响：库里真有那一行才写；没有的写「从未」，不编一个求值时刻
+    assert "上次响" in text
+    assert moment_label(alert.triggered_at, logged.context.settings.server.display_tz) in text
+    assert "从未" in text
+
+
+def test_a_note_belongs_to_the_rule_it_describes(logged):
+    """停用说明原先单起一行 `colspan=7`，紧跟在停用规则后面、贴着下一条启用规则，
+    读起来像在说下面那条。说明并进它自己那一行，启用/停用各成一段。"""
+    _add(logged, name="开着的")
+    off_id = _add(logged, name="关掉的", target_ref="A/000002")
+    logged.context.rule_service.set_enabled(_alice_id(logged), off_id, False)
+
+    page = logged.client.get("/rules")
+    assert page.status_code == 200
+    text = page.text
+    assert 'colspan="7"' not in text
+    row = re.search(r"<tr[^>]*>(?:(?!</tr>).)*关掉的(?:(?!</tr>).)*</tr>", text, re.S)
+    assert row is not None
+    assert "已停用：任何一趟求值都不会取用它" in row.group(0)
+    # 段标题各出现一次，不再靠重复四遍的说明句
+    assert "启用（1）" in text and "已停用（1）" in text
+
+
+def test_the_kind_picker_names_each_kind_in_chinese_and_goes_back(logged):
+    """十四项裸枚举没法让非技术用户选。每一项要有中文名，按用途分组，并有回列表的路。"""
+    page = logged.client.get("/rules/new")
+    assert page.status_code == 200
+    text = page.text
+    for label in ("跌破绝对价即报", "目标价分批提醒", "赔率跌破阈值"):
+        assert label in text, label
+    for group in ("止损", "止盈", "价格", "论点", "定时"):
+        assert group in text, group
+    assert 'href="/rules"' in text
+
+
+def test_the_edit_page_does_not_call_a_required_param_required(logged):
+    """编辑页的参数框空着起步，留空 = 不改：旁边写「必填」与这一份合同自相矛盾。"""
+    rule_id = _add(logged)
+    edit = logged.client.get(f"/rules/{rule_id}/edit").text
+    assert "（必填）" not in edit
+    fresh = logged.client.get("/rules/new?kind=stop.fixed").text
+    assert "（必填）" in fresh
+
+
+def test_saving_says_so_on_the_list_it_returns_to(logged):
+    response = logged.client.post(
+        "/rules/new", data=_new_rule_data(logged), follow_redirects=False
+    )
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert location.startswith("/rules?notice=")
+    rule_id = logged.context.rule_service.list(_alice_id(logged))[0].rule.id
+    assert location.endswith(f"#{rule_id}")
+
+    page = logged.client.get(location)
+    assert "规则已保存。" in page.text
+    assert f'id="{rule_id}"' in page.text
+
+
+def test_toggling_says_which_way_it_went(logged):
+    rule_id = _add(logged)
+    response = logged.client.post(
+        f"/rules/{rule_id}/toggle", data={"csrf": logged.csrf}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    page = logged.client.get(response.headers["location"])
+    assert "规则已停用。" in page.text
+
+
+def test_severity_is_spelled_out_in_chinese_on_the_rule_list(logged):
+    _add(logged)
+    text = logged.client.get("/rules").text
+    assert "<td>强</td>" in text
+    assert "<td>strong</td>" not in text
+
+
+def test_the_form_speaks_chinese_about_targets_and_filters(logged):
+    text = logged.client.get("/rules/new?kind=stop.fixed").text
+    for label in ("单只标的", "自选清单", "论点", "持仓"):
+        assert label in text, label
+    for explanation in (
+        "开盘前后 5 分钟不推价格类",
+        "行情超过 3 天不推",
+        "停牌时不推",
+        "已有未处理告警时不重复推",
+    ):
+        assert explanation in text, explanation

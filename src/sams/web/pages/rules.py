@@ -28,13 +28,23 @@ from collections.abc import Sequence
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
-from sams.core.codes import canonical_market
+from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import DatabaseLocked, SamsError, StorageError, ValidationError
 from sams.core.notify import SEVERITIES
+from sams.core.quotes import quote_state
 from sams.core.rules import FILTER_KEYS, RULE_KINDS, Template, template_for
 from sams.storage.repos.rules import Rule
 from sams.web.auth import csrf_protect, require_user
+from sams.web.display import (
+    filter_label,
+    hms,
+    moment_label,
+    money,
+    state_label,
+    target_type_label,
+)
 from sams.web.forms import filter_flags, form_data, many, one, param_fields, raw_params
+from sams.web.pages.dashboard import _market_open, _price_unit
 
 router = APIRouter()
 
@@ -58,6 +68,118 @@ _UNWRITABLE_TARGETS = ("portfolio",)
 #: 保存那一路靠它分清两种「一个都没勾」：这一屏压根没有那一格（没人答过，交 `None`
 #: =不动），还是满屏的框被人全不勾（那是一句答案：改回默认路由）。
 _CHANNELS_OFFERED = "channels_offered"
+
+#: 列表顶部那一句只可能是应用自己发的 303：`?notice=` 的原文不进屏幕
+_NOTICES = {
+    "created": "规则已保存。",
+    "updated": "规则已更新。",
+    "on": "规则已启用。",
+    "off": "规则已停用。",
+}
+
+#: 选 kind 那一屏的分组（专家验收 P2-2）：十四项裸枚举按用途分成五段。
+#: 前缀是 kind 的点号前那一段，不在表里的前缀归「其他」——新加一组时忘了登记，
+#: 它至少还会出现在屏幕上，而不是静默消失。
+_KIND_GROUPS = (
+    ("stop", "止损"),
+    ("tp", "止盈"),
+    ("price", "价格"),
+    ("thesis", "论点"),
+    ("scheduled", "定时"),
+)
+
+
+def _param_value(value: object) -> str:
+    """参数在屏上的写法：`1200.0` 印成 `1200`——`params_json` 读回来永远是 float。"""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    return str(value)
+
+
+def _condition(rule: Rule) -> str:
+    """这一条在等什么：模板名 + 库里那几个参数。列表原先连阈值都不印。"""
+    template = template_for(rule.kind)
+    parts: list[str] = []
+    for param in template.params:
+        value = rule.params.get(param.name)
+        if value is None:
+            continue
+        text = (
+            ",".join(_param_value(piece) for piece in value)
+            if isinstance(value, list)
+            else _param_value(value)
+        )
+        unit = f" {param.unit}" if param.unit else ""
+        parts.append(f"{param.label} {text}{unit}")
+    return template.label + ("（" + "，".join(parts) + "）" if parts else "")
+
+
+def _target_text(ctx, rule: Rule) -> str:
+    """对象那一列：单只标的说得出名字，持仓/论据说得出是谁的。"""
+    if rule.target_type == "symbol":
+        market, _, code = rule.target_ref.partition("/")
+        master = ctx.symbols.get(market, code) or {}
+        name = str(master.get("name") or "")
+        return f"{name} {rule.target_ref}" if name else rule.target_ref
+    if rule.target_type == "watchlist":
+        return "自选清单（全部）"
+    if rule.target_type == "position":
+        account = ctx.sim_accounts.get(rule.user_id, rule.account_id or "")
+        whose = account.name if account is not None else rule.account_id or "全部"
+        return f"持仓（账户 {whose}）"
+    if rule.target_type == "thesis":
+        thesis = ctx.theses.get(rule.user_id, rule.thesis_id or rule.target_ref)
+        if thesis is not None:
+            return f"论点 {thesis.market}/{thesis.code}"
+        return f"论点 {rule.target_ref[:12]}"
+    return f"{target_type_label(rule.target_type)} {rule.target_ref}"
+
+
+def _target_url(rule: Rule) -> str:
+    """对象那一格通往标的页：专家原话「至少能链接到标的」。写坏的引用不给链接。"""
+    if rule.target_type != "symbol":
+        return ""
+    market, sep, code = rule.target_ref.partition("/")
+    if not sep:
+        return ""
+    try:
+        market = canonical_market(market)
+        return f"/symbol/{market}/{canonical_code(market, code)}"
+    except SamsError:
+        return ""
+
+
+def _quote(ctx, core, rule: Rule, *, now, tz: str) -> dict:
+    """列表里那一格现价：进程级行情板，不查日线。板子空就写「无行情」。
+
+    一行写坏的引用（旧行、手改过的库）不该把整张列表变成 500：
+    那一格留空，规则本身照常显示。
+    """
+    if rule.target_type != "symbol":
+        return {"price": "", "at": "", "state": ""}
+    try:
+        market, sep, code = rule.target_ref.partition("/")
+        if not sep:
+            return {"price": "", "at": "", "state": ""}
+        market = canonical_market(market)
+        code = canonical_code(market, code)
+    except SamsError:
+        return {"price": "", "at": "", "state": ""}
+    quote = core.board.get(market, code)
+    state = quote_state(
+        quote,
+        now=now,
+        market_open=_market_open(ctx, market, now),
+        stale_s=ctx.settings.quote_stale_s,
+    )
+    return {
+        "price": money(quote.price, _price_unit(ctx, market, code)) if quote else "",
+        "at": hms(quote.ts, tz) if quote else "",
+        # 休市优先于「没行情」：周末看到空着的那一格不是故障（`quote_state` 的五态顺序）
+        "state": state_label(state),
+    }
 
 
 def _cooldown(raw: str) -> int | None:
@@ -85,8 +207,8 @@ def _param_text(value: object) -> str:
     """一个参数在提示里的写法。列表折回逗号串（`0.5,1.0`）：`str([0.5, 1.0])` 带着空格
     和方括号，人照着它再敲一遍会被 `_as_tiers` 拒——提示得是表单自己读得懂的东西。"""
     if isinstance(value, list):
-        return ",".join(str(piece) for piece in value)
-    return "" if value is None else str(value)
+        return ",".join(_param_value(piece) for piece in value)
+    return "" if value is None else _param_value(value)
 
 
 def _stored_values(rule: Rule) -> dict[str, str]:
@@ -115,7 +237,7 @@ def _mount(rule: Rule) -> str:
     与 `thesis_id`（合并那一段永远取旧值），换成两个改不动的框等于请用户填一个
     存不下去的选择。要换挂载对象就回列表另建一条。
     """
-    parts = [f"{rule.target_type}:{rule.target_ref}"]
+    parts = [f"{target_type_label(rule.target_type)} {rule.target_ref}"]
     if rule.account_id:
         parts.append(f"账户 {rule.account_id}")
     if rule.thesis_id:
@@ -123,20 +245,69 @@ def _mount(rule: Rule) -> str:
     return "｜".join(parts)
 
 
-def _list_page(request: Request, *, error: str | None = None, status: int = 200):
+def _list_page(
+    request: Request,
+    *,
+    error: str | None = None,
+    status: int = 200,
+    notice: str = "",
+):
     user = request.state.sams_user
     web = request.app.state.web
     ctx = web.contexts.current()
+    now = web.core.clock.now_utc()
+    tz = ctx.settings.server.display_tz
+    # 走服务层而不是仓库那份：`targets` 与 `notes` 说的是「这条规则现在响不响」，
+    # 覆盖 0 个对象是一条静默的规则，而这一屏是唯一能看见它的地方
+    views = ctx.rule_service.list(user.id)
+    # 一趟聚合：每条规则最近一次响在哪天、响过几次。求值时刻没有落库（见设计文档），
+    # 这一格回答的是它的一半：从没响过与昨天响过是两句不同的话
+    last_by_rule = ctx.alerts_store.last_by_rule(user.id)
+    rows = []
+    for view in views:
+        rule = view.rule
+        last = last_by_rule.get(rule.id)
+        rows.append(
+            {
+                "view": view,
+                "rule": rule,
+                "condition": _condition(rule),
+                "target": _target_text(ctx, rule),
+                "target_url": _target_url(rule),
+                "quote": _quote(ctx, web.core, rule, now=now, tz=tz),
+                "last_at": moment_label(last[0], tz) if last else "从未",
+                "last_count": last[1] if last else 0,
+            }
+        )
+    groups = [
+        (heading, [row for row in rows if row["rule"].enabled is wanted])
+        for heading, wanted in (("启用", True), ("已停用", False))
+    ]
     return web.render(
         request,
         "rules.html",
         status_code=status,
         title="规则",
-        # 走服务层而不是仓库那份：`targets` 与 `notes` 说的是「这条规则现在响不响」，
-        # 覆盖 0 个对象是一条静默的规则，而这一屏是唯一能看见它的地方
-        views=ctx.rule_service.list(user.id),
+        groups=[(heading, items) for heading, items in groups if items],
+        notice=notice,
         error=error,
     )
+
+
+def _kind_groups() -> list[dict]:
+    """按前缀分组；没有登记的前缀落到最后一段，不静默丢掉。键名不用 `items`：
+    在 Jinja 里 `group.items` 先命中 dict 自己的方法，循环拿到的是那个函数。"""
+    out = []
+    seen: set[str] = set()
+    for prefix, label in _KIND_GROUPS:
+        kinds = [template_for(kind) for kind in RULE_KINDS if kind.startswith(prefix + ".")]
+        seen.update(item.kind for item in kinds)
+        if kinds:
+            out.append({"label": label, "kinds": kinds})
+    rest = [template_for(kind) for kind in RULE_KINDS if kind not in seen]
+    if rest:
+        out.append({"label": "其他", "kinds": rest})
+    return out
 
 
 def _picker_page(
@@ -148,7 +319,7 @@ def _picker_page(
         status_code=status,
         title="规则",
         template=None,
-        kinds=RULE_KINDS,
+        kind_groups=_kind_groups(),
         values=values,
         filters={},
         error=error,
@@ -187,9 +358,14 @@ def _form_page(
         "rule_form.html",
         status_code=status,
         template=template,
-        # 名单从契约来，不从模板里那份硬编码来
-        targets=[item for item in template.targets if item not in _UNWRITABLE_TARGETS],
-        filter_keys=FILTER_KEYS,
+        # 名单从契约来，不从模板里那份硬编码来；中文名只为屏幕上认得，
+        # 交回去的值仍是契约里那个键（`symbol`/`watchlist`/…）
+        targets=[
+            (item, target_type_label(item))
+            for item in template.targets
+            if item not in _UNWRITABLE_TARGETS
+        ],
+        filter_keys=[(key, filter_label(key)) for key in FILTER_KEYS],
         severities=SEVERITIES,
         values=values,
         filters=filters,
@@ -219,7 +395,9 @@ def _own_view(ctx, user, rule_id: str):
 @router.get("/rules")
 def rules_page(request: Request):
     require_user(request)
-    return _list_page(request)
+    # 只认应用自己发的那几句 303（`_NOTICES`）：query 原文不进屏幕
+    notice = _NOTICES.get(request.query_params.get("notice") or "", "")
+    return _list_page(request, notice=notice)
 
 
 @router.get("/rules/new")
@@ -269,7 +447,7 @@ def rule_create(
         # `target_ref`，要人再把那串 uuid 敲进引用框等于让这个下拉只剩一种用法——产 400
         target_ref = thesis_id
     try:
-        ctx.rule_service.add(
+        created = ctx.rule_service.add(
             user.id,
             kind=kind,
             name=one(data, "name"),
@@ -310,7 +488,8 @@ def rule_create(
         ref_market = canonical_market(ref_market)
         if ref_market in ctx.settings.markets:
             ctx.symbol_interest.ensure(ref_market, ref_code, actor=user.username)
-    return RedirectResponse("/rules", status_code=303)
+    # 回到列表并带上这一条：闪一句「已保存」不够，人得看见它落在哪一行
+    return RedirectResponse(f"/rules?notice=created#{created.rule.id}", status_code=303)
 
 
 @router.get("/rules/{rule_id}/edit")
@@ -394,7 +573,7 @@ def rule_edit(
             bound=_mount(view.rule),
             ticks=many(data, "channel_ids"),
         )
-    return RedirectResponse("/rules", status_code=303)
+    return RedirectResponse(f"/rules?notice=updated#{rule_id}", status_code=303)
 
 
 @router.post("/rules/{rule_id}/toggle")
@@ -410,4 +589,7 @@ def rule_toggle(request: Request, rule_id: str, _csrf: None = Depends(csrf_prote
     except SamsError as exc:
         # 这个按钮长在列表上，话就得回到列表说（重新渲染表单会把用户从哪来的都改掉）
         return _list_page(request, status=400, error=str(exc))
-    return RedirectResponse("/rules", status_code=303)
+    # 说清是哪一头：同一个按钮在两种状态下按下去，「已启用」与「已停用」是两句话
+    return RedirectResponse(
+        f"/rules?notice={'off' if view.rule.enabled else 'on'}#{rule_id}", status_code=303
+    )

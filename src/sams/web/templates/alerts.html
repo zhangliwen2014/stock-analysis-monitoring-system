@@ -19,7 +19,7 @@
     <select name="severity">
       <option value="">全部档位</option>
       {% for level in severities %}
-      <option value="{{ level }}"{% if chosen.severity == level %} selected{% endif %}>{{ level }}</option>
+      <option value="{{ level }}"{% if chosen.severity == level %} selected{% endif %}>{{ severity_label(level) }}</option>
       {% endfor %}
     </select>
   </label>
@@ -46,18 +46,19 @@
   {# 分组是页内各算一次的：真分页时这一组可能被拆开，这句话只在那一屏出现 #}
   {% if group_note %}<p class="muted">{{ group_note }}</p>{% endif %}
   <table>
-    <tr><th>时刻</th><th>档位</th><th>规则</th><th>现值 / 阈值</th><th>状态</th><th></th></tr>
+    <tr><th>时刻</th><th>档位</th><th>规则</th><th>现值 / 阈值</th><th>状态</th><th>投递</th><th></th></tr>
     {% for row in rows %}
     <tr>
       {# 时刻在 Python 里已折到 display_tz：模板拿到的是字符串，不是 datetime #}
       <td class="muted">{{ row.at }}</td>
-      <td><span class="badge">{{ row.severity }}</span></td>
+      <td><span class="badge">{{ severity_label(row.severity) }}</span></td>
       <td>{{ row.rule_name or "—" }}
         {# 测试告警（D131）在列表里也要认得出来：不然它和真告警长得一样 #}
         {% if row.is_test %}<span class="badge">测试</span>{% endif %}
         {% if row.deferred %}<span class="badge">稍后至 {{ row.deferred }}</span>{% endif %}</td>
       <td class="num">{{ row.value_text }} / {{ row.threshold_text }}</td>
       <td>{{ alert_status(row.status) }}</td>
+      <td class="muted">{{ row.delivery or "—" }}</td>
       <td><a href="/alerts/{{ row.id }}">详情</a></td>
     </tr>
     {% endfor %}

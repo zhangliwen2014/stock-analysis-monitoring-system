@@ -518,8 +518,8 @@ class RuleRepo:
         ref = (target_ref or "").strip()
         if not ref:
             raise ValidationError(
-                f"target_ref 不能是空的：{target_type} 类型的规则要能展开成一个具体对象"
-                "（空引用会展开成零个目标，那条规则从此静默不响）"
+                f"对象引用（target_ref）不能是空的：{target_type} 类型的规则要能展开成一个"
+                "具体对象（空引用会展开成零个目标，那条规则从此静默不响）"
             )
         if target_type in _WILDCARD_TARGETS:
             if ref != "*":

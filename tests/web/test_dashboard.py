@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import polars as pl
 from fastapi.testclient import TestClient
@@ -102,7 +102,37 @@ def test_overview_lists_markets_and_the_first_run_checklist(logged):
     for market in ("A", "HK", "US"):
         assert market in page.text
     assert "第一次运行" in page.text
-    assert "今日告警" in page.text
+    assert "今日新增" in page.text
+
+
+def test_the_alert_card_separates_today_from_open(logged):
+    """「今日告警 1 条」点进去默认只看未处理，显示 0 条：两个数口径不同却并排出现。
+    卡上要各自说清口径，链接也要各自落到那个口径上。"""
+    ctx = logged.context
+    user = ctx.users.get_by_username("alice")
+    alert = ctx.alerts_store.create(
+        user.id,
+        rule_id=None,
+        rule_name="止损线",
+        account_id=None,
+        account_name="",
+        market="A",
+        code="600519",
+        symbol_name="贵州茅台",
+        severity="mid",
+        stage="close",
+        value_text="1500.00",
+        threshold_text="1550.00",
+        action_note="",
+        triggered_at=datetime.now(UTC),
+    )
+    ctx.alerts_store.dismiss(alert.id, user_id=user.id, code="expected", reason="")
+
+    page = logged.client.get("/")
+    text = page.text
+    assert "今日新增 1 条" in text
+    assert "未处理 0 条" in text
+    assert 'href="/alerts?status=all"' in text
 
 
 def test_overview_shows_watchlist_quotes(logged):

@@ -42,6 +42,49 @@ def _alice(ctx):
     return ctx.users.get_by_username("alice")
 
 
+def _desktop(ctx, user_id) -> str:
+    return ctx.channels_store.create(user_id, "desktop", "桌面", {}).id
+
+
+def test_the_inbox_says_what_happened_to_the_delivery(logged):
+    """列表原先只有处置状态（未处理/已读/…），一条发不出去的告警和正常告警长得一样。
+    投递结果要上列表：已发送 / 发送失败 / 被抑制 / 未配置通道。"""
+    ctx = logged.context
+    user = _alice(ctx)
+    channel_id = _desktop(ctx, user.id)
+
+    sent = _seed(ctx, user_id=user.id)
+    ctx.alerts_store.record(sent.id, channel_id, "sent")
+    failed = _seed(ctx, user_id=user.id, code="000001")
+    ctx.alerts_store.record(failed.id, channel_id, "failed", error="timeout")
+    missing = _seed(ctx, user_id=user.id, code="000002")
+    ctx.alerts_store.record(missing.id, None, "no_channel")
+
+    text = logged.client.get("/alerts").text
+    assert "投递" in text
+    for label in ("已发送", "发送失败", "未配置通道"):
+        assert label in text, label
+    for raw in (">sent<", ">failed<", ">no_channel<"):
+        assert raw not in text, raw
+
+
+def test_the_detail_names_the_delivery_outcome_in_chinese(logged):
+    ctx = logged.context
+    alert = _seed(ctx, user_id=_alice(ctx).id)
+    ctx.alerts_store.record(alert.id, None, "no_channel")
+
+    text = logged.client.get(f"/alerts/{alert.id}").text
+    assert "未配置通道" in text
+    assert ">no_channel<" not in text
+
+
+def test_severity_is_spelled_out_in_chinese_in_the_inbox(logged):
+    _seed(logged.context, user_id=_alice(logged.context).id, severity="strong")
+    text = logged.client.get("/alerts").text
+    assert '<option value="strong">强</option>' in text
+    assert '<span class="badge">强</span>' in text
+
+
 def test_inbox_lists_and_filters(logged):
     ctx = logged.context
     user = _alice(ctx)
@@ -174,8 +217,9 @@ def test_resend_renders_the_dispatch(logged):
 
     resp = logged.client.post(f"/alerts/{alert.id}/resend", data={"csrf": logged.csrf})
     assert resp.status_code == 200
-    # 一个通道都没配：选路拒绝并留下 no_channel 那一行，页面上要看得见
-    assert "no_channel" in resp.text
+    # 一个通道都没配：选路拒绝并留下 no_channel 那一行，页面上要看得见（说人话，不是码）
+    assert "未配置通道" in resp.text
+    assert "no_channel" not in resp.text
     assert "名下没有启用的通道" in resp.text
     # 重发只动投递，不动状态机（`deliver_existing` 不碰 `alerts.status`）
     assert ctx.alerts_store.get(alert.id).status == NEW
@@ -220,7 +264,9 @@ def test_detail_lists_the_delivery_rows(logged):
     page = logged.client.get(f"/alerts/{alert.id}")
     assert page.status_code == 200
     assert "规则指定的通道都不可用：主群（已停用）" in page.text
-    assert "no_channel" in page.text
+    # 结果码折成中文上屏：屏幕上不该出现 no_channel 这种给程序看的值
+    assert "未配置通道" in page.text
+    assert "no_channel" not in page.text
     # 时刻折到 display_tz 才上屏：同一条告警的几次尝试只差几秒，那一列得到秒
     row = ctx.alerts_store.deliveries(alert.id)[0]
     label = moment_label(row.ts, ctx.settings.server.display_tz, seconds=True)

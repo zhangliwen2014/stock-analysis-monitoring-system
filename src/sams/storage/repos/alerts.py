@@ -388,6 +388,40 @@ class AlertRepo:
             [user_id],
         ))
 
+    def last_by_rule(self, user_id: str) -> dict[str, tuple[datetime, int]]:
+        """每条规则最近一次响在什么时候、响过几次：规则列表那一列「上次响」的口径。
+
+        一趟聚合而不是每行查一次：列表要开几十条规则，而这一屏每天要被打开几十次。
+        系统告警（`rule_id IS NULL`）不在里面——它们不属于任何规则。
+        """
+        rows = self.db.query(
+            "SELECT rule_id, max(triggered_at) AS last_at, count(*) AS n FROM alerts"
+            " WHERE user_id = ? AND rule_id IS NOT NULL GROUP BY rule_id",
+            [user_id],
+        ).to_dicts()
+        return {
+            str(row["rule_id"]): (row["last_at"], int(row["n"])) for row in rows
+        }
+
+    def latest_outcomes(self, alert_ids: Sequence[str]) -> dict[str, str]:
+        """每一条告警**最后一次**投递的结果：收件箱那一列要的是「现在是什么下场」。
+
+        一条告警可能试过三个通道：最早那次失败不能盖住后来成功的那一次，所以取
+        `ts` 最新的一行；`notify_log` 没有 outcome 的旧行按 `failed` 读（同 `deliveries`）。
+        """
+        ids = [str(item) for item in alert_ids]
+        if not ids:
+            return {}
+        marks = ", ".join("?" for _ in ids)
+        rows = self.db.query(
+            "SELECT alert_id, coalesce(outcome, 'failed') AS outcome FROM notify_log"
+            f" WHERE alert_id IN ({marks})"
+            " QUALIFY row_number() OVER"
+            " (PARTITION BY alert_id ORDER BY ts DESC, id DESC) = 1",
+            ids,
+        ).to_dicts()
+        return {str(row["alert_id"]): str(row["outcome"]) for row in rows}
+
     def has_system_alert(self, user_id: str, component: str, *, since: datetime) -> bool:
         """这个人名下从 `since` 起有没有过关于这个组件的系统告警（D102 的去重键）。
 

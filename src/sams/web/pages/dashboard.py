@@ -122,6 +122,9 @@ def overview(request: Request):
 
     day_start = _day_start(now, tz)
     alerts_today = len(ctx.alerts_store.list_for(user.id, since=day_start, limit=200))
+    # 两个数口径不同：今日新增包含已处理的，未处理不限今天。并排出现就得各自说清
+    # 自己是什么、各自点到自己那一屏（原先「今日告警 N 条」点进去默认只列未处理）
+    alerts_open = ctx.alerts_store.count_open(user.id)
 
     accounts = []
     for account in ctx.sim_accounts.list_for(user.id):
@@ -158,6 +161,7 @@ def overview(request: Request):
         markets=markets,
         rows=_quote_rows(ctx, core, user.id, now),
         alerts_today=alerts_today,
+        alerts_open=alerts_open,
         accounts=accounts,
         checklist=checklist,
         failed_channels=failed_channels,

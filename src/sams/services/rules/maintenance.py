@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import StorageError, ValidationError
 from sams.core.version import VersionGate
@@ -115,6 +116,7 @@ class RuleService:
         self._require_user(user_id)
         self._require_account(user_id, account_id)
         self._require_channels(user_id, channel_ids)
+        self._require_configured_market(target_type, target_ref)
         # `thesis_id` 的归属不在这里查：`rules._require_thesis` 已经在做同一件事，
         # 两处各查一份的话，第二处只会把同一句话说两遍
         rule = self.rules.create(
@@ -157,6 +159,13 @@ class RuleService:
         before = self._require(user_id, rule_id)
         if channel_ids is not None:
             self._require_channels(user_id, channel_ids)
+        # 只有真的换了挂载对象才重判市场：改个名字不该被一条历史遗留的坏引用挡住，
+        # 而编辑页本身也不提供换对象那一格
+        if target_type is not None or target_ref is not None:
+            self._require_configured_market(
+                target_type if target_type is not None else before.target_type,
+                target_ref if target_ref is not None else before.target_ref,
+            )
         with self.db.transaction():
             moved = self.rules.update(
                 rule_id,
@@ -253,6 +262,24 @@ class RuleService:
             f"这些通道收不到这条规则的告警：{'、'.join(bad)}。"
             "现在写进去不报错，但每一次命中都只落一条 `no_channel` 记录；而指定过的通道"
             "全部不可用时不会降级到默认路由——那是把 A 群的告警发到 B 群去"
+        )
+
+    def _require_configured_market(self, target_type: str, target_ref: str) -> None:
+        """规则指向的市场必须在配置里：没有日历也没有数据源的市场，存进去是一条
+        看着「启用」、实际谁也没在读的规则（专家验收 P2-3）。形状闸只管「A/代码」两截，
+        配置它看不见。"""
+        if target_type != "symbol":
+            return
+        market, sep, _ = (target_ref or "").strip().partition("/")
+        if not sep:
+            return  # 形状本身不合法，交给仓库那一句
+        normalized = canonical_market(market)
+        if normalized in self.settings.markets:
+            return
+        known = ", ".join(sorted(self.settings.markets))
+        raise ValidationError(
+            f"市场 {normalized} 没有配置（现在只有 {known}）：这条规则读不到任何行情，"
+            "存进去只会是一条看着启用、永远不响的规则。先在 [markets.*] 里配上那个市场"
         )
 
     def _notes(self, rule: Rule, targets: int) -> tuple[str, ...]:

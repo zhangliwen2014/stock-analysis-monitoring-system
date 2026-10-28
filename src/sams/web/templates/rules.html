@@ -3,31 +3,40 @@
 {% block content %}
 <section class="card">
   <h1>规则 <a class="muted" href="/rules/new">新建</a></h1>
+  {% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
-  {% if views %}
+  {% if groups %}
+  {% for heading, rows in groups %}
+  <h2>{{ heading }}（{{ rows | length }}）</h2>
   <table>
-    <tr><th>名称</th><th>类型</th><th>对象</th><th>级别</th><th>覆盖</th><th>启用</th><th></th></tr>
-    {% for view in views %}
-    <tr>
-      <td><a href="/rules/{{ view.rule.id }}/edit">{{ view.rule.name }}</a></td>
-      <td class="muted">{{ view.rule.kind }}</td>
-      <td class="muted">{{ view.rule.target_type }}:{{ view.rule.target_ref }}</td>
-      <td>{{ view.rule.severity }}</td>
-      <td>{{ view.targets }}</td>
-      <td>{{ "是" if view.rule.enabled else "否" }}</td>
+    <tr><th>名称</th><th>条件</th><th>对象</th><th>现价</th><th>档位</th><th>覆盖</th><th>上次响</th><th>启用</th><th></th></tr>
+    {% for row in rows %}
+    {# 说明并进它自己那一行：单起一行会贴着下一条规则，读起来像在说下面那条 #}
+    <tr id="{{ row.rule.id }}">
       <td>
-        <form method="post" action="/rules/{{ view.rule.id }}/toggle" class="inline-form">
+        <a href="/rules/{{ row.rule.id }}/edit">{{ row.rule.name }}</a>
+        {% if row.view.notes %}<div class="muted">{% for note in row.view.notes %}{{ note }}{% if not loop.last %}；{% endif %}{% endfor %}</div>{% endif %}
+      </td>
+      <td>{{ row.condition }}</td>
+      <td class="muted">{% if row.target_url %}<a href="{{ row.target_url }}">{{ row.target }}</a>{% else %}{{ row.target }}{% endif %}</td>
+      <td>
+        {% if row.quote.price %}{{ row.quote.price }}<div class="muted">{{ row.quote.at }} · {{ row.quote.state }}</div>
+        {% else %}<span class="muted">{{ row.quote.state or "—" }}</span>{% endif %}
+      </td>
+      <td>{{ severity_label(row.rule.severity) }}</td>
+      <td>{{ row.view.targets }}</td>
+      <td>{{ row.last_at }}{% if row.last_count %}（{{ row.last_count }} 次）{% endif %}</td>
+      <td>{{ "是" if row.rule.enabled else "否" }}</td>
+      <td>
+        <form method="post" action="/rules/{{ row.rule.id }}/toggle" class="inline-form">
           <input type="hidden" name="csrf" value="{{ csrf }}">
-          <button type="submit">{{ "停用" if view.rule.enabled else "启用" }}</button>
+          <button type="submit">{{ "停用" if row.rule.enabled else "启用" }}</button>
         </form>
       </td>
     </tr>
-    {% if view.notes %}
-    {# 覆盖 0 个对象的规则看着是「启用」而一条都不响：这一行是它唯一的出声处 #}
-    <tr><td colspan="7" class="muted">{% for note in view.notes %}{{ note }}{% if not loop.last %}；{% endif %}{% endfor %}</td></tr>
-    {% endif %}
     {% endfor %}
   </table>
+  {% endfor %}
   {% else %}<p class="muted">还没有规则。</p>{% endif %}
 </section>
 {% endblock %}

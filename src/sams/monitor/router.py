@@ -414,8 +414,8 @@ class NotifyService:
         if not enabled:
             return [], (
                 f"用户 {user.username} 名下没有启用的通道，这条告警发不出去。"
-                f"三步：`sams channel add --user {user.username} --kind wecom --name 主群 "
-                "--config url=…` → `sams channel probe` 试一次 → 在规则里选它"
+                "三步：在「设置 → 通知通道」里加一个通道 → 用 `sams channel probe` 试一次"
+                " → 回规则里选它（网页上就能做完前两步）"
             )
         return [], (
             f"没有 kind 属于 {severity} 级默认路由（{sorted(wanted)}）的启用通道，"
