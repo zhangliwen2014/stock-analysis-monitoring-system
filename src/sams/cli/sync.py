@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 
 from sams.bootstrap import Container
-from sams.cli.common import currency_arg, emit, exit_for, group, iso_date, refused
+from sams.cli.common import currency_arg, emit, exit_for, group, iso_date, refused, stamp
 from sams.core.errors import SamsError, ValidationError
 from sams.core.timeutil import HISTORY_START
 
@@ -61,6 +61,18 @@ def add_to(subparsers) -> None:
         parser.add_argument("--start", help=f"YYYY-MM-DD，默认 {DEFAULT_FUNDAMENTALS_START}")
         parser.add_argument("--end", help="YYYY-MM-DD，默认今天")
         parser.set_defaults(handler=run_fundamental)
+
+    spot = actions.add_parser(
+        "spot",
+        help="全市场快照（一个市场的一次横截面；盘后自动跑的那条同源）",
+    )
+    spot.add_argument("--market", required=True, help="A（本期只接 A 股）")
+    spot.add_argument("--day", help="YYYY-MM-DD，默认按报价时刻的众数日")
+    spot.add_argument(
+        "--code", action="append", help="只采这几只（试跑用；默认=代码表里全部在市）"
+    )
+    spot.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    spot.set_defaults(handler=run_spot)
 
     fx = actions.add_parser(
         "fx",
@@ -206,6 +218,49 @@ def run_fx(container: Container, args: argparse.Namespace) -> int:
     for name, reason in summary.skipped:
         print(f"           跳过 {name}：{reason}")
     return 0
+
+
+def run_spot(container: Container, args: argparse.Namespace) -> int:
+    """补采与盘后 job 调同一个服务函数；这里只负责把范围、日与缺答写成一句话。"""
+    try:
+        report = container.snapshots.sync(
+            args.market,
+            codes=args.code or None,
+            day=iso_date(args.day) if args.day else None,
+        )
+    except SamsError as exc:
+        # 源全链挂掉是「没问到」，不是「这个市场没票」：退出 1，让脚本别把空库当成功
+        return refused(args, exc, exit_for(exc))
+    code = 0 if report.rows else 1
+    if args.json:
+        emit(
+            {
+                "status": "empty" if not report.rows else "ok",
+                "exit": code,
+                "market": report.market,
+                "day": str(report.day),
+                "taken_at": report.taken_at.isoformat(),
+                "rows": report.rows,
+                "universe_size": report.universe_size,
+                "skipped": list(report.skipped),
+                "source": report.source,
+                "empty_everywhere": report.empty_everywhere,
+            }
+        )
+        return code
+    print(
+        f"{report.market} 股  快照 {report.day}  请求 {report.universe_size} 只  "
+        f"{report.rows} 行  来源 {report.source or '–'}  采集 {stamp(report.taken_at)}"
+    )
+    if report.empty_everywhere:
+        print("⇒ 源回了一张空表：旧数据保留，未写入任何行（先看健康页的源状态）")
+    elif report.skipped:
+        print(
+            f"⇒ 源没答 {len(report.skipped)} 只（代码表里有、这次响应里没有）："
+            f"{'、'.join(report.skipped[:20])}"
+            + ("…（--json 拿全表）" if len(report.skipped) > 20 else "")
+        )
+    return code
 
 
 def _trail(attempts) -> str:
