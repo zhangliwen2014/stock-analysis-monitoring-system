@@ -40,6 +40,7 @@ from sams.web.display import (
     alert_status,
     dismiss_label,
     hms,
+    moment_label,
     money,
     pct,
     state_label,
@@ -53,6 +54,7 @@ from sams.web.pages import (
     portfolio,
     review,
     rules,
+    screen,
     settings,
     symbol,
     theses,
@@ -73,6 +75,7 @@ def _templates() -> Jinja2Templates:
         alert_status=alert_status,
         action_label=action_label,
         dismiss_label=dismiss_label,
+        moment_label=moment_label,
     )
     return templates
 
@@ -171,6 +174,7 @@ def create_app(
     app.include_router(portfolio.router)
     app.include_router(review.router)
     app.include_router(rules.router)
+    app.include_router(screen.router)
     app.include_router(settings.router)
     app.include_router(symbol.router)
     app.include_router(theses.router)

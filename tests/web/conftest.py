@@ -9,14 +9,25 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
+import polars as pl
 import pytest
 import support
 from fastapi.testclient import TestClient
 
 from sams.bootstrap import build_core
 from sams.core.timeutil import CalendarDay, SessionWindow
+from sams.datasource.spot import SPOT_SCHEMA
 from sams.web.app import create_app
 from sams.web.context import ThreadContexts
+
+
+class StubSnapshotAdapter(support.StubAdapter):
+    """日线替身 + 一条全市场快照能力：`/screen` 的「立即重采」才排得进 `spot` job。"""
+
+    market_snapshot_markets = frozenset({"A"})
+
+    def market_snapshot(self, market, codes):
+        return pl.DataFrame(schema=SPOT_SCHEMA)
 
 
 class FakeRuntime:
@@ -191,3 +202,48 @@ def logged_minute(minute_app):
     assert response.status_code == 303, response.text
     minute_app.csrf = minute_app.client.cookies.get("sams_csrf").rpartition(".")[0]
     return minute_app
+
+
+@pytest.fixture
+def snapshot_sources(stub_sources):
+    """把全市场快照挂到 A 股链上那个名字：与 `minute_sources` 同一条理由。"""
+    made = dict(stub_sources)
+    made["akshare"] = StubSnapshotAdapter(
+        "akshare", ["A"], support.sample_bars(source="akshare")
+    )
+    return made
+
+
+@pytest.fixture
+def make_screen_app(migrated, snapshot_sources):
+    yield from _build_app_factory(migrated, snapshot_sources)
+
+
+@pytest.fixture
+def screen_app(make_screen_app):
+    """与 `web_app` 同一台 app，只是 A 股链上那个源会答全市场快照。"""
+    web = make_screen_app()
+    context = web.contexts.current()
+    context.users.create("alice", "correct-horse-battery", is_admin=True)
+    with TestClient(web.app) as client:
+        yield SimpleNamespace(
+            client=client,
+            app=web.app,
+            core=web.core,
+            contexts=web.contexts,
+            context=context,
+            runtime=web.app.state.web.runtime,
+        )
+
+
+@pytest.fixture
+def logged_screen(screen_app):
+    """已登录的 alice：给选股页与方案的用例用。"""
+    response = screen_app.client.post(
+        "/login",
+        data={"username": "alice", "password": "correct-horse-battery"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    screen_app.csrf = screen_app.client.cookies.get("sams_csrf").rpartition(".")[0]
+    return screen_app

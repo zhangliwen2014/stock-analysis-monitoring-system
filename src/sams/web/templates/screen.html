@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}选股{% endblock %}
+{% block content %}
+<h1>选股</h1>
+{% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+
+<section class="card">
+  <h2>{{ market }} 股 · 快照</h2>
+  {% if snapshot %}
+  <p>快照 {{ snapshot.rows }} 行 · 采集 {{ snapshot.taken_label }}</p>
+  {% else %}
+  <p class="muted">{{ market }} 股还没有全市场快照：点「立即重采」排队，或先跑
+    <code>sams sync spot --market {{ market }}</code></p>
+  {% endif %}
+  <form method="post" action="/screen/recollect" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="market" value="{{ market }}">
+    {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
+    <button type="submit">立即重采</button>
+  </form>
+</section>
+
+<form method="get" action="/screen" class="panel">
+  <label>市场
+    <select name="market">
+      {% for item in markets %}<option value="{{ item }}"{% if item == market %} selected{% endif %}>{{ item }}</option>{% endfor %}
+    </select>
+  </label>
+  {% for row in rows %}
+  <div class="grid">
+    <label>字段
+      <select name="f">
+        <option value="">（选字段）</option>
+        {% for item in field_options %}
+        <option value="{{ item.name }}"{% if item.name == row.field %} selected{% endif %}{% if not item.enabled %} disabled title="{{ item.why }}"{% endif %}>{{ item.label }}（{{ item.unit }}）</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>比较符
+      <select name="o">
+        {% for value, label in ops %}<option value="{{ value }}"{% if value == row.op %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>值 <input name="v" value="{{ row.value }}" placeholder="between 写 1..5"></label>
+    <a href="{{ remove_urls[loop.index0] }}">删掉这一条</a>
+  </div>
+  {% endfor %}
+  <p><button type="submit">筛选</button> <a href="{{ add_url }}">再加一条</a></p>
+</form>
+
+{% if not rows or not rows[0].field %}
+<p class="muted">加一条条件，按「筛选」。</p>
+{% endif %}
+{% endblock %}
