@@ -20,6 +20,7 @@ import json
 import re
 from collections.abc import Callable
 from datetime import date, datetime
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -404,12 +405,16 @@ def smartbox_get(url: str, params: dict[str, str], *, timeout: int = 15) -> str:
 
 
 def quote_get(url: str, params: dict[str, str], *, timeout: int = 15) -> str:
-    """腾讯报价是 GBK 的 JS 赋值语句，不是 JSON。"""
+    """腾讯报价是 GBK 的 JS 赋值语句，不是 JSON。
+
+    `params=` 会把代码之间的逗号编成 `%2C`：每只多两个字符，800 只的 URL 因此从 7.2k
+    涨到 8.8k，正好跨过实测的 414 分界线（D186）。逗号在这里是分隔符，按原样发。
+    """
     import requests
 
+    query = urlencode(params, safe=",", quote_via=quote)
     response = requests.get(
-        url,
-        params=params,
+        f"{url}?{query}",
         timeout=timeout,
         headers={"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"},
     )

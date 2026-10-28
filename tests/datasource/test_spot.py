@@ -14,7 +14,7 @@ import pytest
 
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift
 from sams.datasource.spot import SPOT_BATCH, parse_spot, spot_symbol
-from sams.datasource.tencent import TencentAdapter
+from sams.datasource.tencent import QUOTE_URL, TencentAdapter, quote_get
 
 ZONE = ZoneInfo("Asia/Shanghai")
 
@@ -141,6 +141,30 @@ def test_adapter_refuses_hk_and_us():
             adapter.market_snapshot(market, ["00700"])
 
 
+def test_the_snapshot_url_keeps_commas_literal(monkeypatch):
+    """实测 880 只（URL 7941）可、1000 只（9021）回 414；`params=` 会把逗号编成 `%2C`，
+    800 只因此涨到 8000 多——分批做了半天，最后还是撞在同一堵墙上（D186）。"""
+    seen = {}
+
+    class Response:
+        status_code = 200
+        content = b""
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, **_kwargs):
+        seen["url"] = url
+        return Response()
+
+    monkeypatch.setattr("requests.get", fake_get)
+    query = ",".join(["sh600000"] * SPOT_BATCH)
+    quote_get(QUOTE_URL, {"q": query})
+    assert "%2C" not in seen["url"]
+    assert len(seen["url"]) < 8192
+    assert seen["url"].endswith("?q=" + query)
+
+
 @pytest.mark.live
 def test_live_snapshot_answers_real_rows_with_the_key_columns():
     """真接口冒烟：A 股 5 只必须都答得上，且 PE/PB/市值不是整列空。"""
@@ -149,3 +173,11 @@ def test_live_snapshot_answers_real_rows_with_the_key_columns():
     assert frame.height == 5
     assert frame.filter(frame["price"].is_not_null()).height == 5
     assert frame.filter(frame["pb"].is_not_null()).height >= 4
+
+
+@pytest.mark.live
+def test_live_snapshot_with_a_full_batch_fits_one_request():
+    """880 只是实测的 URL 上限：整批必须过，否则 800 的分批白做。"""
+    adapter = TencentAdapter()
+    frame = adapter.market_snapshot("A", [f"{600000 + i}" for i in range(880)])
+    assert frame.height > 500
