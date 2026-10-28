@@ -47,6 +47,10 @@ SMARTBOX_URL = "https://smartbox.gtimg.cn/s3/"
 #: 行内六个字段的含义（腾讯给的顺序，收盘价在第 3 个）
 FIELD_ORDER = ("date", "open", "close", "high", "low", "volume")
 QUOTE_URL = "https://qt.gtimg.cn/q"
+#: 分时端点：参数是 `code=`，不是日线那串 `param=`
+MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query"
+#: 分时一行的四个字段：时刻、价格、**累计**量、**累计**额（腾讯给的就是累计，不是每分钟增量）
+_MINUTE_FIELDS = ("time", "price", "cum_volume", "cum_amount")
 _TENCENT_LINE = re.compile(r'v_([^=]+)="([^"]*)"')
 #: 三个市场的时间格式各不相同：同一列 30 的字符串，A 股没有分隔符，港股是斜杠
 _QUOTE_TS_FORMATS = {
@@ -161,6 +165,56 @@ def parse_tencent_daily(payload: object, *, market: str, code: str, symbol: str)
         column_map={k: k for k in FIELD_ORDER},
         # 腾讯 A 股给手、港美股给股（腾讯把 00700 单日写成 23354069，是股）
         volume_scale=LOTS_TO_SHARES if market == "A" else 1.0,
+    )
+
+
+def parse_tencent_minute(payload: object, *, market: str, code: str, symbol: str) -> pl.DataFrame:
+    """纯解析：`minute/query` 的 JSON → `MINUTE_SERIES_COLUMNS`，量已折成股。
+
+    序列在 `data.<symbol>.data.data`：那个键套了两层，照着日线 `data.<symbol>.day`
+    的习惯只取一层会拿到一个 dict，然后在 `.split(" ")` 上崩——那 looks like 接口故障。
+    """
+    if not isinstance(payload, dict):
+        raise FieldDrift("tencent", f"分时响应不是对象: {type(payload).__name__}")
+    data = payload.get("data")
+    body = data.get(symbol) if isinstance(data, dict) else None
+    if not isinstance(body, dict):
+        raise FieldDrift("tencent", f"分时的不是 {symbol}，实际是 {sorted(data or {})}")
+    inner = body.get("data") or {}
+    raw_day = str(inner.get("date") or "")
+    rows = inner.get("data") or []
+    if not raw_day or not rows:
+        # 美股走的就是这一条：`date` 空串、只有一行三字段——它没答「哪一天」
+        raise EmptyResponse("tencent", f"{market} {symbol} 的分时没答出日期或序列")
+    if len(raw_day) != 8 or not raw_day.isdigit():
+        raise FieldDrift("tencent", f"分时的日期形态变了: {raw_day!r}")
+
+    quote = (body.get("qt") or {}).get(symbol)
+    if not isinstance(quote, list) or len(quote) < 5:
+        raise FieldDrift("tencent", f"分时响应里没有可读的 qt[{symbol}]")
+
+    records = []
+    for row in rows:
+        parts = str(row).split()
+        if len(parts) != len(_MINUTE_FIELDS):
+            raise FieldDrift("tencent", f"分时行字段数不对: {row!r}")
+        records.append(dict(zip(_MINUTE_FIELDS, parts, strict=True)))
+    frame = pl.DataFrame(records)
+    return pl.DataFrame(
+        {
+            "market": [market] * frame.height,
+            "code": [code] * frame.height,
+            "date": [datetime.strptime(raw_day, "%Y%m%d").date()] * frame.height,
+            # "0930" → "09:30"：屏幕上那条时间轴与缓存键都用带冒号的那一份
+            "time": [f"{value[:2]}:{value[2:]}" for value in frame["time"].to_list()],
+            "price": frame["price"].cast(pl.Float64).to_list(),
+            # 与日线同一口径：A 股的手折成股，港股腾讯本来就给股（实测 510600 对 09:30 一分钟）
+            "volume": frame["cum_volume"].cast(pl.Float64)
+            * (LOTS_TO_SHARES if market == "A" else 1.0),
+            "amount": frame["cum_amount"].cast(pl.Float64),
+            "prev_close": [float(quote[4])] * frame.height,
+            "source": ["tencent"] * frame.height,
+        }
     )
 
 
@@ -303,6 +357,8 @@ class TencentAdapter:
 
     name = "tencent"
     markets = frozenset({"A", "HK", "US"})
+    #: 分时答哪些市场：美股那一格实测给不出日期（见 `minute_series`）
+    minute_series_markets = frozenset({"A", "HK"})
 
     def __init__(
         self,
@@ -384,6 +440,34 @@ class TencentAdapter:
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
 
+    def minute_series(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        if market not in self.minute_series_markets:
+            raise EmptyResponse(
+                "tencent",
+                f"腾讯分时只供 {sorted(self.minute_series_markets)}，收到 {market}",
+            )
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        # 分时端点的符号与报价同形（美股不带交易所后缀），不走 `tencent_symbol`
+        symbol = tencent_quote_symbol(market, code)
+        try:
+            payload = self._get(MINUTE_URL, {"code": symbol}, timeout=self._timeout)
+            frame = parse_tencent_minute(payload, market=market, code=code, symbol=symbol)
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+        session = frame["date"].to_list()[0]
+        if not start <= session <= end:
+            # 接口永远答最近一个交易日：请求的那天对不上就是没答，
+            # 静默交回隔壁那一天等于把「7 月 8 日的分时」画成今天的样子
+            raise EmptyResponse(
+                "tencent", f"{symbol} 的分时给的是 {session}，不在请求的 {start}~{end} 里"
+            )
+        return frame
+
     def quotes(self, market: str, codes: list[str]) -> QuoteBatch:
         """一次请求的代码清单由调用方按 `QUOTE_BATCH` 分批（service 层负责），本方法不切片。"""
         if market not in self.markets:
@@ -433,6 +517,8 @@ def _bars_for(start: date, end: date) -> int:
 
 
 # 放在模块末尾：装饰器要等类定义完才拿得到 markets
-source("tencent", options=("timeout",), note="腾讯 gtimg 日线 + A/HK 指数日线，三市场，不复权")(
-    TencentAdapter
-)
+source(
+    "tencent",
+    options=("timeout",),
+    note="腾讯 gtimg 日线 + A/HK 指数日线 + A/HK 分时 + A 股分钟K，三市场，不复权",
+)(TencentAdapter)

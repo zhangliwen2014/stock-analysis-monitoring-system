@@ -11,19 +11,23 @@ from datetime import date
 
 import polars as pl
 import pytest
+from support import FrozenClock
 
 from sams.core.errors import EmptyResponse, FieldDrift, RateLimited, TransientError
 from sams.datasource.base import BAR_COLUMNS
+from sams.datasource.minute import MINUTE_SERIES_COLUMNS
 from sams.datasource.tencent import (
     TencentAdapter,
     _bars_for,
     kline_param,
     parse_tencent_daily,
+    parse_tencent_minute,
     parse_us_hint,
     tencent_symbol,
 )
 
 START, END = date(2024, 1, 2), date(2024, 1, 5)
+DAY = date(2026, 10, 28)
 
 #: A 股：[日期, 开, 收, 高, 低, 量(手)]
 A_PAYLOAD = {
@@ -334,3 +338,111 @@ def test_live_tencent_range_is_not_truncated():
     today = date.today()
     frame = TencentAdapter().daily_bars("A", "600519", today.replace(year=today.year - 1), today)
     assert frame.height > 200, f"只回来 {frame.height} 根，接口有隐性上限"
+
+
+# --- 分时（D165）：`minute/query`，累计量折成股，美股在联网前就拒 ----------------------
+
+
+class MinuteGet:
+    """分时端点的参数是 `code=`，而 `FakeGet` 只认日线那串 `param=`：另记一份。"""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def __call__(self, url, params, *, timeout=15):
+        self.calls.append((url, dict(params)))
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        return self.payload
+
+
+def minute_payload(symbol="sh600519", day="20261028", rows=None, quote=None):
+    rows = rows if rows is not None else [
+        "0930 1354.98 1537 208260426.00",
+        "0931 1353.00 3186 430459525.34",
+        "0932 1352.10 4000 540000000.00",
+    ]
+    qt = {"market": "1", symbol: quote or ["1", "600519", "贵州茅台", "1332.08", "1355.90"]}
+    qt[f"v_ff_{symbol}"] = ["x"]  # 实测：`qt` 里混着这个键与 `market`，按符号取才不端回整数
+    return {"code": 0, "msg": "", "data": {symbol: {"data": {"date": day, "data": rows}, "qt": qt}}}
+
+
+def test_minute_series_returns_the_declared_column_set_with_cumulative_volume_in_shares():
+    """A 股分时：`date` 是 `20261028` 那一格，量按 手→股 换算（与日线同一口径）。"""
+    frame = parse_tencent_minute(
+        minute_payload(), market="A", code="600519", symbol="sh600519"
+    )
+    assert frame.columns == MINUTE_SERIES_COLUMNS
+    assert frame["date"].to_list() == [DAY] * 3
+    assert frame["time"].to_list() == ["09:30", "09:31", "09:32"]
+    assert frame["price"].to_list() == [1354.98, 1353.00, 1352.10]
+    # 1537 手 → 153700 股：差两个数量级的量柱在屏幕上读起来完全正常，所以只能钉数
+    assert frame["volume"].to_list() == [153700.0, 318600.0, 400000.0]
+    assert frame["amount"].to_list()[0] == pytest.approx(208260426.0)
+    assert frame["prev_close"].to_list() == [1355.90] * 3
+    assert frame["source"].to_list() == ["tencent"] * 3
+
+
+def test_minute_series_reads_hk_volume_as_shares_without_scaling():
+    """港股那格单位是股：乘 100 会把腾讯一天的量放大成它自己的十倍。"""
+    frame = parse_tencent_minute(
+        minute_payload(
+            symbol="hk00700",
+            rows=["0930 384.000 510600 196105924.933", "0931 384.200 900000 340000000.000"],
+            quote=["1", "00700", "腾讯控股", "384.000", "385.200"],
+        ),
+        market="HK",
+        code="00700",
+        symbol="hk00700",
+    )
+    assert frame["volume"].to_list() == [510600.0, 900000.0]
+    assert frame["prev_close"].to_list() == [385.20, 385.20]
+
+
+def test_minute_series_indexes_qt_by_symbol_not_the_first_key():
+    """`qt` 里还挂着 `market` 与 `v_ff_*`：`next(iter(qt))` 会端回一个整数或列表。
+
+    这不是假想的脏数据，是实测的形状，所以它值得一条自己的用例。
+    """
+    payload = minute_payload()
+    payload["data"]["sh600519"]["qt"] = {
+        "market": "1",
+        "v_ff_sh600519": ["a"],
+        "sh600519": ["1", "600519", "贵州茅台", "1332.08", "1355.90"],
+    }
+    frame = parse_tencent_minute(payload, market="A", code="600519", symbol="sh600519")
+    assert frame["prev_close"].to_list() == [1355.90] * 3
+
+
+def test_minute_series_refuses_us_before_touching_the_network():
+    """美股那一格实测只给三字段、`date` 是空串：它答不了「哪一天」，就直接不答这一档。
+
+    把「没这市场」说成一次空答复会让降级链继续问下去、屏幕显示空白；
+    在这里拒掉，健康页与周期条才知道该置灰。
+    """
+    get = MinuteGet({})
+    adapter = TencentAdapter(get=get, clock=FrozenClock(DAY))
+    with pytest.raises(EmptyResponse, match="只供"):
+        adapter.minute_series("US", "AAPL", DAY, DAY)
+    assert get.calls == []
+
+
+def test_minute_series_refuses_a_session_outside_the_requested_window():
+    """接口永远给「最近一个交易日」，请求的那天对不上就是没答：不许静默交回隔壁那天。"""
+    adapter = TencentAdapter(
+        get=MinuteGet(minute_payload(day="20261027")), clock=FrozenClock(DAY)
+    )
+    with pytest.raises(EmptyResponse, match="不在"):
+        adapter.minute_series("A", "600519", DAY, DAY)
+
+
+def test_minute_series_rejects_a_row_that_is_not_four_fields():
+    """行少了字段是形态变了（`FieldDrift`），不是「今天没数据」：一次定性、立刻换源。"""
+    with pytest.raises(FieldDrift, match="字段"):
+        parse_tencent_minute(
+            minute_payload(rows=["0930 1354.98 1537"]),
+            market="A",
+            code="600519",
+            symbol="sh600519",
+        )

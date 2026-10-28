@@ -63,7 +63,12 @@ def test_the_lacking_reason_is_per_kind_and_states_the_capability():
     assert CAPABILITIES["minute_bars"].label == "分钟 K"
     assert known()["akshare_hk"].capabilities == ("corp_actions", "symbol_list")
     entries = catalog().by_kind()
-    assert entries["tencent"].capabilities == ("daily_bars", "quote", "index_daily")
+    assert entries["tencent"].capabilities == (
+        "daily_bars",
+        "quote",
+        "index_daily",
+        "minute_series",
+    )
 
 
 # --- SP1 新增两种：代码表与指数日线（D148） -----------------------------------------
