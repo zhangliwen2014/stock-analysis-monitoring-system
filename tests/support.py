@@ -10,6 +10,8 @@ from datetime import date, datetime, timedelta
 
 import polars as pl
 
+from sams.core.errors import EmptyResponse
+
 
 class FrozenClock:
     """可控时钟：时间只能由测试推进。
@@ -133,3 +135,93 @@ class StubActionsAdapter(StubAdapter):
         if isinstance(self.actions_outcome, BaseException):
             raise self.actions_outcome
         return self.actions_outcome
+
+
+def sample_minute_series(
+    market: str = "A",
+    code: str = "600519",
+    day: date = date(2026, 10, 28),
+    source: str = "tencent",
+) -> pl.DataFrame:
+    """三条分时：量与额都是**累计**（腾讯给的就是累计，服务层负责差分成每分钟）。"""
+    return pl.DataFrame(
+        {
+            "market": [market] * 3,
+            "code": [code] * 3,
+            "date": [day] * 3,
+            "time": ["09:30", "09:31", "09:32"],
+            "price": [1354.98, 1353.00, 1352.10],
+            "volume": [153700.0, 318600.0, 400000.0],
+            "amount": [208260426.0, 430459525.34, 540000000.0],
+            "prev_close": [1355.90] * 3,
+            "source": [source] * 3,
+        }
+    )
+
+
+def sample_minute_bars(
+    market: str = "A",
+    code: str = "600519",
+    day: date = date(2026, 10, 28),
+    source: str = "tencent",
+) -> pl.DataFrame:
+    """三根分钟 K：`clock` 是这一根的结束时刻，`amount` 留空（单位没核准）。"""
+    return pl.DataFrame(
+        {
+            "market": [market] * 3,
+            "code": [code] * 3,
+            "date": [day] * 3,
+            "clock": ["10:55", "11:00", "11:05"],
+            "open": [1331.35, 1335.25, 1333.10],
+            "high": [1335.83, 1335.83, 1333.10],
+            "low": [1331.02, 1333.02, 1331.00],
+            "close": [1335.25, 1333.09, 1331.41],
+            "volume": [66900.0, 66900.0, 11000.0],
+            "amount": [None, None, None],
+            "source": [source] * 3,
+        }
+    )
+
+
+class StubMinuteAdapter(StubAdapter):
+    """分时 + 分钟 K 双能力替身：默认照腾讯的意愿表关档（分时答 A/HK、分钟 K 只答 A）。"""
+
+    minute_series_markets = frozenset({"A", "HK"})
+    minute_bars_markets = frozenset({"A"})
+
+    def __init__(
+        self,
+        name: str,
+        markets=("A",),
+        outcome=None,
+        *,
+        series=None,
+        bars=None,
+        series_markets=None,
+        bars_markets=None,
+    ) -> None:
+        super().__init__(name, markets, outcome)
+        self.series_frame = series if series is not None else sample_minute_series()
+        self.bars_frame = bars if bars is not None else sample_minute_bars()
+        if series_markets is not None:
+            self.minute_series_markets = frozenset(series_markets)
+        if bars_markets is not None:
+            self.minute_bars_markets = frozenset(bars_markets)
+        self.extra: tuple[int, int] | None = None
+
+    def minute_series(self, market, code, start, end):
+        self.calls += 1
+        if market not in self.minute_series_markets:
+            raise EmptyResponse(self.name, f"分时不答 {market}")
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.series_frame
+
+    def minute_bars(self, market, code, start, end, *, scale, count):
+        self.calls += 1
+        self.extra = (scale, count)
+        if market not in self.minute_bars_markets:
+            raise EmptyResponse(self.name, f"分钟K不答 {market}")
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.bars_frame
