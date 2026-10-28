@@ -2537,6 +2537,10 @@ git commit -m "feat(screener): 选股引擎——票池双缺口、每条件三�
 
 这一屏最容易撒的谎不是算错 PR，是「无数」被当成「不通过」静默丢掉。所以断言分三段读：
 范围行、条件行、无数段；命中与无数各自成段，同一只票只能出现在其中一段。
+
+PR 现值 = PE(动)² ÷ (100×PB)：PB=1 时 PE 5 / 6 / 10 分别是 0.25 / 0.36 / 1.0，
+所以门槛 0.5 下前两只命中、第三只落选。写成 PE=10/20/40 会让「两只通过」在公式上
+根本不成立——PE=10 自己就已经是 1.0。
 """
 
 from __future__ import annotations
@@ -2545,7 +2549,6 @@ import json
 from datetime import UTC, date, datetime
 
 import polars as pl
-import pytest
 from support import FrozenClock
 
 import sams.cli as cli
@@ -2612,9 +2615,9 @@ def test_first_line_is_the_range_then_one_line_per_condition(db, settings, capsy
     container = container_for(
         db,
         settings,
-        snap("600519", pe_dyn=10.0),
-        snap("000001", pe_dyn=20.0),
-        snap("300750", pe_dyn=40.0),
+        snap("600519", pe_dyn=5.0),
+        snap("000001", pe_dyn=6.0),
+        snap("300750", pe_dyn=10.0),
     )
     capsys.readouterr()
     assert run(container, ["screen", "spot", "--market", "A", "--where", "pr_now<=0.5"]) == 0
@@ -2622,9 +2625,13 @@ def test_first_line_is_the_range_then_one_line_per_condition(db, settings, capsy
     first = out.splitlines()[0]
     assert "A 股" in first and "快照 2026-10-28" in first
     assert "票池 3 只" in out and "代码表 3 只" in out
-    assert "pr_now <= 0.5：通过 2 / 不通过 1 / 无数 0" in out
+    assert "pr_now <= 0.5" in out
+    # 单位与标签必须出门（D58/D179）：光有 `pr_now` 三个字，0.5 是 0.5 还是 50 全靠猜
+    assert "现值市赚率 PR" in out
+    assert "通过 2 / 不通过 1 / 无数 0" in out
     assert "600519" in out and "000001" in out
-    assert "300750" in out.split("不通过")[0] or "300750" not in out.split("命中")[-1]
+    # 落选的票不进「命中」，也不冒充「无数」：只报数，不点名
+    assert "300750" not in out
 
 
 def test_missing_codes_are_named_in_their_own_section(db, settings, capsys):
@@ -2638,7 +2645,10 @@ def test_missing_codes_are_named_in_their_own_section(db, settings, capsys):
 
 def test_no_snapshot_exits_1_with_the_next_command(db, settings, capsys):
     container = build_container(
-        settings, db=db, clock=FrozenClock(datetime(2026, 10, 28, 8, 41, tzinfo=UTC)), adapters={}
+        settings,
+        db=db,
+        clock=FrozenClock(datetime(2026, 10, 28, 8, 41, tzinfo=UTC)),
+        adapters={},
     )
     capsys.readouterr()
     assert run(container, ["screen", "spot", "--market", "A", "--where", "price>=1"]) == 1
@@ -2654,15 +2664,29 @@ def test_unknown_field_is_a_parameter_error_with_the_vocabulary(db, settings, ca
 
 
 def test_between_is_written_as_a_range_and_backwards_is_refused(db, settings, capsys):
-    container = container_for(db, settings, snap("600519", turnover=2.0), snap("000001", turnover=9.0))
+    container = container_for(
+        db, settings, snap("600519", turnover=2.0), snap("000001", turnover=9.0)
+    )
     capsys.readouterr()
-    assert run(container, ["screen", "spot", "--market", "A", "--where", "turnover_rate=1..5"]) == 0
+    argv = ["screen", "spot", "--market", "A", "--where", "turnover_rate=1..5"]
+    assert run(container, argv) == 0
     assert "600519" in capsys.readouterr().out
-    assert run(container, ["screen", "spot", "--market", "A", "--where", "turnover_rate=5..1"]) == 2
+    argv[-1] = "turnover_rate=5..1"
+    assert run(container, argv) == 2
+
+
+def test_limit_must_be_positive(db, settings, capsys):
+    container = container_for(db, settings, snap("600519", pe_dyn=5.0))
+    capsys.readouterr()
+    argv = ["screen", "spot", "--market", "A", "--where", "pr_now<=0.5", "--limit", "0"]
+    assert run(container, argv) == 2
+    assert "正整数" in capsys.readouterr().out
 
 
 def test_json_carries_three_counts_and_the_missing_groups(db, settings, capsys):
-    container = container_for(db, settings, snap("600519", pe_dyn=10.0), snap("000001", pe_dyn=-5.0))
+    container = container_for(
+        db, settings, snap("600519", pe_dyn=5.0), snap("000001", pe_dyn=-5.0)
+    )
     capsys.readouterr()
     run(container, ["screen", "spot", "--market", "A", "--where", "pr_now<=0.5", "--json"])
     payload = json.loads(capsys.readouterr().out)
@@ -2680,13 +2704,18 @@ Expected: argparse `SystemExit: 2`（`invalid choice: 'spot'`）。
 
 - [ ] **Step 3: 实现**
 
-`screen.py` 的 import 区补：
+`screen.py` 的 import 区补（`_emit` 与 `json` 已经在了，别再造一个 `emit`；同模块的两行
+合成一行，否则 isort 会判 I001）：
 
 ```python
 import re
 
+from sams.cli.common import exit_for, group, iso_date, stamp
+from sams.core.errors import SamsError, ValidationError
 from sams.core.screener_fields import Condition, fields_for
 ```
+
+`import re` 落在 `import json` 之后（isort 按模块名排，不看 import 形式）。
 
 在 `add_to` 的 `pr` 之后加：
 
@@ -2746,18 +2775,26 @@ def _where_number(text: str, whole: str) -> float:
 def run_spot_screen(container: Container, args: argparse.Namespace) -> int:
     try:
         conditions = [parse_where(text) for text in args.where]
+        # `head(-1)` 在 polars 里是「除最后一只外全要」，看起来跑成功了却少了一只
+        if args.limit is not None and args.limit <= 0:
+            raise ValidationError(
+                f"--limit {args.limit} 要一个正整数：0 或负数会变成「少列最后几只」，"
+                "不是一条看得懂的截断"
+            )
         result = container.screener.run(
             args.market,
             conditions,
             day=iso_date(args.day) if args.day else None,
             limit=args.limit,
         )
-    except ValidationError as exc:
+    except SamsError as exc:
+        # 只兜 ValidationError 会让库打不开一类错误冒到顶层：`--json` 的下游拿到空 stdin
+        code = exit_for(exc)
         if args.json:
-            _emit({"status": "refused", "reason": str(exc), "exit": 2})
+            _emit({"status": "refused", "reason": str(exc), "exit": code})
         else:
-            print(f"参数有误：{exc}")
-        return 2
+            print(f"参数有误：{exc}" if code == 2 else str(exc))
+        return code
     code = 1 if result.universe_size == 0 else 0
     if args.json:
         _emit(_spot_payload(result, code))
