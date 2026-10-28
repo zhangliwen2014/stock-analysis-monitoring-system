@@ -361,7 +361,14 @@ class AdapterRegistry:
         return tuple(name for name in self.sources_for(market) if probe(self.adapter(name)))
 
     def _walk(
-        self, market: str, code: str, start: date, end: date, *, method: str
+        self,
+        market: str,
+        code: str,
+        start: date,
+        end: date,
+        *,
+        method: str,
+        extra: dict[str, object] | None = None,
     ) -> Iterator[_Outcome]:
         """按路由顺序逐源取一次数，把每个源的结果**原样**上报，由调用方定性质。
 
@@ -383,7 +390,7 @@ class AdapterRegistry:
                 yield _Outcome(name, "skipped", error=cap.lacking)
                 continue
             try:
-                frame = self._call(name, market, code, start, end, method=method)
+                frame = self._call(name, market, code, start, end, method=method, extra=extra)
             except _SourceFailed as failed:
                 yield _Outcome(
                     name, "failed", error=failed.error, tries=failed.tries, cause=failed.cause
@@ -404,8 +411,36 @@ class AdapterRegistry:
         在两张表上必须是同一套语义，否则休市看板的空与错分不清。"""
         return self._fetch_bars_frame(market, index_code, start, end, method="index_daily")
 
+    def fetch_minute_series(self, market: str, code: str, day: date) -> FetchResult:
+        """分时链：`start == end == day`。
+
+        复用 `FetchResult` 而不是另立 spec §5.1 写的 `MinuteRead`：`attempts` /
+        `skipped` / `empty_everywhere` 这三样在分时上问的是同一组问题，再造一份
+        只会让「链上谁被跳过」有两套写法。已回写为「实现时订正」。
+        """
+        return self._fetch_bars_frame(market, code, day, day, method="minute_series")
+
+    def fetch_minute_bars(
+        self, market: str, code: str, start: date, end: date, *, scale: int, count: int
+    ) -> FetchResult:
+        return self._fetch_bars_frame(
+            market,
+            code,
+            start,
+            end,
+            method="minute_bars",
+            extra={"scale": scale, "count": count},
+        )
+
     def _fetch_bars_frame(
-        self, market: str, code: str, start: date, end: date, *, method: str
+        self,
+        market: str,
+        code: str,
+        start: date,
+        end: date,
+        *,
+        method: str,
+        extra: dict[str, object] | None = None,
     ) -> FetchResult:
         # 与基本面那条 `_fetch_frame` 差一个词也是没办法：同为「0 行」，这里是「这段确实没交易」
         # 的成功取数，那里是「这张表没这只票」的待核确认（D43）——两套语义不能共用一个名字。
@@ -413,7 +448,7 @@ class AdapterRegistry:
         skipped: list[tuple[str, str]] = []
         empties: list[str] = []
         causes: list[Exception | None] = []
-        for out in self._walk(market, code, start, end, method=method):
+        for out in self._walk(market, code, start, end, method=method, extra=extra):
             if out.kind == "skipped":
                 skipped.append((out.source, out.error))
                 continue
@@ -840,6 +875,7 @@ class AdapterRegistry:
         end: date,
         *,
         method: str = "daily_bars",
+        extra: dict[str, object] | None = None,
     ) -> pl.DataFrame:
         adapter = self.adapter(name)
         invoke_bound = getattr(adapter, method)
@@ -851,7 +887,7 @@ class AdapterRegistry:
         def invoke() -> pl.DataFrame:
             nonlocal calls
             calls += 1
-            return invoke_bound(market, code, start, end)
+            return invoke_bound(market, code, start, end, **(extra or {}))
 
         try:
             # FieldDrift / EmptyResponse 不在 RETRYABLE 里：一次就定性，立刻换源

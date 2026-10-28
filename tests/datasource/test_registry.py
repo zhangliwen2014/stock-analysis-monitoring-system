@@ -719,3 +719,69 @@ def test_fetch_symbol_list_zero_rows_is_empty_everywhere():
     assert result.frame.columns == ["code", "name"]
     assert result.source == "akshare"
     assert [a.source for a in result.attempts] == ["akshare", "akshare_ths"]
+
+
+# --- 分钟粒度两条链：把「要哪一档、要几根」传过降级链（Task 2） --------------------
+
+
+class MinuteFake(FakeAdapter):
+    """分时 + 分钟 K 双能力替身：分钟 K 把收到的 `scale`/`count` 留在 `extra` 上。"""
+
+    def __init__(self, name, markets=("A",), *outcomes):
+        super().__init__(name, markets, *outcomes)
+        self.extra = None
+
+    def minute_series(self, market, code, start, end):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def minute_bars(self, market, code, start, end, *, scale, count):
+        self.calls += 1
+        self.extra = (scale, count)
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def test_minute_bars_carries_the_scale_and_count_to_the_adapter():
+    """`m15` 要真的变成 `scale=15`：适配器猜不到档，而猜错的档看起来完全正常。"""
+    fake = MinuteFake("tencent", ("A",), frame("tencent"))
+    result = registry(fake).fetch_minute_bars(
+        "A", "600519", D1, D2, scale=15, count=240
+    )
+    assert fake.extra == (15, 240)
+    assert result.source == "tencent"
+
+
+def test_minute_series_asks_the_chain_for_one_day():
+    """分时一次只答一天：`start == end == day`，链上不许把它当区间展开。"""
+    fake = MinuteFake("tencent", ("A",), frame("tencent"))
+    registry(fake).fetch_minute_series("A", "600519", D1)
+    assert fake.calls == 1
+
+
+def test_a_source_without_the_minute_method_is_skipped_with_the_right_words():
+    """只有日线的源进 `skipped`，那句话是 `lacking`——不许静默跳过（D38）。"""
+    daily = FakeAdapter("akshare", ("A",), frame("akshare"))
+    minute = MinuteFake("tencent", ("A",), frame("tencent"))
+    result = registry(daily, minute).fetch_minute_series("A", "600519", D1)
+    assert result.source == "tencent"
+    assert ("akshare", "不提供分时") in result.skipped
+
+
+def test_empty_minute_result_carries_the_daily_shaped_frame():
+    """每个源都答「没有」时 `frame` 是 `EMPTY_BARS`（**日线列集**）：读列名之前必须先看旗标。
+
+    这一条是钉陷阱的：分钟服务若照日线那条路读 `frame["price"]`，撞上的不是「今天休市」
+    而是 `ColumnNotFound`，而那次报错会被当成接口故障。
+    """
+    from sams.datasource.base import BAR_COLUMNS
+
+    empty = MinuteFake("tencent", ("A",), EmptyResponse("tencent", "没有那一天"))
+    result = registry(empty).fetch_minute_series("A", "600519", D1)
+    assert result.empty_everywhere is True
+    assert result.frame.columns == list(BAR_COLUMNS)
