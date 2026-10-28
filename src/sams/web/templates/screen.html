@@ -1,5 +1,52 @@
 {% extends "base.html" %}
-{% block title %}选股{% endblock %}
+{% block title %}选股<section class="card">
+  <h2>筛选方案</h2>
+  {% if rows and rows[0].field %}
+  <form method="post" action="/screen/presets" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="market" value="{{ market }}">
+    {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
+    <label>名字 <input name="name" maxlength="40"></label>
+    <button type="submit">保存当前条件</button>
+  </form>
+  {% else %}
+  <p class="muted">先在上面填一条条件，才能存成方案。</p>
+  {% endif %}
+  <table>
+    <tr><th>名字</th><th>市场</th><th>条件</th><th>更新</th><th>动作</th></tr>
+    {% for item in presets %}
+    <tr>
+      <td>{{ item.name }}</td>
+      <td>{{ item.market }}</td>
+      <td>{{ item.summary }}</td>
+      <td class="muted">{{ item.updated }}</td>
+      <td>
+        <form method="post" action="/screen/presets/{{ item.id }}/run" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">重跑</button>
+        </form>
+        <form method="post" action="/screen/presets/{{ item.id }}/rename" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input name="name" value="{{ item.name }}" size="10"><button type="submit">改名</button>
+        </form>
+        {% if rows and rows[0].field %}
+        <form method="post" action="/screen/presets/{{ item.id }}" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="market" value="{{ market }}">
+          {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
+          <button type="submit">覆盖为当前条件</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/screen/presets/{{ item.id }}/delete" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">还没有方案。</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endblock %}
 {% block content %}
 <h1>选股</h1>
 {% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}

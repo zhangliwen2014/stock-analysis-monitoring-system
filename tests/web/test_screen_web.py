@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime
 
 import polars as pl
 
+from sams.core.screener_fields import Condition
 from sams.datasource.spot import SPOT_SCHEMA
 from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
@@ -282,3 +283,113 @@ def test_add_all_confirmed_re_runs_the_conditions_on_the_server(logged_screen):
     assert context.watchlists.contains(alice, "A", "600519")
     assert context.watchlists.contains(alice, "A", "000001")
     assert not context.watchlists.contains(alice, "A", "300750")
+
+
+def _save(logged_screen, name="便宜", *, market="A", f="pr_now", o="<=", v="0.5"):
+    return logged_screen.client.post(
+        "/screen/presets",
+        data={"csrf": logged_screen.csrf, "market": market, "f": f, "o": o, "v": v, "name": name},
+        follow_redirects=False,
+    )
+
+
+def test_save_then_the_list_reads_back_as_a_sentence_not_json(logged_screen):
+    default_seed(logged_screen)
+    response = _save(logged_screen)
+    assert response.status_code == 303
+    page = logged_screen.client.get("/screen")
+    assert "便宜" in page.text
+    assert "现值市赚率 PR（小数比值（0.5 = 50%）） ≤ 0.5" in page.text
+
+
+def test_saving_no_conditions_is_refused(logged_screen):
+    response = logged_screen.client.post(
+        "/screen/presets",
+        data={"csrf": logged_screen.csrf, "market": "A", "f": "", "o": "<=", "v": "", "name": "空"},
+    )
+    assert response.status_code == 200 and "一条条件都没有" in response.text
+    assert logged_screen.context.screener_presets.list(_alice(logged_screen)) == []
+
+
+def test_a_duplicate_name_is_an_error_not_a_silent_overwrite(logged_screen):
+    default_seed(logged_screen)
+    _save(logged_screen)
+    response = _save(logged_screen)
+    assert response.status_code == 200
+    assert "已有同名方案" in response.text
+    assert len(logged_screen.context.screener_presets.list(_alice(logged_screen))) == 1
+
+
+def test_run_links_back_to_the_preset_and_conditions_show_up_in_the_form(logged_screen):
+    default_seed(logged_screen)
+    _save(logged_screen)
+    preset = logged_screen.context.screener_presets.list(_alice(logged_screen))[0]
+    response = logged_screen.client.post(
+        f"/screen/presets/{preset.id}/run",
+        data={"csrf": logged_screen.csrf},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303 and "preset=" in response.headers["location"]
+    page = logged_screen.client.get(response.headers["location"])
+    assert "通过 2 / 不通过 1 / 无数 1" in page.text
+
+
+def test_rename_overwrite_and_delete(logged_screen):
+    default_seed(logged_screen)
+    _save(logged_screen)
+    preset = logged_screen.context.screener_presets.list(_alice(logged_screen))[0]
+    assert (
+        logged_screen.client.post(
+            f"/screen/presets/{preset.id}/rename",
+            data={"csrf": logged_screen.csrf, "name": "很便宜"},
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
+    page = logged_screen.client.get("/screen")
+    section = page.text.split("筛选方案")[1]
+    # 新名字里也含「便宜」二字：按整格比对，才分得清旧行有没有留下
+    assert "<td>很便宜</td>" in section and "<td>便宜</td>" not in section
+
+    assert (
+        logged_screen.client.post(
+            f"/screen/presets/{preset.id}",
+            data={
+                "csrf": logged_screen.csrf,
+                "market": "A",
+                "f": "pr_now",
+                "o": "<=",
+                "v": "0.3",
+            },
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
+    page = logged_screen.client.get(f"/screen?preset={preset.id}")
+    assert 'value="0.3"' in page.text
+
+    assert (
+        logged_screen.client.post(
+            f"/screen/presets/{preset.id}/delete",
+            data={"csrf": logged_screen.csrf},
+            follow_redirects=False,
+        ).status_code
+        == 303
+    )
+    assert logged_screen.context.screener_presets.list(_alice(logged_screen)) == []
+
+
+def test_another_users_preset_is_a_404_without_saying_whose_it_is(logged_screen):
+    other = logged_screen.context.users.create("bob", "correct-horse-battery")
+    foreign = logged_screen.context.screener_presets.create(
+        other.id, "别人的", "A", [Condition("pr_now", "<=", 0.5)]
+    )
+    for path in (
+        f"/screen/presets/{foreign.id}/run",
+        f"/screen/presets/{foreign.id}/delete",
+    ):
+        response = logged_screen.client.post(
+            path, data={"csrf": logged_screen.csrf}, follow_redirects=False
+        )
+        assert response.status_code == 404
+    assert logged_screen.context.screener_presets.list(other.id) != []

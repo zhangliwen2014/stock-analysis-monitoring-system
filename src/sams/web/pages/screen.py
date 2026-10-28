@@ -13,7 +13,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
 from sams.core.errors import ValidationError
-from sams.core.screener_fields import FIELDS, OP_LABELS, OPS, Condition, fields_for
+from sams.core.screener_fields import (
+    FIELDS,
+    OP_LABELS,
+    OPS,
+    Condition,
+    describe_all,
+    fields_for,
+)
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import moment_label
@@ -154,6 +161,16 @@ def _render(
         "prev": _url(market, rows, preset=preset, page=page - 1) if page > 1 else "",
         "next": _url(market, rows, preset=preset, page=page + 1) if page < pages else "",
     }
+    presets_view = [
+        {
+            "id": item.id,
+            "name": item.name,
+            "market": item.market,
+            "summary": describe_all(item.conditions),
+            "updated": moment_label(item.updated_at, ctx.settings.server.display_tz),
+        }
+        for item in ctx.screener_presets.list(user.id)
+    ]
     add_url = _url(market, [*rows, _draft()])
     remove_urls = [_url(market, rows[:i] + rows[i + 1 :]) for i in range(len(rows))]
     if not rows:
@@ -186,6 +203,7 @@ def _render(
         page=page,
         plan=plan,
         confirm_all=confirm_all,
+        presets=presets_view,
     )
 
 
@@ -289,6 +307,16 @@ def _notice(query) -> str:
     kind = query.get("notice") or ""
     if kind == "queued":
         return "已把全市场快照排进下一拍：跑完刷新这一页"
+    if kind == "saved":
+        return "方案已保存"
+    if kind == "renamed":
+        return "方案已改名"
+    if kind == "updated":
+        return "方案的条件已覆盖为当前这一组"
+    if kind == "deleted":
+        return "方案已删除（已加进自选的票不受影响）"
+    if kind == "ran":
+        return "方案已按今天的快照重跑"
     if kind == "added":
         added = _count(query.get("added"))
         already = _count(query.get("already"))
@@ -397,3 +425,94 @@ def _count(text) -> int:
         return max(0, int(text or 0))
     except ValueError:
         return 0
+
+
+@router.post("/screen/presets")
+def save_preset(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _FORM_BODY,
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    market = one(data, "market").strip().upper()
+    rows = _posted_rows(data)
+    try:
+        ctx.screener_presets.create(user.id, one(data, "name"), market, list(_conditions(rows)))
+    except ValidationError as exc:
+        return _render(request, user, market=market, preset=None, rows=rows, error=str(exc))
+    return RedirectResponse(_url(market, rows, notice="saved"), status_code=303)
+
+
+@router.post("/screen/presets/{preset_id}/run")
+def run_preset(request: Request, preset_id: str, _csrf: None = Depends(csrf_protect)):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    preset = _preset(ctx, user.id, preset_id)
+    try:
+        ctx.screener.run(preset.market, list(preset.conditions))
+    except ValidationError as exc:
+        rows = [_draft_of(item) for item in preset.conditions]
+        return _render(
+            request, user, market=preset.market, preset=preset, rows=rows, error=str(exc)
+        )
+    return RedirectResponse(_url(preset.market, [], preset=preset, notice="ran"), status_code=303)
+
+
+@router.post("/screen/presets/{preset_id}/rename")
+def rename_preset(
+    request: Request,
+    preset_id: str,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _FORM_BODY,
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    preset = _preset(ctx, user.id, preset_id)
+    rows = [_draft_of(item) for item in preset.conditions]
+    try:
+        ctx.screener_presets.rename(user.id, preset.id, one(data, "name"))
+    except ValidationError as exc:
+        return _render(
+            request, user, market=preset.market, preset=preset, rows=rows, error=str(exc)
+        )
+    return RedirectResponse(
+        _url(preset.market, [], preset=preset, notice="renamed"), status_code=303
+    )
+
+
+@router.post("/screen/presets/{preset_id}")
+def overwrite_preset(
+    request: Request,
+    preset_id: str,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _FORM_BODY,
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    preset = _preset(ctx, user.id, preset_id)
+    market = one(data, "market").strip().upper()
+    rows = _posted_rows(data)
+    if market != preset.market:
+        return _render(
+            request,
+            user,
+            market=market,
+            preset=preset,
+            rows=rows,
+            error=f"方案的市场不能改（现在是 {preset.market}）：要换市场请另存一条",
+        )
+    try:
+        ctx.screener_presets.update_conditions(user.id, preset.id, list(_conditions(rows)))
+    except ValidationError as exc:
+        return _render(request, user, market=market, preset=preset, rows=rows, error=str(exc))
+    return RedirectResponse(_url(market, rows, preset=preset, notice="updated"), status_code=303)
+
+
+@router.post("/screen/presets/{preset_id}/delete")
+def delete_preset(request: Request, preset_id: str, _csrf: None = Depends(csrf_protect)):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    preset = _preset(ctx, user.id, preset_id)
+    ctx.screener_presets.delete(user.id, preset.id)
+    return RedirectResponse(_url(preset.market, [], notice="deleted"), status_code=303)
