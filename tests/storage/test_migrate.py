@@ -50,6 +50,8 @@ EXPECTED_TABLES = {
     "task_runs",
     "schema_migrations",
     "source_health",
+    "snapshot_daily",
+    "screener_presets",
 }
 
 
