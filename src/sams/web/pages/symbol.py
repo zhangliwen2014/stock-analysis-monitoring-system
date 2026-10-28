@@ -373,6 +373,30 @@ def bars_api(
     )
 
 
+@router.get("/api/symbol/{market}/{code}/minute")
+def minute_api(request: Request, market: str, code: str):
+    """分时：一次只答一天，参数一个都不接（spec §5.2）。
+
+    拒绝也答 200 + `note`：那一格画不出来时屏幕上要说「这条链不供美股的分时」，
+    而不是「这只票没数据」——后者会让人去重跑一条本来好好的采集（§6 钉 8）。
+    这与 `bars` 那条 `NotAdjustable` 是同一个姿势。
+    """
+    user = require_user(request)
+    ctx, market, code, _symbol = _require_symbol(request, user, market, code)
+    share = ctx.minute.timeshare(market, code)
+    return JSONResponse(
+        {
+            "date": str(share.day) if share.day else None,
+            "times": list(share.times),
+            "price": list(share.price),
+            "avg": list(share.avg),
+            "volume": list(share.volume),
+            "prev_close": share.prev_close,
+            "note": share.note,
+        }
+    )
+
+
 #: 图注里那句「最后一根__只走到」要说屏幕上那几个字：档名只有 `CHART_PERIODS` 这一份表
 _PERIOD_LABEL = dict(CHART_PERIODS)
 
