@@ -97,6 +97,7 @@ from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.quotes import QuoteHealthRepo, QuoteRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.scan_results import ScanResultRepo
+from sams.storage.repos.screener_presets import ScreenerPresetRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.source_health import SourceHealthRepo
@@ -201,6 +202,8 @@ class ServiceContext:
     scan_store: ScanResultRepo
     #: 全市场快照（D175）：盘后 `spot` job 整日覆盖写，选股屏读最近一天
     snapshot_store: SnapshotRepo
+    #: 筛选方案（D182）：条件与名字都在这一张表，页面六个动作只经它
+    screener_presets: ScreenerPresetRepo
     #: 快照同步用例（D174）：票池、取数、定日、点名缺答都在它那一头
     snapshots: MarketSnapshotService
     watchlists: WatchlistRepo
@@ -460,6 +463,7 @@ def _context_on(
     flow_store = FundingFlowRepo(database)
     scan_store = ScanResultRepo(database)
     snapshot_store = SnapshotRepo(database)
+    screener_presets = ScreenerPresetRepo(database, clock=clock)
     theses_store = ThesisRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
@@ -718,6 +722,7 @@ def _context_on(
         flow_store=flow_store,
         scan_store=scan_store,
         snapshot_store=snapshot_store,
+        screener_presets=screener_presets,
         snapshots=market_snapshot_sync,
         theses_store=theses_store,
         watchlists=watchlists,
