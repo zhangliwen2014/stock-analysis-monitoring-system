@@ -2,16 +2,39 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
+import polars as pl
 import pytest
-from support import StubAdapter, StubMinuteAdapter, sample_bars
+from support import StubAdapter, StubMinuteAdapter, sample_bars, sample_minute_series
 
-from sams.core.errors import EmptyResponse
+from sams.core.errors import CalendarSourceError, EmptyResponse
+from sams.core.timeutil import Session, parse_hm
 from sams.datasource.registry import AdapterRegistry
 from sams.services.minute import MINUTE_SCALES, MinuteService
 
 DAY = date(2026, 10, 28)
+TZ = ZoneInfo("Asia/Shanghai")
+
+
+class StubCalendar:
+    """只答「这一天几点收市」：尾巴裁剪的唯一外部依赖。"""
+
+    def __init__(self, close_hm: str = "15:00", *, raise_missing: bool = False) -> None:
+        self.close_hm = close_hm
+        self.raise_missing = raise_missing
+
+    def sessions(self, market, day):
+        if self.raise_missing:
+            raise CalendarSourceError("日历没配")
+        return [
+            Session(
+                "午后",
+                datetime.combine(day, time(9, 30), tzinfo=TZ),
+                datetime.combine(day, parse_hm(self.close_hm), tzinfo=TZ),
+            )
+        ]
 
 
 def registry(*adapters, markets=("A",)) -> AdapterRegistry:
@@ -110,3 +133,98 @@ def test_the_frame_is_cached_so_a_second_indicator_pick_does_not_refetch():
     # 列名不带窗口数字，按仓库现实改成 `macd_hist`
     assert "macd_hist" in second.table.columns
     assert "macd_hist" not in first.table.columns
+
+
+def test_timeshare_diffs_the_cumulative_volume_into_per_minute():
+    """第三条 400000 股是累计：每分钟量是 153700 / 164900 / 81400。"""
+    share = MinuteService(
+        registry(StubMinuteAdapter("tencent", ["A"])), StubCalendar()
+    ).timeshare("A", "600519")
+    assert share.times == ("09:30", "09:31", "09:32")
+    assert share.volume == (153700.0, 164900.0, 81400.0)
+    assert share.price == (1354.98, 1353.00, 1352.10)
+    assert share.prev_close == pytest.approx(1355.9)
+    assert share.day == DAY
+
+
+def test_timeshare_avg_is_cumulative_amount_over_cumulative_shares():
+    """spec §6 钉 7：均价 = 累计额 ÷ 累计股数。那「×100」已在适配器折过，这里不许再乘。"""
+    share = MinuteService(
+        registry(StubMinuteAdapter("tencent", ["A"])), StubCalendar()
+    ).timeshare("A", "600519")
+    assert share.avg[0] == pytest.approx(208260426.0 / 153700.0)
+    assert share.avg[2] == pytest.approx(540000000.0 / 400000.0)
+
+
+def test_timeshare_avg_is_null_when_no_volume_has_traded_yet():
+    """第一行累计量为 0（集合竞价还没成交）：除不出数就交 null，而不是一个 0.00 的价。"""
+    frame = pl.DataFrame(
+        {
+            "market": ["A", "A"],
+            "code": ["600519", "600519"],
+            "date": [DAY, DAY],
+            "time": ["09:30", "09:31"],
+            "price": [1354.98, 1353.00],
+            "volume": [0.0, 100.0],
+            "amount": [0.0, 135300.0],
+            "prev_close": [1355.90, 1355.90],
+            "source": ["tencent", "tencent"],
+        }
+    )
+    reader = MinuteService(
+        registry(StubMinuteAdapter("tencent", ["A"], series=frame)), StubCalendar()
+    )
+    assert reader.timeshare("A", "600519").avg == (None, 1353.0)
+
+
+def test_timeshare_trims_rows_after_the_calendar_close():
+    """港股尾巴实测报到 16:08：按日历给的 16:00 收市裁掉，否则时间轴多出 8 根假分钟。"""
+    tail = pl.DataFrame(
+        {
+            "market": ["HK"] * 3,
+            "code": ["00700"] * 3,
+            "date": [DAY] * 3,
+            "time": ["15:59", "16:00", "16:08"],
+            "price": [384.0, 384.2, 384.2],
+            "volume": [400000.0, 450000.0, 460000.0],
+            "amount": [5.4e8, 5.6e8, 5.65e8],
+            "prev_close": [385.2] * 3,
+            "source": ["tencent"] * 3,
+        }
+    )
+    frame = sample_minute_series(market="HK", code="00700").vstack(tail)
+    reader = MinuteService(
+        registry(StubMinuteAdapter("tencent", ["A", "HK"], series=frame), markets=("A", "HK")),
+        StubCalendar("16:00"),
+    )
+    assert reader.timeshare("HK", "00700").times == (
+        "09:30",
+        "09:31",
+        "09:32",
+        "15:59",
+        "16:00",
+    )
+
+
+def test_timeshare_keeps_everything_when_the_calendar_cannot_answer():
+    """日历答不上来就不裁：悄悄删数据比留几根晚到的分钟坏得多。"""
+    reader = MinuteService(
+        registry(StubMinuteAdapter("tencent", ["A"])), StubCalendar(raise_missing=True)
+    )
+    assert reader.timeshare("A", "600519").times == ("09:30", "09:31", "09:32")
+
+
+def test_timeshare_refuses_a_market_the_chain_does_not_answer():
+    """美股：链上没人答分时——note 说清是谁不答，而不是画一张空图（D165）。"""
+    reader = MinuteService(
+        registry(
+            StubMinuteAdapter(
+                "tencent", ["A", "HK", "US"], series_markets=frozenset({"A", "HK"})
+            ),
+            markets=("A", "US"),
+        ),
+        StubCalendar(),
+    )
+    share = reader.timeshare("US", "AAPL")
+    assert share.note and "分时" in share.note
+    assert share.times == ()

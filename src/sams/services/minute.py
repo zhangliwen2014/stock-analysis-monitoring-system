@@ -17,13 +17,14 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
+from itertools import pairwise
 
 import polars as pl
 
 from sams.analysis.adjust import PRICE_COLUMNS, AdjustedSeries
 from sams.analysis.indicators import metrics
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.errors import DatasourceError, ValidationError
+from sams.core.errors import CalendarSourceError, DatasourceError, ValidationError
 from sams.datasource.capabilities import capability
 from sams.datasource.minute import answers
 
@@ -96,6 +97,33 @@ class MinuteBarsRead:
         return cls(period=period, series=None, table=None, source="", note=note)
 
 
+@dataclass(frozen=True)
+class Timeshare:
+    """一天分时：`times` 与三条序列同长同序，`volume` 已经是每分钟的量。"""
+
+    day: date | None
+    times: tuple[str, ...]
+    price: tuple[float, ...]
+    avg: tuple[float | None, ...]
+    volume: tuple[float, ...]
+    prev_close: float | None
+    source: str
+    note: str | None = None
+
+    @classmethod
+    def refusal(cls, note: str) -> Timeshare:
+        return cls(
+            day=None,
+            times=(),
+            price=(),
+            avg=(),
+            volume=(),
+            prev_close=None,
+            source="",
+            note=note,
+        )
+
+
 class MinuteService:
     def __init__(
         self,
@@ -138,6 +166,62 @@ class MinuteService:
             else:
                 refused.append((name, f"{cap.label}不答 {market}"))
         return KindAnswer(cap.label, bool(willing), tuple(refused))
+
+    def timeshare(self, market: str, code: str) -> Timeshare:
+        """一次只答一天：接口本身也只有「最近一个交易日」那一条路（Task 3 的区间校验）。"""
+        answer = self._answer(market, "minute_series")
+        if not answer.ok:
+            return Timeshare.refusal(answer.why_not)
+        today = self._clock.today()
+        try:
+            result = self._registry.fetch_minute_series(market, code, today)
+        except DatasourceError as exc:
+            return Timeshare.refusal(f"{today} 的分时取不出来：{exc}")
+        if result.empty_everywhere:
+            return Timeshare.refusal(f"{today} 没有分时：这条链上每个源都答了「没有那一天」")
+        frame = self._trim_to_session(result.frame, market, today)
+        times = list(frame["time"].to_list())
+        if not times:
+            return Timeshare.refusal(f"{today} 的分时一行有效数据都没有（可能还没开盘）")
+        cum_volume = frame["volume"].to_list()
+        cum_amount = frame["amount"].to_list()
+        # 每分钟量 = 累计的一阶差分：第一项没有前态可减，就是它自己（源给的是累计，D171）
+        volume = [cum_volume[0], *(later - earlier for earlier, later in pairwise(cum_volume))]
+        # 均价：分子分母都是累计值，直接相除；累计量为 0 的那一分钟除不出数，交 null
+        avg = [
+            (amount / cumulative) if cumulative else None
+            for amount, cumulative in zip(cum_amount, cum_volume, strict=True)
+        ]
+        return Timeshare(
+            day=frame["date"].to_list()[0],
+            times=tuple(times),
+            price=tuple(frame["price"].to_list()),
+            avg=tuple(avg),
+            volume=tuple(volume),
+            prev_close=frame["prev_close"].to_list()[0],
+            source=str(frame["source"][0]),
+        )
+
+    def _trim_to_session(self, frame: pl.DataFrame, market: str, day: date) -> pl.DataFrame:
+        """裁掉收市之后的行：港股实测会报到 16:08，A 股全天 267 行里含 `15:00` 之后那一段。
+
+        裁的依据是日历给的当日**最晚**收市时刻（午休与市场自己的收盘不是一个东西），
+        而日历答不上来时原样交回——悄悄删数据比留着几根晚到的分钟坏得多。
+        """
+        if self._calendar is None:
+            return frame
+        try:
+            sessions = self._calendar.sessions(market, day)
+        except CalendarSourceError:
+            return frame
+        closes = [session.close for session in sessions if session.close]
+        if not closes:
+            return frame
+        cutoff = max(closes)
+        # 收市时刻是市场本地时的绝对时刻，`time` 是零填充的 "HH:MM"：比到同一面墙上就是比时刻
+        cut = cutoff.strftime("%H:%M")
+        trimmed = frame.filter(pl.col("time") <= cut)
+        return trimmed if not trimmed.is_empty() else frame
 
     def bars(
         self,
