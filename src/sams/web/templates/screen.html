@@ -56,7 +56,8 @@
 <section class="card">
   <h2>{{ market }} 股 · 快照</h2>
   {% if snapshot %}
-  <p>快照 {{ snapshot.rows }} 行 · 采集 {{ snapshot.taken_label }}</p>
+  {# 范围行：快照日与票池（快照 ∩ 代码表）先说清，后面三个数相加才有个底 #}
+  <p>快照 {{ snapshot.day_label }} · 票池 {{ snapshot.pool }} 只 · 采集 {{ snapshot.taken_label }}</p>
   {% else %}
   <p class="muted">{{ market }} 股还没有全市场快照：点「立即重采」排队，或先跑
     <code>sams sync spot --market {{ market }}</code></p>

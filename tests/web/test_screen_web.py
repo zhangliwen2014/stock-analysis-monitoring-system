@@ -70,7 +70,7 @@ def test_the_range_line_speaks_before_any_condition_is_chosen(logged_screen):
     default_seed(logged_screen)
     response = logged_screen.client.get("/screen", params={"market": "A"})
     assert response.status_code == 200
-    assert "快照 4 行" in response.text
+    assert "快照 2026-10-28 · 票池 4 只" in response.text
     assert "加一条条件" in response.text
 
 

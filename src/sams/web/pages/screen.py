@@ -103,13 +103,23 @@ def _render(
         day = ctx.snapshot_store.latest_day(market)
         if day is not None:
             frame = ctx.snapshot_store.load_day(market, day)
+            pool = (
+                result.universe_size
+                if result is not None
+                else len(
+                    set(frame["code"].to_list())
+                    & set(ctx.symbol_list_store.active_codes(market))
+                )
+            )
             snapshot = {
                 "day": day,
+                "day_label": f"{day:%Y-%m-%d}",
                 "taken_label": moment_label(
                     frame["taken_at"].max() if not frame.is_empty() else None,
                     ctx.settings.server.display_tz,
                 ),
                 "rows": frame.height,
+                "pool": pool,
             }
             stale = (ctx.clock.today() - day).days > STALE_DAYS
 
