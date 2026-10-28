@@ -1,23 +1,33 @@
 {% extends "base.html" %}
 {% block title %}持仓{% endblock %}
 {% block content %}
-<h1>模拟账户</h1>
+<h1>持仓</h1>
+{% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}
 {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
 
-{% if accounts %}
 {% for account in accounts %}
 <section class="card">
   <h2>{{ account.name }}
-    <span class="muted">合计 {{ money(account.total, account.currency) }} · 截至 {{ account.as_of }}</span>
+    <span class="muted">总资产 {{ money(account.total, account.currency) }} · 截至 {{ account.as_of }}</span>
   </h2>
+  {# 现金与持仓市值分开列：只给「总资产」的话，读的人拆不出还能买多少、手里的票值多少 #}
   <table>
-    <tr><th class="num">价格盈亏</th><th class="num">换汇盈亏</th><th class="num">已实现</th></tr>
     <tr>
+      <th>现金（可用）</th><th>持仓市值</th><th class="num">总资产</th>
+      <th class="num">价格盈亏</th><th class="num">换汇盈亏</th><th class="num">已实现</th>
+    </tr>
+    <tr>
+      <td>{% for item in account.cash %}{{ money(item.amount, item.currency) }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</td>
+      <td>{% for item in account.value %}{{ money(item.amount, item.currency) }}{% if not loop.last %}<br>{% endif %}{% else %}—{% endfor %}</td>
+      <td class="num">{{ money(account.total, account.currency) }}</td>
       <td class="num">{{ money(account.price_pnl, account.currency) }}</td>
       <td class="num">{{ money(account.fx_pnl, account.currency) }}</td>
       <td class="num">{{ money(account.realized, account.currency) }}</td>
     </tr>
   </table>
+  {% if account.duplicates %}
+  <ul class="muted">{% for note in account.duplicates %}<li>{{ note }}</li>{% endfor %}</ul>
+  {% endif %}
   {% if account.notes %}
   <ul class="muted">{% for note in account.notes %}<li>{{ note }}</li>{% endfor %}</ul>
   {% endif %}
@@ -25,7 +35,7 @@
     <tr>
       <th>市场</th><th>代码</th><th class="num">数量（股）</th><th class="num">成本</th>
       <th class="num">现价</th><th class="num">价格盈亏</th>
-      {# 这一列是「市值−成本」，与顶上那个合计（现金+持仓市值）不在一个空间，别按列相加 #}
+      {# 这一列是「市值−成本」，与顶上那个总资产（现金+持仓市值）不在一个空间，别按列相加 #}
       <th class="num">盈亏小计（{{ account.currency }}）</th><th>备注</th>
     </tr>
     {% for row in account.positions %}
@@ -34,56 +44,105 @@
       <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
       <td class="num">{{ row.qty }}</td>
       <td class="num">{{ money(row.avg_cost, row.currency) }}</td>
-      <td class="num">{{ money(row.last_price, row.currency) }}</td>
+      <td class="num">{{ money(row.last_price, row.currency) }}
+        {% if row.price_day %}<span class="muted quote-day">{{ row.price_day }}</span>{% endif %}</td>
       <td class="num">{{ money(row.price_pnl, row.currency) }}</td>
-      {# 不可换算那一行不给 0.00：它没进上面那个合计，显示成零会让读数的人以为两只币种的数混在了一列 #}
+      {# 不可换算那一行不给 0.00：它没进上面那个总资产，显示成零会让读数的人以为两只币种的数混在了一列 #}
       <td class="num">{{ money(row.pnl_report, account.currency) if row.convertible else "不计入" }}</td>
       <td class="muted">{{ row.note or "" }}</td>
     </tr>
+    {% else %}
+    <tr><td colspan="8" class="muted">暂无持仓。</td></tr>
     {% endfor %}
   </table>
 </section>
-{% endfor %}
 {% else %}
 <section class="card">
-  <p class="muted">还没有账户：先开一个
-    <code>sams ledger account add --user {{ user.username }} --name 主账户</code>，
-    再按你打算买入的币种注资
-    <code>sams ledger cash --user {{ user.username }} --account 开户给出的那个 id --currency CNY --amount 100000 --reason 起始资金</code>。
-    账户里没有那种币的现金就买不了（§5.4 规则 4），所以下面那张录入表现在还记不了账。</p>
+  <p class="muted">还没有账户：在下面「开一个账户」里填个名字，起始资金可以直接注进去。</p>
+</section>
+{% endfor %}
+
+{% if accounts %}
+<section class="card">
+  <h2>现金</h2>
+  <form method="post" action="/ledger/cash" class="panel">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>账户
+      <select name="account_id">
+        {% for account in accounts %}
+        <option value="{{ account.id }}"{% if account.id == cash.account_id %} selected{% endif %}>{{ account.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>动作
+      <select name="side">
+        <option value="deposit"{% if cash.side == "deposit" %} selected{% endif %}>入金</option>
+        <option value="withdraw"{% if cash.side == "withdraw" %} selected{% endif %}>取出</option>
+      </select>
+    </label>
+    <label>币种
+      <select name="currency">
+        {% for item in currencies %}
+        <option value="{{ item }}"{% if item == cash.currency %} selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>金额 <input name="amount" type="number" step="any" value="{{ cash.amount }}"></label>
+    <label>理由 <input name="reason" value="{{ cash.reason }}" placeholder="可空，默认写「入金」或「取出」"></label>
+    <button type="submit">调整现金</button>
+  </form>
+  <p class="muted">每一笔动现金都留流水与理由：余额能回溯到每一条入金、出金与成交。</p>
 </section>
 {% endif %}
 
+<section class="card">
+  <h2>开一个账户</h2>
+  <form method="post" action="/portfolio/accounts" class="panel">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>账户名 <input name="name" value="{{ account_form.name }}" maxlength="40"></label>
+    <label>起始资金 <input name="cash" type="number" step="any" value="{{ account_form.cash }}" placeholder="可空"></label>
+    <button type="submit">开户</button>
+  </form>
+  <p class="muted">起始资金记在报告币种里；要别的币种，开户后到上面「现金」里入金。</p>
+</section>
+
+{% if accounts %}
 <section class="card">
   <h2>录入成交</h2>
   <form method="post" action="/ledger/fill" class="panel">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>账户
       <select name="account_id">
-        {% for account in accounts %}<option value="{{ account.id }}">{{ account.name }}</option>{% endfor %}
+        {% for account in accounts %}<option value="{{ account.id }}"{% if account.id == fill.account_id %} selected{% endif %}>{{ account.name }}</option>{% endfor %}
       </select>
     </label>
     <label>方向
-      <select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select>
+      <select name="side">
+        <option value="buy"{% if fill.side == "buy" %} selected{% endif %}>买入</option>
+        <option value="sell"{% if fill.side == "sell" %} selected{% endif %}>卖出</option>
+      </select>
     </label>
     <label>市场
       <select name="market">
         {% for option in markets %}
-        <option value="{{ option }}"{% if loop.first %} selected{% endif %}>{{ option }}</option>
+        <option value="{{ option }}"{% if option == fill.market %} selected{% endif %}>{{ option }}</option>
         {% endfor %}
       </select>
     </label>
-    <label>代码 <input name="code"></label>
-    <label>数量 <input name="qty" type="number" step="any"></label>
-    <label>价格 <input name="price" type="number" step="any"></label>
-    <label>费用 <input name="fee" type="number" step="any" value="0"></label>
+    <label>成交日 <input name="on" type="date" value="{{ fill.on }}"></label>
+    <label>代码 <input name="code" value="{{ fill.code }}"></label>
+    <label>数量 <input name="qty" type="number" step="any" value="{{ fill.qty }}"></label>
+    <label>价格 <input name="price" type="number" step="any" value="{{ fill.price }}"></label>
+    <label>费用 <input name="fee" type="number" step="any" value="{{ fill.fee }}"></label>
     <label>关联论点（可空）
       <select name="thesis_id">
         <option value=""></option>
-        {% for thesis in theses %}<option value="{{ thesis.id }}">{{ thesis.id }} · {{ thesis.status }}</option>{% endfor %}
+        {% for thesis in theses %}<option value="{{ thesis.id }}"{% if thesis.id == fill.thesis_id %} selected{% endif %}>{{ thesis.market }} {{ thesis.code }} · {{ thesis.status }}</option>{% endfor %}
       </select>
     </label>
-    <button type="submit">记账</button>
+    <button type="submit">记一笔成交</button>
   </form>
+  <p class="muted">按你填的成交原样记账，不校验整手、T+1 与涨跌停；成交日按该市场本地 15:00 记。</p>
 </section>
+{% endif %}
 {% endblock %}

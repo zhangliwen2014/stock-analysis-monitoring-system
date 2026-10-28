@@ -114,6 +114,20 @@ def test_overview_shows_watchlist_quotes(logged):
     assert "600519" in page.text
 
 
+def test_the_account_column_says_assets_not_market_value(logged):
+    """看板那格是「现金 + 持仓市值」，不是持仓市值；旁边那格只是浮动盈亏。"""
+    ctx = logged.context
+    user = ctx.users.get_by_username("alice")
+    account = ctx.ledger.open_account("alice", "测试户")
+    ctx.ledger.deposit(
+        account.id, "CNY", 100_000.0,
+        username="alice", reason="起始资金", actor_id=user.id,
+    )
+    table = logged.client.get("/").text
+    assert "总资产" in table and "浮动盈亏" in table
+    assert "总市值" not in table and "<th class=\"num\">总盈亏" not in table
+
+
 def test_quotes_partial_is_an_htmx_fragment(logged):
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "A", "600519")
