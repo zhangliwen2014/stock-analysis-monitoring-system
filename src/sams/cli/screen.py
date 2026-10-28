@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import asdict
 from math import isfinite
 
 from sams.bootstrap import Container
-from sams.cli.common import group, iso_date
-from sams.core.errors import ValidationError
+from sams.cli.common import exit_for, group, iso_date, stamp
+from sams.core.errors import SamsError, ValidationError
 from sams.core.fundamentals import (
     PR_SCALE_DECIMALS,
     ROE_BASIS,
@@ -31,6 +32,7 @@ from sams.core.fundamentals import (
     is_year_end,
     roe_basis_note,
 )
+from sams.core.screener_fields import Condition, fields_for
 from sams.services.screen import PrHit
 
 PR_USAGE = "例如 0.4（PR 是小数口径的比值，不是百分数：`PR ≤ 0.4` 写 0.4）"
@@ -69,6 +71,24 @@ def add_to(subparsers) -> None:
     )
     pr.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
     pr.set_defaults(handler=run_pr)
+    spot = screen.add_parser(
+        "spot",
+        help="全市场选股：在一天的全市场快照上跑一组 AND 条件，无数出局的票逐个点名",
+    )
+    spot.add_argument("--market", required=True, help="A")
+    spot.add_argument(
+        "--where",
+        required=True,
+        action="append",
+        help=(
+            "一条条件，可多次传入（AND）：`pr_now<=0.5`、`turnover_rate>=1`、"
+            "`pb=0.5..3`（写成 between）"
+        ),
+    )
+    spot.add_argument("--day", help="YYYY-MM-DD，默认最近一天的快照")
+    spot.add_argument("--limit", type=int, help="命中最多列这么多行（总数照报）")
+    spot.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
+    spot.set_defaults(handler=run_spot_screen)
 
 
 def run_pr(container: Container, args: argparse.Namespace) -> int:
@@ -94,6 +114,113 @@ def run_pr(container: Container, args: argparse.Namespace) -> int:
         _emit(_payload(scan, code))
         return code
     return _print(scan, code)
+
+
+_WHERE = re.compile(r"^\s*([a-z_]+)\s*(>=|<=|==|>|<|=)\s*(.+?)\s*$")
+
+
+def parse_where(text: str) -> Condition:
+    """`field OP value`；`=` 配 `低..高` 就是 between。
+
+    不吃自由表达式：比较符之外的东西一律拒绝，好让「写错一个字符」在这里就有名字，
+    而不是在结果里变成一条永远为假的筛选。
+    """
+    match = _WHERE.match(text or "")
+    if match is None:
+        raise ValidationError(
+            f"--where {text!r} 读不出来：写法是 `字段 比较符 值`，例如 `pr_now<=0.5`"
+        )
+    name, op, raw = match.groups()
+    op = "=" if op == "==" else op
+    if op == "=" and ".." in raw:
+        low, high = raw.split("..", 1)
+        return Condition(name, "between", (_where_number(low, text), _where_number(high, text)))
+    return Condition(name, op, _where_number(raw, text))
+
+
+def _where_number(text: str, whole: str) -> float:
+    try:
+        return float(text)
+    except ValueError:
+        raise ValidationError(f"--where {whole!r} 里的 {text!r} 不是一个数") from None
+
+
+def run_spot_screen(container: Container, args: argparse.Namespace) -> int:
+    try:
+        conditions = [parse_where(text) for text in args.where]
+        # `head(-1)` 在 polars 里是「除最后一只外全要」，看起来跑成功了却少了一只
+        if args.limit is not None and args.limit <= 0:
+            raise ValidationError(
+                f"--limit {args.limit} 要一个正整数：0 或负数会变成「少列最后几只」，"
+                "不是一条看得懂的截断"
+            )
+        result = container.screener.run(
+            args.market,
+            conditions,
+            day=iso_date(args.day) if args.day else None,
+            limit=args.limit,
+        )
+    except SamsError as exc:
+        # 只兜 ValidationError 会让库打不开一类错误冒到顶层：`--json` 的下游拿到空 stdin
+        code = exit_for(exc)
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "exit": code})
+        else:
+            print(f"参数有误：{exc}" if code == 2 else str(exc))
+        return code
+    code = 1 if result.universe_size == 0 else 0
+    if args.json:
+        _emit(_spot_payload(result, code))
+        return code
+    return _print_spot(result, code)
+
+
+def _print_spot(result, code: int) -> int:
+    if result.day is None or not result.universe_size:
+        print(
+            f"{result.market} 股  全市场选股  票池 0 只"
+            f"（代码表 {result.market_size} 只）"
+        )
+        print(f"⇒ {result.note}")
+        return code
+    print(
+        f"{result.market} 股  全市场选股  快照 {result.day}  采集 {stamp(result.taken_at)}"
+    )
+    print(
+        f"票池 {result.universe_size} 只（代码表 {result.market_size} 只；"
+        f"快照里不在代码表 {result.snapshot_only} 只；代码表里快照缺 {result.list_only} 只）"
+    )
+    specs = {item.name: item for item in fields_for(result.market)}
+    for counts in result.fields:
+        spec = specs[counts.field]
+        print(
+            f"条件 {counts.field} {counts.op} {_spot_value(counts.value)}"
+            f"（{spec.label}，{spec.unit}）：通过 {counts.passed} / "
+            f"不通过 {counts.failed} / 无数 {counts.missing}"
+        )
+    print(f"命中 {result.total_hits} 只（按 {result.fields[0].field} 升序）：")
+    for hit in result.hits:
+        values = "  ".join(
+            f"{specs[name].label} {_cell(hit.values.get(name))}" for name in hit.values
+        )
+        print(f"  {hit.code}  {hit.name or '–'}  {values}")
+    if result.truncated:
+        print(f"  …还有 {result.truncated} 只未列（--limit 截的；总数照报）")
+    for missing_group in result.missing:
+        print(
+            f"无数 {len(missing_group.codes)} 只  {missing_group.field}："
+            f"{missing_group.reason}"
+        )
+        shown = missing_group.codes[:20]
+        print(
+            f"  {'、'.join(shown)}"
+            + ("…（--json 拿全表）" if len(missing_group.codes) > 20 else "")
+        )
+    print(
+        "口径：比率列一律小数（0.20 = 20%）；PR 现值 = PE(动)² ÷ (100×PB)，"
+        "亏损 / 净资产为负 / 推出来的 ROE 过界都记「无数」，不算落选"
+    )
+    return code
 
 
 def _threshold(value: str) -> float:
@@ -295,6 +422,57 @@ def _hit_json(hit: PrHit) -> dict:
     row["period"] = str(hit.period) if hit.period else None
     row["valuation_on"] = str(hit.valuation_on) if hit.valuation_on else None
     return row
+
+
+def _spot_value(value) -> str:
+    if isinstance(value, tuple):
+        low, high = value
+        return f"{low:g}..{high:g}"
+    return f"{value:g}"
+
+
+def _cell(value) -> str:
+    return "–" if value is None else f"{value:.4g}"
+
+
+def _spot_payload(result, code: int) -> dict:
+    return {
+        "status": "empty" if not result.universe_size else "ok",
+        "exit": code,
+        "market": result.market,
+        "day": str(result.day) if result.day else None,
+        "taken_at": result.taken_at.isoformat() if result.taken_at else None,
+        "universe_size": result.universe_size,
+        "market_size": result.market_size,
+        "snapshot_only": result.snapshot_only,
+        "list_only": result.list_only,
+        "fields": [
+            {
+                "field": item.field,
+                "op": item.op,
+                "value": list(item.value) if isinstance(item.value, tuple) else item.value,
+                "passed": item.passed,
+                "failed": item.failed,
+                "missing": item.missing,
+            }
+            for item in result.fields
+        ],
+        "hits": [
+            {"code": hit.code, "name": hit.name, "values": hit.values}
+            for hit in result.hits
+        ],
+        "total_hits": result.total_hits,
+        "truncated": result.truncated,
+        "missing": [
+            {
+                "field": missing_group.field,
+                "reason": missing_group.reason,
+                "codes": list(missing_group.codes),
+            }
+            for missing_group in result.missing
+        ],
+        "note": result.note,
+    }
 
 
 def _emit(payload: dict) -> None:
