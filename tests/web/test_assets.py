@@ -44,3 +44,12 @@ def test_app_js_dispatches_on_the_chart_kind_the_template_writes():
     assert "dataset.chartKind" in text
     assert "function timeChart" in text
     assert "function klineChart" in text
+
+
+def test_timeshare_volume_bars_are_capped_instead_of_re_gapping_the_axis():
+    """量轴的 `boundaryGap` 必须留在 false：换成 true 也能治住那根几百像素的柱子，
+    但柱子会挪开它自己那一分钟，而分时线是要贴住左右两边的。
+    """
+    text = (WEB / "static" / "app.js").read_text()
+    assert "boundaryGap: false" in text
+    assert "barMaxWidth" in text

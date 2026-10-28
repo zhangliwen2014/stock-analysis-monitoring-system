@@ -73,6 +73,16 @@
     return String(value);
   }
 
+  function priceTick(value) {
+    // 上下沿是 anchor±span 的浮点结果：收的只是显示，min/max 不动——动了就不再是同一个半径
+    return echarts.format.addCommas(value.toFixed(2));
+  }
+
+  function percentTick(value) {
+    // 上下沿换成百分比后同样是浮点数：不收到两位小数，屏幕右上角就是一长串
+    return value.toFixed(2) + "%";
+  }
+
   function caption(payload) {
     var bits = [];
     if (payload.pending && payload.pending.length) {
@@ -196,10 +206,10 @@
     ];
     var yAxes = [
       { gridIndex: 0, type: "value", min: anchor - span, max: anchor + span,
-        axisLabel: { show: true, hideOverlap: true }, splitLine: { show: true } },
+        axisLabel: { show: true, hideOverlap: true, formatter: priceTick }, splitLine: { show: true } },
       // 第二条轴写百分比：盯盘的人看的是「现在离昨收几个点」，那条轴就在右手边
       { gridIndex: 0, type: "value", position: "right", min: -pctSpan, max: pctSpan,
-        axisLabel: { show: true, hideOverlap: true, formatter: "{value}%" }, splitLine: { show: false } },
+        axisLabel: { show: true, hideOverlap: true, formatter: percentTick }, splitLine: { show: false } },
       { gridIndex: 1, type: "value", axisLabel: { show: true, fontSize: 10, hideOverlap: true,
         formatter: wan }, splitLine: { show: false } },
     ];
@@ -227,6 +237,8 @@
         // 每分钟的量：服务侧已经把累计量差分过（Task 8），前端不能再 diff 一遍
         name: "成交量", type: "bar", data: payload.volume || [],
         xAxisIndex: 1, yAxisIndex: 2,
+        // boundaryGap:false 下柱宽是按整段摊出来的，几个点就能摊出几百像素：4 ≈ 241 分钟铺满这一格的一分钟
+        barMaxWidth: 4,
         itemStyle: {
           color: function (params) {
             var now = prices[params.dataIndex];
