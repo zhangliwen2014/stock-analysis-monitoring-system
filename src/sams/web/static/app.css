@@ -72,6 +72,9 @@ form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
 .chart-group a:hover { border-color: var(--line); }
 /* 当前档要一眼看出：模板同时给 class 与 aria-current，这里按 class 上底色 */
 .chart-group a.on { background: #14141a; color: #f4f4f6; }
+/* 视图与周期的 D165 灰：档还在、还点得动，只是这一屏答不出，所以选中态要能与之并存 */
+.chart-group a.dim { color: var(--muted); opacity: .55; }
+.chart-group a.dim:hover { border-color: transparent; }
 /* 满了的副图开关：留在原位但点不动（悬停有那句为什么） */
 .chart-group a[aria-disabled="true"] { color: var(--muted); opacity: .5; pointer-events: auto; }
 .chart-group a[aria-disabled="true"]:hover { border-color: transparent; }

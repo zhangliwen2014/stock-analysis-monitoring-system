@@ -477,17 +477,23 @@ def test_bars_api_main_group_carries_every_window_the_ma_family_gives(logged):
 
 def test_chart_partial_marks_the_current_period(logged):
     """当前档必须看得出来（D158）：换档之后旧档不再带 `aria-current`。
-    钉属性而不是钉整段文本——文案改了这枚用例不该跟着红。
-    周期条只有一档，所以「整段里 `aria-current` 恰好一次」就是判据；指标开关表达的是
-    「按下/松开」不是「现在在哪」，它带 `aria-pressed`，不占这个数——读屏软件会把
-    一排 `aria-current` 念成「这里有七个『当前』，请选一个」，而它其实是七个复选框。"""
+
+    判据按**组**数而不是整段数：计划 B 加了「视图」那一组（分时 | K线），
+    一块屏上从此有两个「当前」——一个说看的是哪种画法，一个说看的是哪档周期。
+    整段计数为 1 的那条写法会把这两件事混成一件，而读屏软件要的仍然是「一组里只有一个」。
+    指标开关照旧不占这个数：它们带 `aria-pressed`，一排 `aria-current` 会被念成
+    「这里有七个『当前』，请选一个」，而它其实是七个复选框。
+    """
     _seed(logged)
     week = logged.client.get("/api/partials/chart?market=A&code=600519&period=week")
     assert week.status_code == 200
     assert 'aria-current="true"' in week.text
     assert 'data-chart-url="/api/symbol/A/600519/bars?period=week' in week.text
     day = logged.client.get("/api/partials/chart?market=A&code=600519&period=day")
-    assert day.text.count('aria-current="true"') == 1
+    for name in ("周期", "视图"):
+        start = day.text.index(f'aria-label="{name}"')
+        group = day.text[start : day.text.index("</span>", start)]
+        assert group.count('aria-current="true"') == 1
     assert day.text.count('aria-pressed="true"') == 2  # 默认那组：主图均线 + 副图成交量
 
 

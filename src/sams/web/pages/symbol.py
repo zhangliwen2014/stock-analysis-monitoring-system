@@ -193,6 +193,8 @@ CHART_PERIODS: tuple[tuple[str, str], ...] = (
     ("day", "日"), ("week", "周"), ("month", "月"), ("quarter", "季"),
     ("year", "年"), ("5d", "5日"), ("10d", "10日"),
 )
+#: 两种画法（D158）。`time` 那一档没有周期可言——它只答最近一个交易日（Task 3 的区间校验钉着）
+CHART_VIEWS: tuple[tuple[str, str], ...] = (("kline", "K线"), ("time", "分时"))
 #: 开关上那几个字。白名单加了名字这里就必须加一行，缺行会在模板上留一个空按钮
 CHART_INDICATOR_LABELS: dict[str, str] = {
     "ma": "均线", "boll": "布林", "ema": "指数均线",
@@ -287,6 +289,15 @@ _PERIOD_LABEL = dict(CHART_PERIODS)
 def _period_label(period: str) -> str:
     """表里有的照表，自己填的档（`20d`）原样说——屏幕上点不出它，不值得再造一层。"""
     return _PERIOD_LABEL.get(period) or period
+
+
+def _chart_caption(view: str, period: str) -> str:
+    """图注那一句跟着视图换：分钟档压根没乘过因子，还写「后复权」就是假话（D164）。"""
+    if view == "time":
+        return "当日分时 · 昨收为基准线，量是每分钟增量"
+    if period in MINUTE_SCALES:
+        return "分钟 K · 不复权（一个交易日内因子恒定）"
+    return "后复权 · 均线算在同一基上"
 
 
 def _empty_payload(period: str, note: str | None) -> dict:
@@ -463,22 +474,28 @@ def minute_api(request: Request, market: str, code: str):
 
 @router.get("/api/partials/chart")
 def chart_partial(
-    request: Request, market: str, code: str, period: str = "day",
+    request: Request, market: str, code: str, period: str = "day", view: str = "kline",
     main: str = "ma", sub: str = "vol", ma: str = "",
 ):
-    """个股页那一块图：周期条 + 指标开关 + 挂着 `data-chart-url` 的那个 div。
+    """个股页那一块图：视图切换 + 周期条 + 指标开关 + 挂着 `data-chart-url` 的那个 div。
 
     为什么在服务端渲染而不是前端自己切：CSP 是 `'self'`（不许内联脚本），
     而「现在选中的是哪一档」这份状态一旦落在前端，换档后屏上说的就可能是上一档的话（D158）。
 
     周期名要过 `parse_period`：不认识的名字在这里就说 400，而不是悄悄换成日线——
     那一屏会举着「日」的高亮画一段没人请求过的东西，而 `bars` 接口对同一个写法已经是 400。
+    分钟档不走那一道：它认的是日历周期，`m5` 到那儿只会得到 400，而周期条上确实写着这一档。
     指标串同理：局部渲染出去的那条 `data-chart-url` 若注定 400，屏幕上说的是
     「行情序列读不出来。」而不是「副图最多三格」——宁可不画，不说错话。
     """
     require_user(request)
     web = request.app.state.web
-    parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
+    if view not in dict(CHART_VIEWS):
+        raise ValidationError(
+            f"不认识的视图 {view}：可选的是 {'、'.join(label for _name, label in CHART_VIEWS)}"
+        )
+    if period not in MINUTE_SCALES:
+        parse_period(period)  # 只为止声，选中态仍存调用方给的那一串
     _split_names(main, MAIN_INDICATORS)
     picked_sub = _split_names(sub, SUB_INDICATORS, limit=MAX_SUB_PANES)
     _windows(ma)
@@ -487,6 +504,7 @@ def chart_partial(
     code = canonical_code(market, code)
     if market not in ctx.settings.markets:
         raise HTTPException(status_code=404)
+    available = ctx.minute.availability(market)
     return web.render(
         request,
         "partials/chart.html",
@@ -494,6 +512,9 @@ def chart_partial(
         code=code,
         periods=CHART_PERIODS,
         period=period,
+        views=CHART_VIEWS,
+        view=view,
+        minute_scales=tuple(MINUTE_SCALES),
         main=main,
         sub=sub,
         ma=ma,
@@ -503,6 +524,21 @@ def chart_partial(
         # 三格满了就把点不出来的那几个置灰：让人撞上一条 400 不如先让他看见规矩
         sub_full=len(picked_sub) >= MAX_SUB_PANES,
         sub_limit=MAX_SUB_PANES,
+        # 置灰的判据只有一份来源（Task 6）：前端记一张市场×档位表，
+        # 下一句「谁能答」改了屏幕上就是假灰
+        series_ok=available.series.ok,
+        series_why=available.series.why_not,
+        bars_ok=available.bars.ok,
+        bars_why=available.bars.why_not,
+        caption=_chart_caption(view, period),
+        chart_url=(
+            f"/api/symbol/{market}/{code}/minute"
+            if view == "time"
+            else (
+                f"/api/symbol/{market}/{code}/bars"
+                f"?period={period}&main={main}&sub={sub}&ma={ma}"
+            )
+        ),
     )
 
 
