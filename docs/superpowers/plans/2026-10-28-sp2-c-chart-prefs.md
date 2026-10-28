@@ -854,3 +854,27 @@ git commit -m "docs(chart): 计划 C 验收与实测回写"
 - 个股图的周期条按这个人的顺序排；`ma=` 默认取这个人的窗口，URL 里显式给了就听 URL 的；
 - 一个人的偏好看不见另一个人的；库里没有行时屏幕与今天完全一样；
 - lint 绿、全量绿、真页面上存/清各走一遍。
+
+---
+
+## 交付记录（2026-10-28）
+
+- 任务 1–7 全绿，新增测试 17 项：`tests/web/test_chart_prefs.py` 4 项、
+  `tests/storage/test_chart_prefs_repo.py` 5 项、`tests/web/test_chart_prefs_web.py` 8 项。
+- 全量：`4405 passed, 19 deselected`（20 分 14 秒）。lint 绿。
+- 真页面（8765，`sp1verify`）：卡片两格空着；存「日周月…」+`ma=5,20` 后 303 并回显；
+  只写三档 → 400「每档正好一次」且框里留着刚敲的那串；`/api/partials/chart` 的周期条
+  按存的顺序排、`data-chart-url` 带 `ma=5,20`；换成显式 `ma=3,7` 后是 3,7（偏好只做默认）；
+  两格清空 → 回默认顺序，`ma=` 回到空（交给 `bars` 的默认六条）。
+- 偏差与修法：
+  - 迁移号是 **0025**（本计划 Task 2 起就这么写）：spec §7 计划 C 那条原写 `0023`，
+    `0023`/`0024` 已分别被全市场快照与选股预设占用。spec 已同步订正。
+  - `tests/storage/test_chart_prefs.py` 与 `tests/web/test_chart_prefs.py` 同名，
+    rootdir 的 prepend 导入模式下后者会让前者整份收集失败（全量会在收集阶段就断）。
+    已改名为 `tests/storage/test_chart_prefs_repo.py`（`446955f`），沿用仓库测试的
+    `*_repo.py` 命名。
+  - Task 6 计划里写「三条新用例 FAIL」，实际只有两条红：`test_an_explicit_ma_wins_…`
+    在实现前就绿（没有偏好时显式 `ma=` 本来就被渲染出去）。它不是新行为的证明，
+    而是「偏好上线后显式参数仍赢」的回归闸——留着，但别指望它报红。
+  - 设置页保存后的提示语统一是「已保存。」（`saved` 只用来点亮那一行），
+    与资料/免打扰/通道同一姿势，没有单独给 `saved=chart` 写一句话。

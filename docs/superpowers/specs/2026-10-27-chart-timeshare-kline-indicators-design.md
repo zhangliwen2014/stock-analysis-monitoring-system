@@ -336,11 +336,15 @@ Polars（重采样与指标）、腾讯/新浪行情 HTTP 源。
 2. **计划 B**：分钟粒度——`minute_series` / `minute_bars` 两条能力、腾讯/新浪适配器、
    `/minute` 接口、分时图画法、D164 的 `adj_factor=1` 组装、D165 的置灰话术。
 3. **计划 C**：偏好持久化——每人的周期条排序与均线窗口（D166/D162 的「自己设置」落库），
-   新表 `0023_chart_prefs.sql`（**订正**：`0022` 已被 D169 的 `watchlists.removed_at` 占了，
-   迁移号只写不读，撞号会在启动时炸校验和），设置页一个卡片。
+   新表 `0025_chart_prefs.sql`（**订正**：`0022` 已被 D169 的 `watchlists.removed_at` 占了，
+   `0023`/`0024` 又先后被全市场快照与选股预设拿走；迁移号只写不读，撞号会在启动时炸校验和），
+   设置页一个卡片。
 4. 已写好的**数据管理页**（D149–D156）与本期互不阻塞，排在计划 A 之后由用户点头再动。
 
 计划 A 已落地（`docs/superpowers/plans/2026-10-27-sp2-a-kline-periods-indicators.md`，
 Task 1–8 全绿）。计划 B 也已落地（`docs/superpowers/plans/2026-10-28-sp2-b-minute-timeshare.md`，
 Task 1–14 全绿；全量 4267 passed，真接口的 `minute` 与 `period=m5` 都在 8765 上验过）。
+计划 C 已落地（`docs/superpowers/plans/2026-10-28-sp2-c-chart-prefs.md`，D193）：
+`chart_prefs`（迁移 0025）一行一人；`/api/partials/chart` 按偏好排周期条并把 `ma=`
+默认成这个人的窗口，显式参数仍赢；设置页「图表偏好」卡片两格都空=删行回默认。
 落地时与本文有差的地方都写在对应条目下的「实现时订正」里，以代码为准。
