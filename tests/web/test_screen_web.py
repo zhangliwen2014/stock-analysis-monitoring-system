@@ -166,3 +166,28 @@ def test_missing_codes_are_named_with_their_class(logged_screen):
     response = logged_screen.client.get("/screen", params=_condition_params())
     assert "无数 1 只 · pr_now：亏损（PE(动) ≤ 0）" in response.text
     assert "600000" in response.text
+
+
+def test_results_are_paginated_fifty_at_a_time_and_page_two_keeps_the_conditions(logged_screen):
+    codes = [f"{600000 + i:06d}" for i in range(55)]
+    seed(
+        logged_screen.context,
+        *(snap(code) for code in codes),
+        codes=tuple(codes),
+    )
+    first = logged_screen.client.get("/screen", params=_condition_params())
+    assert "第 1 / 2 页" in first.text
+    assert codes[49] in first.text and codes[50] not in first.text
+    second = logged_screen.client.get(
+        "/screen", params=_condition_params() + [("page", "2")]
+    )
+    assert "第 2 / 2 页" in second.text
+    assert codes[50] in second.text and codes[0] not in second.text
+
+
+def test_a_page_number_past_the_end_lands_on_the_last_page(logged_screen):
+    seed(logged_screen.context, snap("600519"))
+    response = logged_screen.client.get(
+        "/screen", params=_condition_params() + [("page", "99")]
+    )
+    assert "第 1 / 1 页" in response.text and "600519" in response.text
