@@ -273,9 +273,10 @@ def _missing_groups(
                 if cond.field == "pr_now":
                     reason = kinds.get(row["code"], "现值 PR 没有数")
                 elif specs[cond.field].source == "financials":
+                    # 补数命令按代码跑，但理由只说一次：逐票把代码拼进去，几千只票就是几千组
                     reason = (
                         f"没有已披露年报里的{specs[cond.field].label}："
-                        f"`sams sync financials --market {market} --code {row['code']}`"
+                        f"`sams sync financials --market {market} --code <代码>`"
                     )
                 else:
                     reason = "快照这一行缺这一列"

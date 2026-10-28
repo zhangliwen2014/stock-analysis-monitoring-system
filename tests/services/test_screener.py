@@ -132,6 +132,23 @@ def test_financial_fields_join_as_of_the_snapshot_day_and_report_the_gap(db):
     assert group.codes == ("000001",) and "financials" in group.reason
 
 
+def test_one_missing_financial_field_is_one_group_not_one_per_code(db):
+    """真实库里几千只票没有年报行：逐票把代码写进理由，页面就散成几千组。"""
+    seed(
+        db,
+        snap("600519"),
+        snap("000001"),
+        snap("300750"),
+        codes=("600519", "000001", "300750"),
+    )
+    FinancialRepo(db).upsert(financial_rows(code="600519"))
+    result = service(db).run("A", [Condition("roe", ">=", 0.1)])
+    (group,) = result.missing
+    assert group.codes == ("000001", "300750")
+    assert "--code <代码>" in group.reason
+    assert "000001" not in group.reason and "300750" not in group.reason
+
+
 def test_snapshot_only_and_list_only_are_two_separate_numbers(db):
     """D174：快照里多出来的、代码表里缺的，两个数分开报，不合并成一个「有效票池」。"""
     seed(db, snap("600519"), snap("999999"), codes=("600519", "000001"))
