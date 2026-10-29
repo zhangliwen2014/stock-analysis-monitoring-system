@@ -1,6 +1,10 @@
 {# 主要财务指标（D217–D219）：估值一行 + 五档报告期 × 图表/明细。
-   比率从小数还原成百分数只经 `ratio_pct`（D58）；金额按本币原值 / 1e8 摆亿元。
+   比率从小数还原成百分数只经 `ratio_pct`（D58）；金额按源的本币原值 / 1e8 摆亿元。
+   港股报表是原币列示（多为人民币），不冒充港元：单位写「报表原币」，每股不挂币种。
    两排开关都用 htmx 只换这张卡，选中态在服务端定（CSP 不许内联脚本）。 #}
+
+{% set amount_note = "亿元（" ~ currency ~ "）" if market != "HK" else "亿元（报表原币，多为人民币）" %}
+{% set share_currency = "" if market == "HK" else currency %}
 
 {% macro cell(value, kind, currency) -%}
 {%- if value is none -%}—
@@ -13,8 +17,8 @@
 
 {% set groups = [
   ("规模", [
-    ("营业总收入（亿元）", "revenue", "yi"),
-    ("归母净利润（亿元）", "net_profit", "yi"),
+    ("营业总收入（亿）", "revenue", "yi"),
+    ("归母净利润（亿）", "net_profit", "yi"),
   ]),
   ("增长", [
     ("营收同比", "revenue_yoy", "pct"),
@@ -67,7 +71,7 @@
       {% for value, label in financial_periods %}
       {% set on = value == read.period_type %}
       <a hx-get="{{ base }}&period_type={{ value }}&view={{ fin_view }}"
-         hx-target="#f10-financials" hx-swap="outerHTML"
+         hx-target="#f10-financials" hx-swap="outerHTML" hx-sync="#f10-financials:replace"
          href="?period_type={{ value }}&view={{ fin_view }}"
          {% if on %}aria-current="true" class="on"{% endif %}>{{ label }}</a>
       {% endfor %}
@@ -76,18 +80,21 @@
       {% for value, label in financial_views %}
       {% set on = value == fin_view %}
       <a hx-get="{{ base }}&period_type={{ read.period_type }}&view={{ value }}"
-         hx-target="#f10-financials" hx-swap="outerHTML"
+         hx-target="#f10-financials" hx-swap="outerHTML" hx-sync="#f10-financials:replace"
          href="?period_type={{ read.period_type }}&view={{ value }}"
          {% if on %}aria-current="true" class="on"{% endif %}>{{ label }}</a>
       {% endfor %}
     </span>
   </div>
 
+  <p class="muted">金额单位：{{ amount_note }} · 比率为百分数</p>
+
   {% if not read.financials %}
   <p class="muted">这一类报告期本地还没有数据。</p>
   {% elif fin_view == "table" %}
   <div class="fin-scroll">
     <table class="fin-table">
+      <thead>
       <tr>
         <th scope="col">指标</th>
         {% for row in read.financials %}
@@ -95,13 +102,19 @@
           <span class="muted">{{ row.period_kind or "" }}</span></th>
         {% endfor %}
       </tr>
+      </thead>
+      <tbody>
       {% for group, items in groups %}
       <tr class="fin-group"><th colspan="{{ read.periods + 1 }}" scope="colgroup">{{ group }}</th></tr>
       {% for label, key, kind in items %}
       <tr>
         <th scope="row">{{ label }}</th>
         {% for row in read.financials %}
-        <td class="num">{{ cell(row[key], kind, currency) }}</td>
+        <td class="num">
+          {%- if row.scheduled -%}<span class="muted">—</span>
+          {%- else -%}{{ cell(row[key], kind, share_currency if kind == "share" else currency) }}
+          {%- endif -%}
+        </td>
         {% endfor %}
       </tr>
       {% endfor %}
@@ -117,6 +130,7 @@
         </td>
         {% endfor %}
       </tr>
+      </tbody>
     </table>
   </div>
   {% else %}
@@ -124,12 +138,13 @@
        data-chart-url="/api/partials/f10/chart?market={{ market }}&code={{ code }}&period_type={{ read.period_type }}"
        style="width:100%;height:440px"></div>
   <p class="muted chart-caption">
-    单位：亿元（{{ currency or "本币" }}）· 比率为百分数 · 柱为营业总收入 / 归母净利润，线为 ROE / 毛利率 / 净利率
+    柱为营业总收入 / 归母净利润，线为 ROE / 毛利率 / 净利率
   </p>
   {% endif %}
 
   {% if market == "HK" %}
-  <p class="muted">本市场源不给披露日：这些指标只用于看数，不参与选股与市赚率（D215）。</p>
+  <p class="muted">本市场源不给披露日：这些指标只用于看数，不参与选股与市赚率（D215）。
+    金额按报表原币列示（源不单给币种，多为人民币），本页不折算成港元。</p>
   {% endif %}
   {% endif %}
 </section>

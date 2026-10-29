@@ -579,11 +579,14 @@ def f10_chart_api(request: Request, market: str, code: str, period_type: str = "
     user = require_user(request)
     ctx, market, code, symbol = _require_symbol(request, user, market, code)
     read = ctx.f10.read(market, code, period_type=period_type)
-    rows = list(reversed(read.financials))
+    # 预约披露日之后的数不画：表里留着日期与「（预约）」，图上连点都不该有
+    rows = [row for row in reversed(read.financials) if not row["scheduled"]]
     if not read.has_financial_data:
         note = "本地还没有这只票的财务指标。"
-    elif not rows:
+    elif not read.financials:
         note = "这一类报告期本地还没有数据。"
+    elif not rows:
+        note = "这一类报告期本地还没有已披露的数据。"
     else:
         note = None
     return JSONResponse(

@@ -187,7 +187,7 @@ class F10Service:
         valued = _first(self.valuation.latest(market, [code], today))
         actions = self.corp_actions.list_for(market, code, until=today).to_dicts()
         raw = self.financials.recent(market, code, limit=RAW_FINANCIAL_LIMIT).to_dicts()
-        picked = _period_rows(raw, period_type)
+        picked = _period_rows(raw, period_type, today)
         return F10Read(
             market=market,
             code=code,
@@ -236,9 +236,14 @@ def _report_kind(row: dict[str, Any]) -> str | None:
 
 
 def _period_rows(
-    rows: list[dict[str, Any]], period_type: str
+    rows: list[dict[str, Any]], period_type: str, as_of: date
 ) -> tuple[dict[str, Any], ...]:
-    """按档位裁列：入参是报告期倒序，输出仍倒序、最多 `PERIOD_LIMITS[period_type]` 期。"""
+    """按档位裁列：入参是报告期倒序，输出仍倒序、最多 `PERIOD_LIMITS[period_type]` 期。
+
+    每行再带一个 `scheduled`：披露日在今天之后（源给的是预约日）的行，日期留在表里
+    但数值不摆出来——否则表头写着「预约」，旁边却已经是一列真数（spec §7）。
+    没有披露日的行（港股，D215）不是预约，照常摆数。
+    """
     if period_type not in PERIOD_TYPES:
         raise ValidationError(
             f"报告期档位只认 {' / '.join(PERIOD_TYPES)}，收到 {period_type!r}"
@@ -250,6 +255,13 @@ def _period_rows(
         picked = [row for row in rows if _report_kind(row) == wanted]
     # 每一行带着自己的档名出去：表头要写「中报/一季报/年报」，图上刻度和 tooltip 要「2025年报」
     return tuple(
-        {**row, "period_kind": _report_kind(row)}
+        {
+            **row,
+            "period_kind": _report_kind(row),
+            "scheduled": (
+                row.get("published_date") is not None
+                and row["published_date"] > as_of
+            ),
+        }
         for row in picked[: PERIOD_LIMITS[period_type]]
     )

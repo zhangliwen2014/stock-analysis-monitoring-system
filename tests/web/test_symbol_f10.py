@@ -313,12 +313,47 @@ def test_future_disclosure_date_is_labelled_as_scheduled(logged_f10):
     ).text
     assert str(tomorrow) in text
     assert "（预约）" in text
+    # 预约日之后的数不能当真数摆出来：日期留着，数值一律「—」
+    assert "9.97%" not in text
+    assert "—" in text
     # 已经过去/今天的披露日不加这个标记
     _financials(ctx, published=date(2025, 8, 31))
     text = logged_f10.client.get(
         "/api/partials/f10?market=A&code=600519&view=table"
     ).text
     assert "2025-08-31（预约）" not in text
+    assert "9.97%" in text
+
+
+def test_chart_leaves_out_a_period_whose_disclosure_is_still_ahead(logged_f10):
+    ctx = logged_f10.context
+    _symbol(ctx)
+    ctx.financials_store.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A", "A"],
+                "code": ["600519", "600519"],
+                "report_date": [date(2024, 12, 31), date(2025, 12, 31)],
+                "published_date": [date(2025, 3, 29), date.today() + timedelta(days=1)],
+                "report_type": ["年报", "年报"],
+                "revenue": [1.74e11, 1.70e11],
+                "net_profit": [8.4e10, 8.6e10],
+                "source": ["akshare", "akshare"],
+            }
+        )
+    )
+    payload = logged_f10.client.get(
+        "/api/partials/f10/chart?market=A&code=600519&period_type=annual"
+    ).json()
+    assert payload["labels"] == ["2024年报"]
+    assert payload["revenue"] == [1.74e11]
+    # 表里仍留着这一期，但数不露出来
+    text = logged_f10.client.get(
+        "/api/partials/f10/financials"
+        "?market=A&code=600519&period_type=annual&view=table"
+    ).text
+    assert "2025-12-31" in text and "（预约）" in text
+    assert "1700.00" not in text
 
 
 def test_us_financials_say_the_chain_has_no_source(logged_f10):
@@ -347,7 +382,7 @@ def test_financials_card_offers_period_and_view_toggles(logged_f10):
     assert 'data-chart-kind="finance"' in text
     assert "/api/partials/f10/chart?market=A&code=600519&period_type=all" in text
     # 默认不摆明细表：表格里的指标名只在 table 视图出现
-    assert "营业总收入（亿元）" not in text
+    assert "营业总收入（亿）" not in text
 
 
 def test_financials_table_view_lays_out_multi_periods_and_groups(logged_f10):
@@ -383,6 +418,24 @@ def test_financials_table_view_keeps_the_hk_footnote(logged_f10):
         "?market=HK&code=00700&period_type=annual&view=table"
     ).text
     assert "不参与选股与市赚率" in text
+    # 港股报表是原币列示（多为人民币）：金额与每股都不能挂 HKD 说成港元
+    assert "报表原币" in text
+    assert "亿元（HKD）" not in text
+    assert "66.00 港元" not in text
+    assert "66.00" in text
+
+
+def test_a_share_financials_state_their_currency(logged_f10):
+    ctx = logged_f10.context
+    _symbol(ctx)
+    _wind_financials(ctx)
+    text = logged_f10.client.get(
+        "/api/partials/f10/financials"
+        "?market=A&code=600519&period_type=annual&view=table"
+    ).text
+    assert "亿元（CNY）" in text
+    assert "66.00 元" in text
+    assert "报表原币" not in text
 
 
 def test_empty_period_bucket_says_so_instead_of_an_empty_chart(logged_f10):

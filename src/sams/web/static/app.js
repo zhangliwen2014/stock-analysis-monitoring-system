@@ -14,12 +14,20 @@
   var PRICE = "#2563eb"; // 分时线：与涨跌无关，它要说的是「走到哪」，红绿会把它读成涨或跌
   var AVG = "#e8a33d"; // 均价线：交易所口径的均价，与分时线交叉处就是「强于均价/弱于均价」
 
-  window.addEventListener("resize", function () {
-    // htmx 换卡后旧元素已经离开文档：先摘掉，再让活着的图跟着窗口重排
+  function sweep() {
+    // 换卡后旧元素已经离开文档：实例要 dispose，不只是从 resize 名单里摘掉
     live = live.filter(function (chart) {
       var dom = chart.getDom();
-      return dom && dom.isConnected;
+      if (!dom || !dom.isConnected) {
+        chart.dispose();
+        return false;
+      }
+      return true;
     });
+  }
+
+  window.addEventListener("resize", function () {
+    sweep();
     live.forEach(function (chart) { chart.resize(); });
   });
 
@@ -307,7 +315,18 @@
   function financeChart(el, payload) {
     var labels = payload.labels || [];
     if (!labels.length) return;
-    var moneyUnit = payload.currency ? " 亿元（" + payload.currency + "）" : " 亿元";
+    var moneyUnit = " 亿元";
+    // 两格各挂各的 series，tooltip 却要一次说全：按横轴标签把五个数拼回一行
+    var rows = {};
+    labels.forEach(function (label, i) {
+      rows[label] = [
+        ["营业总收入", payload.revenue[i] == null ? null : payload.revenue[i] / 1e8, moneyUnit],
+        ["归母净利润", payload.net_profit[i] == null ? null : payload.net_profit[i] / 1e8, moneyUnit],
+        ["ROE", payload.roe[i], " %"],
+        ["毛利率", payload.gross_margin[i], " %"],
+        ["净利率", payload.net_margin[i], " %"],
+      ];
+    });
     mount(el, {
       animation: false,
       legend: { type: "scroll", top: 0 },
@@ -316,13 +335,11 @@
         axisPointer: { type: "shadow" },
         formatter: function (items) {
           if (!items || !items.length) return "";
-          var lines = [items[0].axisValue];
-          items.forEach(function (item) {
-            if (item.value === null || item.value === undefined) return;
-            var bar = item.seriesName === "营业总收入" || item.seriesName === "归母净利润";
-            lines.push(
-              item.marker + item.seriesName + "：" + item.value.toFixed(2) + (bar ? moneyUnit : " %")
-            );
+          var label = items[0].axisValue;
+          var lines = [label];
+          (rows[label] || []).forEach(function (cell) {
+            if (cell[1] === null || cell[1] === undefined) return;
+            lines.push(cell[0] + "：" + Number(cell[1]).toFixed(2) + cell[2]);
           });
           return lines.join("<br>");
         },
@@ -338,7 +355,8 @@
         { type: "category", data: labels, gridIndex: 1, axisTick: { show: false } },
       ],
       yAxis: [
-        { type: "value", gridIndex: 0, name: "亿元", scale: true },
+        // 金额柱必须从 0 起：裁掉基线会把 8% 的营收差画成一半（scale:true 会裁）
+        { type: "value", gridIndex: 0, name: "亿元", min: 0 },
         { type: "value", gridIndex: 1, name: "%", scale: true },
       ],
       series: [
@@ -369,6 +387,8 @@
     fetch(url)
       .then(function (resp) { return resp.json(); })
       .then(function (payload) {
+        // 响应回来时这张卡可能已经被 htmx 换掉：画到摘除的 div 上会留一张看不见的活图
+        if (!el.isConnected) return;
         var box = el.parentNode;
         var note = box && box.querySelector(".chart-caption");
         if (payload.note) {
@@ -384,11 +404,13 @@
         else klineChart(el, payload);
       })
       .catch(function () {
+        if (!el.isConnected) return;
         el.textContent = "行情序列读不出来。";
       });
   }
 
   function boot(root) {
+    sweep();
     (root || document).querySelectorAll("[data-chart-url]").forEach(samsChart);
   }
 

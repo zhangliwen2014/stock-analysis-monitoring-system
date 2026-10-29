@@ -298,6 +298,8 @@ def test_read_model_has_the_four_blocks(db):
     assert read.period_type == "all" and read.periods == 6
     assert read.financials[0]["report_date"] == newest_report
     assert all(row["published_date"] is None for row in read.financials)
+    # 没有披露日不是「预约未披露」：那是 D215 给的展示档案，照常摆数
+    assert all(row["scheduled"] is False for row in read.financials)
     # 最近 10 条公告，新在前
     assert len(read.announcements) == 10
     assert read.announcements[0]["published_on"] == newest_announcement
@@ -455,6 +457,25 @@ def test_an_unknown_period_type_is_refused_not_silently_treated_as_all(db):
     _seed_quarters(db)
     with pytest.raises(ValidationError, match="报告期档位"):
         _read(db, "monthly")
+
+
+def test_a_report_scheduled_after_today_is_flagged(db):
+    """源把预约披露日之后的数也给了：日期要留，但要标成未披露（spec §7）。"""
+    FinancialRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A", "A"],
+                "code": ["600519", "600519"],
+                "report_date": [date(2025, 9, 30), date(2025, 6, 30)],
+                "published_date": [AS_OF + timedelta(days=1), AS_OF - timedelta(days=30)],
+                "roe": [0.2, 0.18],
+                "source": ["akshare", "akshare"],
+            }
+        )
+    )
+    read = _read(db)
+    flags = {row["report_date"]: row["scheduled"] for row in read.financials}
+    assert flags == {date(2025, 9, 30): True, date(2025, 6, 30): False}
 
 
 def test_an_empty_bucket_still_knows_the_local_table_has_rows(db):
