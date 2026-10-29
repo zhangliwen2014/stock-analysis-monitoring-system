@@ -49,6 +49,21 @@ def canonical_code(market: str, code: str) -> str:
     return cleaned
 
 
+def fits_market(market: str, code: str) -> bool:
+    """这个代码是不是这个市场的形态：A 6 位数字、HK 5 位数字；US 不猜（D210）。
+
+    自选里折起的旧行一直留在采集清单里（D169），A 市场的清单里可能混进一只港股形态的
+    代码；它不属于这个市场，报价与入账都该在发请求之前挡下——一只坏代码不该让同批
+    的其余 49 只一起失联。
+    """
+    market = canonical_market(market)
+    if market == "A":
+        return len(code) == 6 and code.isdigit()
+    if market == "HK":
+        return len(code) == 5 and code.isdigit()
+    return True
+
+
 def currency_override(market: str, code: str) -> str | None:
     """市场级默认币种的两个真实例外；返回 None 表示用市场默认。
 

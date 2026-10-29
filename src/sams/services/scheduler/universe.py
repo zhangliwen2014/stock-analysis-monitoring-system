@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from sams.core.codes import canonical_code, canonical_market
+from sams.core.codes import canonical_code, canonical_market, fits_market
 from sams.core.config import Settings
 from sams.core.errors import ValidationError
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
@@ -101,6 +101,19 @@ class UniverseBuilder:
             for status in (OPENED, TRACKING):
                 for thesis in self.theses.list(user.id, status=status):
                     found.add(_key(thesis.market, thesis.code))
+
+        # 形态不对的代码（A 清单里折着的 `00700`）不是「这只票今晚没采到」：它发给
+        # 任何 A 股适配器都只会抛，夜里的 job 因此整晚标成失败并可能在三个周期后告警。
+        # 折起的行照旧留在清单里（D169），但采不了的总得在发请求之前出队（D210）。
+        for market, code in sorted(found):
+            if not fits_market(market, code):
+                logger.warning(
+                    "%s %s 不是 %s 的代码形态，已跳过采集（A 股 6 位、港股 5 位，D210）",
+                    market,
+                    code,
+                    market,
+                )
+        found = {key for key in found if fits_market(*key)}
 
         markets = set(self.settings.markets) | {market for market, _ in found}
         by_market = {

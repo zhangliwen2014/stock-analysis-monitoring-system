@@ -18,7 +18,7 @@ from math import isfinite
 import polars as pl
 
 from sams.core import funds
-from sams.core.codes import canonical_code, canonical_market
+from sams.core.codes import canonical_code, canonical_market, fits_market
 from sams.core.config import MarketCfg
 from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
@@ -323,15 +323,16 @@ def _check_code_shape(market: str, code: str) -> None:
     只闸写入口，不改 `canonical_code` 的读路径：库里已有的 `A/01021` 还要读得出来、
     撤得掉——在归一函数里加校验，那一屏会直接 500，撤错的出口就没了。
     """
-    if market == "A" and not (len(code) == 6 and code.isdigit()):
+    if fits_market(market, code):
+        return
+    if market == "A":
         hint = (
             "：5 位数字通常是港股（港股通请把市场选成「港股通（HK）」），或代码少写了一截"
             if code.isdigit() and len(code) == 5
             else ""
         )
         raise ValidationError(f"A 股的代码是 6 位数字，收到 {code}{hint}")
-    if market == "HK" and not (len(code) == 5 and code.isdigit()):
-        raise ValidationError(f"港股的代码是 5 位数字，收到 {code}")
+    raise ValidationError(f"港股的代码是 5 位数字，收到 {code}")
 
 #: 一次成交动的四张表里，只有订单是「历史」；持仓和余额是「状态」。
 #: 状态可以由历史重放出来，所以写状态必须在历史之后、同一个事务里。

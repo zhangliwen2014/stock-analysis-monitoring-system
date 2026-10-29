@@ -14,6 +14,7 @@ from sams.core.codes import (
     currency_override,
     daily_price_limit,
     exchange_folds_dividend_into_daily_change,
+    fits_market,
     lot_size_of,
 )
 from sams.core.errors import ValidationError
@@ -166,3 +167,21 @@ def test_looks_like_index_code():
     assert looks_like_index_code("US", "usINX")
     assert not looks_like_index_code("US", "AAPL")
     assert not looks_like_index_code("", "sh000001")  # 市场不认就当不是
+
+
+# ---------------------------------------------------------------- 代码形态（D210）
+
+
+def test_fits_market_is_the_shape_rule_shared_by_fill_and_quote():
+    """A 6 位数字、HK 5 位数字；US 不猜形态（D210）。
+
+    自选里折起的旧行会一直留在采集清单里（D169），于是一只港股形态的代码可能出现在
+    A 市场的报价批次里：它不是「今天停牌」，是根本不属于这个市场。
+    """
+    assert fits_market("A", "600519")
+    assert not fits_market("A", "00700")
+    assert not fits_market("A", "01021")
+    assert fits_market("HK", "00700")
+    assert not fits_market("HK", "601088")
+    assert fits_market("US", "AAPL")
+    assert fits_market("US", "BRK-B")

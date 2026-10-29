@@ -382,3 +382,41 @@ def test_each_batch_acquires_from_the_bucket(db):
     service.poll("A", [f"{i:06d}" for i in range(120)], now=T0)
 
     assert bucket.acquires == 3
+
+
+# ---------------------------------------------------------------- 代码形态与批次（D210）
+
+
+def test_an_a_code_of_the_wrong_shape_does_not_poison_the_whole_batch(db):
+    """历史自选里留下的 A/00700 会让腾讯整批拒收：同批的 49 只不能跟着失联。
+
+    这一条用真实适配器的行为做桩：任何一个代码形态不对，整批就抛。
+    """
+
+    class StrictAdapter(StubQuoteAdapter):
+        def quotes(self, market: str, codes: list[str]) -> QuoteBatch:
+            self.calls.append(list(codes))
+            if any(len(code) != 6 or not code.isdigit() for code in codes):
+                raise ValueError(f"A 股代码应为 6 位数字，收到 {codes[-1]!r}")
+            return batch_for(market, codes)
+
+    primary = StrictAdapter("p", batch_for)
+    service, board = make_service(db, {"p": primary})
+
+    result = service.poll("A", ["600519", "00700", "000001"], now=T0)
+
+    assert [q.code for q in result.quotes] == ["600519", "000001"]
+    assert primary.calls == [["600519", "000001"]]
+    assert any("00700" in error for error in result.errors)
+    assert board.snapshot()["A"].last_error is None, "有报价的一轮不该被报成故障"
+
+
+def test_a_universe_of_only_unquotable_codes_says_why_on_the_board(db):
+    primary = StubQuoteAdapter("p", batch_for)
+    service, board = make_service(db, {"p": primary})
+
+    result = service.poll("A", ["00700"], now=T0)
+
+    assert primary.calls == [], "形态不对的代码不该发出去"
+    assert result.quotes == ()
+    assert "6 位" in (board.snapshot()["A"].last_error or "")

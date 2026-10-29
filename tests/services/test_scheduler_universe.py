@@ -176,6 +176,42 @@ def test_build_carries_the_configured_indices(db, settings):
     assert universe.indices("hk") == settings.indices.for_market("HK")
 
 
+def test_a_folded_watchlist_row_of_the_wrong_shape_never_enters_the_universe(
+    db, settings, caplog
+):
+    """A 市场的清单里折起一只港股形态的代码：它进不了采集清单（D210 对 D169 的闸）。
+
+    折起只是从看板消失，这一行一直留在采集清单里；可 `A/00700` 不是一个能表示的 A 股，
+    发给 A 股适配器只会抛——夜里的日线 job 因为一条永远取不到的旧行被标成失败，
+    三个周期后还会响告警。跳过它是「这只票不采」，不是「今晚全市场没采到」。
+    """
+    users = UserRepo(db)
+    alice = users.create("alice", "correct horse battery")
+    watchlists = WatchlistRepo(db)
+    watchlists.add(alice.id, "HK", "00700")
+    watchlists.add(alice.id, "A", "600519")
+    watchlists.add(alice.id, "A", "00700")
+    assert watchlists.remove(alice.id, "A", "00700")
+
+    accounts = SimAccountRepo(db)
+    with caplog.at_level(logging.WARNING, logger="sams.services.scheduler.universe"):
+        universe = UniverseBuilder(
+            users=users,
+            watchlists=watchlists,
+            accounts=accounts,
+            orders=SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db)),
+            rules=RuleRepo(db),
+            theses=ThesisRepo(db),
+            data=StubData(watchlists),
+            settings=settings,
+        ).build()
+
+    assert universe.codes("A") == ("600519",)
+    # 同一个代码在它自己的市场里照常采：闸只看形态，不看代码本身
+    assert universe.codes("HK") == ("00700",)
+    assert any("A 00700" in record.getMessage() for record in caplog.records)
+
+
 def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, caplog):
     """展开失败的规则只跳过自己，其余对象照常进入采集。
 

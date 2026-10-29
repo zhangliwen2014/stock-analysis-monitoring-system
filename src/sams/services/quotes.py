@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.codes import fits_market, looks_like_index_code
 from sams.core.errors import SamsError, StorageError
 from sams.core.events import EventBus, QuoteUpdated, SystemAlarm
 from sams.core.quotes import Quote, QuoteSourceRecord
@@ -224,6 +225,20 @@ class QuoteService:
         wanted = list(dict.fromkeys(codes))
         if not wanted:
             return QuotePollResult()
+        errors: list[str] = []
+        unquotable = [
+            code
+            for code in wanted
+            if not looks_like_index_code(market, code) and not fits_market(market, code)
+        ]
+        if unquotable:
+            # 形态不对的代码不是「今天停牌」：发出去只会让适配器整批抛，
+            # 同批的其余代码跟着失联（历史自选里折起的 A/00700 就是这样）
+            wanted = [code for code in wanted if code not in unquotable]
+            errors.extend(
+                f"{market} {code} 不是这个市场的代码形态（A 股 6 位、港股 5 位），本轮不取价"
+                for code in unquotable
+            )
         chain = self.registry.chain_for(market, "quote")
         if not chain:
             message = f"{market} 没有任何支持 quote 能力的报价源"
@@ -233,7 +248,6 @@ class QuoteService:
 
         collected: list[Quote] = []
         skipped: list[str] = []
-        errors: list[str] = []
         degraded: list[str] = []
         answered: list[str] = []
         #: 首个应答源自己那一次答复：健康判定只看它，不被前面失败源留下的串遮住
