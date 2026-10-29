@@ -177,6 +177,19 @@ def test_every_condition_reports_passed_failed_missing_and_the_hits(logged_scree
     assert "300750" not in response.text
 
 
+def test_each_hit_links_to_its_symbol_page(logged_screen):
+    """结果表不是死文字：点代码或名字就进这只票的现场（详情、K 线、规则、论）。
+
+    筛出「PR ≤ 0.5」之后，下一步一定是「它长什么样」；让人再去另一个页面重搜一遍，
+    正是「两眼一抹黑」的那一步（D211）。
+    """
+    default_seed(logged_screen)
+    response = logged_screen.client.get("/screen", params=_condition_params())
+    assert response.status_code == 200
+    assert 'href="/symbol/A/600519"' in response.text
+    assert 'href="/symbol/A/000001"' in response.text
+
+
 def test_two_conditions_are_anded_and_the_table_carries_both_values(logged_screen):
     default_seed(logged_screen)
     params = _condition_params() + [("f", "turnover_rate"), ("o", ">="), ("v", "2")]

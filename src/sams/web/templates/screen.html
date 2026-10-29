@@ -88,8 +88,9 @@
     {% for row in view %}
     <tr>
       <td><input type="checkbox" name="codes" value="{{ row.code }}"></td>
-      <td>{{ row.code }}</td>
-      <td>{{ row.name }}</td>
+      {# 点进个股页看详情与 K 线（D211）：筛出一只票之后，下一步就是「它长什么样」 #}
+      <td><a href="/symbol/{{ market }}/{{ row.code }}">{{ row.code }}</a></td>
+      <td><a href="/symbol/{{ market }}/{{ row.code }}">{{ row.name }}</a></td>
       {% for cell in row.cells %}<td class="num">{{ cell }}</td>{% endfor %}
       <td class="num">{{ row.price }}</td>
       <td>{% if row.held %}<span class="badge">已在自选</span>{% else %}<button type="submit" name="action" value="one:{{ row.code }}">加自选</button>{% endif %}</td>
