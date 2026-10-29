@@ -19,6 +19,8 @@ ADAPTER_MODULES = {
     "akshare_hk",
     "akshare_ths",
     "eastmoney",
+    "eastmoney_f10",
+    "eastmoney_hk_f10",
     "sina",
     "sina_quote",
     "tencent",

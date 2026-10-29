@@ -30,6 +30,7 @@ from sams.datasource.fundamentals import (
     empty_valuation,
 )
 from sams.datasource.fx import empty_fx, has_fx
+from sams.datasource.f10 import empty_announcements, empty_profile
 from sams.datasource.minute import answers
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
@@ -603,6 +604,26 @@ class AdapterRegistry:
         不是「0 行」：后者会被读成「这只票没有主力进过场」。"""
         return self._fetch_frame(
             market, code, start, end, method="funding_flow", empty=empty_flow()
+        )
+
+    def fetch_company_profile(
+        self, market: str, code: str, start: date, end: date
+    ) -> FrameResult:
+        """公司概况（D214）。没有时间窗口，`start`/`end` 只为与降级链同形。
+
+        与基本面同侧：0 行是「源说这只票没有概况记录」，可以继续问下一个源；
+        全链都这么说才成为一句可落库的确认。
+        """
+        return self._fetch_frame(
+            market, code, start, end, method="company_profile", empty=empty_profile()
+        )
+
+    def fetch_announcements(
+        self, market: str, code: str, start: date, end: date
+    ) -> FrameResult:
+        """公告元数据（D214/D216）。窗口交给源筛，只取最近一页。"""
+        return self._fetch_frame(
+            market, code, start, end, method="announcements", empty=empty_announcements()
         )
 
     def _fetch_frame(

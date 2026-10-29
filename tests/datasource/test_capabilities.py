@@ -27,6 +27,8 @@ def test_the_kind_name_is_the_adapter_method_name():
         "financials",
         "valuation",
         "funding_flow",
+        "company_profile",
+        "announcements",
         "listed_date",
         "fx_rate",
         "quote",

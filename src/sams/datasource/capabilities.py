@@ -17,6 +17,7 @@ from sams.core.errors import DatasourceError
 from sams.datasource.actions import has_actions
 from sams.datasource.base import has_bars
 from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
+from sams.datasource.f10 import has_announcements, has_profile
 from sams.datasource.fx import has_fx
 from sams.datasource.index_daily import has_index_daily
 from sams.datasource.listed_date import has_listed_date
@@ -43,6 +44,12 @@ CAPABILITIES: dict[str, Capability] = {
     "financials": Capability(label="基本面", lacking="不提供基本面", probe=has_financials),
     "valuation": Capability(label="按日估值", lacking="不提供按日估值", probe=has_valuation),
     "funding_flow": Capability(label="资金流", lacking="不提供资金流", probe=has_flow),
+    # 个股资料（D214）：两者都没有计算用途，但仍然走同一条降级链——
+    # 「源答了没有」与「源挂了」在屏幕上必须是两句话
+    "company_profile": Capability(
+        label="公司概况", lacking="不提供公司概况", probe=has_profile
+    ),
+    "announcements": Capability(label="公告", lacking="不提供公告", probe=has_announcements),
     # 主档的一格，不是一类数据：它不走 `_walk`（没有窗口，也不记源健康），
     # 但「哪个源能给」仍然只在这里答一次，好让 `chain_for` 与目录用同一份判据
     "listed_date": Capability(label="上市日期", lacking="不提供上市日期", probe=has_listed_date),

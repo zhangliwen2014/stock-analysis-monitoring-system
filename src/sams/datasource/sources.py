@@ -37,6 +37,7 @@ _NOT_ADAPTERS = frozenset(
         "capabilities",
         "minute",
         "fundamentals",
+        "f10",
         "listed_date",
         "fx",
         "quote",
