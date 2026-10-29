@@ -18,58 +18,20 @@ import polars as pl
 
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift
+from sams.core.f10 import (
+    ANNOUNCEMENT_COLUMNS,
+    ANNOUNCEMENT_DATE_COLUMNS,
+    PROFILE_BOOL_COLUMNS,
+    PROFILE_COLUMNS,
+    PROFILE_DATE_COLUMNS,
+    PROFILE_INT_COLUMNS,
+)
 
 logger = logging.getLogger("sams.datasource.f10")
 
-#: 公司概况一行一只票，键是 `market`/`code`。`fetched_at` 由入库时的 `now()` 写，
-#: 不在采集帧里——它不是源给的业务时间，适配器也不该持有时钟。
-PROFILE_COLUMNS = (
-    "market",
-    "code",
-    "name",
-    "full_name",
-    "name_en",
-    "industry",
-    "industry_csrc",
-    "exchange",
-    "board",
-    "listed_on",
-    "founded_on",
-    "isin",
-    "lot_size",
-    "chairman",
-    "president",
-    "secretary",
-    "legal_person",
-    "phone",
-    "email",
-    "website",
-    "address",
-    "reg_address",
-    "employees",
-    "auditor",
-    "fiscal_year_end",
-    "hk_connect",
-    "stock_type",
-    "summary",
-    "source",
-)
-
-#: 公告元数据。`url` 指向东财详情页，正文与 PDF 留外链（D216）。
-ANNOUNCEMENT_COLUMNS = (
-    "market",
-    "code",
-    "art_code",
-    "published_on",
-    "title",
-    "category",
-    "url",
-    "source",
-)
-
-_PROFILE_DATES = ("listed_on", "founded_on")
-_PROFILE_INTS = ("lot_size", "employees")
-_PROFILE_BOOLS = ("hk_connect",)
+_PROFILE_DATES = PROFILE_DATE_COLUMNS
+_PROFILE_INTS = PROFILE_INT_COLUMNS
+_PROFILE_BOOLS = PROFILE_BOOL_COLUMNS
 
 
 def has_profile(obj: Any) -> bool:
@@ -103,14 +65,8 @@ def empty_profile() -> pl.DataFrame:
 def empty_announcements() -> pl.DataFrame:
     return pl.DataFrame(
         schema={
-            "market": pl.Utf8,
-            "code": pl.Utf8,
-            "art_code": pl.Utf8,
-            "published_on": pl.Date,
-            "title": pl.Utf8,
-            "category": pl.Utf8,
-            "url": pl.Utf8,
-            "source": pl.Utf8,
+            column: pl.Date if column in ANNOUNCEMENT_DATE_COLUMNS else pl.Utf8
+            for column in ANNOUNCEMENT_COLUMNS
         }
     )
 

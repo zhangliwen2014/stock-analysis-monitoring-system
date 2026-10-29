@@ -277,6 +277,19 @@ class FinancialRepo:
             sql.append(f"LIMIT {int(limit)}")
         return self.db.query(" ".join(sql), params)
 
+    def recent(self, market: str, code: str, *, limit: int = 8) -> pl.DataFrame:
+        """展示用的最近几期：**含披露日为 NULL 的行**，报告期倒序。
+
+        只给个股页看数（D215）。它不是第二个 `load_as_of`：这里没有截至日闸门，
+        也不代表这些期「已披露」——港股指标源不给披露日，拿这些行参与 PR 或选股，
+        等于把未来的信息塞进回测。
+        """
+        return self.db.query(
+            "SELECT * FROM financials WHERE market = ? AND code = ?"
+            f" ORDER BY report_date DESC LIMIT {int(limit)}",
+            [canonical_market(market), canonical_code(market, code)],
+        )
+
     def periods(self, market: str, code: str) -> pl.DataFrame:
         """这只票在库里的**每一**期，含披露日为 NULL 的那些，报告期升序。
 
