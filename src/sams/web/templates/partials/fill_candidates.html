@@ -1,0 +1,17 @@
+{# 成交录入的候选：点「填入」只改表单，不发请求（D206） #}
+{% if rows %}
+<table>
+  <tr><th>市场</th><th>代码</th><th>名称</th><th class="num">最近收盘</th><th></th></tr>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.market }}</td>
+    <td>{{ row.code }}</td>
+    <td>{{ row.name or "—" }}</td>
+    <td class="num">{{ money(row.price, row.unit) }}</td>
+    <td><button type="button" data-fill-market="{{ row.market }}" data-fill-code="{{ row.code }}">填入</button></td>
+  </tr>
+  {% endfor %}
+</table>
+{% elif none_found %}
+<p class="muted">查无「{{ query }}」——代码、拼音首字母、名称都没命中。手写代码仍可提交。</p>
+{% endif %}

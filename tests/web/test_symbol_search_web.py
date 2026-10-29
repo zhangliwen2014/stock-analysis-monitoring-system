@@ -161,3 +161,13 @@ def test_unit_follows_currency_override(logged):
     )
     body = logged.client.get("/api/symbol-search?code=txcny").text
     assert "300.00 元" in body and "港元" not in body
+
+
+def test_fill_scope_offers_a_button_that_fills_the_trade_form(logged):
+    """录入成交的代码格要的是「把这行填进表单」，不是「加入自选」：同一个检索，
+    两种用途（D206）。"""
+    _seed(logged.context)
+    body = logged.client.get("/api/symbol-search?code=payh&scope=fills").text
+    assert "平安银行" in body and "填入" in body
+    assert 'data-fill-market="A"' in body and 'data-fill-code="000001"' in body
+    assert "/watchlist/add" not in body

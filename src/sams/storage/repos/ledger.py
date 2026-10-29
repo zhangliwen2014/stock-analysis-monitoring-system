@@ -72,6 +72,20 @@ def _row_to_account(row: dict) -> Account:
     )
 
 
+@dataclass(frozen=True)
+class FxTrade:
+    """账户内一次显式换汇：多币种现金池与券商对账靠它（§5.4 规则 4、D207）。"""
+
+    id: str
+    account_id: str
+    from_ccy: str
+    to_ccy: str
+    from_amt: float
+    to_amt: float
+    rate: float
+    ts: datetime
+
+
 class SimAccountRepo:
     """账户、按币种的现金余额、以及每一分钱的来处。"""
 
@@ -224,6 +238,65 @@ class SimAccountRepo:
             )
         return after
 
+    def convert(
+        self,
+        account_id: str,
+        from_ccy: str,
+        to_ccy: str,
+        amount: float,
+        rate: float,
+        *,
+        actor_id: str,
+        ts: datetime | None = None,
+    ) -> FxTrade:
+        """显式换汇：换汇记录与两条现金流水同进同退（§5.4 规则 4、D207）。
+
+        不做自动折算：汇率是这笔换汇的成交价，由用户按券商的实际价填进来；
+        库里那条只用来预填表单。
+        """
+        from_ccy = (from_ccy or "").strip().upper()
+        to_ccy = (to_ccy or "").strip().upper()
+        if from_ccy == to_ccy:
+            raise ValidationError("换汇的两个币种要不同：同币种恒为 1，不需要换")
+        for currency in (from_ccy, to_ccy):
+            if currency not in _CURRENCIES:
+                raise ValidationError(f"不认识币种 {currency!r}：三字母代码，不做模糊匹配")
+        if not isfinite(amount) or amount <= 0:
+            raise ValidationError(f"换汇金额必须是正有限小数，收到 {amount!r}")
+        if not isfinite(rate) or rate <= 0:
+            raise ValidationError(f"汇率必须是正有限小数，收到 {rate!r}")
+        self._require(account_id)
+        moment = _moment(ts)
+        to_amt = amount * rate
+        trade = FxTrade(
+            id=new_id(),
+            account_id=account_id,
+            from_ccy=from_ccy,
+            to_ccy=to_ccy,
+            from_amt=amount,
+            to_amt=to_amt,
+            rate=rate,
+            ts=moment,
+        )
+        reason = f"换汇 {from_ccy}→{to_ccy} @{rate:.4f}"
+        with self.db.transaction():
+            self.db.execute(
+                "INSERT INTO fx_trades"
+                " (id, account_id, from_ccy, to_ccy, from_amt, to_amt, rate, ts)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    trade.id, account_id, from_ccy, to_ccy,
+                    amount, to_amt, rate, moment,
+                ],
+            )
+            self.adjust_cash(
+                account_id, from_ccy, -amount, reason=reason, actor_id=actor_id, ts=moment
+            )
+            self.adjust_cash(
+                account_id, to_ccy, to_amt, reason=reason, actor_id=actor_id, ts=moment
+            )
+        return trade
+
     def _require(self, account_id: str) -> Account:
         """账户是否存在（不校验归属，那是读用例那一层带 user_id 的事）。"""
         rows = self.db.query("SELECT * FROM sim_accounts WHERE id = ?", [account_id])
@@ -351,8 +424,10 @@ class SimOrderRepo:
         if fee < 0:
             raise ValidationError("手续费不能为负：负手续费等于把成本做低")
         market = canonical_market(market)
+        raw_code = code
         code = canonical_code(market, code)
         self._check_currency(market, code, currency)
+        self._check_market_of_code(market, raw_code, code)
         moment = _moment(ts)
         existing = self.position(account_id, market, code, strict=False)
         held = existing.qty if existing else 0.0
@@ -366,7 +441,8 @@ class SimOrderRepo:
                 raise StorageError(
                     f"账户没有 {currency} 现金，买不了 {currency} 定价的 {market} {code}"
                     f"（现有：{', '.join(sorted(balances)) or '空'}）。"
-                    f"M3 不自动换汇：先补一笔同币种现金并写明理由（§5.4 规则 4）"
+                    f"不自动换汇：先在持仓页「换汇」把 {currency} 换出来"
+                    f"（填实际成交汇率），或记一笔同币种现金并写明理由（§5.4 规则 4）"
                 )
         order_id = new_id()
         with self.db.transaction():
@@ -413,6 +489,96 @@ class SimOrderRepo:
         order = self.order(account_id, order_id)
         assert order is not None
         return order
+
+    def undo_fill(
+        self,
+        account_id: str,
+        order_id: str,
+        *,
+        actor_id: str,
+        ts: datetime | None = None,
+    ) -> bool:
+        """撤销一笔成交：现金逐分反做、持仓从其余成交重放、订单行删除（D205）。
+
+        重放而不是「反着乘一遍」：卖出的成本基础取决于它前面那些买入的顺序，
+        倒着算会在加仓过的持仓上差出一个数。状态由历史推出来，就永远和历史对得上。
+        """
+        order = self.order(account_id, order_id)
+        if order is None:
+            raise StorageError(f"成交 {order_id} 不存在或不属于账户 {account_id}")
+        existing = self.position(account_id, order.market, order.code, strict=False)
+        remaining = [
+            row
+            for row in self.orders(account_id)
+            if not (row.market == order.market and row.code == order.code and row.id == order.id)
+        ]
+        running = 0.0
+        basis = 0.0
+        opened: datetime | None = None
+        for row in remaining:
+            if row.side == BUY:
+                basis += row.qty * row.price + row.fee
+                running += row.qty
+                if opened is None:
+                    opened = row.ts
+            else:
+                if row.qty > running:
+                    raise StorageError(
+                        f"这笔买入撤销后，{row.ts:%Y-%m-%d} 的卖出 {row.qty:g} 股会超卖"
+                        f"（只剩 {running:g} 股）：先撤销后面那笔卖出"
+                    )
+                avg = basis / running if running > 0 else 0.0
+                basis -= row.qty * avg
+                running -= row.qty
+        gross = order.qty * order.price
+        delta = gross + order.fee if order.side == BUY else -(gross - order.fee)
+        moment = _moment(ts)
+        with self.db.transaction():
+            self.db.execute("DELETE FROM sim_orders WHERE id = ?", [order_id])
+            self.db.execute(
+                "INSERT OR REPLACE INTO sim_positions"
+                " (account_id, market, code, currency, qty, avg_cost, open_ts, last_price,"
+                " last_price_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    account_id, order.market, order.code, order.currency,
+                    running, (basis / running) if running > 0 else 0.0,
+                    opened if running > 0 else None,
+                    existing.last_price if existing else None,
+                    existing.last_price_ts if existing else None,
+                ],
+            )
+            self.accounts.adjust_cash(
+                account_id,
+                order.currency,
+                delta,
+                reason=f"撤销成交 {order.id}",
+                actor_id=actor_id,
+                ts=moment,
+            )
+        return True
+
+    def _check_market_of_code(self, market: str, raw_code: str, code: str) -> None:
+        """一只票只该在它自己的市场里记账：A 的表单填 HK 00700 要当场拒（D206）。
+
+        只拒「另一个已配置市场有这只票」：两边主档都没有时照收——新上市、退市整理、
+        主档还没同步都长这样，把数据缺口变成记账障碍是另一类错。
+        """
+        if self.markets is None or self.symbols is None:
+            return
+        if self.symbols.get(market, code) is not None:
+            return
+        for other in self.markets:
+            if other == market:
+                continue
+            try:
+                candidate = canonical_code(other, raw_code)
+            except ValidationError:
+                continue
+            if self.symbols.get(other, candidate) is not None:
+                raise StorageError(
+                    f"{market} 里没有 {code}，但 {other} 有 {candidate}："
+                    f"这笔看起来记错了市场（同一只票要在它自己的市场里记）"
+                )
 
     def _check_currency(self, market: str, code: str, currency: str) -> None:
         """币种三方对齐：配置推定值、库里采集值、这笔单要用的值。不一致就点名两个币种拒掉。

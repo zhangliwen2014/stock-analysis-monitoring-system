@@ -469,3 +469,162 @@ def test_the_cross_currency_refusal_writes_no_order(
         )
     assert _order_rows(db, account_id) == 0
     assert accounts.cash_balances(account_id)["CNY"] == pytest.approx(10_000.0)
+
+
+# --- 撤销成交：录错市场/代码之后唯一的出口（D205） ---------------------------------
+
+
+def test_undoing_a_buy_gives_the_cash_back_to_the_cent(
+    accounts: SimAccountRepo, fills: SimOrderRepo
+) -> None:
+    account_id = _funded(accounts)
+    order = _fill(fills, account_id, "buy", fee=5.0)
+    assert fills.undo_fill(account_id, order.id, actor_id=USER)
+    assert fills.order_rows(account_id) == 0
+    assert accounts.cash_balances(account_id)["CNY"] == pytest.approx(100_000.0)
+    # 0 股行是历史不是持仓（§5.4）：撤销不删这一行，但也不许它带着成本
+    pos = fills.position(account_id, "A", "601088")
+    assert pos.qty == pytest.approx(0.0)
+    assert pos.avg_cost == pytest.approx(0.0)
+    assert accounts.cash_history(account_id)["reason"].to_list() == [
+        "初始", "买入 601088", f"撤销成交 {order.id}",
+    ]
+
+
+def test_undoing_a_sell_puts_the_shares_back_at_the_old_average(
+    accounts: SimAccountRepo, fills: SimOrderRepo
+) -> None:
+    """卖出一笔之后撤掉它：股数与均价回到卖出前，不是「按撤销时的价格重建」。"""
+    account_id = _funded(accounts)
+    _fill(fills, account_id, "buy", qty=100, price=40.0, fee=5.0)
+    sold = _fill(fills, account_id, "sell", qty=40, price=50.0, fee=3.0)
+    assert fills.undo_fill(account_id, sold.id, actor_id=USER)
+    pos = fills.position(account_id, "A", "601088")
+    assert pos.qty == pytest.approx(100.0)
+    assert pos.avg_cost == pytest.approx(40.05)
+    assert accounts.cash_balances(account_id)["CNY"] == pytest.approx(95_995.0)
+
+
+def test_undoing_a_buy_that_later_sells_relied_on_is_refused(
+    accounts: SimAccountRepo, fills: SimOrderRepo
+) -> None:
+    """重放时后面的卖出会超卖：这不是「能撤」，是要先撤后面那笔。"""
+    account_id = _funded(accounts)
+    first = _fill(fills, account_id, "buy", qty=100, price=40.0)
+    _fill(fills, account_id, "sell", qty=100, price=45.0)
+    with pytest.raises(StorageError, match="超卖|先撤销"):
+        fills.undo_fill(account_id, first.id, actor_id=USER)
+    # 拒绝路径什么都不动
+    assert fills.order_rows(account_id) == 2
+    assert fills.position(account_id, "A", "601088").qty == pytest.approx(0.0)
+
+
+def test_undoing_a_sell_whose_proceeds_were_spent_is_refused(
+    accounts: SimAccountRepo, fills: SimOrderRepo
+) -> None:
+    """撤销售出要扣回这笔钱；扣完为负就是透支，无杠杆账户不许。"""
+    account_id = _funded(accounts)
+    _fill(fills, account_id, "buy", qty=100, price=40.0, fee=0.0)
+    sold = _fill(fills, account_id, "sell", qty=100, price=40.0, fee=0.0)
+    accounts.adjust_cash(account_id, "CNY", -99_990.0, reason="花掉", actor_id=USER)
+    with pytest.raises(StorageError, match="现金不足"):
+        fills.undo_fill(account_id, sold.id, actor_id=USER)
+    assert fills.order_rows(account_id) == 2
+
+
+def test_undoing_an_order_that_does_not_exist_is_refused(
+    accounts: SimAccountRepo, fills: SimOrderRepo
+) -> None:
+    account_id = _funded(accounts)
+    with pytest.raises(StorageError, match="不存在"):
+        fills.undo_fill(account_id, "no-such-order", actor_id=USER)
+
+
+# --- 跨市场误记：A 股表单里填了港股通代码（D206） -----------------------------------
+
+
+def test_a_code_that_lives_in_another_market_is_refused(
+    db: Database, accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    """选了 A 却填 HK 00700：A 的主档没有它、HK 有——这不是「新票」，是记错了市场。"""
+    SymbolRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"], "code": ["00700"], "name": ["腾讯控股"],
+                "currency": ["HKD"], "listed_on": [date(2004, 6, 16)],
+            }
+        )
+    )
+    account_id = accounts.open(USER, "G7", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 10_000.0, reason="初始", actor_id=USER)
+    with pytest.raises(StorageError, match="HK"):
+        gated.record_fill(
+            account_id=account_id, user_id=USER, market="A", code="00700",
+            side="buy", qty=100, price=400.0, currency="CNY", fee=0.0,
+        )
+    assert _order_rows(db, account_id) == 0
+
+
+def test_a_code_missing_from_every_market_still_records(
+    db: Database, accounts: SimAccountRepo, gated: SimOrderRepo
+) -> None:
+    """主档两边都没有不等于记错了：新上市、退市整理、还没同步都长这样，照收。"""
+    account_id = accounts.open(USER, "G8", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 10_000.0, reason="初始", actor_id=USER)
+    assert gated.record_fill(
+        account_id=account_id, user_id=USER, market="A", code="999999",
+        side="buy", qty=100, price=1.0, currency="CNY", fee=0.0,
+    )
+
+
+# --- 换汇：港股通先换 HKD 再买（D207） ----------------------------------------------
+
+
+def test_converting_moves_both_balances_and_writes_one_fx_trade(
+    db: Database, accounts: SimAccountRepo
+) -> None:
+    account_id = accounts.open(USER, "F1", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 10_000.0, reason="初始", actor_id=USER)
+    trade = accounts.convert(
+        account_id, "CNY", "HKD", 1_000.0, 1.08, actor_id=USER
+    )
+    assert accounts.cash_balances(account_id) == {
+        "CNY": pytest.approx(9_000.0),
+        "HKD": pytest.approx(1_080.0),
+    }
+    row = db.query("SELECT * FROM fx_trades WHERE account_id = ?", [account_id]).to_dicts()[0]
+    assert row["from_ccy"] == "CNY" and row["to_ccy"] == "HKD"
+    assert row["from_amt"] == pytest.approx(1_000.0)
+    assert row["to_amt"] == pytest.approx(1_080.0)
+    assert row["rate"] == pytest.approx(1.08)
+    assert trade.from_amt == pytest.approx(1_000.0)
+    assert accounts.cash_history(account_id)["reason"].to_list() == [
+        "初始", "换汇 CNY→HKD @1.0800", "换汇 CNY→HKD @1.0800",
+    ]
+
+
+def test_converting_the_same_currency_is_a_typo(accounts: SimAccountRepo) -> None:
+    account_id = accounts.open(USER, "F2", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 1_000.0, reason="初始", actor_id=USER)
+    with pytest.raises(ValidationError, match="不同"):
+        accounts.convert(account_id, "CNY", "CNY", 100.0, 1.0, actor_id=USER)
+
+
+def test_a_non_positive_rate_or_amount_is_a_typo(accounts: SimAccountRepo) -> None:
+    account_id = accounts.open(USER, "F3", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 1_000.0, reason="初始", actor_id=USER)
+    with pytest.raises(ValidationError, match="汇率"):
+        accounts.convert(account_id, "CNY", "HKD", 100.0, 0.0, actor_id=USER)
+    with pytest.raises(ValidationError, match="金额"):
+        accounts.convert(account_id, "CNY", "HKD", 0.0, 1.0, actor_id=USER)
+
+
+def test_converting_more_than_the_balance_is_refused(
+    accounts: SimAccountRepo, db: Database
+) -> None:
+    account_id = accounts.open(USER, "F4", report_currency="CNY").id
+    accounts.adjust_cash(account_id, "CNY", 100.0, reason="初始", actor_id=USER)
+    with pytest.raises(StorageError, match="现金不足"):
+        accounts.convert(account_id, "CNY", "HKD", 200.0, 1.08, actor_id=USER)
+    assert db.scalar("SELECT count(*) FROM fx_trades WHERE account_id = ?", [account_id]) == 0
+    assert accounts.cash_balances(account_id) == {"CNY": pytest.approx(100.0)}

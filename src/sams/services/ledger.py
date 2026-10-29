@@ -19,7 +19,14 @@ from sams.core.config import Settings
 from sams.core.errors import StorageError, ValidationError
 from sams.core.version import VersionGate
 from sams.services.actors import resolve_actor
-from sams.storage.repos.ledger import Account, Order, Position, SimAccountRepo, SimOrderRepo
+from sams.storage.repos.ledger import (
+    Account,
+    FxTrade,
+    Order,
+    Position,
+    SimAccountRepo,
+    SimOrderRepo,
+)
 from sams.storage.repos.theses import OBSERVING, PROPOSED, ThesisRepo
 from sams.storage.repos.users import User, UserRepo
 
@@ -81,6 +88,32 @@ class LedgerService:
         account = self.accounts.rename(user.id, account_id, name)
         self._bump()
         return account
+
+    def undo_fill(self, username: str, account_id: str, order_id: str) -> bool:
+        """录错市场/代码的唯一出口：这笔成交从未发生，现金与持仓一起回到它之前（D205）。"""
+        user = resolve_actor(self.users, username)
+        self._require_account(user, account_id)
+        undone = self.orders.undo_fill(account_id, order_id, actor_id=user.id)
+        self._bump()
+        return undone
+
+    def convert(
+        self,
+        username: str,
+        account_id: str,
+        from_ccy: str,
+        to_ccy: str,
+        amount: float,
+        rate: float,
+    ) -> FxTrade:
+        """浏览器里的换汇：港股通先换 HKD 再买，汇率按用户填的成交价（D207）。"""
+        user = resolve_actor(self.users, username)
+        self._require_account(user, account_id)
+        trade = self.accounts.convert(
+            account_id, from_ccy, to_ccy, amount, rate, actor_id=user.id
+        )
+        self._bump()
+        return trade
 
     def deposit(
         self,

@@ -205,3 +205,40 @@ def test_withdraw_takes_the_absolute_value_so_a_negative_amount_cannot_top_up_ca
     )
     assert after == 99_500.0
     assert svc.cash(account_id) == {"CNY": 99_500.0}
+
+
+def test_undo_fill_resolves_the_username_and_reverses_the_fill(svc) -> None:
+    account_id = _funded(svc, "纠错户")
+    order = svc.buy(account_id, USER, "A", "601088", qty=100, price=40.0, fee=5.0)
+    assert svc.undo_fill(USER, account_id, order.id)
+    assert svc.cash(account_id) == {"CNY": 100_000.0}
+    assert svc.orders.order_rows(account_id) == 0
+
+
+def test_undoing_another_users_fill_is_refused(svc, db) -> None:
+    other = SimAccountRepo(db).open("someone-else", "别人的账户", report_currency="CNY")
+    SimAccountRepo(db).adjust_cash(
+        other.id, "CNY", 10_000.0, reason="初始", actor_id="someone-else"
+    )
+    order = SimOrderRepo(db).record_fill(
+        account_id=other.id, user_id="someone-else", market="A", code="601088",
+        side="buy", qty=100, price=40.0, currency="CNY", fee=0.0,
+    )
+    with pytest.raises(StorageError, match="不属于"):
+        svc.undo_fill(USER, other.id, order.id)
+    assert SimOrderRepo(db).order(other.id, order.id) is not None
+
+
+def test_convert_resolves_the_username_and_moves_both_balances(svc) -> None:
+    account_id = _funded(svc, "港通户")
+    trade = svc.convert(USER, account_id, "CNY", "HKD", 1_000.0, 1.08)
+    assert trade.rate == pytest.approx(1.08)
+    assert svc.cash(account_id) == {
+        "CNY": pytest.approx(99_000.0), "HKD": pytest.approx(1_080.0),
+    }
+
+
+def test_converting_another_users_account_is_refused(svc, db) -> None:
+    other = SimAccountRepo(db).open("someone-else", "别人的账户", report_currency="CNY")
+    with pytest.raises(StorageError, match="不属于"):
+        svc.convert(USER, other.id, "CNY", "HKD", 100.0, 1.08)

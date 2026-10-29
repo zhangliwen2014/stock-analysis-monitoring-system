@@ -154,6 +154,12 @@ def test_ledger_writes_bump_the_ledger_version(db, settings):
         account.id, "CNY", 10000.0, username=NAME, reason="初始入金", actor_id=user.id
     )
     assert gate.current("ledger") == base + 2
+    order = service.buy(account.id, NAME, "A", "601088", qty=10, price=10.0)
+    assert gate.current("ledger") == base + 3
+    service.undo_fill(NAME, account.id, order.id)
+    assert gate.current("ledger") == base + 4
+    service.convert(NAME, account.id, "CNY", "HKD", 100.0, 1.08)
+    assert gate.current("ledger") == base + 5
 
 
 def test_jobdeps_carries_a_gate_by_default():

@@ -246,8 +246,12 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
 
 
 @router.get("/api/symbol-search")
-def symbol_search_partial(request: Request, code: str = "", market: str = ""):
-    """候选面板：htmx 每敲一个字重来一次，空检索词回空面板，不打扰。"""
+def symbol_search_partial(request: Request, code: str = "", market: str = "", scope: str = ""):
+    """候选面板：htmx 每敲一个字重来一次，空检索词回空面板，不打扰。
+
+    `scope=fills` 时那一行是「填进成交表单」而不是「加入自选」（D206）：
+    同一份检索结果，两种用途各有一个模板。
+    """
     require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
@@ -275,7 +279,7 @@ def symbol_search_partial(request: Request, code: str = "", market: str = ""):
     searched = query is not None
     return web.render(
         request,
-        "partials/symbol_search.html",
+        "partials/fill_candidates.html" if scope == "fills" else "partials/symbol_search.html",
         rows=rows,
         query=query,
         none_found=searched and not rows,

@@ -405,3 +405,185 @@ def test_the_thesis_dropdown_names_market_code_and_status(logged):
     page = logged.client.get("/portfolio").text
     assert "A 600519 · observing" in page
 
+
+
+# --- 成交记录与撤销（D205） ----------------------------------------------------------
+
+
+def _seed_symbol(web, market="A", code="601088", name="中国神华", currency="CNY"):
+    from sams.storage.repos.symbols import SymbolRepo
+
+    SymbolRepo(web.contexts.current().db).upsert(
+        pl.DataFrame(
+            {
+                "market": [market],
+                "code": [code],
+                "name": [name],
+                "currency": [currency],
+                "listed_on": [date(2007, 10, 9)],
+            }
+        )
+    )
+
+
+def _record(web, account_id, **over):
+    fields = {
+        "csrf": web.csrf, "account_id": account_id, "market": "A",
+        "code": "601088", "side": "buy", "qty": "100", "price": "40", "fee": "5",
+    }
+    fields.update(over)
+    return web.client.post("/ledger/fill", data=fields, follow_redirects=False)
+
+
+def test_the_fills_table_shows_what_was_recorded_with_its_name(logged):
+    _seed_symbol(logged)
+    account_id = _open_account(logged)
+    assert _record(logged, account_id).status_code == 303
+    page = logged.client.get("/portfolio")
+    assert "成交记录" in page.text
+    assert "中国神华" in page.text
+    assert f"/portfolio/accounts/{account_id}/fills/" in page.text
+    assert "撤销" in page.text
+
+
+def test_undoing_a_misrecorded_fill_removes_it_and_returns_the_cash(logged):
+    """录错了市场/代码：撤销之后现金回来、持仓消失，再按正确的重记一笔。"""
+    account_id = _open_account(logged)
+    assert _record(logged, account_id).status_code == 303
+    order = logged.context.sim_ledger.orders(account_id)[0]
+    response = logged.client.post(
+        f"/portfolio/accounts/{account_id}/fills/{order.id}/undo",
+        data={"csrf": logged.csrf},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/portfolio?notice=undone"
+    page = logged.client.get(response.headers["location"])
+    assert "成交已撤销" in page.text
+    assert "/symbol/A/601088" not in page.text
+    assert logged.context.sim_accounts.cash_balances(account_id) == {"CNY": 200_000.0}
+    assert logged.context.sim_ledger.order_rows(account_id) == 0
+
+
+def test_a_refused_undo_keeps_the_fill_and_says_why(logged):
+    account_id = _open_account(logged)
+    first = _record(logged, account_id, qty="100", price="40").status_code
+    assert first == 303
+    bought = logged.context.sim_ledger.orders(account_id)[0]
+    assert _record(logged, account_id, side="sell", qty="100", price="45").status_code == 303
+    response = logged.client.post(
+        f"/portfolio/accounts/{account_id}/fills/{bought.id}/undo",
+        data={"csrf": logged.csrf},
+    )
+    assert response.status_code == 400
+    assert "先撤销后面那笔" in response.text
+    assert logged.context.sim_ledger.order_rows(account_id) == 2
+
+
+def test_undoing_into_another_users_account_is_an_error(logged):
+    logged.context.users.create("bob", "another-correct-horse")
+    bob_account = _open_account(logged, username="bob", name="bobs户")
+    bob_order = logged.context.sim_ledger.record_fill(
+        account_id=bob_account, user_id=_user_id(logged, "bob"), market="A",
+        code="601088", side="buy", qty=100, price=40.0, currency="CNY", fee=0.0,
+    )
+    response = logged.client.post(
+        f"/portfolio/accounts/{bob_account}/fills/{bob_order.id}/undo",
+        data={"csrf": logged.csrf},
+    )
+    assert response.status_code == 400
+    assert "不属于" in response.text
+    assert logged.context.sim_ledger.order(bob_account, bob_order.id) is not None
+
+
+def test_filling_a_hk_code_under_the_a_market_is_refused_with_the_hint(logged):
+    """用户原话：选了 A、代码是港股通的票，结果记成一笔 A 股人民币成交。
+    现在当场拒，并点名它属于哪个市场（D206）。"""
+    _seed_symbol(logged, market="HK", code="00700", name="腾讯控股", currency="HKD")
+    account_id = _open_account(logged)
+    response = _record(
+        logged, account_id, market="A", code="00700", qty="100", price="400",
+    )
+    assert response.status_code == 400
+    assert "HK" in response.text and "00700" in response.text
+    assert logged.context.sim_ledger.order_rows(account_id) == 0
+
+
+def test_the_fill_form_has_a_live_candidate_panel(logged):
+    _open_account(logged)
+    page = logged.client.get("/portfolio")
+    assert 'hx-get="/api/symbol-search"' in page.text
+    assert 'id="fill-candidates"' in page.text
+    assert 'hx-vals=\'{"scope": "fills"}\'' in page.text
+
+
+# --- 换汇：港股通买入的资金来源（D207） ---------------------------------------------
+
+
+def _convert(web, account_id, **over):
+    data = {
+        "csrf": web.csrf, "account_id": account_id,
+        "from_ccy": "CNY", "to_ccy": "HKD", "amount": "8000", "rate": "1.08",
+    }
+    data.update(over)
+    return web.client.post("/ledger/fx", data=data, follow_redirects=False)
+
+
+def test_the_fx_form_prefills_the_latest_stored_rate(logged):
+    logged.context.fx_store.put(
+        date.today(), "HKD", "CNY", 0.92, source="akshare"
+    )
+    _open_account(logged)
+    page = logged.client.get("/portfolio")
+    assert "换汇" in page.text
+    # 库里只有 HKD→CNY：预填反过来那一侧，并标明是取倒数
+    assert "1.08696" in page.text
+    assert "取倒数" in page.text
+
+
+def test_converting_then_buying_hk_from_cny_works(logged):
+    """用户原话那条路：人民币账户买港股通，先换汇再买，不再被「没有 HKD」挡死。"""
+    account_id = _open_account(logged)
+    response = _convert(logged, account_id)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/portfolio?notice=fx"
+    assert logged.context.sim_accounts.cash_balances(account_id) == {
+        "CNY": 192_000.0, "HKD": 8_640.0,
+    }
+    page = logged.client.get(response.headers["location"])
+    assert "换汇已记账" in page.text
+    buy = logged.client.post(
+        "/ledger/fill",
+        data={"csrf": logged.csrf, "account_id": account_id, "market": "HK",
+              "code": "00700", "side": "buy", "qty": "100", "price": "80"},
+        follow_redirects=False,
+    )
+    assert buy.status_code == 303
+    pos = logged.context.sim_ledger.position(account_id, "HK", "00700")
+    assert pos.qty == 100.0
+
+
+def test_a_bad_rate_is_refused_and_keeps_the_form(logged):
+    account_id = _open_account(logged)
+    response = _convert(logged, account_id, rate="0")
+    assert response.status_code == 400
+    assert "汇率" in response.text and "正有限小数" in response.text
+    assert logged.context.sim_accounts.cash_balances(account_id) == {"CNY": 200_000.0}
+
+
+def test_converting_into_another_users_account_is_an_error(logged):
+    logged.context.users.create("bob", "another-correct-horse")
+    bob_account = _open_account(logged, username="bob", name="bobs户")
+    response = _convert(logged, bob_account)
+    assert response.status_code == 400
+    assert "不属于" in response.text
+    assert logged.context.sim_accounts.cash_balances(bob_account) == {"CNY": 200_000.0}
+
+
+def test_buying_hk_without_hkd_points_at_the_exchange_form(logged):
+    account_id = _open_account(logged)
+    response = _record(
+        logged, account_id, market="HK", code="00700", qty="100", price="400",
+    )
+    assert response.status_code == 400
+    assert "换汇" in response.text

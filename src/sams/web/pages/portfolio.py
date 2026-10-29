@@ -22,6 +22,7 @@ from sams.bootstrap import ServiceContext
 from sams.core.codes import canonical_market
 from sams.core.errors import DatabaseLocked, SamsError, ValidationError
 from sams.web.auth import csrf_protect, require_user
+from sams.web.display import moment_label
 
 router = APIRouter()
 
@@ -29,6 +30,8 @@ router = APIRouter()
 _NOTICES = {
     "account": "账户已开好。",
     "renamed": "账户名已修改。",
+    "undone": "成交已撤销，按正确的重记一笔。",
+    "fx": "换汇已记账。",
     "cash": "现金已调整。",
     "fill": "成交已记一笔。",
 }
@@ -70,6 +73,47 @@ def _cash_defaults(ctx: ServiceContext) -> dict[str, str]:
     }
 
 
+def _rate_hint(ctx: ServiceContext, base: str, quote: str) -> tuple[str, str]:
+    """哪一个是可预填的汇率、这一句说它从哪来（D207）。
+
+    库里只存一个方向；反方向取倒数并**说出来**，不假装它是库里那条。
+    两边都没有就空着：给一个猜的数比让用户填券商成交价更糟。
+    """
+    today = ctx.clock.today()
+    found = ctx.fx_store.latest(today, base, quote)
+    if found is not None:
+        source = found.source or "—"
+        return (
+            f"{found.rate:g}",
+            f"预填：{base}→{quote} {found.rate:.4f}（{found.day}，{source}）",
+        )
+    reverse = ctx.fx_store.latest(today, quote, base)
+    if reverse is not None:
+        rate = 1 / reverse.rate
+        source = reverse.source or "—"
+        return (
+            f"{rate:.6g}",
+            f"预填：由 {quote}→{base} {reverse.rate:.4f} 取倒数（{reverse.day}，{source}）",
+        )
+    return "", f"库里没有 {base}→{quote} 的汇率：填券商给你的成交汇率，或先 `sams sync fx`"
+
+
+def _fx_defaults(ctx: ServiceContext, currencies: list[str]) -> dict[str, str]:
+    base = ctx.settings.report_currency
+    # 港股通是这一栏存在的原因：有 HKD 就默认 CNY→HKD，没有就换到另一种币
+    quote = "HKD" if base != "HKD" and "HKD" in currencies else next(
+        (item for item in currencies if item != base), base
+    )
+    rate, _ = _rate_hint(ctx, base, quote)
+    return {
+        "account_id": "",
+        "from_ccy": base,
+        "to_ccy": quote,
+        "amount": "",
+        "rate": rate,
+    }
+
+
 def _trade_moment(ctx: ServiceContext, raw: str, market: str) -> datetime | None:
     """成交日按市场本地 15:00 记账（与 CLI 的 `--on` 同一条口径，D196）。
 
@@ -87,8 +131,39 @@ def _trade_moment(ctx: ServiceContext, raw: str, market: str) -> datetime | None
     return datetime(day.year, day.month, day.day, 15, 0, tzinfo=zone)
 
 
+def _fills(ctx: ServiceContext, account, tz: str) -> list[dict]:
+    """最近 50 笔成交（新的在上）：撤销要能看见「撤的是哪一笔」（D205）。"""
+    names: dict[tuple[str, str], str] = {}
+    rows = []
+    for order in list(reversed(ctx.sim_ledger.orders(account.id)))[:50]:
+        key = (order.market, order.code)
+        if key not in names:
+            master = ctx.symbols.get(order.market, order.code)
+            names[key] = str((master or {}).get("name") or "")
+        rows.append(
+            {
+                "id": order.id,
+                "at": moment_label(order.ts, tz, seconds=True),
+                "market": order.market,
+                "code": order.code,
+                "name": names[key],
+                "side": "买入" if order.side == "buy" else "卖出",
+                "qty": _qty(order.qty),
+                "price": order.price,
+                "fee": order.fee,
+                "currency": order.currency,
+            }
+        )
+    return rows
+
+
 def _account_view(
-    ctx: ServiceContext, username: str, account, *, rename_name: str | None = None
+    ctx: ServiceContext,
+    username: str,
+    account,
+    *,
+    rename_name: str | None = None,
+    tz: str,
 ) -> dict:
     """一个账户的一屏：汇总 + 逐行持仓。键只留模板要读的那些。
 
@@ -138,6 +213,8 @@ def _account_view(
         "notes": summary.notes,
         "duplicates": ctx.portfolio.duplicate_holdings(username, account.id),
         "positions": positions,
+        "fills": _fills(ctx, account, tz),
+        "fill_total": ctx.sim_ledger.order_rows(account.id),
     }
 
 
@@ -151,17 +228,20 @@ def _portfolio_page(
     cash_form: dict[str, str] | None = None,
     account_form: dict[str, str] | None = None,
     rename_form: dict[str, str] | None = None,
+    fx_form: dict[str, str] | None = None,
 ):
     user = request.state.sams_user
     web = request.app.state.web
     ctx = web.contexts.current()
     markets = sorted(ctx.settings.markets)
+    tz = ctx.settings.server.display_tz
     accounts = [
         _account_view(
             ctx,
             user.username,
             account,
             rename_name=(rename_form or {}).get(account.id),
+            tz=tz,
         )
         for account in ctx.sim_accounts.list_for(user.id)
     ]
@@ -169,6 +249,7 @@ def _portfolio_page(
     currencies = sorted(
         {ctx.settings.report_currency, *(cfg.currency for cfg in ctx.settings.markets.values())}
     )
+    fx = fx_form or _fx_defaults(ctx, currencies)
     return web.render(
         request,
         "portfolio.html",
@@ -185,6 +266,8 @@ def _portfolio_page(
         # 三张表单各自回填：一张被拒不该改写另一张的当前值（D197）
         fill=fill_form or _fill_defaults(ctx, markets),
         cash=cash_form or _cash_defaults(ctx),
+        fx=fx,
+        fx_hint=_rate_hint(ctx, fx["from_ccy"], fx["to_ccy"])[1],
         account_form=account_form or {"name": "", "cash": ""},
     )
 
@@ -250,6 +333,26 @@ def rename_account(
     return RedirectResponse("/portfolio?notice=renamed", status_code=303)
 
 
+@router.post("/portfolio/accounts/{account_id}/fills/{order_id}/undo")
+def undo_fill(
+    request: Request,
+    account_id: str,
+    order_id: str,
+    _csrf: None = Depends(csrf_protect),
+):
+    """录错市场/代码的出口：撤销这笔成交，再按正确的重记一笔（D205）。"""
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    try:
+        ctx.ledger.undo_fill(user.username, account_id, order_id)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _portfolio_page(request, status=400, error=str(exc))
+    return RedirectResponse("/portfolio?notice=undone", status_code=303)
+
+
 @router.post("/ledger/cash")
 def ledger_cash(
     request: Request,
@@ -291,6 +394,43 @@ def ledger_cash(
     except SamsError as exc:
         return _portfolio_page(request, status=400, error=str(exc), cash_form=form)
     return RedirectResponse("/portfolio?notice=cash", status_code=303)
+
+
+@router.post("/ledger/fx")
+def ledger_fx(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    account_id: str = Form(""),
+    from_ccy: str = Form("CNY"),
+    to_ccy: str = Form("HKD"),
+    amount: str = Form(""),
+    rate: str = Form(""),
+):
+    """显式换汇：港股通先换 HKD 再买（D207）。汇率按用户填的实际成交价。"""
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    form = {
+        "account_id": account_id,
+        "from_ccy": from_ccy.strip().upper(),
+        "to_ccy": to_ccy.strip().upper(),
+        "amount": amount,
+        "rate": rate,
+    }
+    try:
+        ctx.ledger.convert(
+            user.username,
+            account_id,
+            form["from_ccy"],
+            form["to_ccy"],
+            _number(amount, "金额"),
+            _number(rate, "汇率"),
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _portfolio_page(request, status=400, error=str(exc), fx_form=form)
+    return RedirectResponse("/portfolio?notice=fx", status_code=303)
 
 
 @router.post("/ledger/fill")

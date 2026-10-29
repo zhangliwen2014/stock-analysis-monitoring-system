@@ -61,6 +61,38 @@
     <tr><td colspan="8" class="muted">暂无持仓。</td></tr>
     {% endfor %}
   </table>
+  {# 录错市场/代码之后唯一的出口：撤销这笔，现金与持仓回到成交之前，再按正确的重记（D205） #}
+  <h3>成交记录</h3>
+  <table>
+    <tr>
+      <th>时刻</th><th>市场 / 代码</th><th>名称</th><th>方向</th><th class="num">数量（股）</th>
+      <th class="num">价格</th><th class="num">费用</th><th>币种</th><th></th>
+    </tr>
+    {% for row in account.fills %}
+    <tr>
+      <td class="muted">{{ row.at }}</td>
+      <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.market }}/{{ row.code }}</a></td>
+      <td>{{ row.name or "—" }}</td>
+      <td>{{ row.side }}</td>
+      <td class="num">{{ row.qty }}</td>
+      <td class="num">{{ money(row.price, row.currency) }}</td>
+      <td class="num">{{ money(row.fee, row.currency) }}</td>
+      <td>{{ row.currency }}</td>
+      <td>
+        <form method="post" action="/portfolio/accounts/{{ account.id }}/fills/{{ row.id }}/undo" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">撤销</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="muted">还没有成交。</td></tr>
+    {% endfor %}
+  </table>
+  {% if account.fill_total > account.fills | length %}
+  <p class="muted">只显示最近 {{ account.fills | length }} 笔（共 {{ account.fill_total }} 笔）。</p>
+  {% endif %}
+  <p class="muted">撤销把现金逐分退回、持仓按其余成交重算；然后按正确的市场与代码重记一笔。</p>
 </section>
 {% else %}
 <section class="card">
@@ -99,6 +131,40 @@
   </form>
   <p class="muted">每一笔动现金都留流水与理由：余额能回溯到每一条入金、出金与成交。</p>
 </section>
+
+<section class="card">
+  <h2>换汇</h2>
+  <form method="post" action="/ledger/fx" class="panel">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>账户
+      <select name="account_id">
+        {% for account in accounts %}
+        <option value="{{ account.id }}"{% if account.id == fx.account_id %} selected{% endif %}>{{ account.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>从
+      <select name="from_ccy">
+        {% for item in currencies %}
+        <option value="{{ item }}"{% if item == fx.from_ccy %} selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>到
+      <select name="to_ccy">
+        {% for item in currencies %}
+        <option value="{{ item }}"{% if item == fx.to_ccy %} selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>金额（从） <input name="amount" type="number" step="any" value="{{ fx.amount }}"></label>
+    <label>汇率（1 从 = 多少到） <input name="rate" type="number" step="any" value="{{ fx.rate }}"></label>
+    <button type="submit">换汇</button>
+  </form>
+  <p class="muted">{{ fx_hint }}</p>
+  <p class="muted">不做自动折算：按券商给的实际成交汇率填，换汇记录与两条现金流水一起落库。
+    港股通买入前先在这里把 CNY 换成 HKD。</p>
+</section>
 {% endif %}
 
 <section class="card">
@@ -115,7 +181,7 @@
 {% if accounts %}
 <section class="card">
   <h2>录入成交</h2>
-  <form method="post" action="/ledger/fill" class="panel">
+  <form method="post" action="/ledger/fill" class="panel" id="portfolio-fill">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>账户
       <select name="account_id">
@@ -136,7 +202,12 @@
       </select>
     </label>
     <label>成交日 <input name="on" type="date" value="{{ fill.on }}"></label>
-    <label>代码 <input name="code" value="{{ fill.code }}"></label>
+    {# 代码格带名称候选：只看六位数字认不出票，选错市场就会记成另一种币（D206） #}
+    <label>代码 <input name="code" value="{{ fill.code }}"
+        placeholder="代码 / 首字母 / 名称，如 601088、zgsh"
+        hx-get="/api/symbol-search" hx-trigger="keyup changed delay:300ms"
+        hx-target="#fill-candidates" hx-include="#portfolio-fill select[name=market]"
+        hx-vals='{"scope": "fills"}' hx-swap="innerHTML"></label>
     <label>数量 <input name="qty" type="number" step="any" value="{{ fill.qty }}"></label>
     <label>价格 <input name="price" type="number" step="any" value="{{ fill.price }}"></label>
     <label>费用 <input name="fee" type="number" step="any" value="{{ fill.fee }}"></label>
@@ -148,7 +219,18 @@
     </label>
     <button type="submit">记一笔成交</button>
   </form>
+  <div id="fill-candidates"></div>
   <p class="muted">按你填的成交原样记账，不校验整手、T+1 与涨跌停；成交日按该市场本地 15:00 记。</p>
+  <script>
+    // 候选行的「填入」把市场与代码一起写进表单：这两格是同一只票的两个字段
+    document.getElementById("portfolio-fill").addEventListener("click", function (event) {
+      const button = event.target.closest("[data-fill-market]");
+      if (!button) return;
+      this.querySelector("select[name=market]").value = button.dataset.fillMarket;
+      this.querySelector("input[name=code]").value = button.dataset.fillCode;
+      document.getElementById("fill-candidates").innerHTML = "";
+    });
+  </script>
 </section>
 {% endif %}
 {% endblock %}
