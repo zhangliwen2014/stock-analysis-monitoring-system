@@ -74,6 +74,14 @@ class LedgerService:
         self._bump()
         return account
 
+    def rename_account(self, username: str, account_id: str, name: str) -> Account:
+        """改名不是开新户：持仓、成交、现金都挂 id，改完还是同一笔账（D204）。"""
+        user = resolve_actor(self.users, username)
+        self._require_account(user, account_id)
+        account = self.accounts.rename(user.id, account_id, name)
+        self._bump()
+        return account
+
     def deposit(
         self,
         account_id: str,

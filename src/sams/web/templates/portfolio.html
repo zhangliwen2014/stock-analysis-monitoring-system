@@ -10,6 +10,12 @@
   <h2>{{ account.name }}
     <span class="muted">总资产 {{ money(account.total, account.currency) }} · 截至 {{ account.as_of }}</span>
   </h2>
+  {# 名字打错就在这张卡上改：持仓、成交、现金与规则都挂 id，改名不动账（D204） #}
+  <form method="post" action="/portfolio/accounts/{{ account.id }}/rename" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>账户名 <input type="text" name="name" value="{{ account.rename_name }}"></label>
+    <button type="submit">改名</button>
+  </form>
   {# 现金与持仓市值分开列：只给「总资产」的话，读的人拆不出还能买多少、手里的票值多少 #}
   <table>
     <tr>

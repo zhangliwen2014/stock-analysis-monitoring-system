@@ -28,6 +28,7 @@ router = APIRouter()
 #: 记账成功后回到这一页的那句话：303 只说明「收了」，屏幕上要有人说「记下了」
 _NOTICES = {
     "account": "账户已开好。",
+    "renamed": "账户名已修改。",
     "cash": "现金已调整。",
     "fill": "成交已记一笔。",
 }
@@ -86,7 +87,9 @@ def _trade_moment(ctx: ServiceContext, raw: str, market: str) -> datetime | None
     return datetime(day.year, day.month, day.day, 15, 0, tzinfo=zone)
 
 
-def _account_view(ctx: ServiceContext, username: str, account) -> dict:
+def _account_view(
+    ctx: ServiceContext, username: str, account, *, rename_name: str | None = None
+) -> dict:
     """一个账户的一屏：汇总 + 逐行持仓。键只留模板要读的那些。
 
     现金（可用）与持仓市值分开给：「合计」是一个**总资产**，只把它端出来，
@@ -116,6 +119,8 @@ def _account_view(ctx: ServiceContext, username: str, account) -> dict:
     return {
         "id": account.id,
         "name": summary.name,
+        # 改名那一格平时就是现在的名字；被拒的那次回填的是刚交上来的那个（D204）
+        "rename_name": account.name if rename_name is None else rename_name,
         "currency": summary.report_currency,
         "cash": [
             {"currency": name, "amount": amount}
@@ -145,13 +150,19 @@ def _portfolio_page(
     fill_form: dict[str, str] | None = None,
     cash_form: dict[str, str] | None = None,
     account_form: dict[str, str] | None = None,
+    rename_form: dict[str, str] | None = None,
 ):
     user = request.state.sams_user
     web = request.app.state.web
     ctx = web.contexts.current()
     markets = sorted(ctx.settings.markets)
     accounts = [
-        _account_view(ctx, user.username, account)
+        _account_view(
+            ctx,
+            user.username,
+            account,
+            rename_name=(rename_form or {}).get(account.id),
+        )
         for account in ctx.sim_accounts.list_for(user.id)
     ]
     theses = ctx.theses.list(user.username)
@@ -215,6 +226,28 @@ def open_account(
     except SamsError as exc:
         return _portfolio_page(request, status=400, error=str(exc), account_form=form)
     return RedirectResponse("/portfolio?notice=account", status_code=303)
+
+
+@router.post("/portfolio/accounts/{account_id}/rename")
+def rename_account(
+    request: Request,
+    account_id: str,
+    _csrf: None = Depends(csrf_protect),
+    name: str = Form(""),
+):
+    """开户时名字打错（「中国银行」/「中国银河」）就在那张卡上改，不必重开一个户（D204）。"""
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    try:
+        ctx.ledger.rename_account(user.username, account_id, name)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _portfolio_page(
+            request, status=400, error=str(exc), rename_form={account_id: name}
+        )
+    return RedirectResponse("/portfolio?notice=renamed", status_code=303)
 
 
 @router.post("/ledger/cash")

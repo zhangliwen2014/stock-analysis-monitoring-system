@@ -116,6 +116,27 @@ class SimAccountRepo:
         assert account is not None  # 刚写完，读不到就是库出了问题
         return account
 
+    def rename(self, user_id: str, account_id: str, name: str) -> Account:
+        """改名只覆盖 `name`：持仓、成交、现金与规则都挂 id，不跟着名字走（D204）。"""
+        clean = name.strip()
+        if not clean:
+            raise ValidationError("账户名不能为空")
+        if self.get(user_id, account_id) is None:
+            raise StorageError(f"账户 {account_id} 不存在")
+        try:
+            self.db.execute(
+                "UPDATE sim_accounts SET name = ? WHERE id = ? AND user_id = ?",
+                [clean, account_id, user_id],
+            )
+        except StorageError as exc:
+            # 与 `open` 同一句：重名是「这一步不让走」，不是「库坏了」
+            if "Constraint" in str(exc) or "unique" in str(exc).lower():
+                raise StorageError(f"账户 {clean!r} 已存在（每个用户的账户名唯一）") from exc
+            raise
+        account = self.get(user_id, account_id)
+        assert account is not None  # 刚改完，读不到就是库出了问题
+        return account
+
     def get(self, user_id: str, account_id: str) -> Account | None:
         rows = self.db.query(
             "SELECT * FROM sim_accounts WHERE id = ? AND user_id = ?",

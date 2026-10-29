@@ -187,6 +187,62 @@ def test_an_account_opened_without_cash_is_zero_not_a_rejection(logged):
     assert logged.context.sim_accounts.cash_balances(account.id) == {}
 
 
+def test_the_page_renames_an_account_in_place(logged):
+    """开户时把名字打成「中国银行」不用重开一个户：同一张卡上改名，持仓与现金不动（D204）。"""
+    account_id = _open_account(logged, name="文-中国银行")
+    response = logged.client.post(
+        f"/portfolio/accounts/{account_id}/rename",
+        data={"csrf": logged.csrf, "name": " 文-中国银河 "},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/portfolio?notice=renamed"
+    page = logged.client.get(response.headers["location"])
+    assert "账户名已修改" in page.text
+    assert "文-中国银河" in page.text
+    assert "文-中国银行" not in page.text
+    # 改名不是新开：钱还是那一笔，id 也没换
+    assert logged.context.sim_accounts.cash_balances(account_id) == {"CNY": 200_000.0}
+
+
+def test_renaming_onto_a_taken_name_keeps_both_cards_as_they_were(logged):
+    _open_account(logged, name="主账户")
+    account_id = _open_account(logged, name="备用")
+    response = logged.client.post(
+        f"/portfolio/accounts/{account_id}/rename",
+        data={"csrf": logged.csrf, "name": "主账户"},
+    )
+    assert response.status_code == 400
+    assert "已存在" in response.text
+    names = [item.name for item in logged.context.sim_accounts.list_for(_user_id(logged))]
+    assert names == ["主账户", "备用"]
+
+
+def test_renaming_to_a_blank_name_is_refused_and_the_old_name_stays(logged):
+    account_id = _open_account(logged, name="主账户")
+    response = logged.client.post(
+        f"/portfolio/accounts/{account_id}/rename",
+        data={"csrf": logged.csrf, "name": "   "},
+    )
+    assert response.status_code == 400
+    assert "不能为空" in response.text
+    assert logged.context.sim_accounts.get(_user_id(logged), account_id).name == "主账户"
+
+
+def test_renaming_another_users_account_is_an_error(logged):
+    logged.context.users.create("bob", "another-correct-horse")
+    bob_account = _open_account(logged, username="bob", name="bobs户")
+    response = logged.client.post(
+        f"/portfolio/accounts/{bob_account}/rename",
+        data={"csrf": logged.csrf, "name": "抢来的名字"},
+    )
+    assert response.status_code == 400
+    assert "不属于" in response.text
+    assert logged.context.sim_accounts.get(
+        _user_id(logged, "bob"), bob_account
+    ).name == "bobs户"
+
+
 def test_cash_moves_in_and_out_from_the_page(logged):
     account_id = _open_account(logged)
     base = {"csrf": logged.csrf, "account_id": account_id, "currency": "CNY"}

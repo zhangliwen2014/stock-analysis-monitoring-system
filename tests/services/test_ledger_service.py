@@ -94,6 +94,21 @@ def test_writing_into_another_users_account_is_refused(svc, db) -> None:
     assert svc.cash(account_id) == {"CNY": 100_000.0}
 
 
+def test_rename_account_resolves_the_username_and_reads_back(svc) -> None:
+    """屏幕上写的是用户名，库里认 id：改名和其它写面走同一道解析（D204）。"""
+    account = svc.open_account(USER, "文-中国银行")
+    renamed = svc.rename_account(USER, account.id, "文-中国银河")
+    assert renamed.name == "文-中国银河"
+    assert [item.name for item in svc.accounts.list_for(_uid(svc))] == ["文-中国银河"]
+
+
+def test_renaming_another_users_account_is_refused(svc, db) -> None:
+    other = SimAccountRepo(db).open("someone-else", "别人的账户", report_currency="CNY")
+    with pytest.raises(StorageError, match="不属于"):
+        svc.rename_account(USER, other.id, "抢来的名字")
+    assert SimAccountRepo(db).get("someone-else", other.id).name == "别人的账户"
+
+
 def test_deposit_into_an_unknown_account_is_refused(svc) -> None:
     """1 不是 2：`--account` 这个参数本身没写错，错的是库里没有这笔账。"""
     with pytest.raises(StorageError, match="不存在"):

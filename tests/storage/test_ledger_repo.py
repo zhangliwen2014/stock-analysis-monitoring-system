@@ -47,6 +47,40 @@ def test_an_empty_account_name_is_a_typo(accounts: SimAccountRepo) -> None:
         accounts.open(USER, "  ", report_currency="CNY")
 
 
+def test_renaming_an_account_reads_back_under_the_new_name(accounts: SimAccountRepo) -> None:
+    """开户时把名字打错（「中国银行」/「中国银河」）只能开一个新户？不：改名读得回来。"""
+    account = accounts.open(USER, "文-中国银行", report_currency="CNY")
+    renamed = accounts.rename(USER, account.id, " 文-中国银河 ")
+    assert renamed.name == "文-中国银河"
+    assert accounts.get(USER, account.id).name == "文-中国银河"
+    # 改名不动身份：id 与币种还是那一行
+    assert renamed.id == account.id
+    assert renamed.report_currency == account.report_currency
+
+
+def test_renaming_onto_an_existing_name_is_the_same_business_refusal(
+    accounts: SimAccountRepo,
+) -> None:
+    accounts.open(USER, "主账户", report_currency="CNY")
+    other = accounts.open(USER, "备用", report_currency="CNY")
+    with pytest.raises(StorageError, match="已存在"):
+        accounts.rename(USER, other.id, "主账户")
+
+
+def test_renaming_to_a_blank_name_is_a_typo(accounts: SimAccountRepo) -> None:
+    account = accounts.open(USER, "主账户", report_currency="CNY")
+    with pytest.raises(ValidationError, match="空"):
+        accounts.rename(USER, account.id, "  ")
+    assert accounts.get(USER, account.id).name == "主账户"
+
+
+def test_another_user_cannot_rename_the_account(accounts: SimAccountRepo) -> None:
+    account = accounts.open(USER, "主账户", report_currency="CNY")
+    with pytest.raises(StorageError, match="不存在"):
+        accounts.rename("u2", account.id, "抢来的名字")
+    assert accounts.get(USER, account.id).name == "主账户"
+
+
 def test_another_user_cannot_read_the_account(accounts: SimAccountRepo) -> None:
     """用户隔离与 watchlists/theses 同形：没有「查全量再由上层过滤」的接口。"""
     account = accounts.open(USER, "主账户", report_currency="CNY")
