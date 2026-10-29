@@ -169,6 +169,7 @@ def test_jobdeps_carries_a_gate_by_default():
         sync=None,
         corp_actions=None,
         fundamentals=None,
+        f10=None,
         fx=None,
         calendar=None,
         rules=None,

@@ -164,7 +164,13 @@ def test_disable_follows_the_same_capability_rule(admin):
     admin.unroute("HK", "tencent")
     with pytest.raises(ValidationError, match="完全取不到数"):
         admin.set_enabled("yfinance", False)
-    assert admin.chains()["HK"] == ("yfinance", "akshare_hk", "sina_quote"), "被拒绝的操作不许改库"
+    assert admin.chains()["HK"] == (
+        "yfinance",
+        "akshare_hk",
+        "eastmoney_f10",
+        "eastmoney_hk_f10",
+        "sina_quote",
+    ), "被拒绝的操作不许改库"
 
 
 def test_a_second_source_unblocks_disabling_the_first(admin):

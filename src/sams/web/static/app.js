@@ -10,13 +10,30 @@
   var BAND = 70; // legend 之下、日期那一行与 dataZoom 滑块之上可用的百分比
   var SUB = 11; // 每格副图的高
   var GAP = 2; // 格与格之间
-  var live = null; // 只留一张活的图：换档是整块重画，旧的不 dispose 会把 resize 挂满
+  var live = []; // 一页可以同时有 K 线与财务图：按元素各记一张，换档只换掉自己那张
   var PRICE = "#2563eb"; // 分时线：与涨跌无关，它要说的是「走到哪」，红绿会把它读成涨或跌
   var AVG = "#e8a33d"; // 均价线：交易所口径的均价，与分时线交叉处就是「强于均价/弱于均价」
 
   window.addEventListener("resize", function () {
-    if (live) live.resize();
+    // htmx 换卡后旧元素已经离开文档：先摘掉，再让活着的图跟着窗口重排
+    live = live.filter(function (chart) {
+      var dom = chart.getDom();
+      return dom && dom.isConnected;
+    });
+    live.forEach(function (chart) { chart.resize(); });
   });
+
+  function mount(el, option) {
+    var stale = echarts.getInstanceByDom(el);
+    if (stale) {
+      stale.dispose();
+      live = live.filter(function (chart) { return chart !== stale; });
+    }
+    var chart = echarts.init(el);
+    chart.setOption(option);
+    live.push(chart);
+    return chart;
+  }
 
   function candlestick(payload, dates) {
     // ECharts 的 candlestick 数据顺序是 [open, close, low, high]，不是 OHLC：
@@ -158,10 +175,7 @@
     subNames.forEach(function (family, i) {
       series = series.concat(paneSeries(payload.sub[family], i + 1, payload));
     });
-    if (live) live.dispose();
-    var chart = echarts.init(el);
-    live = chart;
-    chart.setOption({
+    mount(el, {
       // legend 不给 data：ECharts 自己按 series 的名字铺，加一种指标不必回来改这里
       legend: { type: "scroll", top: 0 },
       tooltip: { trigger: "axis", axisPointer: { type: "cross" } },
@@ -258,10 +272,7 @@
         },
       },
     ];
-    if (live) live.dispose();
-    var chart = echarts.init(el);
-    live = chart;
-    chart.setOption({
+    mount(el, {
       legend: { type: "scroll", top: 0 },
       tooltip: { trigger: "axis", axisPointer: { type: "cross" } },
       axisPointer: { link: [{ xAxisIndex: "all" }] },
@@ -280,6 +291,76 @@
     }
   }
 
+  // 财务图：上格营收/净利双柱（亿元），下格 ROE/毛利率/净利率三线（%）。
+  // 两种单位各占一条 y 轴；NULL 原样交给 ECharts（断线），不补零——补零会画出一条
+  // 「利润归零」的假曲线。
+  var FIN_REVENUE = "#4c78a8"; // 与涨跌无关：营收不是价格，别用红绿说它
+  var FIN_PROFIT = "#f58518";
+  var FIN_LINES = ["#7c3aed", "#0ea5e9", "#b279a2"];
+
+  function yi(values) {
+    return (values || []).map(function (value) {
+      return value == null ? null : value / 1e8;
+    });
+  }
+
+  function financeChart(el, payload) {
+    var labels = payload.labels || [];
+    if (!labels.length) return;
+    var moneyUnit = payload.currency ? " 亿元（" + payload.currency + "）" : " 亿元";
+    mount(el, {
+      animation: false,
+      legend: { type: "scroll", top: 0 },
+      tooltip: {
+        trigger: "axis",
+        axisPointer: { type: "shadow" },
+        formatter: function (items) {
+          if (!items || !items.length) return "";
+          var lines = [items[0].axisValue];
+          items.forEach(function (item) {
+            if (item.value === null || item.value === undefined) return;
+            var bar = item.seriesName === "营业总收入" || item.seriesName === "归母净利润";
+            lines.push(
+              item.marker + item.seriesName + "：" + item.value.toFixed(2) + (bar ? moneyUnit : " %")
+            );
+          });
+          return lines.join("<br>");
+        },
+      },
+      axisPointer: { link: [{ xAxisIndex: "all" }] },
+      grid: [
+        { left: 64, right: 24, top: 34, height: "34%" },
+        { left: 64, right: 24, top: "62%", height: "26%" },
+      ],
+      xAxis: [
+        { type: "category", data: labels, gridIndex: 0,
+          axisLabel: { show: false }, axisTick: { show: false } },
+        { type: "category", data: labels, gridIndex: 1, axisTick: { show: false } },
+      ],
+      yAxis: [
+        { type: "value", gridIndex: 0, name: "亿元", scale: true },
+        { type: "value", gridIndex: 1, name: "%", scale: true },
+      ],
+      series: [
+        { name: "营业总收入", type: "bar", data: yi(payload.revenue),
+          xAxisIndex: 0, yAxisIndex: 0, barMaxWidth: 46,
+          itemStyle: { color: FIN_REVENUE } },
+        { name: "归母净利润", type: "bar", data: yi(payload.net_profit),
+          xAxisIndex: 0, yAxisIndex: 0, barMaxWidth: 46,
+          itemStyle: { color: FIN_PROFIT } },
+        { name: "ROE", type: "line", data: payload.roe,
+          xAxisIndex: 1, yAxisIndex: 1, connectNulls: false, symbolSize: 5,
+          lineStyle: { width: 2, color: FIN_LINES[0] }, itemStyle: { color: FIN_LINES[0] } },
+        { name: "毛利率", type: "line", data: payload.gross_margin,
+          xAxisIndex: 1, yAxisIndex: 1, connectNulls: false, symbolSize: 5,
+          lineStyle: { width: 2, color: FIN_LINES[1] }, itemStyle: { color: FIN_LINES[1] } },
+        { name: "净利率", type: "line", data: payload.net_margin,
+          xAxisIndex: 1, yAxisIndex: 1, connectNulls: false, symbolSize: 5,
+          lineStyle: { width: 2, color: FIN_LINES[2] }, itemStyle: { color: FIN_LINES[2] } },
+      ],
+    });
+  }
+
   function samsChart(el) {
     if (typeof echarts === "undefined" || el.dataset.samsChart === "on") return;
     var url = el.dataset.chartUrl;
@@ -295,9 +376,11 @@
           el.textContent = "";
           return;
         }
-        // 两份 payload 的键不一样：分时时 `payload.times`，蜡烛时 `payload.dates`，
-        // 拿一套键去读另一套会得到一条空白曲线而不是报错——那比空白更难查
+        // 三份 payload 的键不一样：分时时 `payload.times`，蜡烛时 `payload.dates`，
+        // 财务时 `payload.labels`——拿一套键去读另一套会得到一条空白曲线而不是报错，
+        // 那比空白更难查
         if (el.dataset.chartKind === "time") timeChart(el, payload);
+        else if (el.dataset.chartKind === "finance") financeChart(el, payload);
         else klineChart(el, payload);
       })
       .catch(function () {

@@ -71,12 +71,20 @@ def empty_announcements() -> pl.DataFrame:
     )
 
 
+_PLACEHOLDERS = frozenset({"--", "—", "-", "n/a", "na", "null", "none"})
+
+
 def _text(value: object) -> str | None:
-    """空串与全空白按「源没给」处理；非空值原样保留（简介里的空格有语义）。"""
+    """空串、全空白与源的占位符（`--`/`—`）都按「源没给」处理。
+
+    非空值原样保留：简介里的空格有语义，不能顺手 strip。
+    """
     if value is None:
         return None
     text = str(value)
-    return text if text.strip() else None
+    if not text.strip() or text.strip().lower() in _PLACEHOLDERS:
+        return None
+    return text
 
 
 def _as_int(value: object) -> int | None:

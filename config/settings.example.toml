@@ -26,7 +26,7 @@ scheduler_tick_s = 60        # 调度器检查到期任务的间隔（秒）；�
 tz = "Asia/Shanghai"
 currency = "CNY"
 post_close_min = 30
-sources = ["akshare", "eastmoney", "tencent", "sina"]
+sources = ["akshare", "eastmoney", "tencent", "sina", "eastmoney_f10"]
 
 [markets.HK]
 tz = "Asia/Hong_Kong"
@@ -34,7 +34,7 @@ currency = "HKD"
 post_close_min = 30
 # akshare_hk 只报公司行为，取日线时会被跳过（D38）。写在这里是为了「配置兜底」与
 # 库里的种子给同一条链——库里一旦有路由记录，这一行就不再用到了
-sources = ["yfinance", "tencent", "akshare_hk"]
+sources = ["yfinance", "tencent", "akshare_hk", "eastmoney_f10", "eastmoney_hk_f10"]
 
 [markets.US]
 tz = "America/New_York"

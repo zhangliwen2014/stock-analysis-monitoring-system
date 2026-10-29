@@ -1,6 +1,6 @@
 """盘后链上每个 job 的功能本体：只把已有服务拼成一条链，不决定自己何时跑。
 
-五个数据 job 覆盖一个市场的一批票，**按只隔离**：一只票的链断了，剩下的照常入库，
+七个数据 job 覆盖一个市场的一批票，**按只隔离**：一只票的链断了，剩下的照常入库，
 断的那几只进 `JobOutcome.errors`，与「已经写进行数」并存于同一个结果里。
 不按只隔离的后果是「一只停牌票让整个市场今晚没有数据」，而它看起来像一次正常失败。
 
@@ -144,6 +144,26 @@ def run_flow(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return _bump_fundamentals(deps, _collect(_units(ctx), one, "资金流"))
 
 
+#: 公告的盘后窗口：只要最近 30 天。源一次最多给 100 条，今晚没抓到的旧公告
+#: 不会影响任何计算——公告不是回测或规则的输入（D216），这里不追求全历史
+ANNOUNCEMENTS_WINDOW_DAYS = 30
+
+
+def run_profile(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """公司概况一票一行：窗口对它没有意义，重复执行是覆盖（D214）。"""
+    return _collect(_units(ctx), lambda m, c: deps.f10.sync_profile(m, c).written, "公司概况")
+
+
+def run_announcements(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """最近 30 天的公告：按只隔离，一只票的源答不上来不带走其余。"""
+    start = ctx.as_of - timedelta(days=ANNOUNCEMENTS_WINDOW_DAYS)
+
+    def one(market: str, code: str) -> int:
+        return deps.f10.sync_announcements(market, code, start, ctx.as_of).written
+
+    return _collect(_units(ctx), one, "公告")
+
+
 #: 数据 job 的登记表：能力名（= 适配器方法名）→ job 名与实现。
 #: 缺能力的市场不登记（D106）：HK/US 没有按报告期的财务源，每天一条失败会把真故障淹掉
 _DATA_JOBS = (
@@ -152,6 +172,8 @@ _DATA_JOBS = (
     ("financials", "financials", run_financials),
     ("valuation", "valuation", run_valuation),
     ("funding_flow", "flow", run_flow),
+    ("company_profile", "profile", run_profile),
+    ("announcements", "announcements", run_announcements),
 )
 
 

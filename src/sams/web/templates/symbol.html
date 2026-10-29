@@ -13,6 +13,10 @@
        hx-swap="outerHTML"><p class="muted">图加载中…</p></div>
 </section>
 
+{# 资料块在图之后、空态之前（D214）：四张表四条读法，不让 K 线等它 #}
+<div hx-get="/api/partials/f10?market={{ market }}&code={{ code }}" hx-trigger="load"
+     hx-swap="outerHTML"><p class="muted">资料加载中…</p></div>
+
 {% if no_bars %}{# 空态与 404 说两件不同的事：这里是「有这只票、数还没来」（D146） #}
 <section class="card">
   <p>该股数据待同步：{{ backfill_note }}</p>

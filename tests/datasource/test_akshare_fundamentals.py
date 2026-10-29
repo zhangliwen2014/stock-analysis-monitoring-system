@@ -52,6 +52,21 @@ def indicators_raw(**over) -> pl.DataFrame:
         "ROEJQ": 5.83,
         "TOTALOPERATEREVETZ": 7.93,
         "PARENTNETPROFITTZ": 4.10,
+        "REPORT_TYPE": "一季报",
+        "TOTALOPERATEREVE": 1.2e11,
+        "PARENTNETPROFIT": 3.4e10,
+        "ZZCJLL": 3.21,
+        "ROIC": 6.15,
+        "XSMLL": 30.12,
+        "XSJLL": 28.33,
+        "EPSJB": 1.5,
+        "BPS": 25.6,
+        "MGJYXJJE": 2.2,
+        "ZCFZL": 41.5,
+        "LD": 1.8,
+        "SD": 1.4,
+        "CHZZL": 2.7,
+        "TOAZZL": 0.42,
     }
     row.update(over)
     return pl.DataFrame(
@@ -64,6 +79,21 @@ def indicators_raw(**over) -> pl.DataFrame:
                 "ROEJQ": 12.76,
                 "TOTALOPERATEREVETZ": -13.21,
                 "PARENTNETPROFITTZ": -5.30,
+                "REPORT_TYPE": "年报",
+                "TOTALOPERATEREVE": 5.1e11,
+                "PARENTNETPROFIT": 1.3e11,
+                "ZZCJLL": 10.44,
+                "ROIC": 15.2,
+                "XSMLL": 32.0,
+                "XSJLL": 25.5,
+                "EPSJB": 5.6,
+                "BPS": 24.9,
+                "MGJYXJJE": 7.8,
+                "ZCFZL": 40.2,
+                "LD": 1.7,
+                "SD": 1.3,
+                "CHZZL": 10.2,
+                "TOAZZL": 1.65,
             },
         ]
     )
@@ -379,3 +409,39 @@ def test_live_flow_gives_main_net_in_and_leaves_north_bound_unknown():
     assert out["north_net"].to_list() == [None] * out.height
 
 
+
+
+# ---------- 0028：Wind 式展示列（D217） ----------
+
+
+def test_financials_map_the_wind_columns_and_divide_percentages_once():
+    out = adapter().financials("A", "601088", ALL_START, END)
+    q1 = out.filter(pl.col("report_date") == Q1_2024).row(0, named=True)
+    assert q1["report_type"] == "一季报"
+    assert q1["revenue"] == pytest.approx(1.2e11)
+    assert q1["net_profit"] == pytest.approx(3.4e10)
+    # 百分数 ÷100 只发生一次：30.12 → 0.3012，不是 30.12 也不是 0.003012
+    assert q1["gross_margin"] == pytest.approx(0.3012)
+    assert q1["net_margin"] == pytest.approx(0.2833)
+    assert q1["roa"] == pytest.approx(0.0321)
+    assert q1["roic"] == pytest.approx(0.0615)
+    assert q1["debt_ratio"] == pytest.approx(0.415)
+    # 原值列不换单位：每股 1.5 元、流动比率 1.8 倍
+    assert q1["eps"] == pytest.approx(1.5)
+    assert q1["bps"] == pytest.approx(25.6)
+    assert q1["ocf_per_share"] == pytest.approx(2.2)
+    assert q1["current_ratio"] == pytest.approx(1.8)
+    assert q1["quick_ratio"] == pytest.approx(1.4)
+    assert q1["inventory_turnover"] == pytest.approx(2.7)
+    assert q1["total_asset_turnover"] == pytest.approx(0.42)
+
+
+def test_a_missing_optional_indicator_column_is_said_aloud_and_left_null(caplog):
+    """源少一列展示指标：warn 一次、那一列 NULL，ROE/增速这条 PIT 链照常。"""
+    with caplog.at_level("WARNING"):
+        out = adapter(
+            financials_fetch=lambda symbol: indicators_raw().drop("XSMLL")
+        ).financials("A", "601088", ALL_START, END)
+    assert "XSMLL" in caplog.text
+    assert out["gross_margin"].to_list() == [None, None]
+    assert out["roe"].to_list() == [pytest.approx(0.1276), pytest.approx(0.0583)]

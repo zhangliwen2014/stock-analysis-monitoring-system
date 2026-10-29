@@ -15,13 +15,43 @@ from __future__ import annotations
 from datetime import date
 
 #: 比率列：库里一律**小数**，0.20 = 20%，-0.05 = 下降 5%。源给百分数时在此 ÷100。
-RATIO_COLUMNS = ("roe", "revenue_yoy", "profit_yoy", "dividend_yield")
+#: 后半段是 0028 的展示列：它们只给个股页看数，不进选股与市赚率。
+RATIO_COLUMNS = (
+    "roe",
+    "revenue_yoy",
+    "profit_yoy",
+    "dividend_yield",
+    "gross_margin",
+    "net_margin",
+    "roa",
+    "roic",
+    "debt_ratio",
+)
 
 #: 倍数列：20 倍市盈率就存 20.0，永远不参与 ÷100。与比率列搞混的后果见模块开头。
 MULTIPLE_COLUMNS = ("pe_ttm", "pb")
 
 #: 金额列：本币原值（A 股元、港股 HKD、美股 USD），不做单位归一；币种在 `symbols.currency`
-MONEY_COLUMNS = ("market_cap", "main_net_in", "north_net", "north_hold", "margin_bal")
+MONEY_COLUMNS = (
+    "market_cap",
+    "main_net_in",
+    "north_net",
+    "north_hold",
+    "margin_bal",
+    "revenue",
+    "net_profit",
+)
+
+#: 每股列：本币/股（0028 的展示列）。与金额列一样不换单位；屏幕上带币种名。
+PER_SHARE_COLUMNS = ("eps", "bps", "ocf_per_share")
+
+#: 倍数/周转列：倍或次（0028 的展示列），永远不参与 ÷100。
+TURNOVER_COLUMNS = (
+    "current_ratio",
+    "quick_ratio",
+    "inventory_turnover",
+    "total_asset_turnover",
+)
 
 #: 进 `financials` 的列。粒度是**报告期**（主键 market/code/report_date）。
 #: 注意这里刻意不含 `pe_ttm` / `pb`：那两列在 0001 的 DDL 里存在，但「今天的 PE」不属于
@@ -31,11 +61,26 @@ FINANCIAL_COLUMNS = (
     "code",
     "report_date",
     "published_date",
+    "report_type",
     "roe",
     "revenue_yoy",
     "profit_yoy",
     "dividend_yield",
     "market_cap",
+    "revenue",
+    "net_profit",
+    "eps",
+    "bps",
+    "ocf_per_share",
+    "gross_margin",
+    "net_margin",
+    "roa",
+    "roic",
+    "debt_ratio",
+    "current_ratio",
+    "quick_ratio",
+    "inventory_turnover",
+    "total_asset_turnover",
     "source",
 )
 
@@ -67,7 +112,7 @@ FLOW_COLUMNS = (
 
 #: 文本列：三张表共用的键列与来源列。类型判断只看这一份名单——采集侧与仓库侧各写一份
 #: 「哪些列是文本」时，漏写的那一份会把 `market` 补成数值 null，然后在键归一那步炸掉。
-TEXT_COLUMNS = ("market", "code", "source")
+TEXT_COLUMNS = ("market", "code", "source", "report_type")
 
 #: 百分数 → 小数的除数。写成常量而不是在两侧各写一个 `100.0`：口径换算的**数值**也只有一个出处。
 #:
@@ -98,6 +143,12 @@ RATIO_BOUNDS = {
     "revenue_yoy": 5.0,
     "profit_yoy": 5.0,
     "dividend_yield": 1.0,
+    # 0028 的展示列：界设得宽，只挡「百分数没 ÷100」那种量级错，不挡真实的异常值
+    "gross_margin": 2.0,
+    "net_margin": 20.0,
+    "roa": 5.0,
+    "roic": 10.0,
+    "debt_ratio": 2.0,
 }
 
 

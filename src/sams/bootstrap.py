@@ -39,6 +39,7 @@ from sams.services.annotations import AnnotationService
 from sams.services.attachments import AttachmentService, attachments_root
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
+from sams.services.f10 import F10Service, F10SyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
 from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
@@ -91,6 +92,7 @@ from sams.storage.repos.chart_prefs import ChartPrefRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
+from sams.storage.repos.f10 import AnnouncementRepo, CompanyProfileRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.index_daily import IndexDailyRepo
@@ -200,6 +202,10 @@ class ServiceContext:
     financials_store: FinancialRepo
     valuation_store: ValuationRepo
     flow_store: FundingFlowRepo
+    #: 公司概况（D214）：一票一行，页面的资料块与 `sync profile` 写的是同一张表
+    profiles_store: CompanyProfileRepo
+    #: 公告元数据（D216）：只给看，正文与 PDF 留外链
+    announcements_store: AnnouncementRepo
     scan_store: ScanResultRepo
     #: 全市场快照（D175）：盘后 `spot` job 整日覆盖写，选股屏读最近一天
     snapshot_store: SnapshotRepo
@@ -223,6 +229,9 @@ class ServiceContext:
     sync: SyncService
     corp_action_sync: CorpActionSyncService
     fundamental_sync: FundamentalSyncService
+    #: 个股资料（D214）：写侧两条链与读侧四块档案；后者只给页面看，不参与计算
+    f10_sync: F10SyncService
+    f10: F10Service
     #: 汇率那条链：没有市场维度，所以它不跟着 `sync`/`fundamental_sync` 走市场路由
     fx_sync: FxSyncService
     #: 代码表周同步（D141）：调度器登记的 job 与 CLI 走的就是这一份
@@ -467,6 +476,9 @@ def _context_on(
     financials_store = FinancialRepo(database)
     valuation_store = ValuationRepo(database)
     flow_store = FundingFlowRepo(database)
+    # 个股资料（D214）：概况一票一行、公告按 art_code 幂等，正文与 PDF 不进来
+    profiles_store = CompanyProfileRepo(database)
+    announcements_store = AnnouncementRepo(database)
     scan_store = ScanResultRepo(database)
     snapshot_store = SnapshotRepo(database)
     screener_presets = ScreenerPresetRepo(database, clock=clock)
@@ -490,6 +502,15 @@ def _context_on(
     providers = providers if providers is not None else default_providers(cfg)
     calendar = CalendarService(calendar_store, providers, bus=event_bus, clock=clock)
     fundamentals = FundamentalService(financials_store, valuation_store, clock=clock)
+    f10 = F10Service(
+        registry,
+        profiles_store,
+        announcements_store,
+        financials_store,
+        valuation_store,
+        corp_actions,
+        clock=clock,
+    )
     analysis = AnalysisService(bars, corp_actions, corp_actions_coverage, symbols, clock=clock)
     minute = MinuteService(registry, calendar, clock=clock)
     valuation = ValuationService(
@@ -645,6 +666,7 @@ def _context_on(
     fundamental_sync = FundamentalSyncService(
         registry, financials_store, valuation_store, flow_store, symbols
     )
+    f10_sync = F10SyncService(registry, profiles_store, announcements_store, clock=clock)
     fx_sync = FxSyncService(registry, fx_store)
     universe_builder = UniverseBuilder(
         users=users,
@@ -681,6 +703,7 @@ def _context_on(
         sync=sync,
         corp_actions=corp_action_sync,
         fundamentals=fundamental_sync,
+        f10=f10_sync,
         fx=fx_sync,
         calendar=calendar,
         rules=rule_engine,
@@ -728,6 +751,8 @@ def _context_on(
         financials_store=financials_store,
         valuation_store=valuation_store,
         flow_store=flow_store,
+        profiles_store=profiles_store,
+        announcements_store=announcements_store,
         scan_store=scan_store,
         snapshot_store=snapshot_store,
         screener_presets=screener_presets,
@@ -746,6 +771,8 @@ def _context_on(
         sync=sync,
         corp_action_sync=corp_action_sync,
         fundamental_sync=fundamental_sync,
+        f10_sync=f10_sync,
+        f10=f10,
         fx_sync=fx_sync,
         symbol_master_sync=symbol_master_sync,
         fundamentals=fundamentals,

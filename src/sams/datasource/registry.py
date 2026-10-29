@@ -24,13 +24,13 @@ from sams.core.sources import SourceHealthStore, SourceRecord
 from sams.datasource.actions import answers_full_history, empty_actions
 from sams.datasource.base import BarAdapter
 from sams.datasource.capabilities import capability
+from sams.datasource.f10 import empty_announcements, empty_profile
 from sams.datasource.fundamentals import (
     empty_financials,
     empty_flow,
     empty_valuation,
 )
 from sams.datasource.fx import empty_fx, has_fx
-from sams.datasource.f10 import empty_announcements, empty_profile
 from sams.datasource.minute import answers
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter

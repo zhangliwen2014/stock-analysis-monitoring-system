@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from sams.bootstrap import build_core
 from sams.core.timeutil import CalendarDay, SessionWindow
+from sams.datasource.f10 import empty_announcements, empty_profile
 from sams.datasource.spot import SPOT_SCHEMA
 from sams.web.app import create_app
 from sams.web.context import ThreadContexts
@@ -28,6 +29,16 @@ class StubSnapshotAdapter(support.StubAdapter):
 
     def market_snapshot(self, market, codes):
         return pl.DataFrame(schema=SPOT_SCHEMA)
+
+
+class StubF10Adapter(support.StubAdapter):
+    """日线替身 + 公司概况/公告两条能力：资料块只按能力说话，局部读从不真调它。"""
+
+    def company_profile(self, market, code):
+        return empty_profile()
+
+    def announcements(self, market, code, start, end):
+        return empty_announcements()
 
 
 class FakeRuntime:
@@ -247,3 +258,46 @@ def logged_screen(screen_app):
     assert response.status_code == 303, response.text
     screen_app.csrf = screen_app.client.cookies.get("sams_csrf").rpartition(".")[0]
     return screen_app
+
+
+@pytest.fixture
+def f10_sources(stub_sources):
+    """A 股链上的 akshare 带 F10 两能力；HK/US 的 yfinance 不带（US 因此明说缺源）。"""
+    made = dict(stub_sources)
+    made["akshare"] = StubF10Adapter("akshare", ["A"], support.sample_bars(source="akshare"))
+    return made
+
+
+@pytest.fixture
+def make_f10_app(migrated, f10_sources):
+    yield from _build_app_factory(migrated, f10_sources)
+
+
+@pytest.fixture
+def f10_app(make_f10_app):
+    """与 `web_app` 同一台 app，只是 A 股链上的源会答公司概况与公告。"""
+    web = make_f10_app()
+    context = web.contexts.current()
+    context.users.create("alice", "correct-horse-battery", is_admin=True)
+    with TestClient(web.app) as client:
+        yield SimpleNamespace(
+            client=client,
+            app=web.app,
+            core=web.core,
+            contexts=web.contexts,
+            context=context,
+            runtime=web.app.state.web.runtime,
+        )
+
+
+@pytest.fixture
+def logged_f10(f10_app):
+    """已登录的 alice：给个股资料那几条用例用。"""
+    response = f10_app.client.post(
+        "/login",
+        data={"username": "alice", "password": "correct-horse-battery"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    f10_app.csrf = f10_app.client.cookies.get("sams_csrf").rpartition(".")[0]
+    return f10_app

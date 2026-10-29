@@ -14,7 +14,9 @@ from sams.core.fundamentals import (
     FLOW_COLUMNS,
     MONEY_COLUMNS,
     MULTIPLE_COLUMNS,
+    PER_SHARE_COLUMNS,
     RATIO_COLUMNS,
+    TURNOVER_COLUMNS,
     VALUATION_COLUMNS,
     caliber_note,
     is_year_end,
@@ -40,7 +42,13 @@ def test_a_period_is_the_annual_one_only_on_december_31():
 
 def test_the_three_unit_families_do_not_overlap():
     """一列只能属于一个家族。同时属于「比率」和「倍数」的列会被 ÷100 两次或零次。"""
-    families = [set(RATIO_COLUMNS), set(MULTIPLE_COLUMNS), set(MONEY_COLUMNS)]
+    families = [
+        set(RATIO_COLUMNS),
+        set(MULTIPLE_COLUMNS),
+        set(MONEY_COLUMNS),
+        set(PER_SHARE_COLUMNS),
+        set(TURNOVER_COLUMNS),
+    ]
     for i, left in enumerate(families):
         for right in families[i + 1 :]:
             assert not (left & right), f"{left & right} 同时被归进两个单位家族"
@@ -48,9 +56,23 @@ def test_the_three_unit_families_do_not_overlap():
 
 def test_every_value_column_is_classified():
     """没归类的列 = 没人负责它的单位。今天不问，明天就有人按自己的猜想念它。"""
-    keys = {"market", "code", "date", "report_date", "published_date", "source"}
+    keys = {
+        "market",
+        "code",
+        "date",
+        "report_date",
+        "published_date",
+        "source",
+        "report_type",
+    }
     values = (set(FINANCIAL_COLUMNS) | set(VALUATION_COLUMNS) | set(FLOW_COLUMNS)) - keys
-    covered = set(RATIO_COLUMNS) | set(MULTIPLE_COLUMNS) | set(MONEY_COLUMNS)
+    covered = (
+        set(RATIO_COLUMNS)
+        | set(MULTIPLE_COLUMNS)
+        | set(MONEY_COLUMNS)
+        | set(PER_SHARE_COLUMNS)
+        | set(TURNOVER_COLUMNS)
+    )
     assert values - covered == set(), f"这些列没有单位归属: {sorted(values - covered)}"
 
 

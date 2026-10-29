@@ -25,6 +25,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .up { color: var(--danger); }   /* 红涨 */
 .down { color: var(--ok); }     /* 绿跌 */
 .muted { color: var(--muted); }
+/* 简介与备注原样保留源里的换行（D214：清洗过的简介与源里的不是同一段话） */
+.pre-wrap { white-space: pre-wrap; }
 /* 报告币种合计下面那两段（价格 + 换汇）：同一格里换行，不挤占旁边一列 */
 .row-split { display: block; font-size: 12px; }
 .flash-error { color: var(--danger); background: #fee4e2; border: 1px solid #fda29b;
@@ -81,6 +83,19 @@ form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
 .chart-group a[aria-disabled="true"] { color: var(--muted); opacity: .5; pointer-events: auto; }
 .chart-group a[aria-disabled="true"]:hover { border-color: transparent; }
 .chart-caption { margin: 6px 0 0; font-size: 13px; }
+
+/* 财务明细（D218/D219）：指标列钉在左边，期数多了横向滚动而不是把首列滚走 */
+.fin-scroll { overflow-x: auto; }
+.fin-table { min-width: 100%; }
+.fin-table th:first-child, .fin-table td:first-child {
+  position: sticky; left: 0; background: #fff; z-index: 1;
+}
+.fin-table thead th { white-space: nowrap; }
+.fin-table tr.fin-group th {
+  background: #f4f4f6; color: #1c1c22; font-weight: 600;
+  padding-top: 4px; padding-bottom: 4px;
+}
+.fin-table th[scope="row"] { color: #1c1c22; font-weight: 400; white-space: nowrap; }
 
 /* .link：读起来像链接、确实是按钮（要 POST + CSRF）：默认 button 在表格里是块灰砖，
    行高被它撑坏，「移除/恢复」这种低频动作也不该抢那一列的视觉重量 */

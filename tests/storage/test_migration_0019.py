@@ -33,10 +33,11 @@ def test_0019_seeds_sina_quote_at_the_end_of_every_market(db):
     repo = DataSourceRepo(db)
     row = repo.get("sina_quote")
     assert row is not None and row.kind == "sina_quote"
-    assert repo.chains() == {
-        "A": ("akshare", "eastmoney", "tencent", "sina", "akshare_ths", "sina_quote"),
-        "HK": ("yfinance", "tencent", "akshare_hk", "sina_quote"),
-        "US": ("yfinance", "tencent", "sina_quote"),
+    # 这一枚只钉 0019 的位置约定：后面再插什么源，sina_quote 仍得是各链末位
+    assert {market: chain[-1] for market, chain in repo.chains().items()} == {
+        "A": "sina_quote",
+        "HK": "sina_quote",
+        "US": "sina_quote",
     }
 
 

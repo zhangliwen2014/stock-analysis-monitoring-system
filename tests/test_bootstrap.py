@@ -85,10 +85,25 @@ def test_registry_chain_comes_from_the_database(migrated):
         assert built.registry.market_sources == {
             # akshare_ths 只报公司行为（D38）：它在日线链上会被显式跳过，但它确实在库里，
             # 所以 market_sources 这条「链上排了谁」的事实要把它算进来
-            "A": ("akshare", "eastmoney", "tencent", "sina", "akshare_ths", "sina_quote"),
+            "A": (
+                "akshare",
+                "eastmoney",
+                "tencent",
+                "sina",
+                "akshare_ths",
+                "eastmoney_f10",
+                "sina_quote",
+            ),
             # 链是「按市场的路由」，不是「谁能取日线」：akshare_hk 只报公司行为，
             # 采集时被跳过（D38），备源判据走 registry.chain_for(market, method)
-            "HK": ("yfinance", "tencent", "akshare_hk", "sina_quote"),
+            "HK": (
+                "yfinance",
+                "tencent",
+                "akshare_hk",
+                "eastmoney_f10",
+                "eastmoney_hk_f10",
+                "sina_quote",
+            ),
             "US": ("yfinance", "tencent", "sina_quote"),
         }
         assert built.registry.chain_for("HK", "daily_bars") == ("yfinance", "tencent")
@@ -98,6 +113,11 @@ def test_registry_chain_comes_from_the_database(migrated):
         assert built.registry.chain_for("A", "quote") == ("tencent", "sina_quote")
         assert built.registry.chain_for("HK", "quote") == ("tencent", "sina_quote")
         assert built.registry.chain_for("US", "quote") == ("tencent", "sina_quote")
+        # F10（D214）：US 的链上没有概况/公告源；港股财务多一个只服务它的源
+        assert built.registry.chain_for("A", "company_profile") == ("eastmoney_f10",)
+        assert built.registry.chain_for("HK", "announcements") == ("eastmoney_f10",)
+        assert built.registry.chain_for("US", "company_profile") == ()
+        assert built.registry.chain_for("HK", "financials") == ("eastmoney_hk_f10",)
     finally:
         built.close()
 
@@ -117,6 +137,7 @@ def test_disabling_a_source_takes_it_out_of_the_next_container(migrated):
             "tencent",
             "sina",
             "akshare_ths",
+            "eastmoney_f10",
             "sina_quote",
         )
         assert "akshare" not in second.registry.adapters, "停用源连适配器都不该建"

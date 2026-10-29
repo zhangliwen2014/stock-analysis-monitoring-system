@@ -16,8 +16,8 @@ from typing import Any
 from sams.core.errors import DatasourceError
 from sams.datasource.actions import has_actions
 from sams.datasource.base import has_bars
-from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
 from sams.datasource.f10 import has_announcements, has_profile
+from sams.datasource.fundamentals import has_financials, has_flow, has_valuation
 from sams.datasource.fx import has_fx
 from sams.datasource.index_daily import has_index_daily
 from sams.datasource.listed_date import has_listed_date

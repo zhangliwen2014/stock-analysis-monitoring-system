@@ -1,4 +1,4 @@
-"""五个数据 job 的两条规矩：窗口从库里已有的日子往前，失败按只隔离。
+"""七个数据 job 的两条规矩：窗口从库里已有的日子往前，失败按只隔离。
 
 窗口断言看的是**问出去的区间**（`adapter.calls`），不是写回来的行数：一个把 730 天
 写死的 job 也能把今天的 K 线放进库，只是每晚都把所有源重拉一遍。
@@ -13,24 +13,27 @@ from types import SimpleNamespace
 
 import polars as pl
 import pytest
-from support import sample_actions, sample_bars
+from support import FrozenClock, sample_actions, sample_bars
 from support_fundamentals import StubFundamentalsAdapter
 from support_valuation import financial_rows, flow_rows, valuation
 
 from sams.core.config import IndicesCfg
-from sams.core.errors import RateLimited
+from sams.core.errors import DatasourceError, RateLimited
 from sams.core.version import VersionGate
 from sams.datasource.registry import AdapterRegistry
 from sams.services.corp_actions import CorpActionSyncService
+from sams.services.f10 import F10SyncService
 from sams.services.fundamentals import FundamentalSyncService
 from sams.services.market_snapshot import SnapshotSync
 from sams.services.scheduler.jobs import (
     build_jobs,
     run_actions,
+    run_announcements,
     run_bars,
     run_financials,
     run_flow,
     run_indices,
+    run_profile,
     run_spot,
     run_symbol_master,
     run_valuation,
@@ -42,6 +45,7 @@ from sams.services.sync import SyncService
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
+from sams.storage.repos.f10 import AnnouncementRepo, CompanyProfileRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -119,6 +123,48 @@ class StubIndexAdapter:
         )
 
 
+class F10CapableAdapter(RecordingBarsAdapter):
+    """概况 + 公告的记录替身：两个方法就是能力的全部判据（D38）。
+
+    只声明 A/HK，与真实源一致：US 链上没有它，`build_jobs` 就不该登记那两个 job。
+    """
+
+    def __init__(self, *, fail_codes=()):
+        super().__init__(name="eastmoney_f10", markets=("A", "HK"))
+        self.f10_calls: list[tuple[str, str, str, date, date]] = []
+        self.fail_codes = set(fail_codes)
+
+    def company_profile(self, market, code, start, end):
+        self.f10_calls.append(("profile", market, code, start, end))
+        if code in self.fail_codes:
+            raise DatasourceError(self.name, "503 服务不可用")
+        return pl.DataFrame(
+            [
+                {
+                    "market": market,
+                    "code": code,
+                    "name": f"名称{code}",
+                    "source": self.name,
+                }
+            ]
+        )
+
+    def announcements(self, market, code, start, end):
+        self.f10_calls.append(("announcements", market, code, start, end))
+        return pl.DataFrame(
+            {
+                "market": [market],
+                "code": [code],
+                "art_code": [f"{code}-1"],
+                "published_on": [end],
+                "title": [f"{code} 的公告"],
+                "category": ["临时公告"],
+                "url": [f"https://example.test/{code}"],
+                "source": [self.name],
+            }
+        )
+
+
 def deps(
     db,
     settings,
@@ -128,11 +174,14 @@ def deps(
     hk=None,
     index=None,
     with_indices=True,
+    f10=None,
+    with_us=False,
 ):
     """装配这条链上真正跑到的那几个服务；汇率/日历/规则那几个槽位这里是 None，本文件不跑它们。
 
     `index` 给 A 市那条链添一个指数日线的源，`with_indices=False` 则让 `SyncService`
-    拿不到指数仓库——大盘条那两道闸（能力与注入）要分开钉。
+    拿不到指数仓库——大盘条那两道闸（能力与注入）要分开钉。`f10` 与 `with_us` 只在
+    登记表那几枚用例里用到。
     """
     bars = bars or RecordingBarsAdapter()
     hk = hk or RecordingBarsAdapter(name="yfinance", markets=("HK",))
@@ -146,6 +195,14 @@ def deps(
     if index is not None:
         adapters[index.name] = index
         market_sources["A"] = (*market_sources["A"], index.name)
+    if f10 is not None:
+        adapters[f10.name] = f10
+        market_sources["A"] = (*market_sources["A"], f10.name)
+        market_sources["HK"] = (*market_sources["HK"], f10.name)
+    if with_us:
+        us = RecordingBarsAdapter(name="yfinance_us", markets=("US",))
+        adapters[us.name] = us
+        market_sources["US"] = (us.name,)
     registry = AdapterRegistry(
         adapters=adapters, market_sources=market_sources, sleep=lambda _: None
     )
@@ -169,6 +226,12 @@ def deps(
             ValuationRepo(db),
             FundingFlowRepo(db),
             symbols,
+        ),
+        f10=F10SyncService(
+            registry,
+            CompanyProfileRepo(db),
+            AnnouncementRepo(db),
+            clock=FrozenClock(datetime(2024, 10, 25, tzinfo=UTC)),
         ),
         fx=None,  # type: ignore[arg-type]
         calendar=None,  # type: ignore[arg-type]
@@ -418,6 +481,35 @@ def index_rows(market: str, index_code: str, day: date) -> pl.DataFrame:
 
 def titles(deps_obj: JobDeps) -> set[tuple[str, str | None]]:
     return {(job.name, job.market) for job in build_jobs(deps_obj)}
+
+
+def test_build_jobs_registers_f10_only_where_the_chain_has_it(db, settings):
+    """US 的链上没有任何源能给概况/公告 ⇒ 不登记（D106），而不是每晚记一条失败。"""
+    registered = titles(deps(db, settings, f10=F10CapableAdapter(), with_us=True))
+    assert ("profile", "A") in registered
+    assert ("announcements", "A") in registered
+    assert ("profile", "HK") in registered
+    assert ("announcements", "HK") in registered
+    assert ("profile", "US") not in registered
+    assert ("announcements", "US") not in registered
+
+
+def test_profile_job_writes_per_code_and_isolates_failures(db, settings):
+    adapter = F10CapableAdapter(fail_codes={"601088"})
+    outcome = run_profile(deps(db, settings, f10=adapter), ctx("600519", "601088"))
+    assert outcome.rows_affected == 1
+    assert len(outcome.errors) == 1 and "601088" in outcome.errors[0]
+    assert CompanyProfileRepo(db).has("A", "600519")
+    assert not CompanyProfileRepo(db).has("A", "601088")
+
+
+def test_announcements_job_asks_for_the_last_thirty_days(db, settings):
+    adapter = F10CapableAdapter()
+    outcome = run_announcements(deps(db, settings, f10=adapter), ctx("600519"))
+    assert outcome.rows_affected == 1
+    assert adapter.f10_calls == [
+        ("announcements", "A", "600519", AS_OF - timedelta(days=30), AS_OF)
+    ]
 
 
 def test_indices_job_is_incremental(db, settings):

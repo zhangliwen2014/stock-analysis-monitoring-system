@@ -38,16 +38,20 @@ from sams.web.context import ThreadContexts
 from sams.web.display import (
     action_label,
     alert_status,
+    currency_label,
     delivery_label,
     dismiss_label,
     filter_label,
     hms,
     moment_label,
     money,
+    money_compact,
     pct,
+    ratio_pct,
     severity_label,
     state_label,
     target_type_label,
+    website_url,
 )
 from sams.web.pages import (
     admin,
@@ -73,7 +77,11 @@ def _templates() -> Jinja2Templates:
     templates = Jinja2Templates(directory=str(_TEMPLATES))
     templates.env.globals.update(
         money=money,
+        money_compact=money_compact,
+        currency_label=currency_label,
+        website_url=website_url,
         pct=pct,
+        ratio_pct=ratio_pct,
         hms=hms,
         state_label=state_label,
         alert_status=alert_status,

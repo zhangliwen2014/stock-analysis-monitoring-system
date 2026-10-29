@@ -32,7 +32,27 @@ _RATIOS = {
     "ROE_AVG": "roe",
     "OPERATE_INCOME_YOY": "revenue_yoy",
     "HOLDER_PROFIT_YOY": "profit_yoy",
+    "ROA": "roa",
+    "GROSS_PROFIT_RATIO": "gross_margin",
+    "NET_PROFIT_RATIO": "net_margin",
+    "DEBT_ASSET_RATIO": "debt_ratio",
 }
+
+#: 原值列：金额是本币（源已按交易币种换算）、每股是本币/股、比率是倍
+_PLAIN = {
+    "OPERATE_INCOME": "revenue",
+    "HOLDER_PROFIT": "net_profit",
+    "BASIC_EPS": "eps",
+    "BPS": "bps",
+    "PER_NETCASH_OPERATE": "ocf_per_share",
+    "CURRENT_RATIO": "current_ratio",
+}
+
+#: 源给「2026年中报」这种带年份的标签：筛档只认四个固定标签
+_REPORT_TYPES = ("一季报", "中报", "三季报", "年报")
+
+#: 缺了就没法当财务行的四列；其余（含 0028 的展示列）缺了只 warn 并留 NULL
+_REQUIRED = ("REPORT_DATE", "ROE_AVG", "OPERATE_INCOME_YOY", "HOLDER_PROFIT_YOY")
 
 
 def parse_hk_financials(
@@ -64,11 +84,17 @@ def parse_hk_financials(
         return empty_financials()
 
     first = items[0] if isinstance(items[0], dict) else {}
-    absent = [name for name in ("REPORT_DATE", *_RATIOS) if name not in first]
+    absent = [name for name in _REQUIRED if name not in first]
     if absent:
         raise FieldDrift(
             source,
             f"{market} {code} 的港股指标缺少必需列 {absent}，实际列 {list(first)}",
+        )
+    optional = [name for name in (*_RATIOS, *_PLAIN, "REPORT_TYPE") if name not in first]
+    if optional:
+        # 展示列整列消失不拖垮 ROE/增速这条 PIT 链，但必须出声（D217）
+        logger.warning(
+            "%s %s 的港股指标缺少展示列 %s，按 NULL 入库", source, code, optional
         )
 
     canonical = canonical_code(market, code)
@@ -95,12 +121,14 @@ def parse_hk_financials(
                 "report_date": report_date,
                 # 源不给披露日：留 NULL，不拿 REPORT_DATE + 45 天去猜（D61/D215）
                 "published_date": None,
-                "roe": _ratio(item.get("ROE_AVG")),
-                "revenue_yoy": _ratio(item.get("OPERATE_INCOME_YOY")),
-                "profit_yoy": _ratio(item.get("HOLDER_PROFIT_YOY")),
+                "report_type": _report_type(item.get("REPORT_TYPE")),
                 # 源的 DIVIDEND_RATE / TOTAL_MARKET_CAP 时点与口径未核实，不往里塞
                 "dividend_yield": None,
                 "market_cap": None,
+                # 0028 展示列：拿不到的列（速动、存货/总资产周转、季度 ROIC）留在 schema 的
+                # NULL 里，不拿天数的倒数或年度 ROIC 硬凑
+                **{target: _number(item.get(source)) for source, target in _PLAIN.items()},
+                **{target: _ratio(item.get(source)) for source, target in _RATIOS.items()},
                 "source": source,
             }
         )
@@ -123,6 +151,22 @@ def _ratio(value: object) -> float | None:
         return float(value) / PERCENT_DIVISOR  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _number(value: object) -> float | None:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _report_type(value: object) -> str | None:
+    """「2026年中报」→「中报」；认不出就 None，由页面的月份兜底。"""
+    text = str(value or "").strip()
+    for kind in _REPORT_TYPES:
+        if text.endswith(kind):
+            return kind
+    return None
 
 
 def _http_get(url: str, params: dict[str, str]) -> dict:

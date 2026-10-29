@@ -205,10 +205,18 @@ class FinancialRepo:
             self.db.execute(
                 f"""
                 INSERT OR REPLACE INTO {self.TABLE}
-                    (market, code, report_date, roe, revenue_yoy, profit_yoy,
-                     dividend_yield, market_cap, published_date, source)
-                SELECT market, code, report_date, roe, revenue_yoy, profit_yoy,
-                       dividend_yield, market_cap, published_date, source
+                    (market, code, report_date, published_date, report_type,
+                     roe, revenue_yoy, profit_yoy, dividend_yield, market_cap,
+                     revenue, net_profit, eps, bps, ocf_per_share,
+                     gross_margin, net_margin, roa, roic, debt_ratio,
+                     current_ratio, quick_ratio, inventory_turnover,
+                     total_asset_turnover, source)
+                SELECT market, code, report_date, published_date, report_type,
+                       roe, revenue_yoy, profit_yoy, dividend_yield, market_cap,
+                       revenue, net_profit, eps, bps, ocf_per_share,
+                       gross_margin, net_margin, roa, roic, debt_ratio,
+                       current_ratio, quick_ratio, inventory_turnover,
+                       total_asset_turnover, source
                 FROM {view}
                 """
             )

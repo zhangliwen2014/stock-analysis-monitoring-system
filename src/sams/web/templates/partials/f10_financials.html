@@ -1,0 +1,135 @@
+{# 主要财务指标（D217–D219）：估值一行 + 五档报告期 × 图表/明细。
+   比率从小数还原成百分数只经 `ratio_pct`（D58）；金额按本币原值 / 1e8 摆亿元。
+   两排开关都用 htmx 只换这张卡，选中态在服务端定（CSP 不许内联脚本）。 #}
+
+{% macro cell(value, kind, currency) -%}
+{%- if value is none -%}—
+{%- elif kind == "yi" -%}{{ "%.2f"|format(value / 1e8) }}
+{%- elif kind == "pct" -%}{{ ratio_pct(value) }}
+{%- elif kind == "share" -%}{{ money(value, currency_label(currency)) }}
+{%- else -%}{{ "%.2f"|format(value) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% set groups = [
+  ("规模", [
+    ("营业总收入（亿元）", "revenue", "yi"),
+    ("归母净利润（亿元）", "net_profit", "yi"),
+  ]),
+  ("增长", [
+    ("营收同比", "revenue_yoy", "pct"),
+    ("净利润同比", "profit_yoy", "pct"),
+  ]),
+  ("盈利能力", [
+    ("ROE", "roe", "pct"),
+    ("毛利率", "gross_margin", "pct"),
+    ("净利率", "net_margin", "pct"),
+    ("ROA", "roa", "pct"),
+    ("ROIC", "roic", "pct"),
+  ]),
+  ("每股", [
+    ("每股收益", "eps", "share"),
+    ("每股净资产", "bps", "share"),
+    ("每股经营现金流", "ocf_per_share", "share"),
+  ]),
+  ("偿债与运营", [
+    ("资产负债率", "debt_ratio", "pct"),
+    ("流动比率", "current_ratio", "num"),
+    ("速动比率", "quick_ratio", "num"),
+    ("存货周转率", "inventory_turnover", "num"),
+    ("总资产周转率", "total_asset_turnover", "num"),
+  ]),
+] %}
+
+<section class="card" id="f10-financials">
+  <h2>主要财务指标</h2>
+  {% if read.valuation %}
+  <p class="muted">最近交易日 {{ read.valuation.date }}：PE(TTM)
+    {{ "%.2f"|format(read.valuation.pe_ttm) if read.valuation.pe_ttm is not none else "—" }}
+    · PB {{ "%.2f"|format(read.valuation.pb) if read.valuation.pb is not none else "—" }}
+    {%- if read.valuation.dividend_yield is not none %} · 股息率 {{ ratio_pct(read.valuation.dividend_yield) }}{% endif %}
+    · 市值 {{ money_compact(read.valuation.market_cap, currency) }}</p>
+  {% else %}
+  <p class="muted">本地还没有这只票的估值。采一次：<code>{{ valuation_command }}</code></p>
+  {% endif %}
+
+  {% if not read.has_financial_data %}
+  {% if not read.has_financials_source %}
+  <p class="muted">{{ market_name }}的这条链上还没有财务指标的源。</p>
+  {% else %}
+  <p class="muted">本地还没有这只票的财务指标。采一次：<code>{{ financials_command }}</code></p>
+  {% endif %}
+  {% else %}
+
+  {% set base = "/api/partials/f10/financials?market=" ~ market ~ "&code=" ~ code %}
+  <div class="chart-bar fin-bar">
+    <span class="chart-group" role="group" aria-label="报告期">
+      {% for value, label in financial_periods %}
+      {% set on = value == read.period_type %}
+      <a hx-get="{{ base }}&period_type={{ value }}&view={{ fin_view }}"
+         hx-target="#f10-financials" hx-swap="outerHTML"
+         href="?period_type={{ value }}&view={{ fin_view }}"
+         {% if on %}aria-current="true" class="on"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </span>
+    <span class="chart-group" role="group" aria-label="视图">
+      {% for value, label in financial_views %}
+      {% set on = value == fin_view %}
+      <a hx-get="{{ base }}&period_type={{ read.period_type }}&view={{ value }}"
+         hx-target="#f10-financials" hx-swap="outerHTML"
+         href="?period_type={{ read.period_type }}&view={{ value }}"
+         {% if on %}aria-current="true" class="on"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </span>
+  </div>
+
+  {% if not read.financials %}
+  <p class="muted">这一类报告期本地还没有数据。</p>
+  {% elif fin_view == "table" %}
+  <div class="fin-scroll">
+    <table class="fin-table">
+      <tr>
+        <th scope="col">指标</th>
+        {% for row in read.financials %}
+        <th scope="col" class="num">{{ row.report_date }}<br>
+          <span class="muted">{{ row.period_kind or "" }}</span></th>
+        {% endfor %}
+      </tr>
+      {% for group, items in groups %}
+      <tr class="fin-group"><th colspan="{{ read.periods + 1 }}" scope="colgroup">{{ group }}</th></tr>
+      {% for label, key, kind in items %}
+      <tr>
+        <th scope="row">{{ label }}</th>
+        {% for row in read.financials %}
+        <td class="num">{{ cell(row[key], kind, currency) }}</td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+      {% endfor %}
+      <tr class="fin-group"><th colspan="{{ read.periods + 1 }}" scope="colgroup">披露</th></tr>
+      <tr>
+        <th scope="row">披露日</th>
+        {% for row in read.financials %}
+        <td class="num">
+          {%- if row.published_date -%}
+          {{ row.published_date }}{% if row.published_date > read.as_of %}<span class="muted">（预约）</span>{% endif %}
+          {%- else -%}<span class="muted">未给</span>{%- endif -%}
+        </td>
+        {% endfor %}
+      </tr>
+    </table>
+  </div>
+  {% else %}
+  <div class="fin-chart" data-chart-kind="finance" data-chart-period="{{ read.period_type }}"
+       data-chart-url="/api/partials/f10/chart?market={{ market }}&code={{ code }}&period_type={{ read.period_type }}"
+       style="width:100%;height:440px"></div>
+  <p class="muted chart-caption">
+    单位：亿元（{{ currency or "本币" }}）· 比率为百分数 · 柱为营业总收入 / 归母净利润，线为 ROE / 毛利率 / 净利率
+  </p>
+  {% endif %}
+
+  {% if market == "HK" %}
+  <p class="muted">本市场源不给披露日：这些指标只用于看数，不参与选股与市赚率（D215）。</p>
+  {% endif %}
+  {% endif %}
+</section>

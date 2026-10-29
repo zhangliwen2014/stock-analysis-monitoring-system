@@ -1,0 +1,88 @@
+{# 个股资料（D214）：四张卡——概况、主要财务指标、分红送转、公告。
+   比率从小数还原成百分数只经 `ratio_pct`（D58 的对称面）。空态分开说：
+   链上没有源（US）／有源但本地没采／库里没有数——下一句各不相同。 #}
+
+<section class="card" id="f10-profile">
+  <h2>公司概况</h2>
+  {% if read.profile %}
+  {% set p = read.profile %}
+  <div class="grid">
+    {% if p.full_name %}<div><span class="muted">全称</span><br>{{ p.full_name }}</div>{% endif %}
+    {% if p.name_en %}<div><span class="muted">英文名</span><br>{{ p.name_en }}</div>{% endif %}
+    {% if p.industry %}<div><span class="muted">行业</span><br>{{ p.industry }}</div>{% endif %}
+    {% if market == "A" and p.industry_csrc %}<div><span class="muted">证监会行业</span><br>{{ p.industry_csrc }}</div>{% endif %}
+    {% if p.exchange %}<div><span class="muted">交易所</span><br>{{ p.exchange }}</div>{% endif %}
+    {% if p.board %}<div><span class="muted">板块</span><br>{{ p.board }}</div>{% endif %}
+    {% if p.listed_on %}<div><span class="muted">上市日</span><br>{{ p.listed_on }}</div>{% endif %}
+    {% if p.website %}<div><span class="muted">官网</span><br><a href="{{ website_url(p.website) }}" target="_blank" rel="noreferrer">{{ p.website }}</a></div>{% endif %}
+    {% if p.chairman %}<div><span class="muted">董事长</span><br>{{ p.chairman }}</div>{% endif %}
+    {% if p.president %}<div><span class="muted">总经理</span><br>{{ p.president }}</div>{% endif %}
+    {% if p.secretary %}<div><span class="muted">公司秘书</span><br>{{ p.secretary }}</div>{% endif %}
+    {% if p.phone %}<div><span class="muted">电话</span><br>{{ p.phone }}</div>{% endif %}
+    {% if p.email %}<div><span class="muted">邮箱</span><br>{{ p.email }}</div>{% endif %}
+    {% if p.address %}<div><span class="muted">办公地址</span><br>{{ p.address }}</div>{% endif %}
+    {% if p.employees is not none %}<div><span class="muted">员工数</span><br>{{ "{:,}".format(p.employees) }}</div>{% endif %}
+    {% if market == "HK" %}
+    {% if p.isin %}<div><span class="muted">ISIN</span><br>{{ p.isin }}</div>{% endif %}
+    {% if p.lot_size is not none %}<div><span class="muted">每手股数</span><br>{{ "{:,}".format(p.lot_size) }}</div>{% endif %}
+    {% if p.hk_connect is not none %}<div><span class="muted">港股通标的</span><br>{{ "是" if p.hk_connect else "否" }}</div>{% endif %}
+    {% endif %}
+  </div>
+  {% if p.summary %}
+  <details>
+    <summary>公司简介</summary>
+    <p class="pre-wrap">{{ p.summary }}</p>
+  </details>
+  {% endif %}
+  {% elif not read.has_profile_source %}
+  <p class="muted">{{ market_name }}的这条链上还没有公司概况的源。</p>
+  {% else %}
+  <p class="muted">本地还没有这只票的概况。采一次：<code>{{ profile_command }}</code></p>
+  {% endif %}
+</section>
+
+{% include "partials/f10_financials.html" %}
+
+<section class="card" id="f10-dividends">
+  <h2>分红送转</h2>
+  {% if read.dividends %}
+  <table>
+    <tr><th>除权日</th><th>类型</th><th class="num">每股 / 比例</th><th>备注</th></tr>
+    {% for row in read.dividends %}
+    <tr>
+      <td>{{ row.ex_date }}</td>
+      <td>{{ kind_labels.get(row.kind, row.kind) }}</td>
+      <td class="num">
+        {%- if row.cash_per_share is not none -%}
+        每股 {{ money(row.cash_per_share, currency_label(currency)) }}
+        {%- elif row.ratio is not none -%}
+        1 股 → {{ "%.4f"|format(row.ratio) }} 股
+        {%- else -%}—{%- endif -%}
+      </td>
+      <td class="muted">{{ row.note or "" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">本地还没有这只票的分红送转记录。采一次：<code>{{ actions_command }}</code></p>
+  {% endif %}
+</section>
+
+<section class="card" id="f10-announcements">
+  <h2>公告</h2>
+  {% if read.announcements %}
+  <ul>
+    {% for row in read.announcements %}
+    <li>
+      {{ row.published_on }}
+      <a href="{{ row.url }}" target="_blank" rel="noreferrer">{{ row.title }}</a>
+      {% if row.category %}<span class="muted">{{ row.category }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% elif not read.has_announcement_source %}
+  <p class="muted">{{ market_name }}的这条链上还没有公告的源。</p>
+  {% else %}
+  <p class="muted">本地还没有这只票的公告。采一次：<code>{{ announcement_command }}</code></p>
+  {% endif %}
+</section>

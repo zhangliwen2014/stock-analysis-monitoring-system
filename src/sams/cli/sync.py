@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta
 
 from sams.bootstrap import Container
 from sams.cli.common import currency_arg, emit, exit_for, group, iso_date, refused, stamp
@@ -24,6 +25,10 @@ DEFAULT_ACTIONS_START = HISTORY_START
 #: 基本面与估值的默认起点同上：这些接口的答复本来就是「这只票的全部历史」，
 #: 窗口只用来切源返回的帧，把默认值编成「近五年」会让人以为更早的期数不存在
 DEFAULT_FUNDAMENTALS_START = DEFAULT_ACTIONS_START
+
+#: 手动补公告时多留一些余量：盘后 job 每晚问最近 30 天，手敲这一条的人通常是在补
+#: 更早的缺口。源一次最多给 100 条，这个窗口只裁剪那一页
+DEFAULT_ANNOUNCEMENTS_DAYS = 365
 
 #: 命令行上的名字 → （服务方法名, 给人看的种类名）。`flow` 而不是 `funding_flow`：
 #: 命令要短，而名字对不上服务层这件事由这张表一次性承担，不在各处猜
@@ -61,6 +66,24 @@ def add_to(subparsers) -> None:
         parser.add_argument("--start", help=f"YYYY-MM-DD，默认 {DEFAULT_FUNDAMENTALS_START}")
         parser.add_argument("--end", help="YYYY-MM-DD，默认今天")
         parser.set_defaults(handler=run_fundamental)
+
+    profile = actions.add_parser(
+        "profile", help="公司概况（一票一行，重复执行是覆盖，不吃窗口）"
+    )
+    profile.add_argument("--market", required=True, help="A / HK / US")
+    profile.add_argument("--code", required=True, action="append", help="可多次传入")
+    profile.set_defaults(handler=run_profile)
+
+    announcements = actions.add_parser(
+        "announcements", help="公告元数据（最近一页；正文与 PDF 只留外链）"
+    )
+    announcements.add_argument("--market", required=True, help="A / HK / US")
+    announcements.add_argument("--code", required=True, action="append", help="可多次传入")
+    announcements.add_argument(
+        "--start", help=f"YYYY-MM-DD，默认 {DEFAULT_ANNOUNCEMENTS_DAYS} 天前"
+    )
+    announcements.add_argument("--end", help="YYYY-MM-DD，默认今天")
+    announcements.set_defaults(handler=run_announcements)
 
     spot = actions.add_parser(
         "spot",
@@ -114,6 +137,46 @@ def run_fundamental(container: Container, args: argparse.Namespace) -> int:
         for name, reason in summary.skipped:
             print(f"           跳过 {name}：{reason}")
     return 0
+
+
+def run_profile(container: Container, args: argparse.Namespace) -> int:
+    """公司概况一票一行：给锁在里面的代码各问一次，重复执行行数不变。"""
+    for code in args.code:
+        _print_f10(container.f10_sync.sync_profile(args.market, code))
+    return 0
+
+
+def run_announcements(container: Container, args: argparse.Namespace) -> int:
+    """最近一页公告。默认 365 天，窗口只裁剪源返回的那 100 条。"""
+    end = iso_date(args.end) if args.end else container.clock.today()
+    start = (
+        iso_date(args.start)
+        if args.start
+        else end - timedelta(days=DEFAULT_ANNOUNCEMENTS_DAYS)
+    )
+    if start > end:
+        raise ValidationError(f"--start {start} 在 --end {end} 之后：区间反了")
+    for code in args.code:
+        _print_f10(container.f10_sync.sync_announcements(args.market, code, start, end))
+    return 0
+
+
+def _print_f10(summary) -> None:
+    line = f"{summary.code:<10} {summary.kind}  源={summary.source or '—'} 取回={summary.fetched}"
+    if summary.empty:
+        # 「每个有能力的源都说查无记录」不是「取回 0 条」：前者的下一步是接受，
+        # 后者的下一步是查源（D43）
+        line += (
+            f" 入库=0  链上每个有能力的源都说查无记录"
+            f"（{'+'.join(summary.confirmed_empty_by)}）"
+        )
+    else:
+        line += f" 入库={summary.written}"
+    if summary.degraded:
+        line += f" [降级: {_trail(summary.attempts)}]"
+    print(line)
+    for name, reason in summary.skipped:
+        print(f"           跳过 {name}：{reason}")
 
 
 def run_daily(container: Container, args: argparse.Namespace) -> int:

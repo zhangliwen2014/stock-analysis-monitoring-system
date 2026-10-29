@@ -27,7 +27,7 @@ from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
 from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
 from sams.web.chart_prefs import CHART_PERIODS, ordered_periods, parse_windows, windows_text
-from sams.web.display import hms, moment_label, pct_class, state_label
+from sams.web.display import hms, moment_label, pct_class, ratio_num, state_label
 from sams.web.pages.dashboard import _market_open
 
 router = APIRouter()
@@ -444,6 +444,158 @@ def minute_api(request: Request, market: str, code: str):
             "volume": list(share.volume),
             "prev_close": share.prev_close,
             "note": share.note,
+        }
+    )
+
+
+#: 资料卡里的市场叫法：「美股的这条链上还没有公司概况的源」比「US 股」像句人话。
+#: 与持仓页的 `_MARKET_LABELS` 不共用：那一份带「港股通」这条通道口径（D208）
+_F10_MARKET_NAMES = {"A": "A 股", "HK": "港股", "US": "美股"}
+#: 财务卡两排开关（D218/D219）：档名与 `F10Service` 的白名单同一份来源，这里只给字
+FINANCIAL_PERIODS: tuple[tuple[str, str], ...] = (
+    ("all", "全部"),
+    ("annual", "年报"),
+    ("q1", "一季度"),
+    ("h1", "半年"),
+    ("q3", "三季度"),
+)
+FINANCIAL_VIEWS: tuple[tuple[str, str], ...] = (("chart", "图表"), ("table", "明细"))
+#: 公司行为类型的中文名。`unknown` 是「源报了这么一件事但折不成因子」（D39），
+#: 屏幕上仍要原样给它的备注，所以这里只换名字、不做解释
+_ACTION_KIND_LABELS = {
+    "dividend": "派息",
+    "split": "拆股",
+    "bonus": "送股",
+    "transfer": "转增",
+    "rights": "配股",
+    "unknown": "其他方案",
+}
+
+
+@router.get("/api/partials/f10")
+def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
+    """个股资料：概况、主要财务指标、分红送转、公告（D214–D216）。
+
+    与页面同一套归一/404（`_require_symbol`）：`/symbol/HK/700` 与 `/symbol/HK/00700`
+    拆出来的 loader 都指向同一份资料，库里的键也只有一种形态（D50）。
+
+    三种「没有」在这里分开说（设计 §F）：链上没有源（US）→ 明说缺源；有源但本地
+    没数据 → 给采集命令；有数据 → 照常渲染。财务与估值的空态同第二档，只是命令换成
+    它们各自的那一条。
+    """
+    user = require_user(request)
+    web = request.app.state.web
+    ctx, market, code, symbol = _require_symbol(request, user, market, code)
+    _financial_view(view)
+    read = ctx.f10.read(market, code)
+    return web.render(
+        request,
+        "partials/f10.html",
+        market=market,
+        code=code,
+        market_name=_F10_MARKET_NAMES.get(market, market),
+        currency=symbol.get("currency") or "",
+        read=read,
+        kind_labels=_ACTION_KIND_LABELS,
+        fin_view=view,
+        financial_periods=FINANCIAL_PERIODS,
+        financial_views=FINANCIAL_VIEWS,
+        profile_command=f"sams sync profile --market {market} --code {code}",
+        announcement_command=f"sams sync announcements --market {market} --code {code}",
+        financials_command=f"sams sync financials --market {market} --code {code}",
+        valuation_command=f"sams sync valuation --market {market} --code {code}",
+        actions_command=f"sams sync actions --market {market} --code {code}",
+    )
+
+
+def _financial_view(view: str) -> str:
+    """两档视图只认名字；拼错的那一下当场 400，而不是悄悄给一张图。"""
+    allowed = dict(FINANCIAL_VIEWS)
+    if view not in allowed:
+        raise ValidationError(
+            f"不认识的视图 {view}：可选的是 {'、'.join(allowed.values())}"
+        )
+    return view
+
+
+def _financial_card(request: Request, market: str, code: str, symbol: dict):
+    """财务卡的两条出口（整卡局部与图表 JSON）共用同一份上下文。"""
+    web = request.app.state.web
+    return web, {
+        "market": market,
+        "code": code,
+        "market_name": _F10_MARKET_NAMES.get(market, market),
+        "currency": symbol.get("currency") or "",
+        "financial_periods": FINANCIAL_PERIODS,
+        "financial_views": FINANCIAL_VIEWS,
+        "financials_command": f"sams sync financials --market {market} --code {code}",
+        "valuation_command": f"sams sync valuation --market {market} --code {code}",
+    }
+
+
+@router.get("/api/partials/f10/financials")
+def f10_financials_partial(
+    request: Request,
+    market: str,
+    code: str,
+    period_type: str = "all",
+    view: str = "chart",
+):
+    """只换「主要财务指标」这一张卡：五档报告期 × 图表/明细（D218/D219）。
+
+    档位不在白名单里由 `F10Service` 抛 `ValidationError`（400）：同一个写法在图表
+    JSON 上也是 400，两边不能说两套话。
+    """
+    user = require_user(request)
+    ctx, market, code, symbol = _require_symbol(request, user, market, code)
+    _financial_view(view)
+    web, extra = _financial_card(request, market, code, symbol)
+    read = ctx.f10.read(market, code, period_type=period_type)
+    return web.render(
+        request,
+        "partials/f10_financials.html",
+        read=read,
+        fin_view=view,
+        **extra,
+    )
+
+
+def _point_label(row: dict) -> str:
+    """图上一个点叫什么：`2025年报`；老行认不出档名时退回报告期本身。"""
+    day = row.get("report_date")
+    kind = row.get("period_kind") or ""
+    if day is None:
+        return kind
+    return f"{day.year}{kind}" if kind else str(day)
+
+
+@router.get("/api/partials/f10/chart")
+def f10_chart_api(request: Request, market: str, code: str, period_type: str = "all"):
+    """财务图的五个序列：营收/净利（柱）与 ROE/毛利率/净利率（线）。
+
+    `read.financials` 是报告期倒序（屏幕上的表新的在前），图表从左往右读旧→新，
+    所以这里翻一次。NULL 原样给 null，前端断线不补零。
+    """
+    user = require_user(request)
+    ctx, market, code, symbol = _require_symbol(request, user, market, code)
+    read = ctx.f10.read(market, code, period_type=period_type)
+    rows = list(reversed(read.financials))
+    if not read.has_financial_data:
+        note = "本地还没有这只票的财务指标。"
+    elif not rows:
+        note = "这一类报告期本地还没有数据。"
+    else:
+        note = None
+    return JSONResponse(
+        {
+            "labels": [_point_label(row) for row in rows],
+            "revenue": [row.get("revenue") for row in rows],
+            "net_profit": [row.get("net_profit") for row in rows],
+            "roe": [ratio_num(row.get("roe")) for row in rows],
+            "gross_margin": [ratio_num(row.get("gross_margin")) for row in rows],
+            "net_margin": [ratio_num(row.get("net_margin")) for row in rows],
+            "currency": symbol.get("currency") or "",
+            "note": note,
         }
     )
 

@@ -44,11 +44,68 @@ def pct_class(value: float | None) -> str:
     return "up" if value > 0 else ("down" if value < 0 else "")
 
 
+def ratio_num(value: float | None, digits: int = 2) -> float | None:
+    """库里的小数比率 → 图上的百分数数值（0.09966 → 9.97），NULL 仍给 None。
+
+    图表的 JSON 不能带 `%` 字符串，但也不能让前端自己乘 100（D58）：换算只住在
+    这一处，`ratio_pct` 是它的字符串出口。
+    """
+    if value is None:
+        return None
+    return round(value * 100, digits)
+
+
+def ratio_pct(value: float | None, digits: int = 2) -> str:
+    """库里的小数比率 → 屏幕上的百分数（0.09966 → 9.97%）。
+
+    这是 D58「入库只有小数口径」的对称面，也是全站唯一乘 100 的地方：读侧再多乘一次，
+    同一个 ROE 会在两张表上差一百倍，而两张表看起来都像真的。
+    """
+    if value is None:
+        return "—"
+    return f"{ratio_num(value, digits):.{digits}f}%"
+
+
 def money(value: float | None, currency: str = "") -> str:
     if value is None:
         return "—"
     tail = f" {currency}" if currency else ""
     return f"{value:,.2f}{tail}"
+
+
+#: 市值这种十二三位数按元原样摆出来读不出量级；只在估值那一行用这个紧凑口径
+_CURRENCY_UNITS = {"CNY": "元", "HKD": "港元", "USD": "美元"}
+
+
+def currency_label(currency: str = "") -> str:
+    """ISO 币种 → 屏幕上的单位（CNY → 元）；认不出就原样给，不猜。"""
+    return _CURRENCY_UNITS.get(currency, currency)
+
+
+def money_compact(value: float | None, currency: str = "") -> str:
+    """市值 → 「1.69 万亿元」；不到一亿仍按分位原样给，别把小数位吞掉。"""
+    if value is None:
+        return "—"
+    unit = currency_label(currency)
+    if abs(value) >= 1e12:
+        return f"{value / 1e12:,.2f} 万亿{unit}"
+    if abs(value) >= 1e8:
+        return f"{value / 1e8:,.2f} 亿{unit}"
+    return money(value, currency)
+
+
+def website_url(value: str | None) -> str:
+    """源里的官网常只写域名：补协议；已经带协议的（http 或 https）原样给。
+
+    放在这里而不是模板里，是因为模板只该引用站内资源（CSP 'self'），
+    外部地址的统一出口留在 Python 里。
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://")):
+        return text
+    return "https://" + text
 
 
 def hms(moment: datetime | None, tz: str | None = None) -> str:

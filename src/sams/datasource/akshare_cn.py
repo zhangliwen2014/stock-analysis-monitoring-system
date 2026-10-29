@@ -215,14 +215,40 @@ def akshare_fhps(
 FINANCIAL_MAP = {
     "report_date": "REPORT_DATE",
     "published_date": "NOTICE_DATE",
+    "report_type": "REPORT_TYPE",
     "roe": "ROEJQ",
     "revenue_yoy": "TOTALOPERATEREVETZ",
     "profit_yoy": "PARENTNETPROFITTZ",
     "dividend_yield": YIELD_COLUMN,
+    # 0028 展示列（D217）：金额本币原值、每股本币/股、倍数原值
+    "revenue": "TOTALOPERATEREVE",
+    "net_profit": "PARENTNETPROFIT",
+    "eps": "EPSJB",
+    "bps": "BPS",
+    "ocf_per_share": "MGJYXJJE",
+    "current_ratio": "LD",
+    "quick_ratio": "SD",
+    "inventory_turnover": "CHZZL",
+    "total_asset_turnover": "TOAZZL",
+    # 比率列在源里是百分数，由 FINANCIAL_PERCENT 统一 ÷100
+    "roa": "ZZCJLL",
+    "roic": "ROIC",
+    "gross_margin": "XSMLL",
+    "net_margin": "XSJLL",
+    "debt_ratio": "ZCFZL",
 }
-#: **只有这三列 ÷100**。`dividend_yield` 刻意不在内：它来自分红送配表，那一列本来就是小数
+#: **只有这些列 ÷100**。`dividend_yield` 刻意不在内：它来自分红送配表，那一列本来就是小数
 #: （模块开头那条）。把它们一起声明成百分数，股息率会静默小一百倍。
-FINANCIAL_PERCENT = ("roe", "revenue_yoy", "profit_yoy")
+FINANCIAL_PERCENT = (
+    "roe",
+    "revenue_yoy",
+    "profit_yoy",
+    "roa",
+    "roic",
+    "gross_margin",
+    "net_margin",
+    "debt_ratio",
+)
 #: 值列：整列消失按改版处理。`NOTICE_DATE` 不在内——它缺了那些 ROE 仍是真数，
 #: 由 `normalize_rows` 出声告警，而 PIT 读取会自己把没有披露日的那些期挡掉（D61）
 FINANCIAL_REQUIRED = ("REPORT_DATE", "ROEJQ", "TOTALOPERATEREVETZ", "PARENTNETPROFITTZ")

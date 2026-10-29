@@ -16,6 +16,7 @@ from sams.core.config import Settings
 from sams.core.version import VersionGate
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
+from sams.services.f10 import F10SyncService
 from sams.services.fundamentals import FundamentalSyncService
 from sams.services.fx import FxSyncService
 from sams.services.market_snapshot import MarketSnapshotService
@@ -84,6 +85,7 @@ class JobDeps:
     sync: SyncService
     corp_actions: CorpActionSyncService
     fundamentals: FundamentalSyncService
+    f10: F10SyncService
     fx: FxSyncService
     calendar: CalendarService
     rules: RuleEngine

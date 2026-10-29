@@ -369,3 +369,50 @@ def test_periods_keys_like_every_other_read(fin):
     """`hk`/`700` 进来要按 D50 的形态落键，否则这一问在港美股上永远是空表。"""
     fin.upsert(pl.DataFrame([row(market="HK", code="00700", report_date=Q4)]))
     assert fin.periods("hk", "700").height == 1
+
+
+# ---------- 0028：Wind 式展示列（D217） ----------
+
+INDICATORS = row(
+    report_type="一季报",
+    revenue=4.6e10,
+    net_profit=1.2e10,
+    eps=6.8,
+    bps=45.2,
+    ocf_per_share=7.1,
+    gross_margin=0.92,
+    net_margin=0.26,
+    roa=0.08,
+    roic=0.15,
+    debt_ratio=0.18,
+    current_ratio=3.2,
+    quick_ratio=2.8,
+    inventory_turnover=0.4,
+    total_asset_turnover=0.31,
+)
+
+
+def test_the_new_indicator_columns_round_trip(fin):
+    fin.upsert(pl.DataFrame([INDICATORS]))
+    got = fin.recent("A", "601088").to_dicts()[0]
+    for column, value in INDICATORS.items():
+        if column in ("market", "code", "report_date", "published_date", "source"):
+            continue
+        assert got[column] == value, column
+
+
+def test_the_empty_frame_carries_the_new_columns(fin):
+    """空帧是调用方不必写分支的形状：少一列，模板会把它读成「源没给」而不是「表没有」。"""
+    _latest, _dropped = fin.load_as_of("A", [], date(2024, 4, 30))
+    empty = fin.recent("A", "000000")
+    for column in INDICATORS:
+        assert column in empty.columns
+    assert empty.schema["report_type"] == pl.Utf8
+
+
+def test_an_unconverted_percentage_in_the_new_columns_is_zeroed_not_kept(fin):
+    """展示列也守 D58：源给「92」而不是 0.92 时置空那一列，别把 9200% 摆上屏幕。"""
+    fin.upsert(pl.DataFrame([{**INDICATORS, "gross_margin": 92.0}]))
+    got = fin.recent("A", "601088").to_dicts()[0]
+    assert got["gross_margin"] is None
+    assert got["revenue"] == INDICATORS["revenue"], "只置空越界的那一列，行还在"

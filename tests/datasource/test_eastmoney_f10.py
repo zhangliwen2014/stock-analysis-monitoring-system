@@ -160,6 +160,18 @@ def test_hk_profile_maps_isin_and_the_connect_flag():
     assert row["employees"] == 87412
 
 
+def test_placeholder_dashes_are_not_kept_as_fields():
+    """源用「--」表示没给（01021 的电话/邮箱），别把它当正文摆到屏幕上。"""
+    payload = {
+        "jbzl": [{**A_PROFILE["jbzl"][0], "ORG_TEL": "--", "ORG_EMAIL": "—"}],
+        "fxxg": A_PROFILE["fxxg"],
+    }
+    row = parse_profile(
+        payload, market="A", code="600519", source="eastmoney_f10"
+    ).row(0, named=True)
+    assert row["phone"] is None and row["email"] is None
+
+
 def test_a_profile_without_the_basic_block_is_field_drift():
     with pytest.raises(FieldDrift, match="jbzl"):
         parse_profile({"fxxg": []}, market="A", code="600519", source="eastmoney_f10")

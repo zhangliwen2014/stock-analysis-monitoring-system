@@ -88,6 +88,7 @@ def deps(db, settings, *, fx=None, calendar=None, rules=None, recheck=None, user
         sync=SimpleNamespace(indices=None),  # type: ignore[arg-type]
         corp_actions=None,  # type: ignore[arg-type]
         fundamentals=None,  # type: ignore[arg-type]
+        f10=None,  # type: ignore[arg-type]
         fx=fx,
         calendar=calendar,
         rules=rules,
