@@ -66,6 +66,8 @@ class UniverseBuilder:
         self.theses = theses
         self.data = data
         self.settings = settings
+        #: 已经报过形态问题的代码：清单盘中每几秒重建一次，同一条旧行只该说一次
+        self._reported: set[tuple[str, str]] = set()
 
     def build(self) -> Universe:
         found: set[tuple[str, str]] = set()
@@ -106,7 +108,8 @@ class UniverseBuilder:
         # 任何 A 股适配器都只会抛，夜里的 job 因此整晚标成失败并可能在三个周期后告警。
         # 折起的行照旧留在清单里（D169），但采不了的总得在发请求之前出队（D210）。
         for market, code in sorted(found):
-            if not fits_market(market, code):
+            if not fits_market(market, code) and (market, code) not in self._reported:
+                self._reported.add((market, code))
                 logger.warning(
                     "%s %s 不是 %s 的代码形态，已跳过采集（A 股 6 位、港股 5 位，D210）",
                     market,

@@ -194,22 +194,26 @@ def test_a_folded_watchlist_row_of_the_wrong_shape_never_enters_the_universe(
     assert watchlists.remove(alice.id, "A", "00700")
 
     accounts = SimAccountRepo(db)
+    builder = UniverseBuilder(
+        users=users,
+        watchlists=watchlists,
+        accounts=accounts,
+        orders=SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db)),
+        rules=RuleRepo(db),
+        theses=ThesisRepo(db),
+        data=StubData(watchlists),
+        settings=settings,
+    )
     with caplog.at_level(logging.WARNING, logger="sams.services.scheduler.universe"):
-        universe = UniverseBuilder(
-            users=users,
-            watchlists=watchlists,
-            accounts=accounts,
-            orders=SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db)),
-            rules=RuleRepo(db),
-            theses=ThesisRepo(db),
-            data=StubData(watchlists),
-            settings=settings,
-        ).build()
+        universe = builder.build()
+        # 采集清单盘中每几秒重建一次：同一条旧行只报一次，否则这条警告会把日志淹掉
+        builder.build()
 
     assert universe.codes("A") == ("600519",)
     # 同一个代码在它自己的市场里照常采：闸只看形态，不看代码本身
     assert universe.codes("HK") == ("00700",)
-    assert any("A 00700" in record.getMessage() for record in caplog.records)
+    hinted = [record for record in caplog.records if "A 00700" in record.getMessage()]
+    assert len(hinted) == 1
 
 
 def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, caplog):
