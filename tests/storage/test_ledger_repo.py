@@ -749,6 +749,21 @@ def test_a_rate_on_a_same_currency_trade_is_a_typo(
     assert _order_rows(db, account_id) == 0
 
 
+def test_a_settlement_rate_of_one_on_a_cross_currency_fill_is_a_typo(
+    db: Database, accounts: SimAccountRepo, fills: SimOrderRepo
+) -> None:
+    """HKD→CNY 的汇率不会是 1.0000：1 是把标的币种当报告币种记的占位值（D213）。
+
+    它一旦落库，持仓的换汇段会凭空多出一大笔亏损（01021 那行 −2,434 HKD 变成
+    −3,800.97 CNY 就是这么来的）。同币种填汇率已经拒了，跨币种的 1 是它的对称面。
+    """
+    account_id = _funded(accounts)
+    with pytest.raises(ValidationError, match="不会是 1"):
+        _hk_buy(fills, account_id, fx_rate=1.0)
+    assert _order_rows(db, account_id) == 0
+    assert accounts.cash_balances(account_id) == {"CNY": pytest.approx(100_000.0)}
+
+
 @pytest.mark.parametrize("rate", [0.0, -1.0, float("inf")])
 def test_a_non_positive_settlement_rate_is_a_typo(
     rate: float, accounts: SimAccountRepo, fills: SimOrderRepo

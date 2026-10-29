@@ -704,3 +704,67 @@ def test_a_rate_on_a_same_currency_fill_is_refused(logged):
     assert response.status_code == 400
     assert "不需要汇率" in response.text
     assert logged.context.sim_ledger.order_rows(account_id) == 0
+
+
+def test_a_cross_currency_rate_of_one_is_refused_with_the_real_rate_hint(logged):
+    """港股通买入填 1 就是「1 HKD = 1 CNY」：那不是汇率，是占位值（D213）。"""
+    account_id = _hk_account(logged, home="A")
+    response = logged.client.post(
+        "/ledger/fill",
+        data={
+            "csrf": logged.csrf, "account_id": account_id, "market": "HK", "code": "01021",
+            "side": "buy", "qty": "1400", "price": "8.205", "fee": "40", "fx_rate": "1",
+        },
+    )
+    assert response.status_code == 400
+    assert "不会是 1" in response.text
+    assert logged.context.sim_ledger.order_rows(account_id) == 0
+
+
+def _seed_hk_close(logged, code="01021", close=6.495, on=None):
+    ctx = logged.context
+    on = on or date.today()
+    ctx.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"],
+                "code": [code],
+                "date": [on],
+                "open": [close],
+                "high": [close],
+                "low": [close],
+                "close": [close],
+                "volume": [1.0],
+                "amount": [close],
+                "source": ["test"],
+            }
+        )
+    )
+
+
+def test_a_cross_currency_row_splits_its_total_into_price_and_fx(logged):
+    """「−2,434 HKD」与「−3,800.97 CNY」并排时，中间那段换汇必须在同一格里拆出来（D212）。"""
+    _seed_hkd_rate(logged, 0.8496682046)
+    account_id = _hk_account(logged, home="A")
+    logged.context.ledger.buy(
+        account_id, "alice", "HK", "01021", qty=1400, price=8.205, fee=40, fx_rate=0.9
+    )
+    _seed_hk_close(logged)
+    page = logged.client.get("/portfolio")
+    assert "价格段" in page.text and "换汇段" in page.text
+
+
+def test_a_historical_base_rate_of_one_is_named_on_its_row(logged):
+    """历史数据里 1.0 已经落了库：这一行照算，但备注要点名它是录入值（D212）。"""
+    _seed_hkd_rate(logged, 0.8496682046)
+    account_id = _hk_account(logged, home="A")
+    logged.context.ledger.buy(
+        account_id, "alice", "HK", "01021", qty=1400, price=8.205, fee=40, fx_rate=0.9
+    )
+    logged.context.db.execute(
+        "UPDATE sim_orders SET fx_rate_ref = 1.0, fx_rate_applied = 1.0"
+    )
+    _seed_hk_close(logged)
+    page = logged.client.get("/portfolio")
+    assert "基准汇率记成了 1.0000" in page.text
+    assert "3,800.97 CNY" in page.text

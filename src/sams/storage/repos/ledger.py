@@ -475,6 +475,15 @@ class SimOrderRepo:
                     f"{market} {code} 以 {currency} 计价，账户的报告币种也是 {currency}："
                     f"不需要汇率（§5.4 规则 1）"
                 )
+            if fx_rate == 1.0:
+                # 配置里的币种两两都不是 1:1：1.0 不是汇率，是把标的币种当报告币种
+                # 记的占位值。它一旦落库，持仓的换汇段会凭空多出一笔大额亏损（D213）
+                raise ValidationError(
+                    f"{market} {code} 以 {currency} 计价、账户报告币种是 "
+                    f"{account.report_currency}：{currency}→{account.report_currency} 的"
+                    f"结算汇率不会是 1.0000。填券商成交单上的实际汇率；"
+                    f"这笔若从 {currency} 现金付，汇率留空"
+                )
             settle_currency = account.report_currency
         moment = _moment(ts)
         existing = self.position(account_id, market, code, strict=False)

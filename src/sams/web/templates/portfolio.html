@@ -54,8 +54,12 @@
         {% if row.price_day %}<span class="muted quote-day">{{ row.price_day }}</span>{% endif %}</td>
       <td class="num">{{ money(row.price_pnl, row.currency) }}</td>
       {# 不可换算那一行不给 0.00：它没进上面那个总资产，显示成零会让读数的人以为两只币种的数混在了一列 #}
-      <td class="num">{{ money(row.pnl_report, account.currency) if row.convertible else "不计入" }}</td>
-      <td class="muted">{{ row.note or "" }}</td>
+      <td class="num">{{ money(row.pnl_report, account.currency) if row.convertible else "不计入" }}
+        {# 报告币种合计 = 价格段 + 换汇段：不拆开，-2,434 HKD 旁边的 -3,800.97 CNY 就像挤出来的（D212） #}
+        {% if row.convertible and row.currency != account.currency %}
+        <span class="muted row-split">价格段 {{ money(row.price_report, account.currency) }} + 换汇段 {{ money(row.fx_report, account.currency) }}</span>
+        {% endif %}</td>
+      <td class="muted">{{ row.note or "" }}{% if row.note and row.rate_note %}<br>{% endif %}{{ row.rate_note or "" }}</td>
     </tr>
     {% else %}
     <tr><td colspan="8" class="muted">暂无持仓。</td></tr>

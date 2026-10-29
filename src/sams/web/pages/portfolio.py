@@ -258,8 +258,12 @@ def _account_view(
             "price_day": str(row.last_price_date) if row.last_price_date else "",
             "price_pnl": row.price_pnl,
             "pnl_report": row.total_report,
+            # 报告币种合计 = 价格段 + 换汇段：两段分开给，屏幕上才能把那个数拆回去（D212）
+            "price_report": row.price_report,
+            "fx_report": row.fx_pnl,
             "convertible": row.convertible,
             "note": row.unavailable_note,
+            "rate_note": row.rate_note,
         }
         for row in ctx.portfolio.positions(username, account.id)
     ]

@@ -335,3 +335,29 @@ def test_positions_labels_the_two_pnl_halves_with_their_own_currency(
     _, text = out(container, capsys, "positions", "--user", USER, "--account", account_id)
     assert "1000.00 USD" in text and "400.00 CNY" in text
     assert "1000.00400.00" not in text  # 两半之间必须有东西隔着，不能靠列宽挤出来
+
+
+def test_positions_names_a_placeholder_base_rate_and_says_how_to_fix_it(
+    container, capsys
+) -> None:
+    """跨币种的基准汇率记成 1.0：两段照算，但来处要能在文本与 `--json` 里问出来（D212）。"""
+    account_id = _funded(container, capsys)
+    container.bars.upsert(bars(DAYS, [6.495] * len(DAYS), market="HK", code="01021"))
+    assert (
+        invoke(
+            container, "buy", "--user", USER, "--account", account_id,
+            "--market", "HK", "--code", "01021", "--qty", "100", "--price", "8.205",
+            "--on", "2024-10-25", "--fx-rate", "0.9",
+        )
+        == 0
+    )
+    container.fx_store.put(DAYS[-1], "HKD", "CNY", 0.8496682046, source="manual")
+    # 历史数据：录入时没有汇率可填，1 是当时能记下去的占位值
+    container.db.execute("UPDATE sim_orders SET fx_rate_ref = 1.0, fx_rate_applied = 1.0")
+    capsys.readouterr()
+
+    code, body = payload(container, capsys, "positions", "--user", USER, "--account", account_id)
+    assert code == 0
+    assert "1.0000" in body["positions"][0]["rate_note"]
+    _, text = out(container, capsys, "positions", "--user", USER, "--account", account_id)
+    assert "基准汇率记成了 1.0000" in text

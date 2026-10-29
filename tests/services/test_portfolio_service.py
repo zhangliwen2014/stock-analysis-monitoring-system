@@ -71,6 +71,7 @@ def _funded_position(
     qty: float = 100,
     price: float = 40.0,
     fx_rate: float | None = None,
+    fee: float = 0.0,
 ) -> str:
     currency = {"A": "CNY", "HK": "HKD", "US": "USD"}[market]
     account = portfolio.accounts.open(_uid(portfolio), f"账户 {market}", report_currency="CNY")
@@ -87,7 +88,7 @@ def _funded_position(
         qty=qty,
         price=price,
         currency=currency,
-        fee=0.0,
+        fee=fee,
         fx_rate=fx_rate,
     )
     return account.id
@@ -173,6 +174,44 @@ def test_a_position_missing_its_base_rate_is_not_split(db, portfolio) -> None:
     row = portfolio.positions(USER, account_id)[0]
     assert row.pnl is None
     assert "基准" in row.unavailable_note
+
+
+def test_a_placeholder_base_rate_of_one_is_flagged_with_its_two_pieces(db, portfolio) -> None:
+    """01021 那一行：−2,434.00 HKD 与 −3,800.97 CNY 不是同一段数的两种写法（D212）。
+
+    两笔 HK 买在汇率链还没有数据时把基准汇率记成了 1.0；报告币种合计 = 价格段 × 1.0
+    + 换汇段。数照算（系统不静默改账，D205），但每一段都要能从屏幕上拆回去，
+    并且那一行要自己点名「1.0000 是录入值」。
+    """
+    account_id = _funded_position(
+        portfolio, market="HK", code="01021", qty=1400, price=8.205, fee=40.0
+    )
+    # 历史数据就是这么落的：录入时没有汇率可填，1 是当时能记下去的占位值
+    db.execute("UPDATE sim_orders SET fx_rate_ref = 1.0, fx_rate_applied = 1.0")
+    FxRepo(db).put(DAY, "HKD", "CNY", 0.8496682046, source="manual")
+    BarRepo(db).upsert(_bars("HK", "01021", [(DAY, 6.495)]))
+
+    row = portfolio.positions(USER, account_id)[0]
+    assert row.convertible is True
+    assert row.price_pnl == pytest.approx(-2_434.0)
+    assert row.price_report == pytest.approx(-2_434.0)
+    assert row.fx_pnl == pytest.approx(-1_366.97, abs=0.01)
+    assert row.total_report == pytest.approx(-3_800.97, abs=0.01)
+    assert row.price_report + row.fx_pnl == pytest.approx(row.total_report)
+    assert row.rate_note is not None
+    assert "1.0000" in row.rate_note and "撤销" in row.rate_note
+
+
+def test_a_real_base_rate_carries_no_placeholder_note(db, portfolio) -> None:
+    """正常的 0.9 不是占位值：拆解照给，但备注栏不吓人。"""
+    account_id = _funded_position(
+        portfolio, market="HK", code="01021", qty=1400, price=8.205, fx_rate=0.9
+    )
+    FxRepo(db).put(DAY, "HKD", "CNY", 0.85, source="manual")
+    BarRepo(db).upsert(_bars("HK", "01021", [(DAY, 8.0)]))
+    row = portfolio.positions(USER, account_id)[0]
+    assert row.price_report == pytest.approx(1400 * (8.0 - 8.205) * 0.9)
+    assert row.rate_note is None
 
 
 def test_an_unknown_account_is_refused(db, portfolio) -> None:

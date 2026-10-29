@@ -46,11 +46,25 @@ class PositionRow:
     convertible: bool = False
     #: 给不出现价 / 换不出币时的一句话（显示与 `--json` 读同一句，别长两张嘴）
     unavailable_note: str | None = None
+    #: 基准汇率看着像占位值（跨币种却记成 1.0）时的一句话：数照算，来处得说清（D212）
+    rate_note: str | None = None
 
     @property
     def price_pnl(self) -> float | None:
         """标的币种里的价格盈亏；给不出可信拆分时是 None，不是 0。"""
         return None if self.pnl is None else self.pnl.price_pnl
+
+    @property
+    def price_report(self) -> float | None:
+        """价格段折进报告币种：`price_pnl × 基准汇率`（同币种按 1:1）。
+
+        与 `fx_pnl` 相加恒等于 `total_report`：报告币种那一个数是由这两段拼出来的，
+        屏幕必须能按同一条恒等式拆回去（D212）。
+        """
+        if self.pnl is None:
+            return None
+        base = self.pnl.rate_base if self.pnl.rate_base is not None else 1.0
+        return self.pnl.price_pnl * base
 
     @property
     def fx_pnl(self) -> float:
@@ -180,7 +194,7 @@ class PortfolioService:
                 last_price_date=price_day,
                 unavailable_note=note,
             )
-        return replace(
+        row = replace(
             base,
             last_price=price,
             last_price_date=price_day,
@@ -194,6 +208,19 @@ class PortfolioService:
             ),
             convertible=True,
         )
+        if pos.currency != report and rate_base == 1.0:
+            # 配置里的币种两两都不是 1:1：跨币种的基准汇率记成 1.0，几乎总是录入时的
+            # 占位值。数照算（不静默改账），但这一行得自己说清那段换汇从哪来（D212）
+            return replace(
+                row,
+                rate_note=(
+                    f"{pos.market} {pos.code} 的基准汇率记成了 1.0000"
+                    f"（{price_day} 的 {pos.currency}→{report} 是 {rate_today:.4f}）："
+                    f"换汇段是按这个录入值拆的，看着像多出来的一笔亏损；"
+                    f"若当时录错，撤销那笔买入并按实际汇率重记"
+                ),
+            )
+        return row
 
     def _last_price(self, market: str, code: str) -> tuple[float | None, date | None]:
         """未复权收盘（D73）：`BarRepo` 的读取一律带 `adjust = 'raw'`，后复权序列不参与。"""

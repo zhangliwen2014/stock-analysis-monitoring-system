@@ -386,6 +386,7 @@ def _position_payload(row: PositionRow) -> dict:
         "rate_stale": row.rate_stale,
         "convertible": row.convertible,
         "note": row.unavailable_note,
+        "rate_note": row.rate_note,
     }
 
 
@@ -482,6 +483,8 @@ def _print_positions(rows: list[PositionRow]) -> None:
             f"{row.price_pnl:>13.2f} {row.currency:<4}{row.fx_pnl:>13.2f} "
             f"{row.report_currency}{day}"
         )
+        if row.rate_note:
+            print(f"    {row.rate_note}")
 
 
 def _print_summary(summary: AccountSummary) -> None:
