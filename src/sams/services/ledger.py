@@ -68,8 +68,15 @@ class LedgerService:
         broker: str | None = None,
         market_scope: tuple[str, ...] = (),
         margin_enabled: bool = False,
+        home_market: str = "A",
     ) -> Account:
         user = resolve_actor(self.users, username)
+        home_market = canonical_market(home_market)
+        if home_market not in self.settings.markets:
+            raise ValidationError(
+                f"账户的主场市场 {home_market} 没有配置：可选 "
+                f"{', '.join(sorted(self.settings.markets))}"
+            )
         account = self.accounts.open(
             user.id,
             name,
@@ -77,6 +84,7 @@ class LedgerService:
             market_scope=market_scope,
             margin_enabled=margin_enabled,
             report_currency=self.settings.report_currency,
+            home_market=home_market,
         )
         self._bump()
         return account
@@ -160,12 +168,12 @@ class LedgerService:
         price: float,
         fee: float = 0.0,
         thesis_id: str | None = None,
-        fx_rate_ref: float | None = None,
+        fx_rate: float | None = None,
         ts: datetime | None = None,
     ) -> Order:
         return self._fill(
             account_id, username, market, code, side="buy", qty=qty, price=price, fee=fee,
-            thesis_id=thesis_id, fx_rate_ref=fx_rate_ref, ts=ts,
+            thesis_id=thesis_id, fx_rate=fx_rate, ts=ts,
         )
 
     def sell(
@@ -179,12 +187,12 @@ class LedgerService:
         price: float,
         fee: float = 0.0,
         thesis_id: str | None = None,
-        fx_rate_ref: float | None = None,
+        fx_rate: float | None = None,
         ts: datetime | None = None,
     ) -> Order:
         return self._fill(
             account_id, username, market, code, side="sell", qty=qty, price=price, fee=fee,
-            thesis_id=thesis_id, fx_rate_ref=fx_rate_ref, ts=ts,
+            thesis_id=thesis_id, fx_rate=fx_rate, ts=ts,
         )
 
     def _fill(
@@ -199,7 +207,7 @@ class LedgerService:
         price: float,
         fee: float,
         thesis_id: str | None,
-        fx_rate_ref: float | None,
+        fx_rate: float | None,
         ts: datetime | None,
     ) -> Order:
         user = resolve_actor(self.users, username)
@@ -222,7 +230,7 @@ class LedgerService:
             currency=currency,
             fee=fee,
             thesis_id=thesis_id,
-            fx_rate_ref=fx_rate_ref,
+            fx_rate=fx_rate,
             ts=ts,
         )
         self._bump()

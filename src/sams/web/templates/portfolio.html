@@ -77,7 +77,8 @@
       <td class="num">{{ row.qty }}</td>
       <td class="num">{{ money(row.price, row.currency) }}</td>
       <td class="num">{{ money(row.fee, row.currency) }}</td>
-      <td>{{ row.currency }}</td>
+      {# 价格在标的币种里，现金扣的是报告币种：这条成交两种币都出现了，得说清怎么换的（D209） #}
+      <td>{{ row.currency }}{% if row.settled %}<br><span class="muted">{{ row.settled }}</span>{% endif %}</td>
       <td>
         <form method="post" action="/portfolio/accounts/{{ account.id }}/fills/{{ row.id }}/undo" class="inline-form">
           <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -172,20 +173,29 @@
   <form method="post" action="/portfolio/accounts" class="panel">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>账户名 <input name="name" value="{{ account_form.name }}" maxlength="40"></label>
+    <label>账户类型
+      <select name="home_market">
+        {% for option in markets %}
+        <option value="{{ option }}"{% if option == account_form.home_market %} selected{% endif %}>{{ account_labels.get(option, option) }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>起始资金 <input name="cash" type="number" step="any" value="{{ account_form.cash }}" placeholder="可空"></label>
     <button type="submit">开户</button>
   </form>
+  <p class="muted">账户类型只决定录入成交时默认选哪个市场（A 股账户也能买港股通、美股）：不限制你能记什么。</p>
   <p class="muted">起始资金记在报告币种里；要别的币种，开户后到上面「现金」里入金。</p>
 </section>
 
 {% if accounts %}
 <section class="card">
   <h2>录入成交</h2>
-  <form method="post" action="/ledger/fill" class="panel" id="portfolio-fill">
+  <form method="post" action="/ledger/fill" class="panel" id="portfolio-fill"
+      data-fill-rates='{{ fill_rates | tojson }}'>
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>账户
       <select name="account_id">
-        {% for account in accounts %}<option value="{{ account.id }}"{% if account.id == fill.account_id %} selected{% endif %}>{{ account.name }}</option>{% endfor %}
+        {% for account in accounts %}<option value="{{ account.id }}" data-home-market="{{ account.home_market }}" data-cash="{{ account.cash_currencies | join(' ') }}"{% if account.id == fill.account_id %} selected{% endif %}>{{ account.name }}</option>{% endfor %}
       </select>
     </label>
     <label>方向
@@ -197,7 +207,7 @@
     <label>市场
       <select name="market">
         {% for option in markets %}
-        <option value="{{ option }}"{% if option == fill.market %} selected{% endif %}>{{ option }}</option>
+        <option value="{{ option }}"{% if option == fill.market %} selected{% endif %}>{{ market_labels.get(option, option) }}</option>
         {% endfor %}
       </select>
     </label>
@@ -211,6 +221,9 @@
     <label>数量 <input name="qty" type="number" step="any" value="{{ fill.qty }}"></label>
     <label>价格 <input name="price" type="number" step="any" value="{{ fill.price }}"></label>
     <label>费用 <input name="fee" type="number" step="any" value="{{ fill.fee }}"></label>
+    {# 港股通由券商在报告币种侧扣款：填了汇率就折成报告币种结算，不填则从标的币种现金扣 #}
+    <label>汇率（1 标的币种 = ? 报告币种）
+      <input name="fx_rate" type="number" step="any" value="{{ fill.fx_rate }}" data-auto="{{ fill_auto }}"></label>
     <label>关联论点（可空）
       <select name="thesis_id">
         <option value=""></option>
@@ -220,16 +233,55 @@
     <button type="submit">记一笔成交</button>
   </form>
   <div id="fill-candidates"></div>
+  <p class="muted" id="fill-rate-hint">{{ fill_hint }}</p>
   <p class="muted">按你填的成交原样记账，不校验整手、T+1 与涨跌停；成交日按该市场本地 15:00 记。</p>
   <script>
+    const fillForm = document.getElementById("portfolio-fill");
+    const fillAccount = fillForm.querySelector("select[name=account_id]");
+    const fillMarket = fillForm.querySelector("select[name=market]");
+    const fillRate = fillForm.querySelector("input[name=fx_rate]");
+    const fillRateHint = document.getElementById("fill-rate-hint");
+    const fillRates = JSON.parse(fillForm.dataset.fillRates);
+
+    // 有标的币种现金就花它，没有才把汇率预填进来：与服务器首屏是同一条规则（D209）
+    function applyFillRate() {
+      const info = fillRates[fillMarket.value];
+      if (!info) return;
+      const option = fillAccount.options[fillAccount.selectedIndex];
+      const held = option && option.dataset.cash ? option.dataset.cash.split(" ") : [];
+      let auto = "";
+      let hint = info.with_rate;
+      if (info.currency === info.report) {
+        hint = info.with_rate;
+      } else if (held.indexOf(info.currency) >= 0) {
+        hint = info.with_cash;
+      } else {
+        auto = info.rate;
+      }
+      // 手改过的值不覆盖：只有空格子或还是上一次自动值时，才换成本市场的默认值
+      if (fillRate.value === "" || fillRate.value === fillRate.dataset.auto) {
+        fillRate.value = auto;
+        fillRate.dataset.auto = auto;
+      }
+      fillRateHint.textContent = hint;
+    }
+
     // 候选行的「填入」把市场与代码一起写进表单：这两格是同一只票的两个字段
-    document.getElementById("portfolio-fill").addEventListener("click", function (event) {
+    fillForm.addEventListener("click", function (event) {
       const button = event.target.closest("[data-fill-market]");
       if (!button) return;
-      this.querySelector("select[name=market]").value = button.dataset.fillMarket;
-      this.querySelector("input[name=code]").value = button.dataset.fillCode;
+      fillMarket.value = button.dataset.fillMarket;
+      fillForm.querySelector("input[name=code]").value = button.dataset.fillCode;
       document.getElementById("fill-candidates").innerHTML = "";
+      applyFillRate();
     });
+    // 换账户就把市场切到它的主场：账户类型只做默认值，不锁住下拉（D208）
+    fillAccount.addEventListener("change", function () {
+      const home = this.selectedOptions[0] && this.selectedOptions[0].dataset.homeMarket;
+      if (home) fillMarket.value = home;
+      applyFillRate();
+    });
+    fillMarket.addEventListener("change", applyFillRate);
   </script>
 </section>
 {% endif %}

@@ -95,6 +95,18 @@ def test_adding_an_account_prints_the_name_and_the_report_currency(container, ca
     assert "主账户" in body and "CNY" in body
 
 
+def test_an_account_can_be_opened_with_a_home_market(container, capsys) -> None:
+    """主场市场是「平时买什么」（D208）：`--json` 要问得出来，两屏打印也要看得见。"""
+    code, body = payload(
+        container, capsys, "account", "add", "--user", USER, "--name", "港户",
+        "--home-market", "hk",
+    )
+    assert code == 0
+    assert body["account"]["home_market"] == "HK"
+    _, text = out(container, capsys, "account", "list", "--user", USER)
+    assert "主场 HK" in text
+
+
 def test_listing_accounts_keeps_one_line_each(container, capsys) -> None:
     _open_account(container, capsys, "主账户")
     _open_account(container, capsys, "副账户")

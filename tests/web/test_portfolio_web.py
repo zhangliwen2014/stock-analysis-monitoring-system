@@ -6,6 +6,7 @@ from datetime import date
 from zoneinfo import ZoneInfo
 
 import polars as pl
+import pytest
 
 
 def _user_id(web, username="alice") -> str:
@@ -50,6 +51,30 @@ def test_portfolio_lists_an_account_that_has_no_fills_yet(logged):
     assert page.status_code == 200
     assert "测试户" in page.text
     assert "/symbol/A/600519" not in page.text
+
+
+def test_opening_an_account_records_its_home_market(logged):
+    """「港股的账户默认录港股」从一个开户下拉开始（D208）。"""
+    response = logged.client.post(
+        "/portfolio/accounts",
+        data={"csrf": logged.csrf, "name": "港户", "cash": "", "home_market": "HK"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    accounts = logged.context.sim_accounts.list_for(_user_id(logged))
+    assert [account.home_market for account in accounts] == ["HK"]
+
+
+def test_the_fill_form_defaults_market_to_the_first_accounts_home_market(logged):
+    """第一个账户是港股账户时，录入成交的市场默认就是港股（用户仍可改）。"""
+    logged.client.post(
+        "/portfolio/accounts",
+        data={"csrf": logged.csrf, "name": "港户", "cash": "", "home_market": "HK"},
+        follow_redirects=False,
+    )
+    page = logged.client.get("/portfolio")
+    assert "港股账户" in page.text and "港股通（HK）" in page.text
+    assert 'value="HK" selected' in page.text
 
 
 def test_fill_buy_then_sell_roundtrip(logged):
@@ -587,3 +612,95 @@ def test_buying_hk_without_hkd_points_at_the_exchange_form(logged):
     )
     assert response.status_code == 400
     assert "换汇" in response.text
+
+
+# --- 港股通：填汇率就从 CNY 结算（D209） --------------------------------------------
+
+
+def _hk_account(logged, *, hkd: float = 0.0, home: str = "HK") -> str:
+    """开一个港股账户（可顺手放一点 HKD 现金）：港股通/A 股账户都行，就看默认市场。"""
+    logged.client.post(
+        "/portfolio/accounts",
+        data={"csrf": logged.csrf, "name": "港户", "cash": "200000", "home_market": home},
+        follow_redirects=False,
+    )
+    account = logged.context.sim_accounts.list_for(_user_id(logged))[0]
+    if hkd:
+        logged.context.ledger.deposit(
+            account.id, "HKD", hkd,
+            username="alice", reason="港币口袋", actor_id=_user_id(logged),
+        )
+    return account.id
+
+
+def _seed_hkd_rate(logged, rate: float = 0.91) -> None:
+    logged.context.fx_store.put(date.today(), "HKD", "CNY", rate, source="manual")
+
+
+def test_a_hk_buy_with_a_rate_settles_in_cny(logged):
+    """A 股账户买 01021 不必先换 HKD：填汇率，券商在 CNY 侧扣款（D209）。"""
+    account_id = _hk_account(logged, home="A")
+    response = logged.client.post(
+        "/ledger/fill",
+        data={
+            "csrf": logged.csrf, "account_id": account_id, "market": "HK", "code": "01021",
+            "side": "buy", "qty": "1400", "price": "8.205", "fee": "40", "fx_rate": "0.91",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert logged.context.sim_accounts.cash_balances(account_id) == {
+        "CNY": pytest.approx(200_000.0 - (1400 * 8.205 + 40) * 0.91)
+    }
+    page = logged.client.get("/portfolio")
+    # 成交记录把结算说出来：CNY 少了一笔，订单上写的是 HKD，不解释就找不到这两条流水的关系
+    assert "按 0.91 折 CNY" in page.text
+
+
+def test_a_hk_connect_fill_shows_its_name_from_the_master(logged):
+    """成交记录显示「中国银河」：港股名称在 symbol_master 里，symbols 表里没有（D210）。"""
+    logged.context.symbol_list_store.upsert_batch(
+        "HK",
+        [
+            {
+                "code": "01021", "name": "中国银河", "py_initials": "ZGYH",
+                "py_full": "zhongguoyinhe", "currency": "HKD",
+            }
+        ],
+    )
+    account_id = _hk_account(logged, hkd=100_000.0)
+    # 直接走服务层记账（不经过页面的 `symbol_interest.ensure`）：CLI 补录、主档同步前
+    # 记下的成交都没有那行 `symbols`，名称只能从主档读
+    logged.context.ledger.buy(account_id, "alice", "HK", "01021", qty=1000, price=8.205)
+    assert "中国银河" in logged.client.get("/portfolio").text
+
+
+def test_the_rate_is_prefilled_when_the_account_has_no_quote_cash(logged):
+    """港股账户手里没有 HKD：预填库里那条 HKD→CNY，并说明留空会怎样。"""
+    _seed_hkd_rate(logged)
+    _hk_account(logged)
+    page = logged.client.get("/portfolio")
+    assert 'name="fx_rate"' in page.text and 'value="0.91"' in page.text
+    assert "留空则从 HKD 现金扣" in page.text
+
+
+def test_the_rate_stays_blank_when_the_account_holds_quote_cash(logged):
+    """换好了 HKD 就先花换来的钱：预填会把这笔悄悄改成 CNY 结算（D207 的路径不能变）。"""
+    _seed_hkd_rate(logged)
+    _hk_account(logged, hkd=10_000.0)
+    page = logged.client.get("/portfolio")
+    assert "要以 CNY 结算就填汇率" in page.text
+
+
+def test_a_rate_on_a_same_currency_fill_is_refused(logged):
+    account_id = _open_account(logged)
+    response = logged.client.post(
+        "/ledger/fill",
+        data={
+            "csrf": logged.csrf, "account_id": account_id, "market": "A", "code": "600519",
+            "side": "buy", "qty": "100", "price": "1500", "fx_rate": "1",
+        },
+    )
+    assert response.status_code == 400
+    assert "不需要汇率" in response.text
+    assert logged.context.sim_ledger.order_rows(account_id) == 0

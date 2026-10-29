@@ -70,12 +70,13 @@ def _funded_position(
     code: str = "601088",
     qty: float = 100,
     price: float = 40.0,
-    fx_rate_ref: float | None = None,
+    fx_rate: float | None = None,
 ) -> str:
     currency = {"A": "CNY", "HK": "HKD", "US": "USD"}[market]
     account = portfolio.accounts.open(_uid(portfolio), f"账户 {market}", report_currency="CNY")
+    # 填了汇率就是报告币种结算（D209）：钱要从 CNY 口袋里出
     portfolio.accounts.adjust_cash(
-        account.id, currency, 1_000_000.0, reason="初始", actor_id=USER
+        account.id, "CNY" if fx_rate else currency, 1_000_000.0, reason="初始", actor_id=USER
     )
     portfolio.orders.record_fill(
         account_id=account.id,
@@ -87,14 +88,14 @@ def _funded_position(
         price=price,
         currency=currency,
         fee=0.0,
-        fx_rate_ref=fx_rate_ref,
+        fx_rate=fx_rate,
     )
     return account.id
 
 
-def _us_position(portfolio: PortfolioService, *, fx_rate_ref: float | None = None) -> str:
+def _us_position(portfolio: PortfolioService, *, fx_rate: float | None = None) -> str:
     return _funded_position(
-        portfolio, market="US", code="AAPL", qty=10, price=100.0, fx_rate_ref=fx_rate_ref
+        portfolio, market="US", code="AAPL", qty=10, price=100.0, fx_rate=fx_rate
     )
 
 
@@ -139,7 +140,7 @@ def test_the_two_pieces_still_add_up_when_a_rate_exists(db, portfolio) -> None:
 def test_a_usd_position_splits_into_two_pieces(db, portfolio) -> None:
     """涨了 10 美元 + 人民币对美元贬了 4 毛，是两件事，必须显示成两个数（§5.4）。"""
     account_id = _funded_position(
-        portfolio, market="US", code="AAPL", qty=10, price=100.0, fx_rate_ref=7.0
+        portfolio, market="US", code="AAPL", qty=10, price=100.0, fx_rate=7.0
     )
     FxRepo(db).put(date(2024, 10, 1), "USD", "CNY", 7.0, source="manual")
     FxRepo(db).put(DAY, "USD", "CNY", 7.4, source="manual")
@@ -154,7 +155,7 @@ def test_a_usd_position_without_a_rate_contributes_nothing(db, portfolio) -> Non
     """换不出报告币种时不给数字：把 1000 美元当成 1000 人民币加进总市值，
     是一个看起来完全正常的错数。
     """
-    account_id = _us_position(portfolio, fx_rate_ref=7.0)
+    account_id = _us_position(portfolio, fx_rate=7.0)
     BarRepo(db).upsert(_bars("US", "AAPL", [(DAY, 110.0)]))
     row = portfolio.positions(USER, account_id)[0]
     assert row.last_price == pytest.approx(110.0)
@@ -265,7 +266,7 @@ def test_a_position_without_a_price_is_excluded_from_the_subtotal(db, portfolio)
 
 def test_the_fx_piece_is_reported_on_its_own_line(db, portfolio) -> None:
     """换汇影响并进价格盈亏里，用户会把「人民币贬值」读成「这只票涨了」。"""
-    account_id = _us_position(portfolio, fx_rate_ref=7.0)
+    account_id = _us_position(portfolio, fx_rate=7.0)
     FxRepo(db).put(date(2024, 10, 1), "USD", "CNY", 7.0, source="manual")
     FxRepo(db).put(DAY, "USD", "CNY", 7.4, source="manual")
     BarRepo(db).upsert(_bars("US", "AAPL", [(DAY, 100.0)]))

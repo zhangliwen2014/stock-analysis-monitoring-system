@@ -37,6 +37,11 @@ _NOTICES = {
 }
 
 
+#: 市场在录入表单里的叫法：港股通不是市场，是 A 股账户买 HK 的那条通道（D208）
+_MARKET_LABELS = {"A": "A 股", "HK": "港股通（HK）", "US": "美股（US）"}
+_ACCOUNT_LABELS = {"A": "A 股账户", "HK": "港股账户", "US": "美股账户"}
+
+
 def _number(raw: str, label: str) -> float:
     try:
         return float(raw)
@@ -49,11 +54,18 @@ def _qty(value: float) -> str:
     return f"{value:,.4f}".rstrip("0").rstrip(".")
 
 
-def _fill_defaults(ctx: ServiceContext, markets: list[str]) -> dict[str, str]:
+def _fill_defaults(ctx: ServiceContext, markets: list[str], accounts: list[dict]) -> dict[str, str]:
+    """录入成交的默认账户与市场：第一个账户、它的主场（D208）。
+
+    字母序第一个市场恒是 A，与「这个人平时买什么」无关；港股账户每次手改下拉，
+    就是在为一处没有信息的默认值付手续费。
+    """
+    account = accounts[0] if accounts else None
+    home = account["home_market"] if account else ""
     return {
-        "account_id": "",
+        "account_id": account["id"] if account else "",
         "side": "buy",
-        "market": markets[0] if markets else "",
+        "market": home if home in markets else (markets[0] if markets else ""),
         "code": "",
         "qty": "",
         "price": "",
@@ -61,6 +73,56 @@ def _fill_defaults(ctx: ServiceContext, markets: list[str]) -> dict[str, str]:
         "on": str(ctx.clock.today()),
         "thesis_id": "",
     }
+
+
+def _fill_rates(ctx: ServiceContext, markets: list[str]) -> dict[str, dict[str, str]]:
+    """每个市场那一格汇率的预填值与两句提示（D209）。
+
+    唯一的规则是「有标的币种现金就花它，没有才按汇率折报告币种」：预填一个汇率会把
+    D207「换好了 HKD 再买」悄悄改成 CNY 结算，HKD 现金从此趴在账上不动。
+    """
+    report = ctx.settings.report_currency
+    out: dict[str, dict[str, str]] = {}
+    for market in markets:
+        currency = ctx.settings.markets[market].currency
+        if currency == report:
+            same = f"以 {currency} 计价，与报告币种相同：不需要汇率"
+            out[market] = {
+                "currency": currency, "report": report, "rate": "",
+                "with_rate": same, "with_cash": same,
+            }
+            continue
+        rate, caption = _rate_hint(ctx, currency, report)
+        out[market] = {
+            "currency": currency,
+            "report": report,
+            "rate": rate,
+            "with_rate": f"{caption}；填了就从 {report} 结算，留空则从 {currency} 现金扣",
+            "with_cash": f"{caption}；这笔从 {currency} 现金扣，要以 {report} 结算就填汇率",
+        }
+    return out
+
+
+def _fill_rate_default(
+    rates: dict[str, dict[str, str]], account: dict | None, market: str
+) -> str:
+    info = rates.get(market)
+    if info is None or not info["rate"]:
+        return ""
+    held = account["cash_currencies"] if account else []
+    return "" if info["currency"] in held else info["rate"]
+
+
+def _fill_rate_hint(
+    rates: dict[str, dict[str, str]], account: dict | None, market: str
+) -> str:
+    info = rates.get(market)
+    if info is None:
+        return ""
+    held = account["cash_currencies"] if account else []
+    if info["currency"] == info["report"]:
+        return info["with_rate"]
+    return info["with_cash"] if info["currency"] in held else info["with_rate"]
 
 
 def _cash_defaults(ctx: ServiceContext) -> dict[str, str]:
@@ -138,8 +200,12 @@ def _fills(ctx: ServiceContext, account, tz: str) -> list[dict]:
     for order in list(reversed(ctx.sim_ledger.orders(account.id)))[:50]:
         key = (order.market, order.code)
         if key not in names:
-            master = ctx.symbols.get(order.market, order.code)
-            names[key] = str((master or {}).get("name") or "")
+            # 先读全主档再退回 `symbols`：成交记录里的港股通常没有那行 `symbols`
+            # （补录、主档同步前记的），只有主档一直有名称（D210）
+            found = ctx.symbol_list_store.get(order.market, order.code) or ctx.symbols.get(
+                order.market, order.code
+            )
+            names[key] = str((found or {}).get("name") or "")
         rows.append(
             {
                 "id": order.id,
@@ -152,6 +218,12 @@ def _fills(ctx: ServiceContext, account, tz: str) -> list[dict]:
                 "price": order.price,
                 "fee": order.fee,
                 "currency": order.currency,
+                # CNY 少了一笔、订单上写 HKD：不把结算说出来，读账的人找不到两条流水的关系
+                "settled": (
+                    f"按 {order.fx_rate_applied:g} 折 {account.report_currency}"
+                    if order.fx_rate_applied is not None
+                    else ""
+                ),
             }
         )
     return rows
@@ -194,12 +266,18 @@ def _account_view(
     return {
         "id": account.id,
         "name": summary.name,
+        # 开户时选的「平时买什么」：录入成交的市场默认取它（D208）
+        "home_market": account.home_market,
         # 改名那一格平时就是现在的名字；被拒的那次回填的是刚交上来的那个（D204）
         "rename_name": account.name if rename_name is None else rename_name,
         "currency": summary.report_currency,
         "cash": [
             {"currency": name, "amount": amount}
             for name, amount in sorted(summary.cash_by_currency.items())
+        ],
+        # 汇率格的默认值看它：账户里已经有这种币的现金，就不预填汇率（D209）
+        "cash_currencies": [
+            name for name, amount in sorted(summary.cash_by_currency.items()) if amount > 0
         ],
         "value": [
             {"currency": name, "amount": amount}
@@ -250,6 +328,21 @@ def _portfolio_page(
         {ctx.settings.report_currency, *(cfg.currency for cfg in ctx.settings.markets.values())}
     )
     fx = fx_form or _fx_defaults(ctx, currencies)
+    fill_rates = _fill_rates(ctx, markets)
+    if fill_form is None:
+        fill = _fill_defaults(ctx, markets, accounts)
+        fill_account = accounts[0] if accounts else None
+        fill["fx_rate"] = _fill_rate_default(fill_rates, fill_account, fill["market"])
+        # 初始渲染时这一格的值就是自动值：换市场时可以被覆盖
+        fill_auto = fill["fx_rate"]
+    else:
+        fill = fill_form
+        fill_account = next(
+            (row for row in accounts if row["id"] == fill["account_id"]), None
+        ) or (accounts[0] if accounts else None)
+        # 被拒回填的值是用户打的：换市场也不要覆盖它
+        fill_auto = ""
+    fill_hint = _fill_rate_hint(fill_rates, fill_account, fill["market"])
     return web.render(
         request,
         "portfolio.html",
@@ -259,16 +352,21 @@ def _portfolio_page(
         # 拒回来的那句话讲的是币种而不是「你市场填错了」
         markets=markets,
         currencies=currencies,
+        market_labels=_MARKET_LABELS,
+        account_labels=_ACCOUNT_LABELS,
         accounts=accounts,
         theses=theses,
         error=error,
         notice=_NOTICES.get(notice, ""),
         # 三张表单各自回填：一张被拒不该改写另一张的当前值（D197）
-        fill=fill_form or _fill_defaults(ctx, markets),
+        fill=fill,
+        fill_rates=fill_rates,
+        fill_hint=fill_hint,
+        fill_auto=fill_auto,
         cash=cash_form or _cash_defaults(ctx),
         fx=fx,
         fx_hint=_rate_hint(ctx, fx["from_ccy"], fx["to_ccy"])[1],
-        account_form=account_form or {"name": "", "cash": ""},
+        account_form=account_form or {"name": "", "cash": "", "home_market": "A"},
     )
 
 
@@ -284,17 +382,20 @@ def open_account(
     _csrf: None = Depends(csrf_protect),
     name: str = Form(""),
     cash: str = Form(""),
+    home_market: str = Form("A"),
 ):
     """网页开户：空态那句「去跑 CLI」在 `sams serve` 独占库时是一条死路（D194）。"""
     user = require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
-    form = {"name": name, "cash": cash}
+    form = {"name": name, "cash": cash, "home_market": home_market}
     try:
         amount = _number(cash, "起始资金") if cash.strip() else 0.0
         if amount < 0:
             raise ValidationError("起始资金不能是负数")
-        account = ctx.ledger.open_account(user.username, name.strip())
+        account = ctx.ledger.open_account(
+            user.username, name.strip(), home_market=home_market
+        )
         if amount:
             ctx.ledger.deposit(
                 account.id,
@@ -444,6 +545,7 @@ def ledger_fill(
     qty: str = Form(""),
     price: str = Form(""),
     fee: str = Form("0"),
+    fx_rate: str = Form(""),
     thesis_id: str = Form(""),
     on: str = Form(""),
 ):
@@ -458,6 +560,7 @@ def ledger_fill(
         "qty": qty,
         "price": price,
         "fee": fee,
+        "fx_rate": fx_rate,
         "on": on,
         "thesis_id": thesis_id,
     }
@@ -472,6 +575,7 @@ def ledger_fill(
         quantity = _number(qty, "数量")
         trade_price = _number(price, "价格")
         trade_fee = _number(fee, "费用") if fee.strip() else 0.0
+        rate = _number(fx_rate, "汇率") if fx_rate.strip() else None
         moment = _trade_moment(ctx, on, market)
     except ValidationError as exc:
         return _portfolio_page(request, status=400, error=str(exc), fill_form=form)
@@ -480,6 +584,7 @@ def ledger_fill(
             qty=quantity,
             price=trade_price,
             fee=trade_fee,
+            fx_rate=rate,
             thesis_id=thesis_id.strip() or None,
             ts=moment,
         )

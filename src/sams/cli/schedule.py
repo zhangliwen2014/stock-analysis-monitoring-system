@@ -36,7 +36,7 @@ def add_to(subparsers) -> None:
         "--job",
         help=(
             "只跑这个 job（bars/actions/financials/valuation/flow/spot/recheck/rules/fx"
-            "/calendar）"
+            "/calendar/symbol_master）"
         ),
     )
     once.add_argument("--market", help="只跑这个市场（A/HK/US）")

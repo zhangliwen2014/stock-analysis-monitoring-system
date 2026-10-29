@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
+import pytest
+
 from sams.cli import build_parser
 from sams.core.errors import SchedulerBusy, ValidationError
 from sams.services.scheduler.due import DAILY, FX, WEEKLY
@@ -149,6 +151,14 @@ def test_once_normalizes_market_and_parses_as_of():
     assert scheduler.calls == [
         {"as_of": DAY, "only_job": "bars", "only_market": "HK"}
     ]
+
+
+def test_run_once_help_names_every_job_it_accepts(capsys):
+    """`symbol_master` 早就在注册表里，帮助里没有它等于告诉运维「这个 job 不存在」——
+    港股主档同步正是 D210 上线后的第一步。"""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run", "once", "-h"])
+    assert "symbol_master" in capsys.readouterr().out
 
 
 def test_a_malformed_date_is_a_usage_error(capsys):

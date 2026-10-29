@@ -45,6 +45,11 @@ def _account_parser(actions) -> None:
         action="store_true",
         help="允许现金为负（做空/融资）。默认不允许：负余额在屏幕上像一笔丢失的注资",
     )
+    add.add_argument(
+        "--home-market",
+        default="A",
+        help="主场市场 A/HK/US（默认 A）：录入成交时默认选它，不是权限",
+    )
     add.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
     add.set_defaults(handler=run_account)
 
@@ -85,7 +90,10 @@ def _trade_parser(actions, name: str) -> None:
     add.add_argument(
         "--fx-rate",
         type=float,
-        help="标的币种→报告币种当日汇率：非本币账户记账要带它，否则那一段盈亏拆不开",
+        help=(
+            "标的币种→报告币种汇率：填了就从报告币种现金按它结算（港股通正是这样），"
+            "不填就从标的币种现金扣；结算汇率同时作为盈亏拆分的基准"
+        ),
     )
     add.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
     add.set_defaults(handler=run_buy if name == "buy" else run_sell)
@@ -161,7 +169,11 @@ def run_account(container, args) -> int:
             if not args.name:
                 raise ValidationError("`account add` 要 --name：账户名是名下唯一认得出的东西")
             account = container.ledger.open_account(
-                args.user, args.name, broker=args.broker, margin_enabled=args.margin
+                args.user,
+                args.name,
+                broker=args.broker,
+                margin_enabled=args.margin,
+                home_market=args.home_market,
             )
             payload = {"status": "ok", "account": _account_payload(account)}
     except SamsError as exc:
@@ -231,7 +243,7 @@ def _fill(container, args, side: str) -> int:
             price=args.price,
             fee=args.fee,
             thesis_id=args.thesis,
-            fx_rate_ref=args.fx_rate,
+            fx_rate=args.fx_rate,
             ts=_moment(args, container, args.market),
         )
         position = book.position(order.account_id, order.market, order.code)
@@ -323,6 +335,7 @@ def _account_payload(account) -> dict:
         "report_currency": account.report_currency,
         "broker": account.broker,
         "margin_enabled": account.margin_enabled,
+        "home_market": account.home_market,
     }
 
 
@@ -403,7 +416,10 @@ def _summary_payload(summary: AccountSummary) -> dict:
 
 def _print_account(account: dict, username: str) -> None:
     margin = "，允许负余额" if account["margin_enabled"] else ""
-    print(f"{account['name']}  报告币种 {account['report_currency']}{margin}")
+    print(
+        f"{account['name']}  报告币种 {account['report_currency']}"
+        f"  主场 {account['home_market']}{margin}"
+    )
     # 下一步那条命令要能直接敲：屏幕上出现的 id 与用户名，就是它缺的那两个参数
     print(
         "  下一步（数额与理由改成你的）：sams ledger cash --user "
@@ -423,6 +439,7 @@ def _print_account_list(accounts: list[dict], username: str) -> None:
         # 一行一条：20 个账户刷不出下一页（同 `sams thesis list` 那条红线）
         print(
             f"  {account['name']:<10} 报告币种 {account['report_currency']}"
+            f"  主场 {account['home_market']}"
             f"  {'允许负余额' if account['margin_enabled'] else '不许负余额'}"
             f"  id {account['id']}"
         )

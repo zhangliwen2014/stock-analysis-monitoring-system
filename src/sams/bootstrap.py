@@ -456,6 +456,9 @@ def _context_on(
     versions = core.versions
     bars = BarRepo(database)
     symbols = SymbolRepo(database)
+    # 代码表在 sim_orders 之前造：成交的市场闸要拿全主档核对「这只票是不是别处的」（D210）。
+    # `symbols` 只随行情同步写（港股长期 0 行），拿它当全市场清单等于没有这道闸
+    symbol_list_store = SymbolListRepo(database)
     calendar_store = CalendarRepo(database)
     users = UserRepo(database)
     sessions = SessionRepo(database, clock)
@@ -493,7 +496,9 @@ def _context_on(
         fundamentals, analysis, financials_store, valuation_store, flow_store, clock=clock
     )
     sim_accounts = SimAccountRepo(database)
-    sim_orders = SimOrderRepo(database, sim_accounts, markets=cfg.markets, symbols=symbols)
+    sim_orders = SimOrderRepo(
+        database, sim_accounts, markets=cfg.markets, symbols=symbol_list_store
+    )
     ledger = LedgerService(
         sim_accounts, sim_orders, theses_store, users, cfg, versions=versions
     )
@@ -612,7 +617,6 @@ def _context_on(
     # 调度器也要吃它们，而同一个服务被造两份时，容器里那个与 job 里那个不是同一个对象：
     # 测试替换或事后调一处参数，另一处照旧跑——症状不是报错，是「改了没生效」
     # 仓库排在消费方之前：`sync` 的 `indices` 槽位与代码表同步吃的就是这两个对象
-    symbol_list_store = SymbolListRepo(database)
     index_daily_store = IndexDailyRepo(database)
     backfills_store = SymbolBackfillRepo(database)
     sync = SyncService(

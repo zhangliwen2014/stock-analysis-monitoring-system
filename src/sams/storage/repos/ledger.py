@@ -23,6 +23,7 @@ from sams.core.config import MarketCfg
 from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
 from sams.storage.ids import new_id
+from sams.storage.repos.symbol_list import SymbolListRepo
 from sams.storage.repos.symbols import SymbolRepo
 
 #: 认得的币种：三字母代码，不做模糊匹配。`RMB`/`rmb` 一律拒绝——
@@ -57,6 +58,8 @@ class Account:
     fee_model: str
     margin_enabled: bool
     report_currency: str
+    #: 录入成交时默认选中的市场（D208）：账户「平时买什么」，不是权限
+    home_market: str
 
 
 def _row_to_account(row: dict) -> Account:
@@ -69,6 +72,7 @@ def _row_to_account(row: dict) -> Account:
         fee_model=row["fee_model"],
         margin_enabled=bool(row["margin_enabled"]),
         report_currency=row["report_currency"],
+        home_market=row["home_market"],
     )
 
 
@@ -102,6 +106,7 @@ class SimAccountRepo:
         fee_model: str = "default",
         margin_enabled: bool = False,
         report_currency: str = "CNY",
+        home_market: str = "A",
     ) -> Account:
         if not name.strip():
             raise ValidationError("账户名不能为空")
@@ -109,7 +114,8 @@ class SimAccountRepo:
         try:
             self.db.execute(
                 "INSERT INTO sim_accounts (id, user_id, name, broker, market_scope, "
-                "fee_model, margin_enabled, report_currency) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "fee_model, margin_enabled, report_currency, home_market)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     account_id,
                     user_id,
@@ -119,6 +125,7 @@ class SimAccountRepo:
                     fee_model,
                     margin_enabled,
                     report_currency,
+                    canonical_market(home_market),
                 ],
             )
         except StorageError as exc:
@@ -309,6 +316,23 @@ BUY = "buy"
 SELL = "sell"
 SIDES = (BUY, SELL)
 
+
+def _check_code_shape(market: str, code: str) -> None:
+    """A 的代码必须是 6 位数字，HK 归一后必须是 5 位；US 不猜形态（D210）。
+
+    只闸写入口，不改 `canonical_code` 的读路径：库里已有的 `A/01021` 还要读得出来、
+    撤得掉——在归一函数里加校验，那一屏会直接 500，撤错的出口就没了。
+    """
+    if market == "A" and not (len(code) == 6 and code.isdigit()):
+        hint = (
+            "：5 位数字通常是港股（港股通请把市场选成「港股通（HK）」），或代码少写了一截"
+            if code.isdigit() and len(code) == 5
+            else ""
+        )
+        raise ValidationError(f"A 股的代码是 6 位数字，收到 {code}{hint}")
+    if market == "HK" and not (len(code) == 5 and code.isdigit()):
+        raise ValidationError(f"港股的代码是 5 位数字，收到 {code}")
+
 #: 一次成交动的四张表里，只有订单是「历史」；持仓和余额是「状态」。
 #: 状态可以由历史重放出来，所以写状态必须在历史之后、同一个事务里。
 
@@ -341,6 +365,8 @@ class Order:
     fee: float
     thesis_id: str | None
     fx_rate_ref: float | None
+    #: 这笔成交由券商按此汇率折成报告币种结算（D209）；None = 直接从标的币种现金扣/收
+    fx_rate_applied: float | None
 
 
 def _row_to_order(row: dict) -> Order:
@@ -357,6 +383,7 @@ def _row_to_order(row: dict) -> Order:
         fee=float(row["fee"] or 0.0),
         thesis_id=row["thesis_id"],
         fx_rate_ref=row.get("fx_rate_ref"),
+        fx_rate_applied=row.get("fx_rate_applied"),
     )
 
 
@@ -383,7 +410,7 @@ class SimOrderRepo:
         accounts: SimAccountRepo | None = None,
         *,
         markets: dict[str, MarketCfg] | None = None,
-        symbols: SymbolRepo | None = None,
+        symbols: SymbolRepo | SymbolListRepo | None = None,
     ) -> None:
         self.db = db
         #: 现金与流水归 SimAccountRepo 管；成交要顺手动它，所以持有同一个 db 上的一个实例
@@ -405,9 +432,15 @@ class SimOrderRepo:
         currency: str,
         fee: float = 0.0,
         thesis_id: str | None = None,
-        fx_rate_ref: float | None = None,
+        fx_rate: float | None = None,
         ts: datetime | None = None,
     ) -> Order:
+        """记一笔成交：订单用标的币种，现金从「结算币种」的口袋动（D209）。
+
+        结算币种默认就是标的币种；给了 `fx_rate`（标的币种 → 报告币种）就改成报告币种，
+        金额按汇率折算——港股通正是券商在 CNY 侧按参考汇率扣款。订单的币种不跟着变：
+        价格、费用与持仓永远是标的币种（§5.4 规则 1），变的只是钱从哪个口袋出。
+        """
         if side not in SIDES:
             raise ValidationError(f"side 只能是 {'/'.join(SIDES)}，收到 {side!r}")
         for label, value in (("qty", qty), ("price", price), ("fee", fee)):
@@ -423,21 +456,45 @@ class SimOrderRepo:
             )
         if fee < 0:
             raise ValidationError("手续费不能为负：负手续费等于把成本做低")
+        if fx_rate is not None and (not isfinite(fx_rate) or fx_rate <= 0):
+            raise ValidationError(f"汇率必须是正有限小数，收到 {fx_rate!r}")
         market = canonical_market(market)
         raw_code = code
         code = canonical_code(market, code)
         self._check_currency(market, code, currency)
         self._check_market_of_code(market, raw_code, code)
+        # 主档没同步时 D206 说不出话，形态是第二道保险：A 的 6 位列里出现 01021，
+        # 正是港股通最常犯的那一笔（D210）
+        _check_code_shape(market, code)
+        account = self.accounts._require(account_id)
+        settle_currency = currency
+        if fx_rate is not None:
+            if currency == account.report_currency:
+                raise ValidationError(
+                    f"{market} {code} 以 {currency} 计价，账户的报告币种也是 {currency}："
+                    f"不需要汇率（§5.4 规则 1）"
+                )
+            settle_currency = account.report_currency
         moment = _moment(ts)
         existing = self.position(account_id, market, code, strict=False)
         held = existing.qty if existing else 0.0
         if side == SELL and qty > held:
             raise StorageError(f"超卖：{market} {code} 持有 {held:g}，本次要卖 {qty:g}")
         gross = qty * price
-        cash_delta = -gross - fee if side == BUY else gross - fee
+        if fx_rate is None:
+            cash_delta = -gross - fee if side == BUY else gross - fee
+        else:
+            settled = (gross + fee) * fx_rate if side == BUY else (gross - fee) * fx_rate
+            cash_delta = -settled if side == BUY else settled
         if side == BUY:
             balances = self.accounts.cash_balances(account_id)
-            if currency not in balances:
+            if settle_currency not in balances:
+                if fx_rate is not None:
+                    raise StorageError(
+                        f"账户没有 {settle_currency} 现金：这笔 {market} {code} 按汇率 "
+                        f"{fx_rate:g} 结算要 {-cash_delta:.2f} {settle_currency}。"
+                        f"先入金，或留空汇率改从 {currency} 现金扣"
+                    )
                 raise StorageError(
                     f"账户没有 {currency} 现金，买不了 {currency} 定价的 {market} {code}"
                     f"（现有：{', '.join(sorted(balances)) or '空'}）。"
@@ -446,15 +503,15 @@ class SimOrderRepo:
                 )
         order_id = new_id()
         with self.db.transaction():
-            # `fx_rate_applied` 留 NULL：那一列按 spec §5.2 只在「这笔伴随换汇」时才有值，
-            # 换汇本身要到 M5 的 fx_trades 才存在。把基准汇率抄进它会让它从此没有出处。
+            # `fx_rate_applied` 与 `fx_rate_ref` 同值：这笔由券商结算的成交，
+            # 结算汇率就是它的基准汇率（D209）；没填汇率时两列都是 NULL
             self.db.execute(
                 "INSERT INTO sim_orders (id, account_id, market, code, currency, side, qty,"
-                " price, ts, fee, fee_currency, thesis_id, fx_rate_ref)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " price, ts, fee, fee_currency, thesis_id, fx_rate_ref, fx_rate_applied)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     order_id, account_id, market, code, currency, side, qty, price,
-                    moment, fee, currency, thesis_id, fx_rate_ref,
+                    moment, fee, currency, thesis_id, fx_rate, fx_rate,
                 ],
             )
             if side == BUY:
@@ -480,7 +537,7 @@ class SimOrderRepo:
             )
             self.accounts.adjust_cash(
                 account_id,
-                currency,
+                settle_currency,
                 cash_delta,
                 reason=f"{'买入' if side == BUY else '卖出'} {code}",
                 actor_id=user_id,
@@ -531,7 +588,18 @@ class SimOrderRepo:
                 basis -= row.qty * avg
                 running -= row.qty
         gross = order.qty * order.price
-        delta = gross + order.fee if order.side == BUY else -(gross - order.fee)
+        if order.fx_rate_applied is None:
+            settle_currency = order.currency
+            delta = gross + order.fee if order.side == BUY else -(gross - order.fee)
+        else:
+            # 当初按汇率在报告币种里结算的，退回的也必须是报告币种（D209）
+            settle_currency = self.accounts._require(account_id).report_currency
+            rate = order.fx_rate_applied
+            delta = (
+                (gross + order.fee) * rate
+                if order.side == BUY
+                else -(gross - order.fee) * rate
+            )
         moment = _moment(ts)
         with self.db.transaction():
             self.db.execute("DELETE FROM sim_orders WHERE id = ?", [order_id])
@@ -549,7 +617,7 @@ class SimOrderRepo:
             )
             self.accounts.adjust_cash(
                 account_id,
-                order.currency,
+                settle_currency,
                 delta,
                 reason=f"撤销成交 {order.id}",
                 actor_id=actor_id,

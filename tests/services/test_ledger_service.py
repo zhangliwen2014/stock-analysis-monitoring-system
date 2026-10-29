@@ -72,6 +72,18 @@ def test_open_account_delegates_with_the_configured_report_currency(svc) -> None
     assert account.report_currency == "CNY"
 
 
+def test_open_account_keeps_the_home_market_and_canonicalizes_it(svc) -> None:
+    """主场市场决定录入成交默认选哪个：写错大小写不该变成另一个市场（D208）。"""
+    assert svc.open_account(USER, "A 户").home_market == "A"
+    assert svc.open_account(USER, "港户", home_market="hk").home_market == "HK"
+
+
+def test_a_home_market_that_is_not_configured_is_a_typo(svc) -> None:
+    """未配置市场的币种推不出来：开户这一步就拒，别等第一笔成交才炸（D84 同一道闸）。"""
+    with pytest.raises(ValidationError, match="JP"):
+        svc.open_account(USER, "日户", home_market="JP")
+
+
 def test_a_username_that_is_not_in_the_library_is_refused_with_the_fix(svc) -> None:
     """不是 ValidationError 就错了：`--user trder` 是参数打错了（2），不是业务拒绝。"""
     with pytest.raises(ValidationError, match="sams user add"):
@@ -135,6 +147,15 @@ def test_the_hk_counter_part_derives_hkd(svc) -> None:
     svc.deposit(account.id, "HKD", 100_000.0, username=USER, reason="初始", actor_id=USER)
     order = svc.buy(account.id, USER, "HK", "700", qty=100, price=400.0)
     assert order.currency == "HKD"
+
+
+def test_buy_can_settle_in_the_report_currency_at_the_given_rate(svc) -> None:
+    """港股通：填了汇率，现金从 CNY 口袋按汇率出，订单与持仓仍是 HKD（D209）。"""
+    account_id = _funded(svc, "港通")
+    order = svc.buy(account_id, USER, "HK", "01021", qty=10, price=400.0, fx_rate=0.91)
+    assert order.currency == "HKD"
+    assert order.fx_rate_applied == pytest.approx(0.91)
+    assert svc.cash(account_id) == {"CNY": pytest.approx(100_000.0 - 3_640.0)}
 
 
 def test_buy_refuses_when_cash_is_short_with_the_amount_in_the_message(svc) -> None:

@@ -176,14 +176,58 @@ def akshare_hk_payout(symbol: str) -> pl.DataFrame:
     return pl.from_pandas(frame)
 
 
-def akshare_hk_symbol_list() -> pl.DataFrame:
-    """真实网络调用：港股实时快照，全市场代码表只取它的 代码/名称 两列（D148）。"""
+def akshare_hk_symbol_list_em() -> pl.DataFrame:
+    """港股代码表第一源：东财实时快照（代码/名称）。空表返回空帧，由降级链决定下一步。"""
     import akshare as ak
 
     frame = ak.stock_hk_spot_em()
     if frame is None or len(frame) == 0:
-        raise EmptyResponse("akshare_hk", "港股代码表返回空")
+        return pl.DataFrame()
     return pl.from_pandas(frame)
+
+
+def akshare_hk_symbol_list_sina() -> pl.DataFrame:
+    """港股代码表第二源：新浪实时快照（代码/中文名称，约 2800 行，D210）。
+
+    东财那张表在 2026-10 下旬连续 `RemoteDisconnected`，而港股主档空着时，
+    候选面板搜不到、D206 的「另一个市场有这只票」也永远不成立。
+    """
+    import akshare as ak
+
+    frame = ak.stock_hk_spot()
+    if frame is None or len(frame) == 0:
+        return pl.DataFrame()
+    return pl.from_pandas(frame)
+
+
+#: 新浪把名称列叫「中文名称」；`normalize_symbol_list` 只认 code/name 两种叫法
+_SINA_RENAME = {"中文名称": "名称"}
+
+
+def akshare_hk_symbol_list(
+    primary: Callable[[], pl.DataFrame] = akshare_hk_symbol_list_em,
+    fallback: Callable[[], pl.DataFrame] = akshare_hk_symbol_list_sina,
+) -> pl.DataFrame:
+    """两个源依次问：抛错或空表就换下一个，两个都不行才报（D210）。
+
+    最后一个错误原样抛出，而「两个都空」抛 `EmptyResponse`——前者是某家源坏了，
+    后者是港股根本没有代码表，源健康表上该分的两笔账。
+    """
+    last: Exception | None = None
+    for fetch in (primary, fallback):
+        try:
+            frame = _to_polars(fetch())
+        except Exception as exc:  # noqa: BLE001 — 降级链的职责就是把异常换成下一次尝试
+            last = exc
+            continue
+        if frame is None or frame.is_empty():
+            continue
+        if "中文名称" in frame.columns and "名称" not in frame.columns:
+            frame = frame.rename(_SINA_RENAME)
+        return frame
+    if last is not None:
+        raise last
+    raise EmptyResponse("akshare_hk", "两个港股代码表源都返回空")
 
 
 def _to_polars(frame) -> pl.DataFrame:
