@@ -24,11 +24,17 @@ import polars as pl
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.datasource.base import a_share_symbol, classify_error, normalize_bars
+from sams.datasource.fx import normalize_fx
 from sams.datasource.sources import source
 
 KLINE_URL = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
 #: 接口单次最多返回的根数（超过就只给最近这么多，不报错）
 MAX_BARS = 1023
+#: 外汇日 K 走 JSONP：变量名里带着方向，解析时拿它核对请求的那一对
+FX_URL = (
+    "https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php"
+    "/var%20_{symbol}=/NewForexService.getDayKLine"
+)
 
 FIELD_ORDER = ("day", "open", "high", "low", "close", "volume")
 #: 标准列名 → 源列名：新浪的日期列叫 day
@@ -133,6 +139,62 @@ def http_get(url: str, params: dict[str, str], *, timeout: int = 15) -> object:
     return json.loads(response.text)
 
 
+def http_get_text(url: str, params: dict[str, str], *, timeout: int = 15) -> str:
+    """外汇接口回的是 JSONP 文本：交给 `http_get` 会把它当成坏 JSON。"""
+    import requests
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=timeout,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://finance.sina.com.cn",
+        },
+    )
+    if response.status_code == 429:
+        raise RateLimited("sina", "HTTP 429 被限流")
+    response.raise_for_status()
+    return response.text
+
+
+def fx_symbol(base: str, quote: str) -> str:
+    """方向由拼接顺序决定：`fx_shkdcny` 与 `fx_scnyhkd` 是两条不同的序列。"""
+    return f"fx_s{base.lower()}{quote.lower()}"
+
+
+def parse_sina_fx(payload: object, *, base: str, quote: str) -> pl.DataFrame:
+    """JSONP → 标准汇率帧，取每日**收盘**（一行五格里的第 5 格）。
+
+    变量名必须是请求的那一对：反方向的序列同样是一串「看起来正常」的汇率，
+    收下它，每一笔跨币种盈亏都会差近 40%。收盘的位置用相邻两行钉住——
+    今天的开盘等于昨天的收盘，而第 4 格不满足这条。
+    """
+    if not isinstance(payload, str):
+        raise DatasourceError("sina", f"汇率响应不是 JSONP 文本: {type(payload).__name__}")
+    symbol = fx_symbol(base, quote)
+    marker = f'var _{symbol}=("'
+    start = payload.find(marker)
+    if start < 0:
+        raise FieldDrift("sina", f"汇率响应里找不到 var _{symbol}=(\"，形态已变或方向不对")
+    start += len(marker)
+    end = payload.rfind('")')
+    body = payload[start:end] if end >= start else ""
+    rows: list[dict[str, str]] = []
+    for line in body.split("|"):
+        text = line.strip()
+        if not text:
+            continue
+        parts = text.split(",")
+        if len(parts) < 5:
+            # 少一格是改版：静默跳过的那一天不会有人发现，直到锚上它
+            raise FieldDrift("sina", f"汇率行 {text[:40]!r} 不足五格（日期、开、低、高、收）")
+        rows.append({"date": parts[0], "rate": parts[4]})
+    if not rows:
+        raise EmptyResponse("sina", f"{base}→{quote} 的汇率响应里没有一行")
+    return normalize_fx(pl.DataFrame(rows), base=base, quote=quote, source="sina")
+
+
 class SinaAdapter:
     name = "sina"
     markets = frozenset({"A"})
@@ -143,10 +205,12 @@ class SinaAdapter:
         self,
         *,
         get: Callable[..., object] = http_get,
+        fx_get: Callable[..., object] = http_get_text,
         timeout: int = 15,
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self._get = get
+        self._fx_get = fx_get
         self._timeout = timeout
         self._clock = clock
 
@@ -226,6 +290,24 @@ class SinaAdapter:
         # normalize_bars 把 code 归一个股形态，而指数表的键要源形态（sh000001 ≠ 平安银行，D145）
         return frame.with_columns(pl.lit(code).alias("code"))
 
+    def fx_rate(self, base: str, quote: str, start: date, end: date) -> pl.DataFrame:
+        """人民币汇率日线：`X→CNY` 与 `CNY→X` 各自有代码，方向不靠取倒数。
+
+        源给全史（2014 起），窗口裁剪在 `registry._call_fx`——那里对每条链只做一次，
+        适配器再裁一遍会让「这条源到过哪一天」多出第二个说法。
+        """
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        base, quote = base.upper(), quote.upper()
+        symbol = fx_symbol(base, quote)
+        try:
+            payload = self._fx_get(
+                FX_URL.format(symbol=symbol), {"symbol": symbol}, timeout=self._timeout
+            )
+        except Exception as exc:  # noqa: BLE001 — 只包网络这一跳
+            raise classify_error(self.name, exc) from exc
+        return parse_sina_fx(payload, base=base, quote=quote)
+
     def minute_bars(
         self, market: str, code: str, start: date, end: date, *, scale: int, count: int
     ) -> pl.DataFrame:
@@ -258,5 +340,5 @@ class SinaAdapter:
 source(
     "sina",
     options=("timeout",),
-    note="新浪 A 股日线 + 指数日线 + 分钟K，日线只覆盖最近约 1023 根",
+    note="新浪 A 股日线 + 指数日线 + 分钟K + 人民币汇率日线，日线只覆盖最近约 1023 根",
 )(SinaAdapter)
