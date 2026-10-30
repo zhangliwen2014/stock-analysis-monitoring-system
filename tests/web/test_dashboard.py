@@ -197,6 +197,18 @@ def test_watchlist_rejects_an_unconfigured_market(logged):
     assert "XX" in response.text
 
 
+def test_watchlist_rejects_a_code_whose_shape_belongs_to_another_market(logged):
+    """A 股清单里写 00700：主档会建出一行永远没有行情的票，补数队列还会反复重试（D210）。"""
+    user = logged.context.users.get_by_username("alice")
+    response = logged.client.post(
+        "/watchlist/add", data={"csrf": logged.csrf, "market": "A", "code": "00700"}
+    )
+    assert response.status_code == 200
+    assert "形态" in response.text
+    assert not logged.context.watchlists.contains(user.id, "A", "00700")
+    assert logged.context.backfills_store.open_for("A", "00700") is None
+
+
 def test_watchlist_is_private_per_user(web_app):
     web_app.context.users.create("bob", "another-correct-horse")
     _login(web_app.client, "alice", "correct-horse-battery")

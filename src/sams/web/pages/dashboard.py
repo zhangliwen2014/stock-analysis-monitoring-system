@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
 from sams.bootstrap import AppCore, ServiceContext
-from sams.core.codes import canonical_code, canonical_market, currency_override
+from sams.core.codes import canonical_code, canonical_market, currency_override, fits_market
 from sams.core.errors import SamsError, ValidationError
 from sams.core.quotes import DELAYED, LIVE, NO_DATA, quote_state
 from sams.services.symbol_search import hinted_market, normalize_query
@@ -331,15 +331,21 @@ def watchlist_add(
             error=f"市场 {market or '（空）'} 没配：只有 {sorted(ctx.settings.markets)}",
         )
     try:
+        cleaned = canonical_code(market, code.strip())
+        if not fits_market(market, cleaned):
+            raise ValidationError(
+                f"{market} 里没有 {code.strip()} 这种形态："
+                "A 股 6 位数字、港股 5 位数字"
+            )
         ctx.watchlists.add(
-            request.state.sams_user.id, market, code.strip(), note=note.strip() or None
+            request.state.sams_user.id, market, cleaned, note=note.strip() or None
         )
     except ValidationError as exc:
         # 代码形态不对（HK 给了四位、US 给了小写中文）都是用户输入错：回原页带话，
         # 而不是抛给全局处理器变成一屏没有表单的 400
         return _watch_page(request, error=str(exc))
     # 加票即登记兴趣：主档建行 + 排补数拍（D144），归一在登记处做
-    ctx.symbol_interest.ensure(market, code.strip(), actor=request.state.sams_user.username)
+    ctx.symbol_interest.ensure(market, cleaned, actor=request.state.sams_user.username)
     return RedirectResponse("/watchlist", status_code=303)
 
 
