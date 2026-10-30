@@ -91,6 +91,92 @@ def test_the_growth_columns_keep_a_wider_ceiling_but_the_same_inclusive_guard(fi
     assert yoy("600002") == [None], "含边界：5.0 与 5.01 同侧"
 
 
+def test_an_extreme_growth_confirmed_by_the_level_columns_survives(fin, db):
+    """300750 2023Q1 的净利同比 +558%（5.58）是真数，不是「558% 没 ÷100」。
+
+    只盯数值的闸分不开这两种形状；但同一批里的 `net_profit` 能作证：
+    9,822,265,100 / 1,492,804,600 − 1 = 5.5798，与 5.58 吻合。
+    """
+    fin.upsert(
+        pl.DataFrame(
+            [
+                fin_row(
+                    code="300750",
+                    report_date=date(2022, 3, 31),
+                    published_date=date(2022, 4, 30),
+                    revenue=48_678_419_100.0,
+                    net_profit=1_492_804_600.0,
+                    revenue_yoy=1.5397,
+                    profit_yoy=-0.2362,
+                ),
+                fin_row(
+                    code="300750",
+                    report_date=date(2023, 3, 31),
+                    published_date=date(2023, 4, 21),
+                    revenue=89_038_465_300.0,
+                    net_profit=9_822_265_100.0,
+                    revenue_yoy=0.8291,
+                    profit_yoy=5.58,
+                ),
+            ]
+        )
+    )
+    got = db.query(
+        "SELECT report_date, profit_yoy FROM financials WHERE code = '300750'"
+        " ORDER BY report_date"
+    ).to_dicts()
+    assert got == [
+        {"report_date": date(2022, 3, 31), "profit_yoy": -0.2362},
+        {"report_date": date(2023, 3, 31), "profit_yoy": 5.58},
+    ]
+
+
+def test_a_growth_the_level_columns_contradict_is_still_nulled(fin, db):
+    """12.0 若真是 +1200%，净利应是上年度的 13 倍；实际只涨了 12%——它是没 ÷100 的「12%」。"""
+    fin.upsert(
+        pl.DataFrame(
+            [
+                fin_row(code="600001", net_profit=100.0, profit_yoy=0.0),
+                fin_row(
+                    code="600001",
+                    report_date=date(2024, 12, 31),
+                    published_date=date(2025, 3, 20),
+                    net_profit=112.0,
+                    profit_yoy=12.0,
+                ),
+            ]
+        )
+    )
+    got = db.query(
+        "SELECT report_date, profit_yoy FROM financials WHERE code = '600001'"
+        " ORDER BY report_date"
+    ).to_dicts()
+    assert got[-1] == {"report_date": date(2024, 12, 31), "profit_yoy": None}
+
+
+def test_a_growth_over_a_zero_base_cannot_be_confirmed_and_stays_null(fin, db):
+    """上年金额为 0 时同比无法用金额复算：没有证据就不放行，仍是「无数」。"""
+    fin.upsert(
+        pl.DataFrame(
+            [
+                fin_row(code="600002", net_profit=0.0, profit_yoy=0.0),
+                fin_row(
+                    code="600002",
+                    report_date=date(2024, 12, 31),
+                    published_date=date(2025, 3, 20),
+                    net_profit=558.0,
+                    profit_yoy=5.58,
+                ),
+            ]
+        )
+    )
+    got = db.query(
+        "SELECT report_date, profit_yoy FROM financials WHERE code = '600002'"
+        " ORDER BY report_date"
+    ).to_dicts()
+    assert got[-1]["profit_yoy"] is None
+
+
 def test_the_negative_side_uses_the_same_abs_ceiling(fin, db):
     """负方向同样只看绝对值：ROE 的 −1.0 与 +1.0 一道被拒。
 

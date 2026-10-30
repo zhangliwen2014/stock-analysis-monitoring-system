@@ -43,6 +43,10 @@ from sams.storage.repos._keys import normalize_keys
 
 logger = logging.getLogger("sams.storage.fundamentals")
 
+#: 增速列的「独立证据」：同一行的金额列能按上年同期复算出同一个同比（D223）。
+#: 只有**被量级闸拦下**的值才问这一句，闸对其余值的判据不变。
+_GROWTH_LEVELS = {"revenue_yoy": "revenue", "profit_yoy": "net_profit"}
+
 
 def _basis_clause(basis: str) -> str:
     """ROE 口径 → SQL 谓词（D62）。认报告期的日历日，不认名字或字段。
@@ -60,6 +64,41 @@ def _basis_clause(basis: str) -> str:
         if basis == ROE_BASIS_ANNUAL
         else ""
     )
+
+
+def _last_year(day: date) -> date:
+    try:
+        return day.replace(year=day.year - 1)
+    except ValueError:  # 2 月 29 日：上一年没有这一天
+        return day.replace(year=day.year - 1, day=28)
+
+
+def _confirmed_by_levels(out: pl.DataFrame, ratio: str, level: str) -> pl.Series:
+    """被量级闸拦下的增速，能否由同一批里的金额列作证是小数口径（D223）。
+
+    增速的百分数写法与小数写法在 1–100 这一段完全重叠：12 既可能是 +1200%，
+    也可能是没 ÷100 的「12%」，单看数值分不开。金额列是独立证据——同一行有
+    revenue/net_profit、上一年的同期行也在这一批里，就能复算出同比。吻合则保留，
+    不吻合、上年金额 ≤ 0 或不给证据则维持置空：证据不足时仍然选择「不出数」。
+    """
+    if not {"code", "report_date", level}.issubset(out.columns):
+        return pl.Series([False] * out.height, dtype=pl.Boolean)
+    levels = {
+        (row["code"], row["report_date"]): row[level]
+        for row in out.select("code", "report_date", level).iter_rows(named=True)
+    }
+    confirmed: list[bool] = []
+    for row in out.select("code", "report_date", ratio).iter_rows(named=True):
+        value, day = row[ratio], row["report_date"]
+        current = levels.get((row["code"], day))
+        previous = levels.get((row["code"], _last_year(day))) if day is not None else None
+        # 上年为 0 或负数时同比没有可比基准：金额列无法作证，也就不放行
+        if value is None or current is None or previous is None or previous <= 0:
+            confirmed.append(False)
+            continue
+        computed = current / previous - 1
+        confirmed.append(abs(computed - value) <= max(0.02, abs(value) * 0.05))
+    return pl.Series(confirmed, dtype=pl.Boolean)
 
 
 def _prepare(
@@ -119,8 +158,22 @@ def _prepare(
     for column in RATIO_BOUNDS:
         if column not in out.columns:
             continue
-        flagged = [out_of_caliber(column, value) for value in out[column].to_list()]
-        suspect = sum(flagged)
+        flagged = pl.Series(
+            [out_of_caliber(column, value) for value in out[column].to_list()],
+            dtype=pl.Boolean,
+        )
+        if column in _GROWTH_LEVELS:
+            # 单看数值分不开「+558%」与「558% 没 ÷100」；金额列是独立证据（D223）
+            rescued = flagged & _confirmed_by_levels(out, column, _GROWTH_LEVELS[column])
+            if rescued.any():
+                logger.info(
+                    "%s 有 %d 行的 %s 越界但金额列复算吻合，按小数口径保留",
+                    table,
+                    int(rescued.sum()),
+                    column,
+                )
+            flagged = flagged & ~rescued
+        suspect = int(flagged.sum())
         if suspect:
             logger.warning(
                 "%s 有 %d 行的 %s 越出小数口径的可信范围（|x| >= %g，疑似百分数未 ÷100）已置空",
