@@ -152,6 +152,15 @@ class ScreenerService:
             universe = universe.with_columns(
                 pl.Series("pr_now", values, dtype=pl.Float64)
             )
+        if "peg" in specs:
+            # PE 与年报净利同比都为正才有意义：负增速的 PEG 是一个看起来更便宜的负数
+            universe = universe.with_columns(
+                pl.when((pl.col("pe_ttm") > 0) & (pl.col("profit_yoy") > 0))
+                .then(pl.col("pe_ttm") / (pl.col("profit_yoy") * 100))
+                .otherwise(None)
+                .cast(pl.Float64)
+                .alias("peg")
+            )
         counts: list[FieldCounts] = []
         masks: list[pl.Series] = []
         for cond in checked:
@@ -215,8 +224,13 @@ class ScreenerService:
 
         快照帧里没有财务列，所以判据必须是 `Field.source == "financials"`，
         不是「帧里有没有这一列」——后者永远为假，join 永远不会发生。
+        推导列（如 PEG）用 `needs` 声明自己依赖的财务列，否则它会在缺少分母的帧上
+        算出一列 None，而页面只会说「无数」，看不出是 join 漏了（D222）。
         """
-        columns = sorted({item.column for item in wanted if item.source == "financials"})
+        columns = sorted(
+            {item.column for item in wanted if item.source == "financials"}
+            | {column for item in wanted for column in item.needs}
+        )
         if not columns:
             return universe
         loaded, _dropped = self.financials.load_as_of(
@@ -272,6 +286,8 @@ def _missing_groups(
             if value is None or (isinstance(value, float) and isnan(value)):
                 if cond.field == "pr_now":
                     reason = kinds.get(row["code"], "现值 PR 没有数")
+                elif specs[cond.field].missing_note:
+                    reason = specs[cond.field].missing_note
                 elif specs[cond.field].source == "financials":
                     # 补数命令按代码跑，但理由只说一次：逐票把代码拼进去，几千只票就是几千组
                     reason = (

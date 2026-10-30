@@ -149,6 +149,93 @@ def test_one_missing_financial_field_is_one_group_not_one_per_code(db):
     assert "000001" not in group.reason and "300750" not in group.reason
 
 
+def financial(db, code, **values):
+    """一期年报的最小行：没给的列按可选留空，与适配器缺列时的处理一致。"""
+    row = {
+        "market": "A",
+        "code": code,
+        "report_date": date(2025, 12, 31),
+        "published_date": date(2026, 3, 20),
+        "source": "akshare",
+    } | values
+    FinancialRepo(db).upsert(pl.DataFrame([row]))
+
+
+def test_annual_quality_fields_are_joined_at_the_snapshot_day(db):
+    seed(db, snap("600519"), snap("000001"), codes=("600519", "000001"))
+    financial(
+        db,
+        "600519",
+        roe=0.20,
+        gross_margin=0.50,
+        net_margin=0.25,
+        roa=0.12,
+        roic=0.18,
+        debt_ratio=0.30,
+        current_ratio=2.0,
+        dividend_yield=0.04,
+    )
+    result = service(db).run(
+        "A",
+        [
+            Condition("gross_margin", ">=", 0.40),
+            Condition("debt_ratio", "<=", 0.50),
+            Condition("dividend_yield", ">=", 0.03),
+        ],
+    )
+    assert [hit.code for hit in result.hits] == ["600519"]
+    assert result.hits[0].values["gross_margin"] == pytest.approx(0.50)
+    (group,) = result.missing
+    assert group.codes == ("000001",) and "毛利率" in group.reason
+
+
+def test_peg_is_pe_divided_by_the_growth_percent_and_needs_the_financial_join(db):
+    """PEG 只选了推导列，引擎也必须把年报净利同比带进来——否则每一行都是无数。"""
+    seed(
+        db,
+        snap("600519", pe_dyn=20.0),
+        snap("000001", pe_dyn=10.0),
+        codes=("600519", "000001"),
+    )
+    financial(db, "600519", profit_yoy=0.20)
+    financial(db, "000001", profit_yoy=-0.10)
+    result = service(db).run("A", [Condition("peg", "<=", 1.0)])
+    assert result.fields[0].passed == 1 and result.fields[0].missing == 1
+    (hit,) = result.hits
+    assert hit.code == "600519" and hit.values["peg"] == pytest.approx(1.0)
+    (group,) = result.missing
+    assert group.field == "peg" and group.codes == ("000001",)
+    assert "PEG 没有意义" in group.reason
+
+
+def test_quality_fields_take_the_latest_annual_report_not_a_quarter(db):
+    """PIT + 年报口径：季报的毛利率不能冒充年报，否则「年报 ROE/毛利率」就是一句假话（D62）。"""
+    seed(db, snap("600519"))
+    financial(db, "600519", report_date=date(2025, 12, 31), gross_margin=0.30)
+    financial(
+        db,
+        "600519",
+        report_date=date(2026, 3, 31),
+        published_date=date(2026, 4, 30),
+        gross_margin=0.90,
+    )
+    result = service(db).run("A", [Condition("gross_margin", "between", (0.29, 0.31))])
+    assert result.fields[0].passed == 1
+    assert result.hits[0].values["gross_margin"] == pytest.approx(0.30)
+
+
+def test_a_quality_number_published_after_the_snapshot_day_is_missing_not_guessed(db):
+    seed(db, snap("600519"))
+    financial(
+        db,
+        "600519",
+        published_date=date(2026, 11, 1),
+        gross_margin=0.50,
+    )
+    result = service(db).run("A", [Condition("gross_margin", ">=", 0.40)])
+    assert result.fields[0].missing == 1 and not result.hits
+
+
 def test_snapshot_only_and_list_only_are_two_separate_numbers(db):
     """D174：快照里多出来的、代码表里缺的，两个数分开报，不合并成一个「有效票池」。"""
     seed(db, snap("600519"), snap("999999"), codes=("600519", "000001"))

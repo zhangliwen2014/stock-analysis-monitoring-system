@@ -21,6 +21,7 @@ from sams.core.screener_fields import (
     describe_all,
     fields_for,
 )
+from sams.core.screener_recipes import recipes_for
 from sams.services.screener import preset_strategy_id
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
@@ -180,13 +181,30 @@ def _render(
                 "id": item.id,
                 "name": item.name,
                 "market": item.market,
+                "description": item.description,
                 "summary": describe_all(item.conditions),
+                "load_url": _url(item.market, [], preset=item),
                 "updated": moment_label(item.updated_at, ctx.settings.server.display_tz),
                 "last_run": moment_label(runs[0]["created_at"], ctx.settings.server.display_tz)
                 if runs
                 else "",
             }
         )
+    recipes_view = [
+        {
+            "key": item.key,
+            "name": item.name,
+            "investor": item.investor,
+            "market": item.market,
+            "summary": describe_all(item.conditions),
+            "description": item.description,
+            "basis": item.basis,
+            "caveat": item.caveat,
+            "rows": [_draft_of(cond) for cond in item.conditions],
+            "load_url": _url(item.market, [_draft_of(cond) for cond in item.conditions]),
+        }
+        for item in recipes_for(market)
+    ]
     add_url = _url(market, [*rows, _draft()])
     remove_urls = [_url(market, rows[:i] + rows[i + 1 :]) for i in range(len(rows))]
     if not rows:
@@ -222,6 +240,7 @@ def _render(
         plan=plan,
         confirm_all=confirm_all,
         presets=presets_view,
+        recipes=recipes_view,
     )
 
 
@@ -327,8 +346,8 @@ def _notice(query) -> str:
         return "已把全市场快照排进下一拍：跑完刷新这一页"
     if kind == "saved":
         return "方案已保存"
-    if kind == "renamed":
-        return "方案已改名"
+    if kind == "edited":
+        return "方案的名字与说明已更新"
     if kind == "updated":
         return "方案的条件已覆盖为当前这一组"
     if kind == "deleted":
@@ -456,7 +475,13 @@ def save_preset(
     market = one(data, "market").strip().upper()
     rows = _posted_rows(data)
     try:
-        ctx.screener_presets.create(user.id, one(data, "name"), market, list(_conditions(rows)))
+        ctx.screener_presets.create(
+            user.id,
+            one(data, "name"),
+            market,
+            list(_conditions(rows)),
+            description=one(data, "description"),
+        )
     except ValidationError as exc:
         return _render(request, user, market=market, preset=None, rows=rows, error=str(exc))
     return RedirectResponse(_url(market, rows, notice="saved"), status_code=303)
@@ -485,8 +510,8 @@ def run_preset(request: Request, preset_id: str, _csrf: None = Depends(csrf_prot
     return RedirectResponse(_url(preset.market, [], preset=preset, notice="ran"), status_code=303)
 
 
-@router.post("/screen/presets/{preset_id}/rename")
-def rename_preset(
+@router.post("/screen/presets/{preset_id}/edit")
+def edit_preset(
     request: Request,
     preset_id: str,
     _csrf: None = Depends(csrf_protect),
@@ -497,13 +522,15 @@ def rename_preset(
     preset = _preset(ctx, user.id, preset_id)
     rows = [_draft_of(item) for item in preset.conditions]
     try:
-        ctx.screener_presets.rename(user.id, preset.id, one(data, "name"))
+        ctx.screener_presets.edit(
+            user.id, preset.id, one(data, "name"), one(data, "description")
+        )
     except ValidationError as exc:
         return _render(
             request, user, market=preset.market, preset=preset, rows=rows, error=str(exc)
         )
     return RedirectResponse(
-        _url(preset.market, [], preset=preset, notice="renamed"), status_code=303
+        _url(preset.market, [], preset=preset, notice="edited"), status_code=303
     )
 
 

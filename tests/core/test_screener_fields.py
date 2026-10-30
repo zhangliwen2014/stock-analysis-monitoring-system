@@ -78,6 +78,25 @@ def test_registry_and_page_vocabulary_are_the_same_object():
     assert {"pr_now", "pe_dyn", "pb", "roe", "turnover_rate"} <= names
     assert "pr_now" not in {f.name for f in fields_for("HK")}
 
+
+def test_annual_financial_quality_fields_are_a_only_and_read_as_decimals():
+    """D222：七个年报字段只供 A 股；比率都是小数（0.35 = 35%），流动比率才是倍。"""
+    by_name = {item.name: item for item in FIELDS}
+    names = {"dividend_yield", "gross_margin", "net_margin", "roa", "roic", "debt_ratio"}
+    assert names <= set(by_name)
+    assert all(by_name[name].markets == frozenset({"A"}) for name in names)
+    assert all("小数" in by_name[name].unit for name in names)
+    assert by_name["current_ratio"].unit == "倍"
+    assert by_name["current_ratio"].markets == frozenset({"A"})
+
+
+def test_peg_declares_its_financial_input_and_a_missing_reason():
+    """PEG 是推导列：它必须先拿到净利同比，否则引擎只会算出一列 None。"""
+    peg = {item.name: item for item in FIELDS}["peg"]
+    assert peg.source == "derived" and peg.column == "peg"
+    assert peg.needs == ("profit_yoy",)
+    assert "净利同比" in peg.missing_note
+
 def test_describe_all_is_the_only_readable_spelling_of_a_condition_set():
     """方案列表要一句人话，不是 JSON；单位也必须在这句里（D58）。"""
     from sams.core.screener_fields import describe_all

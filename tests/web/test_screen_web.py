@@ -340,10 +340,27 @@ def test_add_all_confirmed_re_runs_the_conditions_on_the_server(logged_screen):
     assert not context.watchlists.contains(alice, "A", "300750")
 
 
-def _save(logged_screen, name="便宜", *, market="A", f="pr_now", o="<=", v="0.5"):
+def _save(
+    logged_screen,
+    name="便宜",
+    *,
+    market="A",
+    f="pr_now",
+    o="<=",
+    v="0.5",
+    description="",
+):
     return logged_screen.client.post(
         "/screen/presets",
-        data={"csrf": logged_screen.csrf, "market": market, "f": f, "o": o, "v": v, "name": name},
+        data={
+            "csrf": logged_screen.csrf,
+            "market": market,
+            "f": f,
+            "o": o,
+            "v": v,
+            "name": name,
+            "description": description,
+        },
         follow_redirects=False,
     )
 
@@ -389,14 +406,18 @@ def test_run_links_back_to_the_preset_and_conditions_show_up_in_the_form(logged_
     assert "通过 2 / 不通过 1 / 无数 1" in page.text
 
 
-def test_rename_overwrite_and_delete(logged_screen):
+def test_edit_overwrite_and_delete(logged_screen):
     default_seed(logged_screen)
-    _save(logged_screen)
+    _save(logged_screen, description="旧说明")
     preset = logged_screen.context.screener_presets.list(_alice(logged_screen))[0]
     assert (
         logged_screen.client.post(
-            f"/screen/presets/{preset.id}/rename",
-            data={"csrf": logged_screen.csrf, "name": "很便宜"},
+            f"/screen/presets/{preset.id}/edit",
+            data={
+                "csrf": logged_screen.csrf,
+                "name": "很便宜",
+                "description": "只做底仓",
+            },
             follow_redirects=False,
         ).status_code
         == 303
@@ -405,6 +426,7 @@ def test_rename_overwrite_and_delete(logged_screen):
     section = page.text.split("筛选方案")[1]
     # 新名字里也含「便宜」二字：按整格比对，才分得清旧行有没有留下
     assert "<td>很便宜</td>" in section and "<td>便宜</td>" not in section
+    assert "只做底仓" in section and "旧说明" not in section
 
     assert (
         logged_screen.client.post(
@@ -422,6 +444,7 @@ def test_rename_overwrite_and_delete(logged_screen):
     )
     page = logged_screen.client.get(f"/screen?preset={preset.id}")
     assert 'value="0.3"' in page.text
+    assert "只做底仓" in page.text
 
     assert (
         logged_screen.client.post(
@@ -434,6 +457,64 @@ def test_rename_overwrite_and_delete(logged_screen):
     assert logged_screen.context.screener_presets.list(_alice(logged_screen)) == []
 
 
+def test_a_description_longer_than_the_limit_is_refused_and_nothing_is_saved(logged_screen):
+    response = logged_screen.client.post(
+        "/screen/presets",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "f": "pr_now",
+            "o": "<=",
+            "v": "0.5",
+            "name": "长说明",
+            "description": "说" * 201,
+        },
+    )
+    assert response.status_code == 200 and "说明最多" in response.text
+    assert logged_screen.context.screener_presets.list(_alice(logged_screen)) == []
+
+
+def test_a_preset_has_a_load_link_that_puts_its_conditions_back_in_the_form(logged_screen):
+    default_seed(logged_screen)
+    _save(logged_screen)
+    preset = logged_screen.context.screener_presets.list(_alice(logged_screen))[0]
+    page = logged_screen.client.get("/screen")
+    assert f"/screen?market=A&amp;preset={preset.id}" in page.text
+    loaded = logged_screen.client.get(f"/screen?preset={preset.id}")
+    assert '<option value="pr_now" selected>' in loaded.text
+
+
+def test_the_recommended_recipes_show_their_conditions_basis_and_caveat(logged_screen):
+    page = logged_screen.client.get("/screen", params={"market": "A"})
+    assert "推荐选股组合" in page.text
+    for name in ("巴菲特：高 ROE 少负债", "格雷厄姆：安全边际", "林奇：成长与价格匹配"):
+        assert name in page.text
+    assert "依据：" in page.text and "注意：" in page.text
+    # 配方带的是普通 GET 链接：载入后条件回到表单里，仍可继续改
+    assert "载入并筛选" in page.text and "f=gross_margin" in page.text
+
+
+def test_a_recipe_saved_as_my_preset_keeps_its_description(logged_screen):
+    default_seed(logged_screen)
+    response = _save(
+        logged_screen,
+        name="巴菲特：高 ROE 少负债",
+        f="roe",
+        o=">=",
+        v="0.15",
+        description="年报 ROE ≥ 15%、毛利率 ≥ 35%、资产负债率 ≤ 55%",
+    )
+    assert response.status_code == 303
+    (preset,) = logged_screen.context.screener_presets.list(_alice(logged_screen))
+    assert preset.name == "巴菲特：高 ROE 少负债"
+    assert "毛利率" in preset.description
+
+
+def test_a_market_without_recipes_does_not_show_the_recipe_card(logged_screen):
+    page = logged_screen.client.get("/screen", params={"market": "HK"})
+    assert "推荐选股组合" not in page.text
+
+
 def test_another_users_preset_is_a_404_without_saying_whose_it_is(logged_screen):
     other = logged_screen.context.users.create("bob", "correct-horse-battery")
     foreign = logged_screen.context.screener_presets.create(
@@ -441,10 +522,13 @@ def test_another_users_preset_is_a_404_without_saying_whose_it_is(logged_screen)
     )
     for path in (
         f"/screen/presets/{foreign.id}/run",
+        f"/screen/presets/{foreign.id}/edit",
         f"/screen/presets/{foreign.id}/delete",
     ):
         response = logged_screen.client.post(
-            path, data={"csrf": logged_screen.csrf}, follow_redirects=False
+            path,
+            data={"csrf": logged_screen.csrf, "name": "抢走", "description": "x"},
+            follow_redirects=False,
         )
         assert response.status_code == 404
     assert logged_screen.context.screener_presets.list(other.id) != []

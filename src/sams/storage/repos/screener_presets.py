@@ -1,6 +1,6 @@
 """筛选方案的增删改查（D182）：per-user，名字在一个人手里唯一。
 
-条件以 JSON 存：形状跟着词表走，加一个字段不必改 schema。`updated_at` 只被「改名」
+条件以 JSON 存：形状跟着词表走，加一个字段不必改 schema。`updated_at` 只被「编辑」
 与「改条件」碰，重跑不碰——它回答的是「这条方案现在是什么时候这样写的」，
 「上次跑」是 `scan_results` 那一列的事（D183）。
 """
@@ -19,6 +19,7 @@ from sams.core.screener_fields import Condition, validate
 from sams.storage.db import Database
 
 MAX_NAME = 40
+MAX_DESCRIPTION = 200
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class Preset:
     conditions: tuple[Condition, ...]
     created_at: datetime
     updated_at: datetime
+    description: str = ""
 
 
 class ScreenerPresetRepo:
@@ -40,10 +42,17 @@ class ScreenerPresetRepo:
         self.clock = clock
 
     def create(
-        self, user_id: str, name: str, market: str, conditions: list[Condition]
+        self,
+        user_id: str,
+        name: str,
+        market: str,
+        conditions: list[Condition],
+        *,
+        description: str = "",
     ) -> Preset:
         user_id = _user(user_id)
         name = _name(name)
+        description = _description(description)
         market = canonical_market(market)
         checked = _checked(market, conditions)
         existing = self.find(user_id, name)
@@ -56,9 +65,9 @@ class ScreenerPresetRepo:
         now = self.clock.now_utc()
         self.db.execute(
             f"INSERT INTO {self.TABLE}"
-            " (id, user_id, name, market, conditions_json, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [preset_id, user_id, name, market, _to_json(checked), now, now],
+            " (id, user_id, name, market, conditions_json, description, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [preset_id, user_id, name, market, _to_json(checked), description, now, now],
         )
         saved = self.get(user_id, preset_id)
         assert saved is not None
@@ -85,18 +94,19 @@ class ScreenerPresetRepo:
         )
         return _to_preset(rows.to_dicts()[0]) if not rows.is_empty() else None
 
-    def rename(self, user_id: str, preset_id: str, name: str) -> bool:
+    def edit(self, user_id: str, preset_id: str, name: str, description: str) -> bool:
         user_id = _user(user_id)
         name = _name(name)
+        description = _description(description)
         existing = self.find(user_id, name)
         if existing is not None and existing.id != preset_id:
             raise ValidationError(f"已有同名方案「{name}」：换个名字，或先删掉那一条")
         if self.get(user_id, preset_id) is None:
             return False
         self.db.execute(
-            f"UPDATE {self.TABLE} SET name = ?, updated_at = ?"
+            f"UPDATE {self.TABLE} SET name = ?, description = ?, updated_at = ?"
             " WHERE user_id = ? AND id = ?",
-            [name, self.clock.now_utc(), user_id, preset_id],
+            [name, description, self.clock.now_utc(), user_id, preset_id],
         )
         return True
 
@@ -144,6 +154,16 @@ def _name(name: str) -> str:
     return cleaned
 
 
+def _description(description: str | None) -> str:
+    cleaned = (description or "").strip()
+    if len(cleaned) > MAX_DESCRIPTION:
+        raise ValidationError(
+            f"说明最多 {MAX_DESCRIPTION} 个字，收到 {len(cleaned)} 个：长文请存在别处，"
+            "这里只写选它/不选它的那句话"
+        )
+    return cleaned
+
+
 def _checked(market: str, conditions: list[Condition]) -> tuple[Condition, ...]:
     if not conditions:
         raise ValidationError("一条条件都没有：空条件等于「全市场都通过」，那不是一个能重跑的方案")
@@ -172,4 +192,5 @@ def _to_preset(row: dict) -> Preset:
         conditions=tuple(conditions),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        description=row["description"] or "",
     )

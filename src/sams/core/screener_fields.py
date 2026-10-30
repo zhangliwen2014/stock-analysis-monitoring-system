@@ -37,6 +37,10 @@ class Field:
     note: str = ""
     #: 不可同篮的字段共用一个非空值（D59/D177）
     basket: str = ""
+    #: 推导字段依赖的工作帧列（D222）：引擎据此决定还要 join 哪些财务列
+    needs: tuple[str, ...] = ()
+    #: 这一列无数时的固定理由；比「快照缺列」更准确，且不逐票展开
+    missing_note: str = ""
 
 
 _SNAPSHOT_MARKETS = frozenset({"A"})
@@ -108,6 +112,82 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "profit_yoy",
         _SNAPSHOT_MARKETS,
+    ),
+    # D222：0028 的展示列里挑出有稳定年报口径的七列接进选股；其余金额/每股/周转率
+    # 仍只做展示——词表是选股的唯一入口，没进来就等于引擎不认
+    Field(
+        "dividend_yield",
+        "股息率",
+        "小数比值（0.03 = 3%）",
+        "financials",
+        "dividend_yield",
+        _SNAPSHOT_MARKETS,
+        note="最近一期年报分红方案对应的股息率（PIT）；没有就记「无数」",
+    ),
+    Field(
+        "gross_margin",
+        "毛利率",
+        "小数比值（0.35 = 35%）",
+        "financials",
+        "gross_margin",
+        _SNAPSHOT_MARKETS,
+        note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
+    ),
+    Field(
+        "net_margin",
+        "净利率",
+        "小数比值（0.15 = 15%）",
+        "financials",
+        "net_margin",
+        _SNAPSHOT_MARKETS,
+        note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
+    ),
+    Field(
+        "roa",
+        "总资产净利率 ROA",
+        "小数比值（0.08 = 8%）",
+        "financials",
+        "roa",
+        _SNAPSHOT_MARKETS,
+        note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
+    ),
+    Field(
+        "roic",
+        "投入资本回报率 ROIC",
+        "小数比值（0.15 = 15%）",
+        "financials",
+        "roic",
+        _SNAPSHOT_MARKETS,
+        note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
+    ),
+    Field(
+        "debt_ratio",
+        "资产负债率",
+        "小数比值（0.60 = 60%）",
+        "financials",
+        "debt_ratio",
+        _SNAPSHOT_MARKETS,
+        note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
+    ),
+    Field(
+        "current_ratio",
+        "流动比率",
+        "倍",
+        "financials",
+        "current_ratio",
+        _SNAPSHOT_MARKETS,
+        note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
+    ),
+    Field(
+        "peg",
+        "PEG（PE÷净利增速）",
+        "倍",
+        "derived",
+        "peg",
+        _SNAPSHOT_MARKETS,
+        note="PE(TTM) ÷ 年报净利同比百分数；PE 或同比 ≤ 0 记「无数」",
+        needs=("profit_yoy",),
+        missing_note="PE(TTM) 或年报净利同比缺失，或净利同比不大于 0：PEG 没有意义",
     ),
 )
 

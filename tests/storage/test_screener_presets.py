@@ -36,8 +36,23 @@ def test_create_reads_back_the_conditions_and_the_times(db):
     assert saved.name == "便宜" and saved.market == "A"
     assert saved.conditions == tuple(CONDITIONS)
     assert saved.created_at == NOW and saved.updated_at == NOW
+    assert saved.description == ""
     got = repo(db).get(alice.id, saved.id)
     assert got == saved
+
+
+def test_a_description_is_stored_and_reads_back(db):
+    alice, _ = users(db)
+    saved = repo(db).create(
+        alice.id, "便宜", "A", CONDITIONS, description="  PR 五折以下，适合做底仓候选  "
+    )
+    assert saved.description == "PR 五折以下，适合做底仓候选"
+
+
+def test_a_description_longer_than_the_limit_is_refused_not_truncated(db):
+    alice, _ = users(db)
+    with pytest.raises(ValidationError, match="说明最多"):
+        repo(db).create(alice.id, "便宜", "A", CONDITIONS, description="说" * 201)
 
 
 def test_between_survives_the_json_round_trip(db):
@@ -70,36 +85,52 @@ def test_another_users_preset_is_invisible(db):
     assert repo(db).get(alice.id, saved.id) is not None
 
 
-def test_rename_moves_updated_at_but_not_created_at(db):
+def test_edit_changes_name_and_description_and_moves_updated_at(db):
     alice, _ = users(db)
     clock = FrozenClock(NOW)
-    repo(db, clock).create(alice.id, "便宜", "A", CONDITIONS)
+    repo(db, clock).create(alice.id, "便宜", "A", CONDITIONS, description="旧说明")
     clock.advance(hours=1)
     saved = repo(db).list(alice.id)[0]
-    assert repo(db, clock).rename(alice.id, saved.id, "很便宜")
+    assert repo(db, clock).edit(alice.id, saved.id, "很便宜", "新说明")
     got = repo(db).get(alice.id, saved.id)
-    assert (got.name, got.created_at, got.updated_at) == ("很便宜", NOW, clock.moment)
+    assert (got.name, got.description) == ("很便宜", "新说明")
+    assert (got.created_at, got.updated_at) == (NOW, clock.moment)
 
 
-def test_rename_onto_another_name_is_refused_but_onto_itself_is_fine(db):
+def test_edit_can_clear_the_description(db):
+    alice, _ = users(db)
+    saved = repo(db).create(alice.id, "便宜", "A", CONDITIONS, description="旧说明")
+    assert repo(db).edit(alice.id, saved.id, "便宜", "")
+    assert repo(db).get(alice.id, saved.id).description == ""
+
+
+def test_edit_onto_another_name_is_refused_but_onto_itself_is_fine(db):
     alice, _ = users(db)
     first = repo(db).create(alice.id, "便宜", "A", CONDITIONS)
     repo(db).create(alice.id, "更便宜", "A", CONDITIONS)
     with pytest.raises(ValidationError, match="已有同名方案"):
-        repo(db).rename(alice.id, first.id, "更便宜")
-    assert repo(db).rename(alice.id, first.id, "便宜")
+        repo(db).edit(alice.id, first.id, "更便宜", "")
+    assert repo(db).edit(alice.id, first.id, "便宜", "")
 
 
-def test_overwriting_conditions_keeps_the_name(db):
+def test_edit_of_another_users_preset_is_invisible(db):
+    alice, bob = users(db)
+    saved = repo(db).create(alice.id, "便宜", "A", CONDITIONS)
+    assert repo(db).edit(bob.id, saved.id, "抢走", "x") is False
+    assert repo(db).get(alice.id, saved.id).name == "便宜"
+
+
+def test_overwriting_conditions_keeps_the_name_and_the_description(db):
     alice, _ = users(db)
     clock = FrozenClock(NOW)
-    saved = repo(db, clock).create(alice.id, "便宜", "A", CONDITIONS)
+    saved = repo(db, clock).create(alice.id, "便宜", "A", CONDITIONS, description="底仓候选")
     clock.advance(minutes=5)
     assert repo(db, clock).update_conditions(
         alice.id, saved.id, [Condition("pr_now", "<=", 0.3)]
     )
     got = repo(db).get(alice.id, saved.id)
-    assert got.name == "便宜" and got.conditions == (Condition("pr_now", "<=", 0.3),)
+    assert got.name == "便宜" and got.description == "底仓候选"
+    assert got.conditions == (Condition("pr_now", "<=", 0.3),)
     assert got.updated_at == clock.moment
 
 
