@@ -69,6 +69,8 @@ class ScreenResult:
     truncated: int = 0
     missing: tuple[MissingGroup, ...] = ()
     note: str = ""
+    #: 结果的排列方式，页面原样念给用户听（D224）
+    order_note: str = ""
 
 
 class ScreenerService:
@@ -181,8 +183,13 @@ class ScreenerService:
         hit_mask = masks[0]
         for mask in masks[1:]:
             hit_mask = hit_mask & mask
-        sort_column = specs[checked[0].field].column
-        ranked = universe.filter(hit_mask).sort([sort_column, "code"], nulls_last=True)
+        sort_field = specs[checked[0].field]
+        descending = sort_field.prefer == "high"
+        ranked = universe.filter(hit_mask).sort(
+            [sort_field.column, "code"],
+            descending=[descending, False],
+            nulls_last=True,
+        )
         total = ranked.height
         limited = ranked.head(limit) if limit is not None else ranked
         labels = [cond.field for cond in checked]
@@ -210,6 +217,8 @@ class ScreenerService:
             total_hits=total,
             truncated=total - limited.height,
             missing=_missing_groups(universe, checked, specs, hit_codes, kinds, market),
+            # 首批条件决定整个名单的顺序：质量/成长从高到低，估值/负债从低到高（D224）
+            order_note=f"{sort_field.label} {'从高到低' if descending else '从低到高'}",
         )
 
     def _with_financials(

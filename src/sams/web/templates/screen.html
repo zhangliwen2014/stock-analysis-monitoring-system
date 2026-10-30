@@ -89,7 +89,7 @@
 {% for counts in counts_view %}
 <p>条件 {{ counts.label }}：通过 {{ counts.passed }} / 不通过 {{ counts.failed }} / 无数 {{ counts.missing }}</p>
 {% endfor %}
-<p>命中 {{ total }} 只</p>
+<p>命中 {{ total }} 只{% if sort_hint %}<span class="muted"> · 按{{ sort_hint }}排序（同值按代码）</span>{% endif %}</p>
 
 {% if plan %}
 <p class="flash-ok">全部 {{ plan.total }} 只里有 {{ plan.already }} 只已在自选：这次会加入 {{ plan.will_add }} 只{% if plan.capped %}，另有 {{ plan.capped }} 只因自选上限 {{ plan.max }} 只没加{% endif %}。</p>

@@ -34,6 +34,9 @@ class Field:
     #: 工作帧里的列名（引擎负责把三种来源拼成同一张帧）
     column: str
     markets: frozenset[str]
+    #: 排序方向（D224）：`high` = 越大越靠前，`low` = 越小越靠前，空 = 按升序。
+    #: 首批条件决定整个结果的顺序，所以它必须是字段自己的语义，不能让页面猜。
+    prefer: str = ""
     note: str = ""
     #: 不可同篮的字段共用一个非空值（D59/D177）
     basket: str = ""
@@ -55,7 +58,15 @@ FIELDS: tuple[Field, ...] = (
         "pct_chg",
         _SNAPSHOT_MARKETS,
     ),
-    Field("amount", "成交额", "元", "snapshot", "amount", _SNAPSHOT_MARKETS),
+    Field(
+        "amount",
+        "成交额",
+        "元",
+        "snapshot",
+        "amount",
+        _SNAPSHOT_MARKETS,
+        prefer="high",
+    ),
     Field(
         "turnover_rate",
         "换手率",
@@ -73,9 +84,25 @@ FIELDS: tuple[Field, ...] = (
         "amplitude",
         _SNAPSHOT_MARKETS,
     ),
-    Field("pe_ttm", "市盈率(TTM)", "倍", "snapshot", "pe_ttm", _SNAPSHOT_MARKETS),
-    Field("pe_dyn", "市盈率(动)", "倍", "snapshot", "pe_dyn", _SNAPSHOT_MARKETS),
-    Field("pb", "市净率", "倍", "snapshot", "pb", _SNAPSHOT_MARKETS),
+    Field(
+        "pe_ttm",
+        "市盈率(TTM)",
+        "倍",
+        "snapshot",
+        "pe_ttm",
+        _SNAPSHOT_MARKETS,
+        prefer="low",
+    ),
+    Field(
+        "pe_dyn",
+        "市盈率(动)",
+        "倍",
+        "snapshot",
+        "pe_dyn",
+        _SNAPSHOT_MARKETS,
+        prefer="low",
+    ),
+    Field("pb", "市净率", "倍", "snapshot", "pb", _SNAPSHOT_MARKETS, prefer="low"),
     Field("market_cap", "总市值", "亿元", "snapshot", "market_cap", _SNAPSHOT_MARKETS),
     Field("float_cap", "流通市值", "亿元", "snapshot", "float_cap", _SNAPSHOT_MARKETS),
     Field(
@@ -85,6 +112,7 @@ FIELDS: tuple[Field, ...] = (
         "derived",
         "pr_now",
         _SNAPSHOT_MARKETS,
+        prefer="low",
         note="PE(动)² ÷ (100×PB)：分母是价推出来的 ROE，随价格变，与年报口径的 pr 不同口径",
         basket="pr",
     ),
@@ -95,6 +123,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "roe",
         _SNAPSHOT_MARKETS,
+        prefer="high",
         note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
     ),
     Field(
@@ -104,6 +133,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "revenue_yoy",
         _SNAPSHOT_MARKETS,
+        prefer="high",
     ),
     Field(
         "profit_yoy",
@@ -112,6 +142,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "profit_yoy",
         _SNAPSHOT_MARKETS,
+        prefer="high",
     ),
     # D222：0028 的展示列里挑出有稳定年报口径的七列接进选股；其余金额/每股/周转率
     # 仍只做展示——词表是选股的唯一入口，没进来就等于引擎不认
@@ -122,6 +153,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "dividend_yield",
         _SNAPSHOT_MARKETS,
+        prefer="high",
         note="最近一期年报分红方案对应的股息率（PIT）；没有就记「无数」",
     ),
     Field(
@@ -131,6 +163,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "gross_margin",
         _SNAPSHOT_MARKETS,
+        prefer="high",
         note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
     ),
     Field(
@@ -140,6 +173,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "net_margin",
         _SNAPSHOT_MARKETS,
+        prefer="high",
         note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
     ),
     Field(
@@ -149,6 +183,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "roa",
         _SNAPSHOT_MARKETS,
+        prefer="high",
         note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
     ),
     Field(
@@ -158,6 +193,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "roic",
         _SNAPSHOT_MARKETS,
+        prefer="high",
         note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
     ),
     Field(
@@ -167,6 +203,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "debt_ratio",
         _SNAPSHOT_MARKETS,
+        prefer="low",
         note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
     ),
     Field(
@@ -176,6 +213,7 @@ FIELDS: tuple[Field, ...] = (
         "financials",
         "current_ratio",
         _SNAPSHOT_MARKETS,
+        prefer="high",
         note="截至快照日已披露的最近一期年报（PIT）；没有就记「无数」",
     ),
     Field(
@@ -185,6 +223,7 @@ FIELDS: tuple[Field, ...] = (
         "derived",
         "peg",
         _SNAPSHOT_MARKETS,
+        prefer="low",
         note="PE(TTM) ÷ 年报净利同比百分数；PE 或同比 ≤ 0 记「无数」",
         needs=("profit_yoy",),
         missing_note="PE(TTM) 或年报净利同比缺失，或净利同比不大于 0：PEG 没有意义",

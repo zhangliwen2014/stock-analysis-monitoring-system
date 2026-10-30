@@ -227,6 +227,7 @@ def _render(
         counts_view=counts_view,
         view=view,
         total=total,
+        sort_hint=result.order_note if result is not None else "",
         pages=pages,
         pager=pager,
         missing=result.missing if result is not None else (),

@@ -82,6 +82,30 @@ def test_every_condition_reports_passed_failed_missing_that_sum_to_the_universe(
     assert [hit.code for hit in result.hits] == ["600519", "000001"]
 
 
+def test_hits_rank_quality_descending_and_valuation_ascending(db):
+    """首批条件决定顺序（D224）：ROE 越高越靠前，PE 越低越靠前——不能一律升序。"""
+    seed(
+        db,
+        snap("600519", pe_dyn=30.0),
+        snap("000001", pe_dyn=10.0),
+        codes=("600519", "000001"),
+    )
+    FinancialRepo(db).upsert(
+        pl.concat(
+            [
+                financial_rows(code="600519").with_columns(pl.lit(0.20).alias("roe")),
+                financial_rows(code="000001").with_columns(pl.lit(0.35).alias("roe")),
+            ]
+        )
+    )
+    roe = service(db).run("A", [Condition("roe", ">=", 0.1)])
+    assert [hit.code for hit in roe.hits] == ["000001", "600519"]
+    assert roe.order_note == "年报 ROE 从高到低"
+    pe = service(db).run("A", [Condition("pe_ttm", ">=", 1.0)])
+    assert [hit.code for hit in pe.hits] == ["000001", "600519"]
+    assert pe.order_note == "市盈率(TTM) 从低到高"
+
+
 def test_hits_carry_the_values_of_the_condition_that_picked_them(db):
     seed(db, snap("600519", pe_dyn=5.0, pb=1.0))
     hit = service(db).run("A", [Condition("pr_now", "<=", 0.5)]).hits[0]

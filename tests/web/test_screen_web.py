@@ -99,6 +99,13 @@ def test_a_condition_in_the_second_row_alone_still_counts_and_can_be_saved(logge
     assert "先在上面填一条条件" not in response.text
 
 
+def test_the_result_line_says_which_way_it_was_ranked(logged_screen):
+    default_seed(logged_screen)
+    params = [("market", "A"), ("f", "pr_now"), ("o", "<="), ("v", "0.5")]
+    response = logged_screen.client.get("/screen", params=params)
+    assert "按现值市赚率 PR 从低到高排序" in response.text
+
+
 def test_a_new_page_has_one_blank_row_and_the_unit_on_every_field(logged_screen):
     response = logged_screen.client.get("/screen", params={"market": "A"})
     assert '<option value="">（选字段）</option>' in response.text

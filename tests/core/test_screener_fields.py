@@ -97,6 +97,14 @@ def test_peg_declares_its_financial_input_and_a_missing_reason():
     assert peg.needs == ("profit_yoy",)
     assert "净利同比" in peg.missing_note
 
+def test_fields_declare_their_sensible_sort_direction():
+    """D224：首批条件决定名单顺序；质量/成长降序，估值/负债升序，中性字段保持升序。"""
+    by_name = {item.name: item for item in FIELDS}
+    assert by_name["roe"].prefer == by_name["profit_yoy"].prefer == "high"
+    assert by_name["pe_ttm"].prefer == by_name["debt_ratio"].prefer == "low"
+    assert by_name["price"].prefer == ""
+
+
 def test_describe_all_is_the_only_readable_spelling_of_a_condition_set():
     """方案列表要一句人话，不是 JSON；单位也必须在这句里（D58）。"""
     from sams.core.screener_fields import describe_all
