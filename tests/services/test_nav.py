@@ -133,6 +133,45 @@ def test_an_external_deposit_is_not_counted_as_return(world) -> None:
     assert series.twr == pytest.approx(0.0)
 
 
+def test_the_curve_starts_at_the_earliest_ledger_event_not_at_the_record(
+    world,
+) -> None:
+    """R3-18：账是 1 月 10 日建的，补记的成交与存入在 1 月 2 日——曲线要从 1 月 2 日起（D294）。
+
+    拿 `sim_accounts.created_at` 钳起点，等于让「先建账、再回填真实券商历史」这种用法
+    永远没有开头那几天：那段的行情、除权日都落不进窗口，屏幕上只看到曲线比持仓短一截。
+    """
+    world.db.execute(
+        "UPDATE sim_accounts SET created_at = ? WHERE id = ?",
+        [datetime(2024, 1, 10, 1, 0, tzinfo=UTC), world.account.id],
+    )
+    _buy(world, date(2024, 1, 3))
+    _bars(world, {date(2024, 1, 2): 10.0, date(2024, 1, 3): 10.0, date(2024, 1, 4): 11.0})
+
+    written = world.nav.rebuild(world.account.id, date(2024, 1, 2), date(2024, 1, 4))
+    series = world.nav.series(world.account.id, date(2024, 1, 2), date(2024, 1, 4))
+
+    assert written == 3
+    assert [point.day for point in series.days] == [
+        date(2024, 1, 2),
+        date(2024, 1, 3),
+        date(2024, 1, 4),
+    ]
+    # 1 月 2 日只有那笔存入：还没买，净值就是现金
+    assert _row(series, date(2024, 1, 2)).nav == pytest.approx(100_000.0)
+    assert _row(series, date(2024, 1, 4)).nav == pytest.approx(100_100.0)
+
+
+def test_the_earliest_ledger_event_still_respects_the_requested_window(world) -> None:
+    """起点提前是按「台账里最早的那条」来的，不是无限往前：请求窗口更早就停在窗口头。"""
+    _buy(world, date(2024, 1, 3))
+    _bars(world, {date(2024, 1, 2): 10.0, date(2024, 1, 3): 10.0})
+
+    written = world.nav.rebuild(world.account.id, date(2024, 1, 2), date(2024, 1, 3))
+
+    assert written == 2
+
+
 def test_a_missing_price_makes_the_whole_day_incomplete(world) -> None:
     _buy(world, date(2024, 1, 3))
     _bars(world, {date(2024, 1, 4): 11.0})

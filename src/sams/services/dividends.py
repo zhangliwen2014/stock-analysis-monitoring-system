@@ -1,12 +1,16 @@
 """分红入账（S4-D §6.2）。
 
-只做一件事：把 `corp_actions` 里那些「账户开着、除权日已到、那天之前手里有股」的派息
-记进现金流水。没有派息日就按**除权日**入账，不编造一个；金额是**税前毛额**，A 股红利税
+只做一件事：把 `corp_actions` 里那些「除权日已到、那天之前手里有股」的派息记进现金流水。
+没有派息日就按**除权日**入账，不编造一个；金额是**税前毛额**，A 股红利税
 在卖出时按持有期补扣，v0 不建模，页面文案由 `TAX_NOTE` 说出这件事。
 
 数量按**除权日前**（市场本地日）已成交的累计持股算，不是今天的持仓：除权日当天才买进来的
 股不享有这次派息，卖光之后的除权日也不会凭空长出一笔。重跑同一区间靠 `ref`
 （`market:code:ex_date`）跳过已入账的那些——它不是错误，是 0 行。
+
+资格只看这个账户的**成交**，不看 `sim_accounts.created_at`（D294）：先把真实券商的
+历史成交补记进一个新建的账户是支持的用法，那一天的除权日早于「我们按下新增按钮的时刻」，
+派息仍然欠着。
 """
 
 from __future__ import annotations
@@ -18,14 +22,12 @@ from sams.core import funds
 from sams.core.codes import canonical_market
 from sams.core.config import Settings
 from sams.core.errors import StorageError
+from sams.services.actors import SYSTEM_ACTOR
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.ledger import Order, SimAccountRepo, SimOrderRepo
 
 #: 屏幕上那句话的唯一出处：服务、CLI、页面读同一份，不各写一句略有出入的
 TAX_NOTE = "税前毛额，未扣红利税"
-
-#: 自动入账的 actor：分红不是某个人记的，审计行要能一眼分开
-SYSTEM_ACTOR = "system"
 
 _KIND = "dividend"
 
@@ -88,9 +90,8 @@ class DividendService:
         warnings: list[str] = []
         for key in wanted:
             zone = self.settings.market_cfg(key).zone()
-            opened_on = account.opened_at.astimezone(zone).date()
             for row in self.actions.list_market(key, until=as_of).iter_rows(named=True):
-                if row["kind"] != _KIND or row["ex_date"] < opened_on:
+                if row["kind"] != _KIND:
                     continue
                 held = by_code.get((key, row["code"]))
                 if held is None:

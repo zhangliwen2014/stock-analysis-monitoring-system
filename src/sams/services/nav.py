@@ -28,7 +28,7 @@ from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.holding_nav import HoldingNavPoint, HoldingNavRepo
-from sams.storage.repos.ledger import Order, SimAccountRepo, SimOrderRepo
+from sams.storage.repos.ledger import Account, Order, SimAccountRepo, SimOrderRepo
 from sams.storage.repos.nav import NavPoint, NavRepo
 
 #: 停牌也不该无限沿用最后一根收盘：超过 5 个交易日就记缺价，不拿旧价补出一条平滑曲线
@@ -106,21 +106,23 @@ class NavService:
     def rebuild(self, account_id: str, start: date, end: date) -> int:
         """重建 `[start, end]` 每一天并整段覆盖旧行；返回写入天数。
 
-        起点不早于账户开立日：开户之前的每一天都只是「还没有这个账户」。
+        起点不早于「账户开立日与台账最早一笔事件里更早的那个」：建账按钮按下去之前
+        回填的真实成交同样有这一段历史，剪掉它等于让曲线比持仓短一截（D294）。
         """
         account = self.accounts.find(account_id)
         if account is None:
             raise StorageError(f"账户 {account_id} 不存在")
         if end < start:
             return 0
-        start = max(start, self._opened_on(account.opened_at, account.home_market))
+
+        orders = self.orders.orders(account.id)
+        moves_by_day, flows_by_day = self._cash_by_day(account.id, end)
+        start = max(start, self._curve_start(account, orders, moves_by_day))
         if start > end:
             return 0
 
-        orders = self.orders.orders(account.id)
         by_code = _orders_by_code(orders)
         bar_series = self._load_bars(by_code, start, end)
-        moves_by_day, flows_by_day = self._cash_by_day(account.id, end)
         opened_before: dict[tuple[str, str], float] = {}
         orders_by_day: dict[date, list[tuple[tuple[str, str], float]]] = {}
         for order in orders:
@@ -193,6 +195,26 @@ class NavService:
         except (StorageError, ValidationError, KeyError):
             zone = next(iter(self.settings.markets.values())).zone()
         return opened_at.astimezone(zone).date()
+
+    def _curve_start(
+        self,
+        account: Account,
+        orders: list[Order],
+        moves_by_day: dict[date, list[tuple[str, float]]],
+    ) -> date:
+        """曲线最早能从哪天开始算：建账那天，或台账里最早的那一笔，取更早的（D294）。
+
+        `sim_accounts.created_at` 记的是「什么时候按下了建账按钮」，不是「这个账户的钱
+        从哪天开始有」。先建账、再回填真实券商历史是常见用法：拿 created_at 钳起点，
+        开头那几天永远没有净值行，归因与回撤都少一段，屏幕上只看到曲线比持仓短。
+        """
+        days = list(moves_by_day)
+        days.extend(
+            order.ts.astimezone(self.settings.market_cfg(order.market).zone()).date()
+            for order in orders
+        )
+        opened_on = self._opened_on(account.opened_at, account.home_market)
+        return min([opened_on, *days]) if days else opened_on
 
     def _cash_by_day(
         self, account_id: str, end: date

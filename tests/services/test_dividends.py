@@ -26,7 +26,8 @@ from sams.storage.repos.users import UserRepo
 USER = "trader"
 PWD = "correct-horse-battery"
 
-#: 账户开在这一切之前：分红只入开立之后的除权日
+#: 用例里那句「2024 年的分红」问的是除权日到了没有，与账户哪一刻建的无关（D294）；
+#: 这一份开立时刻留在更早，只是为了让每条用例都从「账户已经在跑」开始
 OPENED_AT = datetime(2024, 1, 2, 1, 0, tzinfo=UTC)
 
 
@@ -45,7 +46,8 @@ def books(db: Database, settings):
 def _account(books, *, created_at: datetime = OPENED_AT) -> str:
     db, ledger, _, _ = books
     account = ledger.open_account(USER, "主账户")
-    # 开立时刻决定「哪些除权日算这个账户的」：用例要验 2024 年的分红，就把开户时刻放回去
+    # 有些用例要一个「去年就开好的账户」，那就把库里的时刻放回去；
+    # 它不再决定哪些除权日算这个账户的（D294）
     db.execute("UPDATE sim_accounts SET created_at = ? WHERE id = ?", [created_at, account.id])
     ledger.deposit(account.id, "CNY", 100_000.0, username=USER, reason="初始", actor_id=USER)
     return account.id
@@ -209,7 +211,26 @@ def test_a_market_filter_only_posts_that_market(books) -> None:
     assert [(row.market, row.code) for row in only_hk.postings] == [("HK", "00700")]
 
 
-def test_an_account_opened_after_the_ex_date_gets_nothing(books) -> None:
+def test_a_backfilled_fill_before_the_ex_date_earns_the_dividend(books) -> None:
+    """R3-18：先建账、再补记真实券商的历史成交——除权日早于建账日也欠着这笔派息（D294）。
+
+    判据是「除权日前手里有没有股」，不是「账户哪一刻建的」：`created_at` 是我们
+    按下新增按钮的时刻，而那张券商成交单上的日期才是这段历史的起点。
+    """
+    _, ledger, actions, dividends = books
+    _dividend(actions, ex_date=date(2024, 7, 8), cash=0.5)
+    account_id = _account(books, created_at=datetime(2024, 8, 1, 1, 0, tzinfo=UTC))
+    _buy(ledger, account_id, when=datetime(2024, 6, 3, 15, 0, tzinfo=UTC))
+
+    report = dividends.post(account_id, date(2024, 9, 1))
+
+    assert [(row.code, row.ex_date, row.amount) for row in report.postings] == [
+        ("601088", date(2024, 7, 8), 50.0)
+    ]
+
+
+def test_a_dividend_before_this_account_ever_held_the_stock_posts_nothing(books) -> None:
+    """除权日前这个账户里根本没有这只票（一笔成交都没记过）：不入账，也不凭空长出一笔。"""
     _, ledger, actions, dividends = books
     _dividend(actions, ex_date=date(2024, 7, 8), cash=0.5)
     account_id = _account(books, created_at=datetime(2024, 8, 1, 1, 0, tzinfo=UTC))

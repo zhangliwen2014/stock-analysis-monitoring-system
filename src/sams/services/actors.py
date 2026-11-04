@@ -13,6 +13,10 @@ from __future__ import annotations
 from sams.core.errors import ValidationError
 from sams.storage.repos.users import ACTIVE, User, UserRepo
 
+#: 替系统自动动账的 actor：分红入账、占位汇率回算都不是某个人记的，
+#: 审计行要能一眼分开「人录的」与「系统补的」
+SYSTEM_ACTOR = "system"
+
 
 def resolve_actor(users: UserRepo, username: str) -> User:
     user = users.get_by_username((username or "").strip())
