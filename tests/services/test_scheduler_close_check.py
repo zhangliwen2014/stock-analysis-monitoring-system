@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import polars as pl
@@ -215,3 +215,52 @@ def test_build_jobs_registers_nothing_to_audit_without_a_witness_or_a_queue(db, 
 
     no_queue = [job.title for job in build_jobs(deps(db, settings, spot=True, queue=False))]
     assert "close-check@A" not in no_queue
+
+
+def write_bars_on(db, code: str, days: list[date], close: float = 10.0) -> None:
+    """按只写几天的日线：缺整根那条判据问的是「这只票最近还有没有线」。"""
+    BarRepo(db).upsert(sample.bars(days, [close] * len(days), market="A", code=code))
+
+
+def test_a_whole_missing_bar_with_a_recent_witness_is_enqueued(db, settings):
+    """快照有价、当天没那根 K 线、而这只票几天前还有线 ⇒ 断链，排一次重采（#380 F2）。
+
+    内连接那一条看不见这种缺口（11-04 那晚念的是「0 只不平」），于是断了一根与
+    本来就不交易在对账里是同一个答案——而前者能补、也该补。
+    """
+    write_bars(db, {"600519": 10.00})  # 这个市场当天已经落了线
+    write_bars_on(db, "601088", [AS_OF - timedelta(days=3)])
+    write_snapshot(db, {"600519": 10.00, "601088": 20.00})
+
+    outcome = run_close_check(deps(db, settings), ctx())
+
+    assert open_rows(db) == [("601088", BARS)]
+    assert outcome.rows_affected == 1
+    assert "1 只缺整根" in outcome.note
+
+
+def test_a_bar_missing_for_a_month_is_still_suspension(db, settings):
+    """断了一个月的那种照旧不算缺口：停牌票的日线是成片没有，断链票是最近连着有。"""
+    write_bars(db, {"600519": 10.00})
+    write_bars_on(db, "601088", [AS_OF - timedelta(days=30)])
+    write_snapshot(db, {"600519": 10.00, "601088": 20.00})
+
+    outcome = run_close_check(deps(db, settings), ctx())
+
+    assert open_rows(db) == []
+    assert outcome.rows_affected == 0
+
+
+def test_a_market_that_landed_nowhere_is_left_to_the_bars_job(db, settings):
+    """整个市场当天都没落：那是日线 job 那一层的活，不往单票队列里塞几千行。
+
+    11-02 那天没有任何市场跑过日线，这条扫描那天会一口气报出几千只、每只都是 730 天的
+    补采，把真正等补的那几只挤在后面——所以它只在"当天已有别的票落了线"时才点名。
+    """
+    write_bars_on(db, "601088", [AS_OF - timedelta(days=3)])
+    write_snapshot(db, {"601088": 20.00})
+
+    outcome = run_close_check(deps(db, settings), ctx())
+
+    assert open_rows(db) == []
+    assert "交给日线" in outcome.note

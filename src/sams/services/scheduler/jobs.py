@@ -319,6 +319,9 @@ CLOSE_TOLERANCE = 0.001
 def run_close_check(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """当晚的收盘快照是当天日线收盘的见证；对不上的自动排一次日线重采（D301）。
 
+    整根没进来的也算（D310）：`close_mismatches` 是内连接，它看不见那种缺口，
+    于是「断了一根」与「本来就不交易」在对账里是同一个答案，而前者能补、也该补。
+
     这一趟不联网、不改价，只做「查出来 + 排进队列 + 留一行读数」。屏幕上永远不该出现
     「请你重采日线」那一类话：数据不全是后台的事。重采走 `symbol_backfills` 那条队，
     消费者拉的是 730 天，所以定稿窗口（D300）够不着的老账也由这一条自动盖回去。
@@ -326,19 +329,32 @@ def run_close_check(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     assert ctx.market is not None  # 对账 job 只在市场 job 上登记
     assert deps.snapshots is not None  # 登记前查过注入，这里只兜编程错误
     assert deps.backfills is not None
-    audit = deps.snapshots.audit_closes(ctx.market, ctx.as_of, tolerance=CLOSE_TOLERANCE)
+    audit = deps.snapshots.audit_closes(
+        ctx.market, ctx.as_of, tolerance=CLOSE_TOLERANCE, within_days=SETTLE_DAYS
+    )
     if audit.witness_day is None:
         return JobOutcome(note=f"{ctx.market} {ctx.as_of} 没有收盘快照：这一晚不对账")
     off = audit.mismatches
     for row in off:
         deps.backfills.enqueue(ctx.market, row.code, BARS)
-    note = f"{ctx.market} {ctx.as_of} 与收盘快照比对：{len(off)} 只不平"
+    # 整个市场当天都没落，那是日线 job 那一层的活（它的单位就是整个市场）：这一层这时候
+    # 会一口气报出几千只、每只都是 730 天的补采，把真正等补的那几只挤到后面（#380 F2）
+    market_latest = deps.sync.bars.latest_date_for_market(ctx.market)
+    landed = market_latest is not None and market_latest >= ctx.as_of
+    missing = audit.missing if landed else ()
+    for code in missing:
+        deps.backfills.enqueue(ctx.market, code, BARS)
+    note = f"{ctx.market} {ctx.as_of} 与收盘快照比对：{len(off)} 只不平，{len(missing)} 只缺整根"
     if off:
         head = "、".join(
             f"{row.code} 库{row.stored:.2f}/快照{row.witness:.2f}" for row in off[:5]
         )
         note = f"{note}，已排重采：{head}"
-    return JobOutcome(rows_affected=len(off), note=note)
+    if missing:
+        note = f"{note}，缺的是 {'、'.join(missing[:5])}"
+    if not landed:
+        note = f"{note}，市场整体未落（最新 {market_latest}），缺口交给日线 job"
+    return JobOutcome(rows_affected=len(off) + len(missing), note=note)
 
 
 def run_screener(deps: JobDeps, ctx: JobContext) -> JobOutcome:

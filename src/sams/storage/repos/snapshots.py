@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import polars as pl
 
@@ -126,6 +126,40 @@ class SnapshotRepo:
             )
             for row in rows.to_dicts()
         ]
+
+    def missing_bars(self, market: str, day: date, *, within_days: int) -> list[str]:
+        """当天快照有价、日线里没那根、而这几天有线的那些票（D310）。
+
+        `close_mismatches` 是内连接，它看不见「整根缺了」——那正是它当初故意挡掉的那一批，
+        因为最常见的原因是停牌。挡住停牌靠的是最后那个 EXISTS：停牌票的 bars_daily 是成片没有，
+        断链票是最近连着有、就缺这一根。这一条只回答「这只票是不是断了」，
+        整个市场当天都没落那种情况由调用方用市场自己的最大 K 线日拦（#380 F2）。
+        """
+        rows = self.db.query(
+            f"""
+            SELECT s.code AS code
+            FROM {self.TABLE} s
+            LEFT JOIN bars_daily b
+              ON b.market = s.market AND b.code = s.code AND b.date = s.day
+                 AND b.adjust = ?
+            WHERE s.market = ? AND s.day = ? AND s.price IS NOT NULL AND b.date IS NULL
+              AND EXISTS (
+                SELECT 1 FROM bars_daily r
+                WHERE r.market = s.market AND r.code = s.code AND r.adjust = ?
+                  AND r.date >= ? AND r.date < ?
+              )
+            ORDER BY s.code
+            """,
+            [
+                ADJUST,
+                canonical_market(market),
+                day,
+                ADJUST,
+                day - timedelta(days=within_days),
+                day,
+            ],
+        )
+        return [str(row["code"]) for row in rows.to_dicts()]
 
     def count(self) -> int:
         return int(self.db.scalar(f"SELECT count(*) FROM {self.TABLE}") or 0)

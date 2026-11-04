@@ -45,6 +45,10 @@ class CloseAudit:
 
     witness_day: date | None
     mismatches: tuple[CloseMismatch, ...]
+    #: 当天快照有价、bars_daily 里没那根、而这几天有线的（D310）。
+    #: 与 `mismatches` 分开列：那一批是「数不对」，这一批是「整根没进来」，
+    #: 排的是同一种活，但读数得能分清是哪种不平
+    missing: tuple[str, ...] = ()
 
 
 class MarketSnapshotService:
@@ -103,21 +107,26 @@ class MarketSnapshotService:
             source=result.source,
         )
 
-    def audit_closes(self, market: str, day: date, *, tolerance: float) -> CloseAudit:
+    def audit_closes(
+        self, market: str, day: date, *, tolerance: float, within_days: int
+    ) -> CloseAudit:
         """当天这一份全市场快照，与库里的日线逐只对一遍（D301）。
 
         见证是快照，不是另一个日线源：那一篮价格是盘后取的、不复权、覆盖全市场，
         而「库里这根 K 线是什么时候写的」没有第二处能回答。没有当天那一份时不拿
         前一天冒充——那会把「今天还没收盘」念成「今天的收盘价和昨天一样」。
+        `missing` 是同一份见证问的第二句：内连接看不见「整根没进来」，而那是能补也该补的
+        （D310）。要不要排由调用方判断，这里只把缺口列出来。
         """
         market = canonical_market(market)
         if self.snapshots.latest_until(market, day) != day:
-            return CloseAudit(witness_day=None, mismatches=())
+            return CloseAudit(witness_day=None, mismatches=(), missing=())
         return CloseAudit(
             witness_day=day,
             mismatches=tuple(
                 self.snapshots.close_mismatches(market, day, tolerance=tolerance)
             ),
+            missing=tuple(self.snapshots.missing_bars(market, day, within_days=within_days)),
         )
 
 
