@@ -154,7 +154,8 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
 
     # 五个能力都在的源才登记得出 A 的那五条数据 job：`WorldAdapter` 少一个方法，
     # 这一晚会安静地退化成「只验了日线」（D38 的按方法路由 + D106 的按能力登记）。
-    # 分红与净值不依赖市场源（单元是账户），所以紧跟数据链登记、三个市场都有；
+    # 分红、汇率回算与净值不依赖市场源（单元是账户），所以紧跟数据链登记、三个市场都有；
+    # 汇率回算夹在分红与净值中间：它补的正是这两头都依赖的那笔汇率（D212）；
     # news@ 紧贴净值之后登记，港美没源也登记，跑起来是「未接入，跳过」
     assert [job.title for job in container.scheduler.jobs] == [
         "bars@A",
@@ -163,6 +164,7 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
         "valuation@A",
         "flow@A",
         "dividends@A",
+        "rate-repair@A",
         "nav@A",
         "news@A",
         "industry@A",
@@ -173,6 +175,7 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
         "digest@A",
         "bars@HK",
         "dividends@HK",
+        "rate-repair@HK",
         "nav@HK",
         "news@HK",
         "industry@HK",
@@ -183,6 +186,7 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
         "digest@HK",
         "bars@US",
         "dividends@US",
+        "rate-repair@US",
         "nav@US",
         "news@US",
         "industry@US",
