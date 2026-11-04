@@ -32,14 +32,16 @@ TAKEN = datetime(2026, 10, 30, 8, 30, tzinfo=UTC)
 BAIJIU = "食品饮料-饮料-白酒"
 
 
-def service(db) -> PeerService:
+def service(
+    db, *, today: datetime = datetime(2026, 10, 30, 16)
+) -> PeerService:
     return PeerService(
         CompanyProfileRepo(db),
         SymbolRepo(db),
         ValuationRepo(db),
         FinancialRepo(db),
         SnapshotRepo(db),
-        clock=FrozenClock(datetime(2026, 10, 30, 16)),
+        clock=FrozenClock(today),
     )
 
 
@@ -145,9 +147,17 @@ def snapshots(
     SnapshotRepo(db).replace_day(market="A", day=day, taken_at=TAKEN, frame=pl.DataFrame(rows))
 
 
-def seed_baijiu(db, *, self_revenue: float | None = 6e10, with_snapshot: bool = True) -> None:
+def seed_baijiu(
+    db,
+    *,
+    self_revenue: float | None = 6e10,
+    with_snapshot: bool = True,
+    valuation_day: date = DAY,
+    peer_valuation_days: dict[str, date] | None = None,
+) -> None:
     """自己 + 5 家白酒：市值、PE、PB、ROE、营收各是一把尺子。"""
-    seed(db, "600519", "贵州茅台", pe=20.0, pb=7.0, roe=0.35, revenue=self_revenue)
+    seed(db, "600519", "贵州茅台", pe=20.0, pb=7.0, roe=0.35, revenue=self_revenue,
+         valuation_day=valuation_day)
     peers = [
         ("600809", "山西汾酒", 10.0, 2.0, 0.10, 5e10),
         ("000568", "泸州老窖", 12.0, 3.0, 0.15, 4e10),
@@ -156,7 +166,16 @@ def seed_baijiu(db, *, self_revenue: float | None = 6e10, with_snapshot: bool = 
         ("603198", "迎驾贡酒", 18.0, 6.0, 0.30, 1e10),
     ]
     for code, name, pe, pb, roe, revenue in peers:
-        seed(db, code, name, pe=pe, pb=pb, roe=roe, revenue=revenue)
+        seed(
+            db,
+            code,
+            name,
+            pe=pe,
+            pb=pb,
+            roe=roe,
+            revenue=revenue,
+            valuation_day=(peer_valuation_days or {}).get(code, valuation_day),
+        )
     if not with_snapshot:
         return
     snapshots(
@@ -376,3 +395,43 @@ def test_without_a_snapshot_market_cap_is_missing_and_selection_uses_revenue(db)
         "603369",
         "603198",
     }
+
+
+def test_the_card_names_the_day_of_every_number_not_the_day_it_was_read(db):
+    """一屏一 as-of（D288）：卡上那一句日期只能是「那个数自己的数据日」。
+
+    读卡日（11-02）、快照日（10-30）、估值日（10-29）、年报期（2025-12-31）四个故意取不同天，
+    谁被当成谁在这一条里就藏不住。
+    """
+    seed_baijiu(db, valuation_day=DAY - timedelta(days=1))
+
+    report = service(db, today=datetime(2026, 11, 2, 16)).compare("A", "600519")
+
+    assert report.as_of == date(2026, 11, 2), "读卡日仍然要给：它是这一卡的计算时间，不是数据日"
+    assert report.snapshot_day == DAY, "市值那一列取的是快照那一天"
+    assert report.valuation_days == (DAY - timedelta(days=1),)
+    assert report.financial_periods == (REPORT,)
+
+
+def test_rows_with_different_valuation_days_all_get_named(db):
+    """同业那一行不是同一天的数：中位是几行不同估值日并起来的，日期得逐日列出来。"""
+    seed_baijiu(
+        db,
+        valuation_day=DAY,
+        peer_valuation_days={"600809": DAY - timedelta(days=3)},
+    )
+
+    report = service(db).compare("A", "600519", as_of=DAY)
+
+    assert report.valuation_days == (DAY, DAY - timedelta(days=3))
+
+
+def test_a_stale_snapshot_names_itself_as_absent_not_as_the_read_day(db):
+    """快照超过 7 天就不出市值（D239）：那一句来源也就没有资格写一个日期。"""
+    seed_baijiu(db)
+
+    report = service(db, today=datetime(2026, 11, 20, 16)).compare("A", "600519")
+
+    assert report.snapshot_day is None
+    assert all(row.market_cap is None for row in report.rows)
+

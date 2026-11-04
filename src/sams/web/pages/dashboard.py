@@ -18,14 +18,14 @@ from fastapi.responses import RedirectResponse
 from sams.bootstrap import AppCore, ServiceContext
 from sams.core.codes import canonical_code, canonical_market, fits_market
 from sams.core.errors import SamsError, ValidationError
-from sams.core.quotes import DELAYED, LIVE, NO_DATA, quote_state
+from sams.core.quotes import DELAYED, LIVE, NO_DATA, local_day, quote_state
 from sams.services.symbol_search import hinted_market, normalize_query
 from sams.web.auth import csrf_protect, require_user
 from sams.web.back import local_back
-from sams.web.display import hms, index_close_label, pct_class, state_label
+from sams.web.display import hms, index_close_label, pct_class, price_point_label, state_label
 from sams.web.forms import form_data, one
 from sams.web.live_prices import board_prices
-from sams.web.quotes import QuoteView, price_unit, quote_reader
+from sams.web.quotes import QuoteView, market_timezone, price_unit, quote_reader
 from sams.web.quotes import market_open as _market_open
 
 router = APIRouter()
@@ -207,6 +207,7 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
     for market in sorted(settings.markets):
         rows = []
         market_open = _market_open(ctx, market, now)
+        tz = market_timezone(ctx, market)
         for index_code in settings.indices.for_market(market):
             quote = core.board.get(market, index_code)
             # 判活与自选行同一个口径（`quote_state`）：`is_stale` 只说「源没给时刻」，
@@ -225,7 +226,12 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
                         # 源的涨跌幅按源自己给的前收盘算，与库里那列的基线不同，可以不相等
                         "pct": quote.pct_chg,
                         "pct_class": pct_class(quote.pct_chg),
-                        "at": state_label(state),
+                        # 两格各说一件事（D288）：`state` 是市场此刻，`at` 是这个数的时点。
+                        # 挤成一格写「实时」就把「几点取的」丢了，而那一格正是盘中读数要的
+                        "state": state_label(state),
+                        "at": price_point_label(
+                            state, local_day(quote.ts, ZoneInfo(tz)), quote.ts, tz
+                        ),
                     }
                 )
                 continue
@@ -241,6 +247,7 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
                     # 仓库这列是本仓库按前一根日线算的，与源那一列基线不同，同一日可能给出不同数
                     "pct": latest.change_pct,
                     "pct_class": pct_class(latest.change_pct),
+                    "state": state_label(state),
                     "at": index_close_label(latest.day),
                 }
             )

@@ -114,7 +114,9 @@ def _snapshots(ctx, caps, *, day=None):
     )
 
 
-def _six_baijiu(ctx):
+def _six_baijiu(ctx, *, valuation_day=None, snapshot_day=None):
+    """六个同业。两个日期参数是给「一屏一 as-of」那几条留的钩子：
+    读卡日、快照日、估值日全取同一天时，标签错了也看不出来。"""
     basket = [
         ("600519", "贵州茅台", 500.0, 20.0, 0.35, 6e10),
         ("600809", "山西汾酒", 400.0, 10.0, 0.10, 5e10),
@@ -124,6 +126,8 @@ def _six_baijiu(ctx):
         ("603198", "迎驾贡酒", 50.0, 18.0, 0.30, 1e10),
     ]
     today = ctx.clock.today()
+    valuation_day = valuation_day or today
+    snapshot_day = snapshot_day or today
     for code, name, _, _, _, _ in basket:
         _symbol(ctx, code=code, name=name, sector=BAIJIU)
     _profiles(
@@ -133,7 +137,7 @@ def _six_baijiu(ctx):
             for code, name, *_ in basket
         ],
     )
-    _valuation_rows(ctx, [(code, today, pe, pb) for code, _, _, pe, pb, _ in basket])
+    _valuation_rows(ctx, [(code, valuation_day, pe, pb) for code, _, _, pe, pb, _ in basket])
     for code, _name, _, _, roe, revenue in basket:
         ctx.financials_store.upsert(
             pl.DataFrame(
@@ -150,7 +154,27 @@ def _six_baijiu(ctx):
                 ]
             ).with_columns(pl.col("published_date").cast(pl.Date))
         )
-    _snapshots(ctx, {code: cap for code, _, cap, *_ in basket}, day=today)
+    _snapshots(ctx, {code: cap for code, _, cap, *_ in basket}, day=snapshot_day)
+
+
+def test_the_peers_card_names_the_day_of_every_number(logged):
+    """一屏一 as-of（D288）：卡头那一句必须是「那个数的日子」，不是读卡那一天。
+
+    11-04 实测：卡头写「截至 2026-11-04」，而市值取的是 11-03 快照、PE 取的是 11-02 估值、
+    ROE 取的是 2025 年报——三个数共用一句今天的话，复盘与归因就按今天取了。
+    """
+    ctx = logged.context
+    today = ctx.clock.today()
+    snapshot_day = today - timedelta(days=1)
+    valuation_day = today - timedelta(days=2)
+    _six_baijiu(ctx, valuation_day=valuation_day, snapshot_day=snapshot_day)
+
+    text = logged.client.get("/api/partials/peers?market=A&code=600519").text
+
+    assert f"市值取 {snapshot_day:%m-%d} 快照" in text
+    assert f"估值 {valuation_day:%m-%d}" in text
+    assert "2025-12-31 年报" in text
+    assert f"截至 {today}" not in text, "读卡日不能占掉数据日那个位置"
 
 
 def test_the_symbol_page_loads_the_three_fundamentals_blocks(logged):

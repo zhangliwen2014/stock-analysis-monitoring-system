@@ -691,11 +691,13 @@ def chart_partial(
     available = ctx.minute.availability(market)
     caption = _chart_caption(view, period)
     if view == "kline" and period not in MINUTE_SCALES:
-        # 图上的最后一根是哪一天：不复权的报价那一格写着「10-30 收盘」，
-        # 图却可能因为采集没追上停在更早，不标出来读的人会以为它画到昨天（S0-E）
+        # 库里最后一根是哪一天（D288）：这一句只报告库的进度，不替「图画没画出来」说话。
+        # 报价那一格写着「10-30 收盘」而图可能停在更早，是要标的；反过来图空着而图注说
+        # 「数据截至今天」，那句日期就成了假话——画不出来由前端的 `note` 与
+        # 「这一段没有数可画」说，这里不预跑一遍复权与守卫去猜那个结果（D290）
         latest = ctx.bars.latest_date(market, code)
         if latest is not None:
-            caption += f" · 数据截至 {latest:%Y-%m-%d}"
+            caption += f" · 日线库最后一根 {latest:%m-%d}"
     return web.render(
         request,
         "partials/chart.html",

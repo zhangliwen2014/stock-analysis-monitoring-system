@@ -20,7 +20,7 @@
     {% if code %}<a href="/news?market={{ market }}">清除代码过滤</a>{% endif %}
   </form>
   <p class="muted">
-    自选、持仓与观察 · 最近 {{ window_days }} 天 · 数据截至 {{ as_of }}
+    自选、持仓与观察 · 最近 {{ window_days }} 天 · 每条按自己的发布时间标注（本列表读于 {{ as_of }}）
     {% if not covered %}· {{ market_label }}新闻源未接入（v0 只接 A 股）{% endif %}
   </p>
 </section>

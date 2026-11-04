@@ -110,3 +110,18 @@ def test_another_users_digest_is_a_404(logged) -> None:
 
 def test_an_unknown_digest_id_is_a_404(logged) -> None:
     assert logged.client.get("/digest/no-such-digest").status_code == 404
+
+
+def test_the_list_column_promises_a_day_not_a_trading_day(logged) -> None:
+    """列名不能替每一行担保「它是交易日」（D288）：库里那行周日是历史，删不得。
+
+    写入侧从此有了闸（日历说休市就不落行），但已落库的那一行还在；
+    叫「日期」之后它不再是假话，叫「交易日」就还是。
+    """
+    _seed(logged.context, as_of=date(2026, 11, 1))
+
+    page = logged.client.get("/digest").text
+
+    assert "2026-11-01" in page
+    assert "<th>日期</th>" in page
+    assert "<th>交易日</th>" not in page

@@ -116,6 +116,17 @@ def test_the_range_line_speaks_before_any_condition_is_chosen(logged_screen):
     assert "加一条条件" in response.text
 
 
+def test_the_range_line_says_which_columns_belong_to_that_day(logged_screen):
+    """快照日管的是除价格外的每一列，这句话不能省（D288）。
+
+    价格列有自己的时点（盘中/收盘逐行在标），「快照 10-28」顶在表头旁边很容易被
+    读成整张表都是 10-28 的数——那样盘中价就成了快照日收盘价。
+    """
+    default_seed(logged_screen)
+    response = logged_screen.client.get("/screen", params={"market": "A"})
+    assert "除「价格」外的列都是这一天的数" in response.text
+
+
 def test_the_preset_card_is_in_the_page_body_not_the_head(logged_screen):
     """方案卡曾整段落在 `{% block title %}` 里：浏览器把标题后的一切当文本，正文里就没有它。"""
     response = logged_screen.client.get("/screen", params={"market": "A"})

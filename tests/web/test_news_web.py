@@ -97,6 +97,23 @@ def test_login_is_required(web_app) -> None:
     assert response.headers["location"] == "/login"
 
 
+def test_the_header_names_the_read_moment_not_a_data_day(logged) -> None:
+    """「数据截至 X」是假话（D288）：X 是本次读数的时刻，而每一条有自己的发布日。
+
+    列表那一列本来就按发布时间标（今天给时分、更早给「月-日 时:分」），头部那句
+    只该说「这一屏读于何时」，不能占掉「数据日」那个位置。
+    """
+    ctx = logged.context
+    _symbol(ctx)
+    _watch(ctx)
+    _news(ctx, "N1", title="公司拟回购股份")
+
+    page = logged.client.get("/news").text
+
+    assert "数据截至" not in page
+    assert "读于" in page
+
+
 def test_the_nav_links_to_news_next_to_the_digest(logged) -> None:
     page = logged.client.get("/calendar").text
     assert 'href="/news"' in page

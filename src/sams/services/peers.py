@@ -99,6 +99,7 @@ class PeerMetric:
 class PeerComparison:
     market: str
     code: str
+    #: 这一卡的**计算时间**，不是任何一个数的数据日（D288）：卡上不拿它替来源说话
     as_of: date
     #: 归一后的行业路径
     industry: str
@@ -116,6 +117,12 @@ class PeerComparison:
     notes: tuple[str, ...] = ()
     #: ok / thin / not_covered / not_disclosed
     state: str = "ok"
+    #: 市值那一列来自哪一天的快照；快照不新鲜时为 `None`，与「市值不出数」同一条判断
+    snapshot_day: date | None = None
+    #: 本卡各行 PE/PB 的估值日（去重、降序）：中位是几天并起来的，只有这里能看出来
+    valuation_days: tuple[date, ...] = ()
+    #: 本卡各行 ROE/营收所属的年报期（去重、降序）
+    financial_periods: tuple[date, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -314,6 +321,9 @@ class PeerService:
             market=market,
             code=code,
             as_of=until,
+            snapshot_day=snapshot_day if snapshot_fresh else None,
+            valuation_days=_distinct_day(row.valuation_on for row in rows),
+            financial_periods=_distinct_day(row.roe_period for row in rows),
             industry=self_path.path,
             level_used=_LEVEL_LABELS[level],
             rows=tuple(rows),
@@ -491,6 +501,11 @@ def _share(rank: int, total: int) -> int:
 
 
 # --- 行与说明 -----------------------------------------------------------------------------
+
+
+def _distinct_day(days: Sequence[date | None]) -> tuple[date, ...]:
+    """去重并按新到旧排：卡头那句「估值 11-03 ~ 11-02」用的就是这一份。"""
+    return tuple(sorted({day for day in days if day is not None}, reverse=True))
 
 
 def _row(

@@ -185,18 +185,22 @@ def test_symbol_page_shows_quote_bars_rules_and_theses(logged):
     assert moment_label(triggered, logged.context.settings.server.display_tz) in page.text
 
 
-def test_the_chart_caption_says_how_far_the_data_runs(logged):
-    """图注要标截止日（S0-E）：报价那一格写着「10-30 收盘」，图却可能停得更早。
+def test_the_chart_caption_names_the_bar_store_without_claiming_what_is_drawn(logged):
+    """图注只说库里到哪一根，不替「画没画出来」说话（D288/D290）。
 
+    11-04 实测：图注写「数据截至 2026-11-04」而 bars 接口回 `dates=0`（复权闸没过），
+    那一句日期兼职了两件事——它读起来像「这张图画到 11-04」。画不出来由前端那句
+    「这一段没有数可画」/`payload.note` 说，服务端这里只报告库里的进度。
     分钟档与分时没有这一句：分时自己带当天日期，分钟 K 的日期在横轴上。
     """
     _seed(logged)
     latest = logged.context.bars.latest_date("A", "600519")
     assert latest is not None
     daily = logged.client.get("/api/partials/chart?market=A&code=600519&period=day").text
-    assert f"数据截至 {latest:%Y-%m-%d}" in daily
+    assert f"日线库最后一根 {latest:%m-%d}" in daily
+    assert "数据截至" not in daily, "库里的进度不能写成图上画到了"
     minute = logged.client.get("/api/partials/chart?market=A&code=600519&period=m5").text
-    assert "数据截至" not in minute
+    assert "日线库最后一根" not in minute
 
 
 def test_symbol_page_normalises_a_loose_code(logged):

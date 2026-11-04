@@ -855,6 +855,7 @@ def _context_on(
     # 没有通知线程的上下文（CLI）同步发
     digest = DigestService(
         settings=cfg,
+        calendar=calendar,
         users=users,
         watchlists=watchlists,
         theses=theses_store,

@@ -3,7 +3,8 @@
 摘要是一份快照：同一 `(user, market, as_of)` 写一次就不再改，重跑返回已有行。
 正文按「持仓 / 自选 / 观察」三栏组织，有告警但不在三栏里的标的进「其他」。
 没有变化的日子也落行，好让「系统还活着」这件事在网页上看得到；推送则按心跳、
-变化、周一与数据失败四条理由决定。
+变化、周一与数据失败四条理由决定。日历能说的那一天是休市时一行都不落（D289）：
+「收盘摘要」挂在周日身上就是一句假话，而这一趟的入口有可能是被强指定的 `as_of`。
 
 投递口是一个 `Callable[[str], None]`（参数是摘要 id）：本层不认识通知队列，
 队列版由 `bootstrap` 接线，避免 `services` import `monitor`。
@@ -44,6 +45,8 @@ class DigestOutcome:
     digest: Digest | None
     created: bool
     pushed: bool
+    #: 这一天被跳过的原因（日历说休市）；没跳过就是 `None`
+    skipped_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,8 @@ class DigestService:
         self,
         *,
         settings,
+        #: 只问「日历能不能回答这一天」：写摘要不该顺手去补日历（D289）
+        calendar,
         users: UserRepo,
         watchlists: WatchlistRepo,
         theses: ThesisRepo,
@@ -77,6 +82,7 @@ class DigestService:
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self.settings = settings
+        self.calendar = calendar
         self.users = users
         self.watchlists = watchlists
         self.theses = theses
@@ -96,6 +102,17 @@ class DigestService:
         existing = self.digests.get(user.id, market, as_of)
         if existing is not None:
             return DigestOutcome(existing, created=False, pushed=False)
+
+        # 休市日没有「收盘摘要」可写（D289）：调度的 `daily_due` 已经过了交易日闸，
+        # 被强指定 `as_of` 跑那一趟才是漏口。日历答不上时照常写——
+        # 「不知道」不能变成「摘要被静默吞掉」。
+        if self.calendar.known_status(market, as_of) is False:
+            return DigestOutcome(
+                None,
+                created=False,
+                pushed=False,
+                skipped_reason=f"{market} 在 {as_of.isoformat()} 休市，不写摘要",
+            )
 
         sections = self._sections(user, market)
         if not sections.codes():

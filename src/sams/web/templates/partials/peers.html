@@ -3,11 +3,27 @@
    未覆盖/未披露不摆一张空表：先说清楚是哪一档、下一步做什么。 #}
 
 <section class="card" id="peers">
+  {# 一屏一 as-of（D288）：这一卡有三个来源（快照 / 估值行 / 年报），
+     卡头那句日期因此必须分别说它们各自是哪一天——写一个「截至今天」等于替三个数说了三句假话 #}
   <h2>同业对比
     {% if report.industry %}
-    <span class="muted">{{ report.industry }}{% if report.level_used %} · {{ report.level_used }}行业{% endif %} · 截至 {{ report.as_of }}</span>
+    <span class="muted">{{ report.industry }}{% if report.level_used %} · {{ report.level_used }}行业{% endif %}</span>
     {% endif %}
   </h2>
+  {% if report.state not in ("not_covered", "not_disclosed") %}
+  <p class="muted">
+    {%- if report.snapshot_day %}市值取 {{ report.snapshot_day.strftime("%m-%d") }} 快照
+    {% else %}市值：快照太旧或缺失，不出数{%- endif -%}
+    {%- if report.valuation_days %} · PE/PB 取估值
+      {%- if report.valuation_days|length == 1 %} {{ report.valuation_days[0].strftime("%m-%d") }}
+      {% else %} {{ report.valuation_days[-1].strftime("%m-%d") }} ~ {{ report.valuation_days[0].strftime("%m-%d") }}（按行见表）{% endif -%}
+    {%- else %} · PE/PB：没有估值行{%- endif -%}
+    {%- if report.financial_periods %} · ROE/营收取
+      {%- if report.financial_periods|length == 1 %} {{ report.financial_periods[0] }} 年报
+      {% else %} {{ report.financial_periods|join(" / ") }} 年报{% endif -%}
+    {%- else %} · ROE/营收：没有已披露年报{%- endif %}
+  </p>
+  {% endif %}
   {% if report.state in ("not_covered", "not_disclosed") %}
   <p class="muted">{{ missing_label(report.position_missing) }}：{{ report.position or report.notes[0] }}</p>
   {% else %}
@@ -22,7 +38,13 @@
     </tr>
     {% for row in report.rows %}
     <tr{% if row.is_self %} class="self"{% endif %}>
-      <td><a href="/symbol/{{ market }}/{{ row.code }}?back={{ origin_url|urlencode }}">{{ row.name }}</a>{% if row.is_self %} <span class="muted">（自己）</span>{% endif %}</td>
+      {# 链接统一（D146）……行末那半句是这一行自己的两个数据日：中位是把不同估值日的 PE 并起来算的 #}
+      <td><a href="/symbol/{{ market }}/{{ row.code }}?back={{ origin_url|urlencode }}">{{ row.name }}</a>{% if row.is_self %} <span class="muted">（自己）</span>{% endif %}
+        <div class="muted">
+          {%- if row.valuation_on %} {{ row.valuation_on.strftime("%m-%d") }} 估值{% endif -%}
+          {%- if row.roe_period %} · {{ row.roe_period }} 年报{% else %}{% if not row.valuation_on %}没有已披露年报{% endif %}{% endif -%}
+        </div>
+      </td>
       <td class="num">{{ "%.1f"|format(row.market_cap) if row.market_cap is not none else "—" }}</td>
       <td class="num">{% if row.pe_ttm is not none %}{{ "%.2f"|format(row.pe_ttm) }}{% else %}— <span class="muted">{{ missing_label(row.pe_missing) }}</span>{% endif %}</td>
       <td class="num">{% if row.pb is not none %}{{ "%.2f"|format(row.pb) }}{% else %}— <span class="muted">{{ missing_label(row.pb_missing) }}</span>{% endif %}</td>

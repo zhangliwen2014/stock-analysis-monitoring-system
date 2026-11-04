@@ -5,7 +5,7 @@
 <p class="muted">每个交易日收盘后一条，只说变化；没有变化的日子也会落一行，只是不推送。</p>
 {% if digests %}
 <table>
-  <tr><th>交易日</th><th>市场</th><th>摘要</th><th>投递</th></tr>
+  <tr><th>日期</th><th>市场</th><th>摘要</th><th>投递</th></tr>
   {% for item in digests %}
   <tr>
     <td>{{ item.as_of }}</td>

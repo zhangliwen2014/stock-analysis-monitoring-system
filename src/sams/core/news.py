@@ -24,7 +24,8 @@ class InfoItem:
     published_at: datetime
     source: str
     url: str
-    #: 我们是什么时候知道这条资讯的；用于页面上说明「数据截至」。
+    #: 我们是什么时候知道这条资讯的：资讯卡与「本列表读于何时」那句都问它（D288）。
+    #: 屏幕上的时间线不用它——那一列说的是 `published_at`。
     as_of: datetime | None = None
     #: 新闻在自己源里的 id（公告没有这一格）：关键词命中按 `(source, item_id)`
     #: 去重，缺了它「同一篇只提醒一次」就落不了地。

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dtime
 from types import SimpleNamespace
@@ -159,6 +160,30 @@ def test_stale_board_quote_falls_back_to_the_last_close(logged_at):
     r = page.client.get("/api/partials/indices")
     assert "实时" not in r.text and "收盘" in r.text
     assert "3,900.00" not in r.text
+
+
+def test_the_intraday_cell_names_the_minute_it_was_taken_at(logged_at):
+    """「实时」那一格不能只说状态（D288）：同一天上午与收盘前是两个数，时刻才是区别。
+
+    与同一屏的自选行同一个格式：市场状态与数据时点各一格，谁也不替谁说话。
+    """
+    page = logged_at(_moment(weekday=0, hour_utc=2))
+    _seed_index(page.ctx, [100.0, 101.0])
+    _board_quote(page.core, page.moment, price=3900.0, pct_chg=0.5)
+    r = page.client.get("/api/partials/indices")
+    # 时刻到分钟，且不写死具体几点：板上那一笔比冻结点早几秒，落在哪一分钟由源决定
+    assert re.search(r"\d{2}:\d{2} 盘中", r.text)
+    assert "实时" in r.text
+
+
+def test_the_fallback_cell_says_its_day_and_the_market_state(logged_at):
+    """休市 + 板上有上一交易日那一笔：落回库里的收盘，并明说此刻休市。"""
+    page = logged_at(_moment(weekday=5, hour_utc=2))
+    _seed_index(page.ctx, [100.0, 101.0])
+    _board_quote(page.core, page.moment, price=3900.0)
+    r = page.client.get("/api/partials/indices")
+    assert "10-21 收盘" in r.text
+    assert "休市" in r.text
 
 
 def test_missing_everywhere_market_absent(logged):

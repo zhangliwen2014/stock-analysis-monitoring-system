@@ -31,6 +31,18 @@ from sams.storage.repos.watchlists import WatchlistRepo
 NOW = datetime(2026, 10, 30, 7, 30, tzinfo=UTC)
 DAY = date(2026, 10, 30)
 PERIOD = DAY.isoformat()
+#: 周日：日历会说「休市」的那一天，也是实机上真出现过的错误摘要日
+SUNDAY = date(2026, 11, 1)
+
+
+class StubCalendar:
+    """日历替身：只有 `known_status`。摘要闸门因此拿不到「顺手去补日历」的能力。"""
+
+    def __init__(self) -> None:
+        self.unknown: set[date] = set()
+
+    def known_status(self, market: str, day: date) -> bool | None:
+        return None if day in self.unknown else day.weekday() < 5
 
 
 class World:
@@ -59,8 +71,10 @@ class World:
         self.keywords = NewsKeywordRepo(db, clock=self.clock)
         self.hits = NewsHitRepo(db, clock=self.clock)
         self.sent: list[str] = []
+        self.calendar = StubCalendar()
         self.service = DigestService(
             settings=settings,
+            calendar=self.calendar,
             users=self.users,
             watchlists=self.watchlists,
             theses=self.theses,
@@ -431,3 +445,37 @@ def test_an_unjudgeable_limit_is_said_out_loud_instead_of_hidden(world):
     assert "【限额】" in body
     assert "· 限额未判：账户总资产不为正，权重算不出来" in body
     assert outcome.digest.has_changes is True
+
+
+def test_a_day_the_calendar_calls_closed_writes_and_pushes_nothing(world):
+    """周日没有「收盘摘要」：写入侧的闸（D289）。
+
+    调度的 `daily_due` 已经过了交易日闸，被强指定 `as_of` 跑那一趟才是漏口；
+    日历明确说休市时不写行、不推送，且要说清是哪一天被跳过。
+    """
+    world.hold("600519")
+    world.alert("600519")
+
+    outcome = world.run(as_of=SUNDAY)
+
+    assert outcome.digest is None
+    assert (outcome.created, outcome.pushed) == (False, False)
+    assert world.sent == [], "休市日连推送都不该发生"
+    assert world.digests.get(world.user.id, "A", SUNDAY) is None
+    assert "2026-11-01" in outcome.skipped_reason
+
+
+def test_a_day_the_calendar_cannot_answer_still_gets_a_digest(world):
+    """降级方向：日历答不上时照常写。
+
+    `is_trading_day` 在没铺到的那天会给一个降级答案，拿它当闸等于让「不知道」
+    变成「摘要被静默吞掉」。宁可多一条摘要，不要漏一条。
+    """
+    world.hold("600519")
+    world.calendar.unknown.add(DAY)
+
+    outcome = world.run()
+
+    assert outcome.created is True
+    assert outcome.skipped_reason is None
+    assert outcome.digest is not None
