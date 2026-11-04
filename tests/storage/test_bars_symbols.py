@@ -40,7 +40,24 @@ def test_same_key_updates_in_place(bars, bars_frame):
     assert loaded["close"][0] == 9.9
 
 
+def test_the_settle_repull_stamps_the_row_it_overwrites(bars, bars_frame):
+    """定稿窗口重拉的前提：覆盖同一键时 `updated_at` 跟着刷新（D300）。
+
+    写入时刻是「这根定没定稿」唯一的库内证据，它必须说的是最后一次写入，
+    而不是第一次——否则重拉盖掉了盘中价，库里却仍自称那笔是中午写的。
+    """
+    bars.upsert(bars_frame)
+    before = bars.load("A", ["600519"], start=D2, end=D2)["updated_at"][0]
+    fixed = bars_frame.with_columns(
+        pl.when(pl.col("date") == D2).then(9.9).otherwise(pl.col("close")).alias("close")
+    )
+    bars.upsert(fixed)
+    after = bars.load("A", ["600519"], start=D2, end=D2)["updated_at"][0]
+    assert after > before
+
+
 def test_latest_date_and_empty_market(bars):
+
     assert bars.latest_date("A", "600519") is None
     bars.upsert(
         pl.DataFrame(
