@@ -446,6 +446,40 @@ def run_rate_repairs(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return JobOutcome(rows, note, tuple(errors))
 
 
+def run_cash_audit(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """每个账户的现金余额按流水复原一次，不平就地改回来并点名那个口袋（D298）。
+
+    全局一趟，不分市场：口袋属于账户、币种属于钱，按市场登记会把同一个口袋一夜改三遍，
+    `rows_affected` 还翻三倍。
+
+    以流水为准不是猜测：余额与流水写在同一事务里（`adjust_cash`），会不平只剩下绕开 API
+    的动结果。人对着流水加一遍会把「撤销成交」那条反做读成多扣一次——任务 #377 就是这么
+    开出来的，钱本来就平。这一趟把「平不平」变成一个每晚有人答一次的问题。
+    """
+    assert deps.sim_accounts is not None
+    pockets: list[str] = []
+    errors: list[str] = []
+    for user in active_users(deps.users):
+        for account in deps.sim_accounts.list_for(user.id):
+            try:
+                rows = deps.sim_accounts.reconcile_cash(account.id)
+            except SamsError as exc:
+                errors.append(f"{user.username} {account.name}: {exc}")
+                continue
+            pockets.extend(
+                f"{account.name} {row.currency} {row.stored:.2f}→{row.derived:.2f}"
+                for row in rows
+            )
+    changed = len(pockets)
+    if changed:
+        note = f"{changed} 个口袋按流水改回：{'、'.join(pockets)}"
+    else:
+        note = "所有账户的现金余额都与流水相符"
+    if errors:
+        note += f"，{len(errors)} 个账户失败"
+    return JobOutcome(changed, note, tuple(errors))
+
+
 def run_nav(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """逐个账户重放最近 400 天的净值（S4-D §6.3）。
 
@@ -687,6 +721,10 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         jobs.append(JobSpec("rules", DAILY, market, partial(run_rules, deps)))
         if deps.digest is not None:
             jobs.append(JobSpec("digest", DAILY, market, partial(run_digest, deps)))
+    # 现金对账排在全局这一组的开头：上面每个市场的账户都问过了，一夜只改一次余额；
+    # 它动的是 `sim_cash_balances`，而净值读的是流水，与它互不依赖
+    if deps.sim_accounts is not None:
+        jobs.append(JobSpec("cash-audit", DAILY, None, partial(run_cash_audit, deps)))
     jobs.append(JobSpec("fx", FX, None, partial(run_fx, deps)))
     for market in sorted(deps.settings.markets):
         jobs.append(JobSpec("calendar", MONTHLY, market, partial(run_calendar, deps)))

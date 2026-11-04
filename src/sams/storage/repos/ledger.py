@@ -43,6 +43,10 @@ CASH_KINDS = frozenset(
 #: 被一条唯一索引悄悄拒掉，而拒的原因看起来像「库坏了」。
 _REF_KINDS = frozenset({"dividend"})
 
+#: 半分钱包余：浮点逐笔累加的误差，不是钱。对账时小于它的差不算不平，
+#: 否则每晚都会为了 1e-12 改一次余额并把它报出去。
+_CENT = 0.01
+
 
 def _moment(ts: datetime | None) -> datetime:
     """成交/调现金的时刻：带时区才收，裸 datetime 一律拒。
@@ -104,6 +108,16 @@ class FxTrade:
     to_amt: float
     rate: float
     ts: datetime
+
+
+@dataclass(frozen=True)
+class CashDrift:
+    """一个口袋对不平时的那两个数：库里存的与流水加出来的。"""
+
+    account_id: str
+    currency: str
+    stored: float
+    derived: float
 
 
 class SimAccountRepo:
@@ -245,6 +259,45 @@ class SimAccountRepo:
                 [account_id, kind, ref],
             )
         )
+
+    def reconcile_cash(self, account_id: str) -> tuple[CashDrift, ...]:
+        """把每个币种的余额改回「这个口袋流水的和」，并报出改过的口袋（D298）。
+
+        余额与流水写在同一事务里（`adjust_cash`），所以「不平」只能是绕开 API 的结果：
+        手工改过余额、或删过审计行。以流水为准——审计行是账，余额只是它的缓存。
+        没人每晚对一遍的话，人对着一遍流水加一遍就会把「撤销成交」那条反做读成多扣一次
+        （任务 #377 就是这么开出来的：钱本来就平，只是没人能一眼看出来）。
+        """
+        stored = self.cash_balances(account_id)
+        derived = {
+            row["currency"]: float(row["delta"])
+            for row in self.db.query(
+                "SELECT currency, sum(delta) AS delta FROM sim_cash_moves"
+                " WHERE account_id = ? GROUP BY currency",
+                [account_id],
+            ).to_dicts()
+        }
+        drift = [
+            CashDrift(
+                account_id=account_id,
+                currency=currency,
+                stored=stored.get(currency, 0.0),
+                derived=derived.get(currency, 0.0),
+            )
+            for currency in sorted(stored.keys() | derived.keys())
+            if abs(stored.get(currency, 0.0) - derived.get(currency, 0.0)) > _CENT / 2
+        ]
+        if not drift:
+            return ()
+        moment = _moment(None)
+        with self.db.transaction():
+            for row in drift:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO sim_cash_balances"
+                    " (account_id, currency, amount, updated_at) VALUES (?, ?, ?, ?)",
+                    [account_id, row.currency, row.derived, moment],
+                )
+        return tuple(drift)
 
     def adjust_cash(
         self,

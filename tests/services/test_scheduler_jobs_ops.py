@@ -422,8 +422,8 @@ def test_build_jobs_puts_recheck_before_rules_and_fx_after_every_market(db, sett
 def test_build_jobs_registers_the_ops_jobs_on_every_market_with_their_period(db, settings):
     """四个运维 job 每一个都要有人登记，而且按各自的周期：少一行、或周期写错一格，这一枚就该红。
 
-    写错一格不是笔误那么轻：`fx` 挂到 DAILY 上，`due_for` 对「全局 job（market=None）」直接答
-    None，于是它一个晚上都不会跑——而注册表看起来是完整的。
+    周期不能靠到期计算来验：D298 之后全局的 `DAILY` 也算得出到期日，`fx` 挂错成一格
+    照样每晚跑——所以这里直接核对注册表里那一格 `period` 与 `market`。
     """
     by_title = {job.title: job for job in built(db, settings)}
     for market in sorted(settings.markets):

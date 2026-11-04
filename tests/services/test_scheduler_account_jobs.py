@@ -18,6 +18,7 @@ from sams.services.dividends import DividendPosting, DividendReport
 from sams.services.nav import NAV_WINDOW_DAYS
 from sams.services.scheduler.jobs import (
     build_jobs,
+    run_cash_audit,
     run_dividends,
     run_nav,
     run_rate_repairs,
@@ -53,7 +54,7 @@ def _deps(db, settings, *, dividends=None, nav=None, ledger=None, sim_accounts=N
 
 def _ctx(market="A"):
     return JobContext(
-        period_key="2024-10-25",
+        period_key="2024-10-25" if market else "2024-10-25@全局",
         as_of=AS_OF,
         market=market,
         universe=Universe(by_market={market: ()}, fx_pairs=()),
@@ -245,3 +246,55 @@ def test_rate_repair_job_says_so_when_there_is_nothing_to_fix(db, settings):
     assert outcome.rows_affected == 0
     assert "没有占位汇率要回算" in outcome.note
     assert outcome.ok
+
+
+def test_cash_audit_job_restores_a_drifted_pocket_and_names_it(db, settings):
+    """每晚把每个口袋按流水复原一次：不平就当场改掉，note 里点名是哪个口袋（D298）。
+
+    这一趟的意义是「不用人去加一遍流水」：note 里那两个数就是审计证据，
+    改了多少与改在哪儿都写在健康页唯一的读数来源上。
+    """
+    repo, a, hk, bob_a = _accounts(db)
+    repo.adjust_cash(a.id, "CNY", 1_000.0, reason="存入 初始", actor_id="alice", kind="deposit")
+    db.execute(
+        "UPDATE sim_cash_balances SET amount = 900 WHERE account_id = ? AND currency = 'CNY'",
+        [a.id],
+    )
+
+    outcome = run_cash_audit(_deps(db, settings), _ctx(market=None))
+
+    assert outcome.rows_affected == 1
+    assert "A 股账户" in outcome.note and "CNY" in outcome.note
+    assert "900.00" in outcome.note and "1000.00" in outcome.note
+    assert repo.cash_balances(a.id) == {"CNY": 1_000.0}
+    assert outcome.ok
+
+
+def test_cash_audit_job_says_so_when_every_pocket_matches(db, settings):
+    """一笔都没改也要说得清：note 里那句「与流水相符」是健康页唯一的读数来源。"""
+    repo, a, hk, bob_a = _accounts(db)
+    repo.adjust_cash(a.id, "CNY", 1_000.0, reason="存入 初始", actor_id="alice", kind="deposit")
+
+    outcome = run_cash_audit(_deps(db, settings), _ctx(market=None))
+
+    assert outcome.rows_affected == 0
+    assert "与流水相符" in outcome.note
+    assert outcome.ok
+
+
+def test_build_jobs_registers_cash_audit_once_for_everyone(db, settings):
+    """现金对账是全局一趟：口袋属于账户、不属市场，按市场登记会把同一口袋修三遍。"""
+    deps = _deps(
+        db,
+        settings,
+        dividends=RecordingDividends(),
+        nav=RecordingNav(),
+        ledger=RecordingRepairs(),
+        chain=("stub",),
+    )
+    titles = [job.title for job in build_jobs(deps)]
+
+    assert titles.count("cash-audit@全局") == 1
+    # 每个市场的账户都在上面那几组里问过了，对账排在这一组的开头：一夜只改一次余额
+    assert titles.index(f"nav@{sorted(settings.markets)[0]}") < titles.index("cash-audit@全局")
+    assert titles.index("cash-audit@全局") < titles.index("fx@全局")

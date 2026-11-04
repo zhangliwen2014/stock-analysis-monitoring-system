@@ -5,7 +5,9 @@ from datetime import UTC, date, datetime
 from support_scheduler import FakeCalendar
 
 from sams.services.scheduler.due import (
+    DAILY,
     daily_due,
+    due_for,
     fx_due,
     monthly_due,
     period_key,
@@ -89,6 +91,20 @@ def test_fx_does_not_wait_for_a_market_that_is_closed(settings):
     late = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
     # 美股周五仍开市且已收盘；A/HK 当天休市不参与等待
     assert fx_due(cal, settings, late).as_of == FRIDAY
+
+
+def test_a_global_daily_job_waits_for_every_market_the_way_fx_does(settings):
+    """全局的日任务（现金对账，D298）没有市场维度：等当天开市的市场都收盘，一夜一次。
+
+    它必须有人回答到期日，否则 `due_for` 直接答 None，注册表里那一行永远躺在 waiting，
+    而这一条正是「账对不上却没人修」的最后一道。
+    """
+    cal = FakeCalendar(settings)
+    early = datetime(2024, 10, 25, 8, 0, tzinfo=UTC)
+    assert due_for(DAILY, cal, settings, market=None, now=early) is None
+    late = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
+    due = due_for(DAILY, cal, settings, market=None, now=late)
+    assert due.period_key == "2024-10-25" and due.as_of == FRIDAY
 
 
 def test_period_key_follows_the_job_period():

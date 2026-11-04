@@ -7,7 +7,8 @@
   偏移去问 `CalendarView`。
 * 周期键不是「今天」（D98）：周五的任务可能周六补跑，周任务横跨两天，月任务跨月。
 * 汇率没有市场维度，但它的到期日要等**当天开市的市场都收盘**（D108）：
-  周五晚上用周五的汇率，不能拿美股周四的收盘价去换算。
+  周五晚上用周五的汇率，不能拿美股周四的收盘价去换算。不挂市场的日任务
+  （现金对账，D298）等到的是同一天。
 
 `CalendarView` 只声明本模块用到的三个方法；`CalendarService` 恰好都实现了。
 """
@@ -108,8 +109,8 @@ def monthly_due(
     return Due(period_key(MONTHLY, day.as_of), day.as_of)
 
 
-def fx_due(view: CalendarView, settings: Settings, now: datetime) -> Due | None:
-    """当天开市的市场都已收盘的最近一天；还没有任何市场拿到到期日时不跑（D108）。"""
+def _all_closed_day(view: CalendarView, settings: Settings, now: datetime) -> date | None:
+    """当天开市的市场都已收盘的最近一天；还没有任何市场拿到到期日时返回 None。"""
     latest: dict[str, date] = {}
     for market in settings.markets:
         due = daily_due(view, settings, market, now)
@@ -122,7 +123,22 @@ def fx_due(view: CalendarView, settings: Settings, now: datetime) -> Due | None:
         if view.is_trading_day(market, newest) and latest.get(market) != newest:
             # 这个市场那天开市、但它的收盘还没过：等它
             return None
-    return Due(period_key(FX, newest), newest)
+    return newest
+
+
+def fx_due(view: CalendarView, settings: Settings, now: datetime) -> Due | None:
+    day = _all_closed_day(view, settings, now)
+    return None if day is None else Due(period_key(FX, day), day)
+
+
+def global_daily_due(view: CalendarView, settings: Settings, now: datetime) -> Due | None:
+    """不挂在任何市场市场上的日任务：与汇率等到同一时点（D298）。
+
+    现金对账问的是「所有账户」，而账户分属三个市场：A 股刚收盘就去改余额，HK 与 US
+    今晚那几笔还没入。所以它等的是同一天——三个市场都收盘，那一夜才算过完。
+    """
+    day = _all_closed_day(view, settings, now)
+    return None if day is None else Due(period_key(DAILY, day), day)
 
 
 def period_key(period: str, as_of: date) -> str:
@@ -143,11 +159,13 @@ def due_for(
     market: str | None,
     now: datetime,
 ) -> Due | None:
-    """一个 job 的到期日。全局 job 只有汇率一类（D108）。"""
+    """一个 job 的到期日。全局 job 有汇率和「等所有市场收盘的日任务」两类（D108/D298）。"""
     if period == FX:
         return fx_due(view, settings, now)
     if market is None:
-        return None
+        # 周与月是市场日历的属性（哪个市场的周五？哪个月的那一天？），全局答不出：
+        # 让它留在 waiting，而不是替某个市场瞎猜一个锚
+        return global_daily_due(view, settings, now) if period == DAILY else None
     if period == WEEKLY:
         return weekly_due(view, settings, market, now)
     if period == MONTHLY:

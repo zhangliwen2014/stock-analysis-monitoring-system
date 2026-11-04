@@ -140,6 +140,52 @@ def test_backfill_classifies_known_reasons(tmp_path) -> None:
         db.close()
 
 
+def test_reconcile_cash_returns_the_balance_to_what_the_moves_say(db: Database) -> None:
+    """余额是流水的和：不平就按流水改回来，并把改过的口袋报出去（D298）。
+
+    `adjust_cash` 把余额与流水写在同一事务里，所以「不平」只能是绕开 API 的动结果
+    （手工 SQL、或有人删了审计行）。这时候仍以流水为准：审计行是账，余额是它的缓存。
+    """
+    accounts = SimAccountRepo(db)
+    account_id = _account(db)
+    accounts.adjust_cash(
+        account_id, "CNY", 1_000.0, reason="存入 初始", actor_id=USER, kind="deposit"
+    )
+    accounts.adjust_cash(
+        account_id, "HKD", 200.0, reason="存入 港币", actor_id=USER, kind="deposit"
+    )
+    db.execute(
+        "UPDATE sim_cash_balances SET amount = 999 WHERE account_id = ? AND currency = 'CNY'",
+        [account_id],
+    )
+
+    repaired = accounts.reconcile_cash(account_id)
+
+    assert [(row.currency, row.stored, row.derived) for row in repaired] == [
+        ("CNY", 999.0, 1_000.0)
+    ]
+    assert accounts.cash_balances(account_id) == {"CNY": 1_000.0, "HKD": 200.0}
+    # 修完再来一趟没有第二次改动：这一趟是幂等的，每晚跑都不会自己编出新数
+    assert accounts.reconcile_cash(account_id) == ()
+
+
+def test_reconcile_cash_fills_in_a_balance_row_that_is_not_there(db: Database) -> None:
+    """流水有、余额行没有：补一行按流水的和（不是报个错等人去补）。"""
+    accounts = SimAccountRepo(db)
+    account_id = _account(db)
+    accounts.adjust_cash(
+        account_id, "CNY", 1_000.0, reason="存入 初始", actor_id=USER, kind="deposit"
+    )
+    db.execute("DELETE FROM sim_cash_balances WHERE account_id = ?", [account_id])
+
+    repaired = accounts.reconcile_cash(account_id)
+
+    assert [(row.currency, row.stored, row.derived) for row in repaired] == [
+        ("CNY", 0.0, 1_000.0)
+    ]
+    assert accounts.cash_balances(account_id) == {"CNY": 1_000.0}
+
+
 def write_0042(db: Database, tmp_path, all_paths) -> None:
     """只补上 0042 再迁移：前面那 41 个文件已经在库里记过账。"""
     path = next(p for p in all_paths if int(p.name[:4]) == 42)

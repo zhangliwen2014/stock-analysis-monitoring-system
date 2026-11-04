@@ -156,7 +156,8 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
     # 这一晚会安静地退化成「只验了日线」（D38 的按方法路由 + D106 的按能力登记）。
     # 分红、汇率回算与净值不依赖市场源（单元是账户），所以紧跟数据链登记、三个市场都有；
     # 汇率回算夹在分红与净值中间：它补的正是这两头都依赖的那笔汇率（D212）；
-    # news@ 紧贴净值之后登记，港美没源也登记，跑起来是「未接入，跳过」
+    # news@ 紧贴净值之后登记，港美没源也登记，跑起来是「未接入，跳过」；
+    # 现金对账只在`全局`那一组登记一条：口袋属于账户不属市场，一夜只该改一次余额（D298）
     assert [job.title for job in container.scheduler.jobs] == [
         "bars@A",
         "actions@A",
@@ -195,6 +196,7 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
         "assumptions@US",
         "rules@US",
         "digest@US",
+        "cash-audit@全局",
         "fx@全局",
         "calendar@A",
         "calendar@HK",
