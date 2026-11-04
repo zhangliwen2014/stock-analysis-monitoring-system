@@ -7,7 +7,7 @@
     <span class="badge">
       {{ row.label }}
       {# 指数点数不是钱：D145 的读数额外不带币种（终审 重要2） #}
-      <strong class="num">{{ money(row.value) }}</strong>
+      <strong class="num">{{ price(row.value) }}</strong>
       <span class="{{ row.pct_class }}">{{ pct(row.pct) }}</span>
       <span class="muted">{{ row.state }} · {{ row.at }}</span>
     </span>

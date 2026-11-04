@@ -39,7 +39,7 @@ from sams.web.display import (
     delivery_label,
     filter_label,
     moment_label,
-    money,
+    price,
     state_label,
     target_type_label,
 )
@@ -190,7 +190,7 @@ def _quote(rule: Rule, quotes: dict[tuple[str, str], QuoteView]) -> dict:
         # 没有价时说市场此刻是什么状态（休市/无行情），比一整格空白更能解释自己
         return {"price": "", "at": "", "state": state_label(view.state)}
     return {
-        "price": money(view.price, view.unit),
+        "price": price(view.price, view.unit),
         "at": view.label,
         "state": state_label(view.state),
     }
@@ -220,8 +220,8 @@ def _line_notes(template: Template, values: dict[str, str], view: QuoteView) -> 
     说的是位置，不是结论：「已经破了」是这条线的算术，而这一趟真跑会出哪一档（pre/hit/
     urgent）还要过除权换算、过滤器、冷却与状态跃迁四道闸——那句话归试算。
     """
-    price = view.price
-    if not price or price <= 0:
+    current = view.price
+    if not current or current <= 0:
         return {}
     out: dict[str, str] = {}
     for spec in template.params:
@@ -234,14 +234,14 @@ def _line_notes(template: Template, values: dict[str, str], view: QuoteView) -> 
             continue
         if line <= 0:
             continue
-        gap = (line - price) / price * 100
+        gap = (line - current) / current * 100
         if abs(gap) < 0.005:
             where = "这条线就是现价"
         elif gap > 0:
             where = f"这条线在现价上方 {gap:.2f}%"
         else:
             where = f"这条线在现价下方 {abs(gap):.2f}%"
-        out[spec.name] = f"{spec.label} {money(line, view.unit)}：{where}"
+        out[spec.name] = f"{spec.label} {price(line, view.unit)}：{where}"
     return out
 
 
@@ -292,7 +292,7 @@ def _price_panel(ctx, reader, template: Template, values: dict[str, str]) -> dic
     name = str(master.get("name") or "")
     head = f"{name} {market}/{code}" if name else f"{market}/{code}"
     return {
-        "text": f"{head} 现价 {money(view.price, view.unit)}｜{view.label}｜{view.detail}",
+        "text": f"{head} 现价 {price(view.price, view.unit)}｜{view.label}｜{view.detail}",
         "lines": _line_notes(template, values, view),
     }
 

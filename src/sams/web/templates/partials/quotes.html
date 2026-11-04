@@ -15,7 +15,7 @@
     <td><a href="/symbol/{{ row.market }}/{{ row.code }}{% if page_url %}?back={{ page_url|urlencode }}{% endif %}">{{ row.code }}</a></td>
     {# 备注并进名称那一列：这张板就是「为什么加这只票」唯一露脸的地方 #}
     <td>{{ row.name }}{% if manage and row.note %} <span class="muted">{{ row.note }}</span>{% endif %}</td>
-    <td class="num">{{ money(row.price, row.unit) }}</td>
+    <td class="num">{{ price(row.price, row.unit) }}</td>
     <td class="num {{ row.pct_class }}">{{ pct(row.pct) }}</td>
     <td>{{ row.state }}</td>
     <td class="muted">{{ row.quote_at }}{% if row.quote_detail %}<br>{{ row.quote_detail }}{% endif %}</td>

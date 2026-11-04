@@ -168,8 +168,8 @@
       <td><a href="/symbol/{{ row.market }}/{{ row.code }}?back={{ page_url|urlencode }}">{{ row.code }}</a>
         <a class="muted" href="/symbol/{{ row.market }}/{{ row.code }}?back={{ page_url|urlencode }}#decision">决策</a></td>
       <td class="num">{{ row.qty }}</td>
-      <td class="num">{{ money(row.avg_cost, row.currency) }}</td>
-      <td class="num">{{ money(row.last_price, row.currency) }}
+      <td class="num">{{ price(row.avg_cost, row.currency) }}</td>
+      <td class="num">{{ price(row.last_price, row.currency) }}
         {% if row.price_label %}<span class="muted quote-label">{{ row.price_label }}</span>{% endif %}</td>
       <td class="num">{{ money(row.price_pnl, row.currency) }}</td>
       {# 不可换算那一行不给 0.00：它没进上面那个总资产，显示成零会让读数的人以为两只币种的数混在了一列 #}
@@ -198,7 +198,7 @@
       <td>{{ row.name or "—" }}</td>
       <td>{{ row.side }}</td>
       <td class="num">{{ row.qty }}</td>
-      <td class="num">{{ money(row.price, row.currency) }}</td>
+      <td class="num">{{ price(row.price, row.currency) }}</td>
       <td class="num">{{ money(row.fee, row.currency) }}</td>
       {# 价格在标的币种里，现金扣的是报告币种：这条成交两种币都出现了，得说清怎么换的（D209） #}
       <td>{{ row.currency }}{% if row.settled %}<br><span class="muted">{{ row.settled }}</span>{% endif %}</td>

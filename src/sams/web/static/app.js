@@ -116,6 +116,16 @@
     return echarts.format.addCommas(value.toFixed(2));
   }
 
+  function priceText(value) {
+    // 港股行情就在三位小数上（D308）：写死两位会把昨收 4.855 印成 4.86，而这一格是
+    // 人拿去和券商对照的数。两位能表示就两位，否则往下加，最多四位——与 display.price 同规则
+    var digits = 2;
+    while (digits < 4 && Math.abs(value - Number(value.toFixed(digits))) > 1e-9) {
+      digits += 1;
+    }
+    return echarts.format.addCommas(value.toFixed(digits));
+  }
+
   function percentTick(value) {
     // 上下沿换成百分比后同样是浮点数：不收到两位小数，屏幕右上角就是一长串
     return value.toFixed(2) + "%";
@@ -293,7 +303,7 @@
               symbol: "none", silent: true, animation: false,
               data: [{ yAxis: baseline }],
               lineStyle: { type: "dashed", color: "#8a8a94" },
-              label: { formatter: "昨收 " + baseline.toFixed(2), position: "insideStartTop" },
+              label: { formatter: "昨收 " + priceText(baseline), position: "insideStartTop" },
             }
           : undefined,
       },

@@ -5,7 +5,7 @@
 <section class="card">
   <h1>{{ symbol.get("name") or code }} <span class="muted">{{ market }}/{{ code }}</span></h1>
   <p>
-    <strong class="num">{{ money(price, quote_unit) }}</strong>
+    <strong class="num">{{ price(quote_price, quote_unit) }}</strong>
     <span class="{{ pct_class }}">{{ pct(quote_pct) }}</span>
     <span class="badge">{{ state }}</span>
     <span class="muted">{{ quote_at }}</span>
@@ -24,7 +24,7 @@
       <th>标的状态</th>
       <td>
         {% if decision.held %}
-          {% for item in decision.held %}{{ item.account_name }}：{{ item.qty }} 股 @ {{ money(item.avg_cost, quote_unit) }}{% if not loop.last %}；{% endif %}{% endfor %}
+          {% for item in decision.held %}{{ item.account_name }}：{{ item.qty }} 股 @ {{ price(item.avg_cost, quote_unit) }}{% if not loop.last %}；{% endif %}{% endfor %}
         {% else %}未持仓{% endif %}
         · {{ "在自选" if decision.watched else "不在自选" }}
         {% if decision.thesis %}· 论点 {{ decision.thesis.status }}{% endif %}
@@ -34,7 +34,7 @@
     <tr>
       <th>现价与价值区间</th>
       <td>
-        {{ money(decision.quote.price, quote_unit) }}
+        {{ price(decision.quote.price, quote_unit) }}
         <span class="muted">{{ decision.quote.label }}</span>
         {% if decision.fair_low is not none and decision.fair_high is not none %}
         · 合理区间 {{ money(decision.fair_low, quote_unit) }}~{{ money(decision.fair_high, quote_unit) }}（{{ decision.price_vs_fair }}）

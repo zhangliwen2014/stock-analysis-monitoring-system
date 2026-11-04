@@ -124,6 +124,22 @@ def money(value: float | None, currency: str = "") -> str:
     return f"{value:,.2f}{tail}"
 
 
+def price(value: float | None, currency: str = "") -> str:
+    """每股价格按源给的精度显示（D308）：两位能表示就两位，不能就往下加，最多四位。
+
+    港股行情本身就在三位小数上（实测 hk00386 今日 4.855/4.795，腾讯、东财、新浪一致），
+    按 `money` 的两位抹平会把人拿去对照下单的数印错一分，而同屏的 K 线画的是原值。
+    上限留到四位：真出现四位时（美股仙股有），只到三位会把 0.0045 印成 0.005，比两位更坏。
+    """
+    if value is None:
+        return "—"
+    tail = f" {currency}" if currency else ""
+    digits = 2
+    while digits < 4 and abs(value - round(value, digits)) > 1e-9:
+        digits += 1
+    return f"{value:,.{digits}f}{tail}"
+
+
 #: 市值这种十二三位数按元原样摆出来读不出量级；只在估值那一行用这个紧凑口径
 _CURRENCY_UNITS = {"CNY": "元", "HKD": "港元", "USD": "美元"}
 

@@ -6,7 +6,7 @@
     <td>{{ row.market }}</td>
     <td><a href="/symbol/{{ row.market }}/{{ row.code }}{% if back_url %}?back={{ back_url|urlencode }}{% endif %}">{{ row.code }}</a></td>
     <td>{% if row.name %}<a href="/symbol/{{ row.market }}/{{ row.code }}{% if back_url %}?back={{ back_url|urlencode }}{% endif %}">{{ row.name }}</a>{% else %}—{% endif %}</td>
-    <td class="num">{{ money(row.price, row.unit) }}</td>
+    <td class="num">{{ price(row.price, row.unit) }}</td>
     <td>
       <form method="post" action="/watchlist/add" class="inline-form">
         <input type="hidden" name="csrf" value="{{ csrf }}">

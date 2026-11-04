@@ -25,7 +25,7 @@ from sams.core.screener_recipes import recipes_for
 from sams.services.screener import preset_strategy_id
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
-from sams.web.display import moment_label, money
+from sams.web.display import moment_label, price
 from sams.web.forms import form_data, many, one
 from sams.web.quotes import QuoteView, price_unit, quote_reader
 
@@ -492,11 +492,11 @@ def _hit_row(
     并把「10-28 快照」写出来——快照价不是现价，假装成现价就是另一个数。"""
     unit = quote.unit if quote is not None else price_unit(ctx, market, hit.code)
     if quote is not None and quote.price is not None:
-        price = money(quote.price, unit)
+        price_text = price(quote.price, unit)
         price_point = quote.label
     else:
         raw = hit.values.get("price")
-        price = money(raw, unit) if raw is not None else "—"
+        price_text = price(raw, unit) if raw is not None else "—"
         price_point = f"{day:%m-%d} 快照" if raw is not None and day is not None else ""
     return {
         "code": hit.code,
@@ -505,7 +505,7 @@ def _hit_row(
             "—" if hit.values.get(item.field) is None else f"{hit.values[item.field]:g}"
             for item in conditions
         ],
-        "price": price,
+        "price": price_text,
         "price_point": price_point,
         "held": hit.code in held,
     }

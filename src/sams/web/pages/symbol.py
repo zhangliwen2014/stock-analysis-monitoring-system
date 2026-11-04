@@ -184,7 +184,7 @@ def symbol_page(request: Request, market: str, code: str):
         market=market,
         code=code,
         symbol=symbol,
-        price=quote.price,
+        quote_price=quote.price,
         quote_pct=quote.pct,
         pct_class=pct_class(quote.pct),
         state=state_label(quote.state),

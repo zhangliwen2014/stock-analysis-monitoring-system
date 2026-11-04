@@ -8,7 +8,7 @@
       <span class="nav-hit-market">{{ row.market }}</span>
       <span class="nav-hit-code">{{ row.code }}</span>
       <span class="nav-hit-name">{{ row.name or "—" }}</span>
-      <span class="nav-hit-price">{{ money(row.price, row.unit) }}</span>
+      <span class="nav-hit-price">{{ price(row.price, row.unit) }}</span>
     </a>
   </li>
   {% endfor %}
