@@ -4,6 +4,7 @@
 承 T2 §5 与上一轮 §9（`2026-11-05-daily-bar-settle-window-and-close-basis-design.md`）
 **目标**：让休市看板的美股那一段真的有三条指数，并把「库里一根指数日线都没有」这种空序列
 从 `ok · 3/3` 里揪出来——和上一轮的日线同一条规矩：当晚自己回补，不在界面上念给人听。
+**状态**：已实现并实机验收（F1/F2 见 §7，全量回归与实机读数见 §8）。
 
 ## 1. 实机读数（2026-11-05，实例 8765）
 
@@ -185,7 +186,8 @@ def tencent_index_symbol(market: str, code: str) -> str:
 ## 7. 实现后怎么验（实机）
 
 1. `sams run once --job indices --market US`：`note` 应报 `3/3 只指数日线`、
-   `rows_affected > 0`（首次是 730 天窗口那批，约每只一百多根），不再是 0。
+   `rows_affected > 0`（首次是 730 天窗口那批，每只约 500 根），不再是 0。
+   同一周期键已经 `ok` 时这一句会被跳过（见 §8 末尾那条坑），换个 `--as-of` 就是新周期。
 2. 库里 `SELECT index_code, count(*), max(date) FROM index_daily WHERE market='US' GROUP BY index_code`
    返回三行，`max(date)` 落在最近一个美股交易日。
 3. 空序列那一句要能看见：在 `config/settings.toml` 临时加一段，把 US 换成源不认的码
@@ -196,8 +198,55 @@ def tencent_index_symbol(market: str, code: str) -> str:
    codes = ["usSPX"]
    ```
 
-   `sams run once --job indices --market US` 的 note 应含 `1 只库里一根指数日线都没有`且仍算成功。
+   `sams run once --job indices --market US` 的 note 应含 `1 只一根 K 线都没有`且仍算成功。
 4. 休市时段打开看板（`/api/partials/indices`）：美股那一段出现三条指数，
    每条带最近一个交易日的收点与涨跌幅，而不是整段消失。
 5. `indices@A` 与 `indices@HK` 的 `rows_affected` 从今晚起非零（定稿窗口在回拉最近 14 天）——
    这是 D305 的预期，不是回归。
+
+## 8. 实现记录与实机验收（2026-11-05 已跑，实例 8765）
+
+| 提交 | 内容 |
+| --- | --- |
+| `f925a16` | F1：`tencent.index_daily` 放开市场闸 + `tencent_index_symbol` 的点号请求键 |
+| `c2a41cb` | F2：`run_indices` 换 `_settle_window`，note 点名空序列；模块 docstring 的窗口规则同步改口 |
+| `8819c91` | 补 live 用例 `test_live_tencent_index_daily_covers_all_three_markets`（真接口问三市场的指数） |
+
+测试按 §4 逐枚见过红→绿：F1 那两枚先红在 `EmptyResponse: 腾讯指数日线没有 US 市场`，
+F2 的窗口两枚先红在「问出去的区间是 `AS_OF` 而不是 `AS_OF-14`」与「calls 为空」，
+点名那枚先红在 `note == "1/1 只指数日线"`。全量 **5583 passed, 20 deselected**（40 分 40 秒，exit 0）。
+
+实机读数（停服 → `run once` → 查库 → 重启）：
+
+```
+task_runs（job_name='indices'，按结束时间倒序）
+  indices A  2026-11-05  ok  rows=33    3/3 只指数日线
+  indices US 2026-11-05  ok  rows=0     1/1 只指数日线，1 只一根 K 线都没有   ← §7.3 的临时配置探针
+  indices US 2026-11-04  ok  rows=1503  3/3 只指数日线                      ← F1 之后第一次真取数
+  indices HK 2026-11-04  ok  rows=3     3/3 只指数日线
+  indices A  2026-11-04  ok  rows=3     3/3 只指数日线
+  indices US 2026-11-03  ok  rows=0     3/3 只指数日线                      ← 修好之前那一条静默
+```
+
+最后一行与倒数第四行是这一轮的全部内容：同一只 job、同一句 `3/3`、一个写 1503 行一个写 0 行。
+
+- §7.2：`index_daily` 的 US 段现在有 `usINX` / `usIXIC` / `usDJI` 各 **501 行**，
+  区间 2024-11-04 → 2026-11-03，`source='tencent'`。
+- 数是对的：库内 `usINX` 2026-11-03 收 **7568.92**，而腾讯报价 `q=usINX` 那一条的
+  「昨收」字段也是 7568.92（`v_usINX="200~标普500~.INX~7707.44~7568.92~…"`，取数于 11-04 盘中）。
+  两个不同的端点、两条不同的解析路径落在同一个数上，这比「看起来有数」强。
+- §7.4 只验到一半：验收时美股**正在盘中**，看板走的是实时报价那一条分支，
+  三条 bar 都出得来（标普500 7,699.20 +1.72%）。休市回落库内那一条分支
+  （`dashboard.py:238` 的 `latest_with_change`）没法当场看见，
+  但它读的就是上面那 501 行，而 A 与 HK 两段同一时刻报的正是这条分支的结果（`休市 · 11-04 收盘`）。
+- §7.5：`indices@A` 从 3 行变成 **33 行**（3 只 × 最近 14 个日历天里的 11 个交易日）——
+  定稿窗口在指数上开始回头，与 D300 在日线上做的是同一件事。
+
+一处坑，记下来免得下次再踩：`run once` 按**周期键**判重，同一只 job 在同一个
+`period_key` 上已经 `ok` 就直接跳过（`runner.py:149-151`）。验收时那一晚 US 的周期键已经是
+2026-11-03，所以第一次 `run once --job indices --market US` 报的是「周期 2026-11-03 已经成功」，
+得用 `--as-of 2026-11-04` 换一个新键才会真跑。这不是 bug——它挡的正是「同一晚把同一段重跑一遍」。
+
+顺带看见（不在本轮，交给 #368/#365）：`run once` 会先把补数队列排一遍，
+本次那里撞了 yfinance 的限流（`源 yfinance 连续失败 1999 次…冷却 1800 秒`），
+与本轮无关，但那条链上的失败计数怎么涨到 1999 仍未有人查过。
