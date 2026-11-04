@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -77,6 +78,59 @@ def _seed_a(world, account_id: str, closes: dict[date, float], *, buy_day: date)
     )
 
 
+def _seed_hk(world, account_id: str, closes: dict[date, float], *, buy_day: date) -> None:
+    """再加一只港股：CNY 侧按汇率结算，港币汇率按净值走的那几天每天给一条。
+
+    跨市场这件事必须由卡片自己说，所以这里要的是「两个市场都真的拿着」——
+    净值重放缺了汇率就落不出行，卡片会先卡在「没有连续两个净值日」。
+    """
+    ctx = world.context
+    ctx.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"],
+                "code": ["00700"],
+                "name": ["腾讯控股"],
+                "currency": ["HKD"],
+                "sector": ["互联网"],
+            }
+        )
+    )
+    for day in closes:
+        ctx.fx_store.put(day, "HKD", "CNY", 0.90, source="manual")
+    ctx.ledger.buy(
+        account_id,
+        "alice",
+        "HK",
+        "00700",
+        qty=200,
+        price=300.0,
+        fx_rate=0.90,
+        ts=_at(buy_day),
+    )
+    ctx.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"] * len(closes),
+                "code": ["00700"] * len(closes),
+                "date": list(closes),
+                "close": list(closes.values()),
+                "source": ["test"] * len(closes),
+            }
+        )
+    )
+
+
+def _benchmark_line(text: str) -> str:
+    """卡片上「基准 … · 超额 …」那一行，折成单行空格。
+
+    断言要盯整行：两格分开各对一次「—」，漏掉的是「基准有名有姓、超额却没数」
+    这种半截话——它比两格都空更像结论。
+    """
+    paragraph = next(p for p in re.findall(r"<p>(.*?)</p>", text, re.S) if "基准" in p)
+    return " ".join(paragraph.split())
+
+
 def _partial(logged, account_id: str, days: int = 90) -> str:
     response = logged.client.get(
         f"/api/partials/portfolio/attribution?account={account_id}&days={days}"
@@ -136,6 +190,27 @@ def test_the_benchmark_line_stays_a_dash_when_the_index_is_not_stored(logged) ->
     assert "上证指数" in text
     assert "超额 —" in text
     assert "没有收盘数据" in text
+
+
+def test_the_card_prints_why_a_cross_market_run_has_no_benchmark(logged) -> None:
+    """A 股与港股都拿着：基准与超额两格都是「—」，note 紧跟在后头（D291）。
+
+    合成基准这轮不做，所以屏幕上不能出现那个数；但「为什么没有」必须出现，
+    否则这一行看起来像是数据没同步。
+    """
+    account_id = _open(logged, backdate_days=40)
+    today = logged.context.clock.today()
+    days = [today - timedelta(days=2), today - timedelta(days=1), today]
+    _seed_a(logged, account_id, {day: 11.0 for day in days}, buy_day=days[0])
+    _seed_hk(logged, account_id, {day: 300.0 for day in days}, buy_day=days[0])
+    logged.context.nav.rebuild(account_id, days[0], today)
+
+    line = _benchmark_line(_partial(logged, account_id))
+
+    assert line.startswith("基准 — — · 超额 —")
+    assert "只出绝对收益" in line
+    assert "A" in line and "HK" in line
+    assert "上证指数" not in line and "恒生指数" not in line
 
 
 def test_the_window_switcher_moves_the_start_day(logged) -> None:

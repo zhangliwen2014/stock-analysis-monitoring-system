@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import polars as pl
 import pytest
-from support_valuation import TODAY, make_container
+from support_valuation import DAYS, TODAY, make_container
 
 import sams.cli as cli
 
@@ -80,6 +80,128 @@ def rebuild(world) -> None:
 
 def attribution(*extra: str) -> tuple[str, ...]:
     return ("attribution", *extra)
+
+
+def _seed_hk(world, account_id: str, *, price: float = 300.0) -> None:
+    """给这个账户加一笔港股：主档 + 300 天日线 + HKD→CNY 汇率 + CNY 侧按汇率结算的买入。
+
+    日线与汇率铺满整段样本期，是因为基准行要跟着「这段压在哪几个市场」——中间缺一天，
+    测试就分不清基准没数是因为跨市场，还是因为净值重放不了。
+    """
+    container = world.container
+    container.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"],
+                "code": ["00700"],
+                "name": ["腾讯控股"],
+                "currency": ["HKD"],
+                "sector": ["互联网"],
+            }
+        )
+    )
+    container.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"] * len(DAYS),
+                "code": ["00700"] * len(DAYS),
+                "date": DAYS,
+                "close": [price] * len(DAYS),
+                "source": ["test"] * len(DAYS),
+            }
+        )
+    )
+    for day in DAYS:
+        container.fx_store.put(day, "HKD", "CNY", 0.90, source="manual")
+    container.ledger.buy(
+        account_id, USER, "HK", "00700", qty=200, price=price, fx_rate=0.90, ts=BUY_AT
+    )
+
+
+def _index(world, market: str, code: str, first: float, last: float) -> None:
+    """整段样本期铺一根从 `first` 走到 `last` 的指数线。
+
+    基准要同窗口（D292）：中间缺一天就整段不给数，那样测不出「基准跟哪个市场走」。
+    """
+    step = (last - first) / (len(DAYS) - 1)
+    world.container.index_daily_store.upsert(
+        pl.DataFrame(
+            {
+                "market": [market] * len(DAYS),
+                "index_code": [code] * len(DAYS),
+                "date": DAYS,
+                "close": [first + step * index for index in range(len(DAYS))],
+                "source": ["test"] * len(DAYS),
+            }
+        )
+    )
+
+
+def _benchmark_line(text: str) -> str:
+    return next(line for line in text.splitlines() if line.startswith("基准"))
+
+
+def test_the_benchmark_line_follows_the_markets_actually_held(world, capsys):
+    """同一段里 A 与 HK 都拿着：基准与超额两格都是「—」，note 下一行说为什么（D291）。
+
+    断言把「基准行」和报告里的市场分组放在一起看：分组明明跨两个市场，那一行却印着
+    某个指数的名字，就是文本层自己造了一个卡片上没有的数。
+    """
+    _seed_hk(world, world.account_id)
+    _index(world, "A", "sh000001", 3_000.0, 3_150.0)
+    _index(world, "HK", "hkHSI", 20_000.0, 20_600.0)
+    rebuild(world)
+
+    code, text = out(
+        world, capsys, *attribution("--account", world.account_id, "--window", "20")
+    )
+
+    assert code == 0
+    assert _benchmark_line(text) == "基准 — — · 超额 —"
+    assert "只出绝对收益" in text
+    assert "上证指数" not in text and "恒生指数" not in text
+    # 区间收益照印：不给基准不等于不给这段的数
+    assert "区间收益" in text
+
+    _, body = payload(
+        world, capsys, *attribution("--account", world.account_id, "--window", "20")
+    )
+    assert sorted(group["label"] for group in body["markets"]) == ["A", "HK"]
+    assert body["benchmark"]["value"] is None
+    assert body["excess"] is None
+
+
+def test_an_all_hong_kong_account_prints_the_hong_kong_index(db, world, capsys):
+    """R3-05 在命令行这一端：基准跟着持仓的市场走，不跟着开户市场走（D291）。
+
+    同一个容器里留一个纯 A 股账户做对照——两只账户都配了指数、都只压一个市场，
+    印出来的名字不同才说明那个名字是从持仓来的。
+    """
+    container = world.container
+    user = container.users.get_by_username(USER)
+    hk_account = container.sim_accounts.open(user.id, "港股户")
+    db.execute("UPDATE sim_accounts SET created_at = ? WHERE id = ?", [OPENED_AT, hk_account.id])
+    container.sim_accounts.adjust_cash(
+        hk_account.id,
+        "CNY",
+        100_000.0,
+        reason="存入 初始",
+        actor_id=USER,
+        ts=OPENED_AT,
+        kind="deposit",
+    )
+    _seed_hk(world, hk_account.id)
+    _index(world, "A", "sh000001", 3_000.0, 3_150.0)
+    _index(world, "HK", "hkHSI", 20_000.0, 20_600.0)
+    assert invoke(world, "nav", "rebuild", "--account", hk_account.id, "--days", "300") == 0
+    rebuild(world)
+
+    _, hk_text = out(world, capsys, *attribution("--account", hk_account.id, "--window", "20"))
+    _, a_text = out(world, capsys, *attribution("--account", world.account_id, "--window", "20"))
+
+    assert _benchmark_line(hk_text).startswith("基准 恒生指数")
+    assert "上证指数" not in hk_text
+    assert _benchmark_line(a_text).startswith("基准 上证指数")
 
 
 def test_attribution_says_what_to_run_before_any_nav_exists(world, capsys):
