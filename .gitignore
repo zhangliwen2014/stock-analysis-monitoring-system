@@ -14,3 +14,6 @@ logs/
 *.swo
 *~
 config/settings.toml
+# 实机脚本、serve 日志、那份密钥都住在 tmp/：各计划里反复写的「tmp/ 不入库」
+# 一直只是口头规矩，写进这里才算——否则一次 `git add -A` 就把 tmp/.sams_secret 推出去
+tmp/
