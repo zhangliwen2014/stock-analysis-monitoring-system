@@ -15,7 +15,7 @@ from sams.cli.common import emit, exit_for, refused
 from sams.core.errors import SamsError, StorageError, ValidationError
 from sams.services.attribution import AttributionReport
 
-#: 与持仓页那三个按钮同一份口径：`0` 是「全部」，起点落到开户那一天
+#: 与持仓页那三个按钮同一份口径：`0` 是「全部」，起点落到台账最早那一笔（D296）
 ALL = 0
 
 
@@ -31,7 +31,7 @@ def add_to(subparsers) -> None:
         "--window",
         type=int,
         default=90,
-        help=f"往回看多少个日历天，{ALL} = 从开户那天算起（默认 90）",
+        help=f"往回看多少个日历天，{ALL} = 从台账最早一笔算起（默认 90）",
     )
     parser.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
     parser.set_defaults(handler=run_report)
@@ -41,7 +41,7 @@ def run_report(container, args) -> int:
     try:
         if args.window < ALL:
             raise ValidationError(
-                f"--window 要的是 {ALL} 或一个正整数（{ALL} = 从开户那天算起），收到 {args.window}"
+                f"--window 要 {ALL} 或一个正整数（{ALL} = 从台账最早一笔起），收到 {args.window}"
             )
         account = container.sim_accounts.find(args.account)
         if account is None:
@@ -53,9 +53,8 @@ def run_report(container, args) -> int:
         if args.window:
             start = end - timedelta(days=args.window)
         else:
-            # 「全部」的起点是开户那一天，按账户所属市场的当地时区取——净值重放分日用的就是这条
-            zone = container.settings.market_cfg(account.home_market).zone()
-            start = account.opened_at.astimezone(zone).date()
+            # 「全部」的起点由台账说话（最早一笔成交或流水），不是建账那一刻（D296）
+            start = container.nav.curve_start(account.id, end)
         report = container.attribution.evaluate(owner.username, args.account, start, end)
     except SamsError as exc:
         return refused(args, exc, exit_for(exc))
@@ -123,7 +122,7 @@ def _payload(report: AttributionReport, window: int) -> dict:
 
 
 def _print(report: AttributionReport, window: int) -> None:
-    window_label = "全部（自开户起）" if window == ALL else f"{window} 天"
+    window_label = "全部（自台账最早一笔起）" if window == ALL else f"{window} 天"
     print(f"业绩归因 {report.account_id} · 窗口 {window_label}")
     if report.skipped:
         print(f"  {report.skipped}")

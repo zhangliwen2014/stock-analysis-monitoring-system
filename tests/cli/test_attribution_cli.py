@@ -277,6 +277,27 @@ def test_the_window_counts_calendar_days_back_from_today_and_zero_means_since_op
     assert "窗口 全部" in text
 
 
+def test_the_full_window_starts_at_the_earliest_ledger_event_not_at_the_record(
+    db, world, capsys
+):
+    """「全部」的起点是台账里最早的那一笔，不是按下建账按钮的那一刻（D296）。
+
+    先建账、再回填真实券商历史是常规用法：起点落在 `created_at`，回填的那段行情在归因里
+    永远看不见，而屏幕上那句「全部」就成了假话——话说的是「全部」。
+    """
+    later = datetime(2024, 6, 1, 1, 0, tzinfo=UTC)
+    db.execute("UPDATE sim_accounts SET created_at = ? WHERE id = ?", [later, world.account_id])
+    rebuild(world)
+
+    _, body = payload(
+        world, capsys, *attribution("--account", world.account_id, "--window", "0")
+    )
+
+    # 成交与首笔存入都在 2024-01-02：那才是这段历史的第一天
+    assert body["start"] == "2024-01-02"
+    assert body["days"] > 150
+
+
 def test_a_holding_without_fx_or_dividend_prints_a_dash_not_a_zero(world, capsys):
     rebuild(world)
     _, text = out(

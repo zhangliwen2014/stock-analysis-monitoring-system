@@ -187,6 +187,20 @@ class NavService:
             orders=self.orders.orders(account.id),
         )
 
+    # --- 这段历史从哪天开始 ---------------------------------------------------------------
+
+    def curve_start(self, account_id: str, end: date) -> date:
+        """这个账户的台账最早能从哪天算起：净值重放的起点，也是「全部」窗口的起点（D296）。
+
+        「全部」要说的是「这个账户的全部历史」，而历史的起点由台账说话，不由建账按钮说话。
+        两个读数各钳一次 `created_at`，就会一个说「全部」另一个少一段。
+        """
+        account = self.accounts.find(account_id)
+        if account is None:
+            raise StorageError(f"账户 {account_id} 不存在")
+        moves_by_day, _ = self._cash_by_day(account.id, end)
+        return self._curve_start(account, self.orders.orders(account.id), moves_by_day)
+
     # --- 重建用的小件 -------------------------------------------------------------------
 
     def _opened_on(self, opened_at: datetime, home_market: str) -> date:
@@ -415,8 +429,12 @@ class NavService:
 
     @staticmethod
     def _run_ending_at(points: list[NavPoint], latest: NavPoint | None) -> list[NavPoint]:
-        """从 `latest` 往前收连续完整日：隔一天不完整就停，缺口不当 0 收益。"""
-        if latest is None:
+        """从 `latest` 往前收连续完整日：隔一天不完整就停，缺口不当 0 收益。
+
+        净值不是正数的那天也停（D297）：回撤与 TWR 都是拿上一日净值当分母的比率，
+        负分母上连乘出来的仍然印成「最大回撤」，量级越离谱越像结论。
+        """
+        if latest is None or not _usable_as_base(latest.nav):
             return []
         index = points.index(latest)
         run = [latest]
@@ -425,7 +443,7 @@ class NavService:
             candidate = points[cursor - 1]
             if (
                 not candidate.complete
-                or candidate.nav is None
+                or not _usable_as_base(candidate.nav)
                 or candidate.day != points[cursor].day - timedelta(days=1)
             ):
                 break
@@ -454,6 +472,15 @@ class NavService:
         )
 
 
+def _usable_as_base(nav: float | None) -> bool:
+    """这天能不能当百分比的分母：只有正净值能（D297）。
+
+    「先买后入金」的账户在回填历史后会有这样一段——钱还没进来、仓位已经有了，净值是负的。
+    负分母上的比率仍然会被印成「收益率/回撤」，而越离谱越像结论。
+    """
+    return nav is not None and nav > 0
+
+
 def _orders_by_code(orders: list[Order]) -> dict[tuple[str, str], list[Order]]:
     grouped: dict[tuple[str, str], list[Order]] = {}
     for order in orders:
@@ -462,22 +489,17 @@ def _orders_by_code(orders: list[Order]) -> dict[tuple[str, str], list[Order]]:
 
 
 def _twr(run: list[NavPoint]) -> tuple[float | None, date | None]:
-    """连续完整日上的时间加权收益：`(NAV_t − F_t) / NAV_{t−1} − 1` 逐日连乘。"""
+    """连续完整日上的时间加权收益：`(NAV_t − F_t) / NAV_{t−1} − 1` 逐日连乘。
+
+    进来的 `run` 已经只留正净值的日子（`_run_ending_at`，D297），这里不再判分母：
+    同一条规则写两遍，改一遍漏一遍。
+    """
     if len(run) < 2:
         return None, run[0].day if run else None
     growth = 1.0
-    start = run[0].day
-    usable = False
     for previous, current in zip(run, run[1:], strict=False):
-        assert previous.nav is not None and current.nav is not None
-        if previous.nav <= 0:
-            # 上一日净值为 0/负：除不出比率，把这一段重新起头，不猜一个收益
-            growth = 1.0
-            start = current.day
-            continue
         growth *= (current.nav - current.external_flow) / previous.nav
-        usable = True
-    return (growth - 1.0 if usable else None), start
+    return growth - 1.0, run[0].day
 
 
 def _max_drawdown(run: list[NavPoint]) -> float | None:

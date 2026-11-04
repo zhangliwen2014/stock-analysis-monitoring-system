@@ -728,8 +728,8 @@ _ATTRIBUTION_WINDOWS = ((30, "30 天"), (90, "90 天"), (0, "全部"))
 def portfolio_attribution_partial(request: Request, account: str, days: int = 90):
     """业绩归因卡（S5 §5）：异步局部，与 `sams attribution` 读同一个服务、同一份话术。
 
-    `days=0` 是「全部」：起点落到开户那一天，而不是某个魔法常数——写死 400 天会让
-    一个开了两年的账户在卡上看不见前一年半。
+    `days=0` 是「全部」：起点落到台账最早那一笔，而不是某个魔法常数——写死 400 天会让
+    一个两年的账户在卡上看不见前一年半，而钳在 `created_at` 会丢掉回填进去的真实历史（D296）。
     """
     user = require_user(request)
     web = request.app.state.web
@@ -738,11 +738,7 @@ def portfolio_attribution_partial(request: Request, account: str, days: int = 90
     if found is None:
         raise HTTPException(status_code=404)
     end = ctx.clock.today()
-    if days > 0:
-        start = end - timedelta(days=days)
-    else:
-        zone = ctx.settings.market_cfg(found.home_market).zone()
-        start = found.opened_at.astimezone(zone).date()
+    start = end - timedelta(days=days) if days > 0 else ctx.nav.curve_start(found.id, end)
     report = ctx.attribution.evaluate(user.username, found.id, start, end)
     return web.render(
         request,

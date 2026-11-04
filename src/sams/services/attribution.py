@@ -309,8 +309,12 @@ def _run_markets(entries: list[HoldingContribution]) -> tuple[str, ...]:
 
 
 def _run_ending_at_last_complete(points) -> list:
-    """从最后一个完整日往回走，只收连续的日子：缺口前后的行情不并成一段。"""
-    complete = [point for point in points if point.complete and point.nav]
+    """从最后一个完整日往回走，只收连续的日子：缺口前后的行情不并成一段。
+
+    净值不是正数的那天也断在这里（D297）：`(NAV_t − F_t) / NAV_{t−1}` 除以负分母，
+    出来的数仍然叫「区间收益」，而它长成 −92,016.96% 的样子就是在说自己算错了。
+    """
+    complete = [point for point in points if point.complete and point.nav and point.nav > 0]
     if not complete:
         return []
     run = [complete[-1]]

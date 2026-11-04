@@ -3,7 +3,7 @@
 **日期**：2026-11-04
 **来源**：第三轮专家实机报告 R3-05 / R3-18 / R3-19（`2026-11-03-expert-testing-round3.md`），开放决策 D7
 **任务**：#372（T3）
-**状态**：设计待批
+**状态**：已实现（F4 实机数见 §7）
 
 ---
 
@@ -139,3 +139,65 @@
 - **D293** 存量占位汇率（`fx_rate_ref = 1.0` 且币种 ≠ 报告币种）由后台按成交日的汇率表回算，改写汇率两列并**补一条 `adjust` 现金流水**（不改写历史流水），取不到汇率就不动；屏幕上不再出现「撤销重录」这类手工指令。
 - **D294** 分红资格与净值起点的判据是**台账本身**（最早的成交/流水、除权日前的持股），不是 `sim_accounts.created_at`。把真实券商历史回填进新建的账户是支持的用法，`created_at` 不是这段历史的起点。
 - **D295** 允许曲线头部出现负现金（先买后入金的真实样子），不自动补期初余额、也不隐藏那几天。
+- **D296** 「全部」窗口的起点是**台账最早那一笔**（成交或流水），不是 `sim_accounts.created_at`。D294 说的是同一件事：`created_at` 记的是按下建账按钮的时刻，不是这段历史的开头；卡片与命令行两处各钳一次，就会出现一个说「全部」、另一个少一段。起点由 `NavService.curve_start` 一处给。
+
+## 7. 实现记录
+
+四个改动按 F1 → F3 → F2 的顺序落地（F2 依赖 F3 把「回填历史」这条路走通，否则回算
+发生在一条本来就不完整的曲线上）。
+
+| 改动 | 落点 | 提交 |
+| --- | --- | --- |
+| F1 基准跟持仓市场走、缺任一净值日就不给超额 | `services/attribution.py:_benchmark`、`bootstrap.py`（不再传 `calendar`） | `940d7d1` |
+| F3a 分红资格看除权日前的持股 | `services/dividends.py`（删账户级 `opened_on` 日期闸） | `b93ba51` |
+| F3b 净值起点 = min(建账日, 最早流水, 最早成交) | `services/nav.py:_curve_start` | `b93ba51` |
+| F2 占位汇率后台按成交日回算 | `storage/repos/ledger.py:repave_rate` + `settled_amount`、`services/ledger.py:repair_placeholder_rates`、`services/scheduler/jobs.py:run_rate_repairs` | `bac1928` |
+| D212 持仓卡话术改为「系统自动回算」 | `services/portfolio.py` | `bac1928` |
+| §4-13/14 介质层基准行 | `tests/web/test_portfolio_attribution_web.py`、`tests/cli/test_attribution_cli.py` | `0235b0f` |
+| D296 「全部」窗口从台账最早一笔起 | `services/nav.py:curve_start`、`cli/attribution.py`、`web/pages/portfolio.py`（两处各钳一次 `created_at` 的重复消掉） | 本轮 |
+
+实现里定下来的三件事，写在这里而不是只留在代码里：
+
+- **回算写新流水，不改历史流水**：`repave_rate` 在同一事务里改 `sim_orders` 的两列汇率，
+  并补一条 `kind = "adjust"` 的现金移动。`adjust` 不进 `nav.py` 的 `_EXTERNAL_KINDS`
+  （那里是 `deposit`/`withdraw` 白名单），所以 TWR 不会被这笔内部移动扭曲。
+- **两种情况整笔跳过**：成交日往前找不到汇率（不许猜数字）、或补差会让账户透支
+  （半笔修复比不修更糟）。跳过时返回的计数如实反映没动的笔数。
+- **`SYSTEM_ACTOR` 挪到 `services/actors.py`**：分红入账与占位汇率回算都是「系统替谁动的账」，
+  这个判断只该有一份。
+
+§4 第 11 项不用新写用例：`tests/web/test_portfolio_web.py::test_a_cross_currency_rate_of_one_is_refused_with_the_real_rate_hint`
+早就同时断言了 400、「不会是 1」那句话和不落单，HTTP 这一层并不是没人守。
+
+### 实机（F4）
+
+在 `data/sams.duckdb`（当前库）上跑的，命令与读数：
+
+1. `sams run jobs` → 注册 60 个 job，三个市场都是 `dividends → rate-repair → nav` 这个顺序。
+2. `sams portfolio dividends --account 827caebe… --as-of 2026-11-04`
+   → `rows=1`：601088 除权日 2026-10-26、持股 100 股、每股 0.98、入账 **98.00 CNY**（税前毛额）；
+   `skipped_no_shares=23`、`skipped_existing=1`——删掉日期闸之后「除权日前一股没买」仍然是不入账的。
+3. `sams nav rebuild --account 827caebe… --days 400`
+   → 写入 **16 天**（此前是 4 天），曲线从 **2026-10-20**（最早一笔成交）起，而不是 11-01（建账那天）。
+   头部那几天 `cash = -3,800`、10-26 起 `-3,702`（98 的派息落在除权日）：先买后入金的样子照印，不补期初余额（D295）。
+4. `sams run once --job rate-repair` → `rate-repair@HK ok：6 个账户回算 2 笔占位汇率`（A/US 各 0 笔）。
+   银河账户（`a50aa9f3…`）两笔：
+   * 03690 买入 2026-09-10：`1.0000 → 0.855330`，`kind='adjust'` 流水 **+1,086.48 CNY**，`actor_id=system`；
+   * 01021 买入 2026-10-29：`1.0000 → 0.849012`，adjust **+1,740.44 CNY**。
+   全库现在 `currency <> 'CNY' and (fx_rate_ref = 1.0 or fx_rate_applied = 1.0)` 的行数是 **0**。
+5. `sams nav rebuild --account a50aa9f3… --days 400` → 写入 **56 天**（此前 7 天），从 2026-09-10 起。
+6. `sams attribution --account a50aa9f3… --window 0`
+   → 基准行是 `基准 恒生指数 — · 超额 —`，note「恒生指数 缺 2026-09-12、2026-09-13、2026-09-19 等 18 天 的收盘，
+   这一段不完整，只出绝对收益」——D291（跟持仓市场走）与 D292（缺天不给超额）都在实机上成立；
+   缺的那 18 天本身归 #375 那趟当晚补采。
+
+### 实机跑出来的两条新问题（不在本轮范围，已开决策）
+
+* **D297**（任务 #376）：同一条归因输出里 `区间收益 −92,016.96%`、`区间均权 87,546.31%`。
+  根因是这个账户 2026-09-10 ~ 10-28 的净值是**负数**（先买后入金），而 `_run_ending_at_last_complete`
+  只做了真值判断，负净值照样进链乘当分母。净值起点提前（F3b）把这段暴露出来了——本轮改动自己踩出来的坑，
+  修法与非正净值日的回撤（同一段在持仓卡上印出 `max_drawdown = 1291.52`，即 129,152%）一起做。
+* **任务 #377**：银河账户 2026-10-29 的 `sim_cash_moves` 里有**两条** `kind='buy'` −11,527，
+  而 `sim_orders` 只剩一笔 01021——撤销/重记那条路留下的孤儿流水，CNY 口袋多扣了一次。
+  与今天的回算无关（回算只新增 adjust 行），但它决定「余额能不能从流水复原」这条账能不能信。
+

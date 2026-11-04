@@ -507,6 +507,29 @@ def test_a_run_spanning_two_markets_gets_no_benchmark_at_all(world) -> None:
     assert "A" in report.benchmark.note and "HK" in report.benchmark.note
 
 
+def test_a_day_with_non_positive_nav_is_not_used_as_the_denominator(world) -> None:
+    """净值不是正数的那几天当归因起点，链乘出来的是没意义的数（D297）。
+
+    实机那条：账户先买后入金，回填历史把曲线头部撑成负净值，屏幕上出现
+    区间收益 −92,016.96%、单票区间均权 87,546.31%。负数当分母时符号与量级都失真，
+    这一段就不该进百分比——宁可从第一个正净值那天算起，并如实说丢了几天。
+    """
+    _buy(world, "601088", 4_000, 10.0)
+    _bars(world, "601088", {DAY_1: 9.5, DAY_2: 10.5, DAY_3: 10.5})
+    # 存入挪到 DAY_3：DAY_1/DAY_2 于是是「拿着仓位、钱还没进来」的负净值两天
+    world.db.execute(
+        "UPDATE sim_cash_moves SET ts = ? WHERE reason = '存入 初始'", [_at(DAY_3)]
+    )
+
+    report = _report(world)
+
+    assert (report.start, report.days) == (DAY_2, 2)
+    assert report.dropped_days == 1
+    # DAY_2→DAY_3 价格没动，存入也不算收益
+    assert report.window_return == pytest.approx(0.0, abs=1e-9)
+    assert _row(report, "601088").contribution == pytest.approx(0.0, abs=1e-9)
+
+
 def test_another_users_account_is_not_readable_through_attribution(world) -> None:
     """别人的账户读不到：归因按 `user_id + account_id` 取账户，不是按 id 全库找。"""
     world.users.create("bob", PWD)
