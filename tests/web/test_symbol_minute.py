@@ -56,12 +56,14 @@ def test_bars_answers_a_minute_period_with_the_daily_key_set(logged_minute):
     assert payload["period_label"] == "5分"
     # 分钟档的标签要带上时刻：同一天的三根只写「10-28」在屏幕上分不出谁是谁
     assert payload["dates"][0].endswith("10:55")
+    # 前端按 `basis` 挑蜡烛画哪一族（D302）：分钟这一档因子恒为 1，说 `raw` 才是真话
+    assert payload["basis"] == "raw"
     assert payload["close"] == payload["close_hfq"]
     assert set(payload["main"]["ma"]) and set(payload["sub"]["vol"]) == {"volume"}
 
 
 def test_minute_bars_reuse_the_empty_shape_when_the_chain_refuses(logged_minute):
-    """HK 的分钟 K 不答：200 + 与日线空态同形的 16 个键 + 那句 note。"""
+    """HK 的分钟 K 不答：200 + 与日线空态同形的那一串键 + 那句 note。"""
     _seed(logged_minute, market="HK", code="00700")
     payload = logged_minute.client.get("/api/symbol/HK/00700/bars?period=m5").json()
     assert payload["dates"] == [] and payload["main"] == {} and payload["sub"] == {}

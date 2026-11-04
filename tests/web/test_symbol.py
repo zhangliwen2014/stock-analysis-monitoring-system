@@ -496,19 +496,35 @@ def test_bars_api_empty_state_is_the_same_shape_as_a_real_read(logged):
     assert set(empty) == set(full)
 
 
+def test_bars_api_names_the_two_bases_it_hands_out(logged):
+    """`close` 是交易所那一根，`close_hfq` 是乘过因子那一根，`basis` 说图上画哪一根（D302）。
+
+    R3-06 报的「同一天两个收盘价」其实是同一根日线的两个基：接口把后复权填进 `close`
+    那个键，于是头部现价 383.60 与图上 388.07 都自称收盘价，核对的人得先在心里换基。
+    """
+    _seed_dividend(logged)
+    payload = logged.client.get("/api/symbol/A/600519/bars?days=120").json()
+    assert payload["basis"] == "hfq"
+    assert payload["close"][-1] == pytest.approx(39.90), "库里那一根是不复权收盘"
+    assert payload["close_hfq"][-1] == pytest.approx(42.00), "除息之后乘过因子的是另一根"
+
+
 def test_bars_api_gives_the_four_candle_prices_on_the_adjusted_basis(logged):
     """蜡烛要四档，而四档都得在与均线同一基上（D159）。
     复权之后 `high ≥ max(open, close)`、`low ≤ min(open, close)` 仍要成立，
     否则画出来的是一根实体穿过影线的假蜡烛。"""
     _seed(logged)
     payload = logged.client.get("/api/symbol/A/600519/bars?days=120").json()
-    for column in ("open", "high", "low", "close"):
+    for column in ("open_hfq", "high_hfq", "low_hfq", "close_hfq"):
         assert payload[column], f"{column} 该有数"
         assert len(payload[column]) == len(payload["dates"])
     last = -1
-    assert payload["high"][last] >= max(payload["open"][last], payload["close"][last])
-    assert payload["low"][last] <= min(payload["open"][last], payload["close"][last])
-    assert payload["close"] == payload["close_hfq"], "图上那一档收价就是后复权那一档"
+    assert payload["high_hfq"][last] >= max(
+        payload["open_hfq"][last], payload["close_hfq"][last]
+    )
+    assert payload["low_hfq"][last] <= min(
+        payload["open_hfq"][last], payload["close_hfq"][last]
+    )
 
 
 def test_bars_api_5d_resamples_from_the_daily_bars(logged):

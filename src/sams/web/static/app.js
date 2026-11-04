@@ -44,11 +44,23 @@
     return chart;
   }
 
-  function candlestick(payload, dates) {
+  function candles(payload) {
+    // 接口把两基都给了（D302）：`open/high/low/close` 是交易所原值，`*_hfq` 是乘过累计
+    // 因子的那一根，`basis` 点名图上该画哪一族。均线全算在 `close_hfq` 上，所以画错一族
+    // 就等于把每一次分红都画成「还没收复」
+    return payload.basis === "hfq"
+      ? {
+          open: payload.open_hfq, close: payload.close_hfq,
+          low: payload.low_hfq, high: payload.high_hfq,
+        }
+      : payload;
+  }
+
+  function candlestick(prices, dates) {
     // ECharts 的 candlestick 数据顺序是 [open, close, low, high]，不是 OHLC：
     // 写反会得到实体与影线互相穿过的假蜡烛
     var rows = dates.map(function (_date, i) {
-      return [payload.open[i], payload.close[i], payload.low[i], payload.high[i]];
+      return [prices.open[i], prices.close[i], prices.low[i], prices.high[i]];
     });
     return {
       name: "K线", type: "candlestick", data: rows,
@@ -57,7 +69,7 @@
     };
   }
 
-  function paneSeries(group, pane, payload) {
+  function paneSeries(group, pane, prices) {
     var out = [];
     Object.keys(group).forEach(function (column) {
       var data = group[column];
@@ -69,7 +81,7 @@
           // 量柱跟着那根的涨跌上色：看量要看的是「放量那天是涨是跌」
           itemStyle: {
             color: function (params) {
-              return payload.close[params.dataIndex] >= payload.open[params.dataIndex]
+              return prices.close[params.dataIndex] >= prices.open[params.dataIndex]
                 ? UP : DOWN;
             },
           },
@@ -177,12 +189,13 @@
       indices.push(p);
     });
     var series = [];
-    if (payload.open && payload.open.length) series.push(candlestick(payload, dates));
+    var prices = candles(payload);
+    if (prices.open && prices.open.length) series.push(candlestick(prices, dates));
     Object.keys(payload.main || {}).forEach(function (family) {
-      series = series.concat(paneSeries(payload.main[family], 0, payload));
+      series = series.concat(paneSeries(payload.main[family], 0, prices));
     });
     subNames.forEach(function (family, i) {
-      series = series.concat(paneSeries(payload.sub[family], i + 1, payload));
+      series = series.concat(paneSeries(payload.sub[family], i + 1, prices));
     });
     // 告警详情带过来的那一天：找到就画竖线并把窗口收到它前后各 30 根；
     // 找不到不能假装标上了——默认窗口只有 180 天，那句话得由图注说

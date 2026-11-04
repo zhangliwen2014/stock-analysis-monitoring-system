@@ -306,7 +306,7 @@ def _chart_caption(view: str, period: str) -> str:
 
 
 def _empty_payload(period: str, note: str | None) -> dict:
-    """空态与真数据**同形**的 16 个键。
+    """空态与真数据**同形**的那一串键。
 
     前端在画图之前就读键，缺键会在 `fetch` 之后崩成一片白；这一份现在有两个出口
     （`NotAdjustable` 与分钟档的拒答），所以它只能有一处写法。
@@ -315,10 +315,14 @@ def _empty_payload(period: str, note: str | None) -> dict:
         "dates": [],
         "period": period,
         "period_label": _period_label(period),
+        "basis": "raw",
         "open": [],
         "high": [],
         "low": [],
         "close": [],
+        "open_hfq": [],
+        "high_hfq": [],
+        "low_hfq": [],
         "close_hfq": [],
         "volume": [],
         "main": {},
@@ -390,13 +394,18 @@ def bars_api(
             "dates": [str(value) for value in table["date"].to_list()],
             "period": read.period,
             "period_label": _period_label(read.period),
-            # 蜡烛四档取 `frame` 的 `*_hfq`：`read.table` 那张表只给终端打印（`keep` 白名单），
-            # 没有开/高/低三档。图上那一档与均线同基（`metrics()` 里 MA 全算在 `close_hfq` 上），
-            # 给裸价就等于把均线画到价格线上方——那一段里每一次分红都算成「还没收复」
-            "open": _column(frame, "open_hfq"),
-            "high": _column(frame, "high_hfq"),
-            "low": _column(frame, "low_hfq"),
-            "close": _column(frame, "close_hfq"),
+            # 两基都给，各按各的名字（D302）：`open/high/low/close` 是库里的交易所原值，
+            # `*_hfq` 是乘过累计因子的另一根，`basis` 说图上画的是哪一族。
+            # 以前 `close` 装的是后复权，于是「头部现价 383.60 / 图上同日 388.07」两句都
+            # 自称收盘价（R3-06/R3-20）——两根线可以都画，一个名字不行
+            "basis": "hfq",
+            "open": _column(frame, "open"),
+            "high": _column(frame, "high"),
+            "low": _column(frame, "low"),
+            "close": _column(frame, "close"),
+            "open_hfq": _column(frame, "open_hfq"),
+            "high_hfq": _column(frame, "high_hfq"),
+            "low_hfq": _column(frame, "low_hfq"),
             "close_hfq": _column(frame, "close_hfq"),
             "volume": _column(frame, _VOLUME_COLUMN),
             "main": {name: _group(table, name) for name in mains},
@@ -440,12 +449,16 @@ def _minute_bars_payload(ctx, market, code, period, end, mains, subs, ma_windows
             "dates": [value.strftime("%m-%d %H:%M") for value in table["date"].to_list()],
             "period": read.period,
             "period_label": _period_label(read.period),
-            # 因子恒为 1（D164），所以 `*_hfq` 与裸价逐字相等：键名照旧给，
-            # 前端不必知道这一档没有复权这回事，图注那句才是给人看的口径
-            "open": _column(frame, "open_hfq"),
-            "high": _column(frame, "high_hfq"),
-            "low": _column(frame, "low_hfq"),
-            "close": _column(frame, "close_hfq"),
+            # 因子恒为 1（D164），所以 `*_hfq` 与裸价逐字相等：两族键都给（前端只认一套读法），
+            # `basis` 说 "raw"——这一档没有复权这回事，图注那句才是给人看的口径
+            "basis": "raw",
+            "open": _column(frame, "open"),
+            "high": _column(frame, "high"),
+            "low": _column(frame, "low"),
+            "close": _column(frame, "close"),
+            "open_hfq": _column(frame, "open_hfq"),
+            "high_hfq": _column(frame, "high_hfq"),
+            "low_hfq": _column(frame, "low_hfq"),
             "close_hfq": _column(frame, "close_hfq"),
             "volume": _column(frame, _VOLUME_COLUMN),
             "main": {name: _group(table, name) for name in mains},
