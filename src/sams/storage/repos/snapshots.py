@@ -7,12 +7,25 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime
 
 import polars as pl
 
 from sams.core.codes import canonical_market
 from sams.storage.db import Database
+from sams.storage.repos.bars import ADJUST
+
+#: 快照的 `day` 与日线的 `date` 是同一件事的两个名字，这里统一叫 day
+
+
+@dataclass(frozen=True)
+class CloseMismatch:
+    """一只票某一天的「库里的收盘」与「见证快照里的收盘」。"""
+
+    code: str
+    stored: float
+    witness: float
 
 #: 写入的列（顺序与迁移一致）。market/day/taken_at 由 SQL 侧给，不进帧
 _COLUMNS = (
@@ -84,6 +97,35 @@ class SnapshotRepo:
             f"SELECT * FROM {self.TABLE} WHERE market = ? AND day = ? ORDER BY code",
             [canonical_market(market), day],
         )
+
+    def close_mismatches(
+        self, market: str, day: date, *, tolerance: float
+    ) -> list[CloseMismatch]:
+        """某一天「库里的收盘」与「当天的收盘快照」对不上的那些票，差得最多的排前面。
+
+        只比两边都有数的票：快照里有、库里当天没 K 线，最常见的解释是停牌，把它算成不平
+        会往补数队列里塞几千行根本补不出来的活，真正的缺口反而排不上。
+        `b.close > 0` 不是防除零的装饰：收盘为 0 的那几行是源给的脏数，除下去就是无穷大。
+        """
+        rows = self.db.query(
+            f"""
+            SELECT b.code AS code, b.close AS stored, s.price AS witness
+            FROM bars_daily b
+            JOIN {self.TABLE} s
+              ON s.market = b.market AND s.code = b.code AND s.day = b.date
+            WHERE b.market = ? AND b.date = ? AND b.adjust = ? AND b.close > 0
+              AND s.price IS NOT NULL
+              AND abs(b.close - s.price) / b.close > ?
+            ORDER BY abs(b.close - s.price) / b.close DESC
+            """,
+            [canonical_market(market), day, ADJUST, tolerance],
+        )
+        return [
+            CloseMismatch(
+                code=row["code"], stored=float(row["stored"]), witness=float(row["witness"])
+            )
+            for row in rows.to_dicts()
+        ]
 
     def count(self) -> int:
         return int(self.db.scalar(f"SELECT count(*) FROM {self.TABLE}") or 0)

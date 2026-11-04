@@ -40,7 +40,7 @@ from sams.services.scheduler.types import (
     JobOutcome,
     JobSpec,
 )
-from sams.storage.repos.symbol_backfills import ACTIONS
+from sams.storage.repos.symbol_backfills import ACTIONS, BARS
 
 #: 首次见到一只票时回补多久：对齐 PR 分位的样本地板 `MIN_SAMPLES = 250`
 #: （`analysis/valuation/percentile.py`：少于它，「分位说的是抽样噪声而不是估值位置」）。
@@ -308,6 +308,36 @@ def run_spot(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     if report.skipped:
         note += f"，源没答 {len(report.skipped)} 只"
     return JobOutcome(rows_affected=report.rows, note=note)
+
+
+#: 收盘对账的容差（相对差）。不能用绝对差：A 股低价票一档 0.01 元就是 0.3%，
+#: 而 300 元的票差 0.05 元连 0.02% 都不到。0.1% 以内一律当作「快照与日线取的时刻差几分钟」
+CLOSE_TOLERANCE = 0.001
+
+
+def run_close_check(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """当晚的收盘快照是当天日线收盘的见证；对不上的自动排一次日线重采（D301）。
+
+    这一趟不联网、不改价，只做「查出来 + 排进队列 + 留一行读数」。屏幕上永远不该出现
+    「请你重采日线」那一类话：数据不全是后台的事。重采走 `symbol_backfills` 那条队，
+    消费者拉的是 730 天，所以定稿窗口（D300）够不着的老账也由这一条自动盖回去。
+    """
+    assert ctx.market is not None  # 对账 job 只在市场 job 上登记
+    assert deps.snapshots is not None  # 登记前查过注入，这里只兜编程错误
+    assert deps.backfills is not None
+    audit = deps.snapshots.audit_closes(ctx.market, ctx.as_of, tolerance=CLOSE_TOLERANCE)
+    if audit.witness_day is None:
+        return JobOutcome(note=f"{ctx.market} {ctx.as_of} 没有收盘快照：这一晚不对账")
+    off = audit.mismatches
+    for row in off:
+        deps.backfills.enqueue(ctx.market, row.code, BARS)
+    note = f"{ctx.market} {ctx.as_of} 与收盘快照比对：{len(off)} 只不平"
+    if off:
+        head = "、".join(
+            f"{row.code} 库{row.stored:.2f}/快照{row.witness:.2f}" for row in off[:5]
+        )
+        note = f"{note}，已排重采：{head}"
+    return JobOutcome(rows_affected=len(off), note=note)
 
 
 def run_screener(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -725,6 +755,12 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         # 快照排在数据链之后：它读的是当天收盘价，与日线那批互不依赖，但都在盘后完成
         if deps.snapshots is not None and _has(deps, market, "market_snapshot"):
             jobs.append(JobSpec("spot", DAILY, market, partial(run_spot, deps)))
+            # 收盘对账紧跟它的见证：比的是今晚这一张快照。没有补数队列就不登记——
+            # 查出来却没地方排重采，那一趟只剩一句「有 N 只不平」，把问题念给人听
+            if deps.backfills is not None:
+                jobs.append(
+                    JobSpec("close-check", DAILY, market, partial(run_close_check, deps))
+                )
         # 方案监控读的是当晚刚落的快照，排在 spot 之后；先于 rules/digest，
         # 今晚的新命中才进得了同一晚的规则链与摘要（S4-B）
         if deps.screener_monitor is not None:

@@ -18,7 +18,7 @@ import polars as pl
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import ValidationError
-from sams.storage.repos.snapshots import SnapshotRepo
+from sams.storage.repos.snapshots import CloseMismatch, SnapshotRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
 
 
@@ -33,6 +33,18 @@ class SnapshotSync:
     skipped: tuple[str, ...] = ()
     source: str = ""
     empty_everywhere: bool = False
+
+
+@dataclass(frozen=True)
+class CloseAudit:
+    """一晚的收盘对账：当天有没有见证快照，以及与它对不上的那些票。
+
+    `witness_day=None` 与「有见证且零只不平」是两种答案，不能都写成 0：前者是这一晚
+    什么都没比对，后者是比对过且相符。
+    """
+
+    witness_day: date | None
+    mismatches: tuple[CloseMismatch, ...]
 
 
 class MarketSnapshotService:
@@ -89,6 +101,23 @@ class MarketSnapshotService:
             universe_size=len(wanted),
             skipped=tuple(code for code in wanted if code not in answered),
             source=result.source,
+        )
+
+    def audit_closes(self, market: str, day: date, *, tolerance: float) -> CloseAudit:
+        """当天这一份全市场快照，与库里的日线逐只对一遍（D301）。
+
+        见证是快照，不是另一个日线源：那一篮价格是盘后取的、不复权、覆盖全市场，
+        而「库里这根 K 线是什么时候写的」没有第二处能回答。没有当天那一份时不拿
+        前一天冒充——那会把「今天还没收盘」念成「今天的收盘价和昨天一样」。
+        """
+        market = canonical_market(market)
+        if self.snapshots.latest_until(market, day) != day:
+            return CloseAudit(witness_day=None, mismatches=())
+        return CloseAudit(
+            witness_day=day,
+            mismatches=tuple(
+                self.snapshots.close_mismatches(market, day, tolerance=tolerance)
+            ),
         )
 
 
