@@ -406,7 +406,8 @@ class NavService:
         change = pct = None
         if latest is not None and previous is not None and previous.nav:
             change = latest.nav - previous.nav - latest.external_flow
-            pct = change / previous.nav
+            if _usable_as_base(previous.nav):
+                pct = change / previous.nav
 
         run = self._run_ending_at(points, latest)
         twr, twr_start = _twr(run)

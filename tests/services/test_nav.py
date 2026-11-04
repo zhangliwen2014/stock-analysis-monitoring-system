@@ -260,6 +260,64 @@ def test_the_current_drawdown_is_peak_to_latest_not_the_window_max(world) -> Non
     assert series.current_drawdown == pytest.approx((100_200.0 - 100_100.0) / 100_200.0)
 
 
+def test_a_day_without_positive_nav_ends_the_drawdown_run(world) -> None:
+    """净值不是正数的那天不进回撤那一段（D297）：实机印出过 `129,152%`。
+
+    先买后入金的回填历史里有这样一段：撑得起高点的那个「正数」只有一两千块，紧接着的坑是负净值，
+    `(peak − trough) / peak` 于是远大于 1。这种天数当分母时什么都说明不了，所以整段不要。
+    """
+    _buy(world, date(2024, 1, 2), qty=10_000, price=10.0)  # 花光 100,000，买到 10,000 股
+    world.db.execute(
+        "UPDATE sim_cash_moves SET ts = ? WHERE reason = '存入 初始'",
+        [_at(date(2024, 1, 8))],  # 钱在窗口之后才进来：这四天的现金都是 −100,000
+    )
+    _bars(
+        world,
+        {
+            date(2024, 1, 2): 10.1,  # 101,000 − 100,000 = +1,000：那段唯一的高点
+            date(2024, 1, 3): 9.0,  # − 10,000
+            date(2024, 1, 4): 9.5,  # − 5,000
+            date(2024, 1, 5): 8.0,  # − 20,000：今天本身就是负净值
+        },
+    )
+
+    world.nav.rebuild(world.account.id, date(2024, 1, 2), date(2024, 1, 5))
+    series = world.nav.series(world.account.id, date(2024, 1, 2), date(2024, 1, 5))
+
+    assert _row(series, date(2024, 1, 5)).nav == pytest.approx(-20_000.0)
+    assert series.max_drawdown is None
+    assert series.current_drawdown is None
+
+
+def test_the_day_change_percent_is_not_divided_by_a_negative_previous_nav(world) -> None:
+    """「当日涨跌」的百分比也一样：昨日净值是负数就不给比率，金额照给（D297）。
+
+    金额 `180,000 − (−20,000) − 100,000 = 100,000` 说的是行情赚了多少，仍然成立；
+    同一个数除以 −20,000 得到 −500%，而屏幕上那一格的名字是「当日涨跌」。
+    """
+    _buy(world, date(2024, 1, 2), qty=10_000, price=10.0)  # 花光 100,000，买到 10,000 股
+    world.db.execute(
+        "UPDATE sim_cash_moves SET ts = ? WHERE reason = '存入 初始'",
+        [_at(date(2024, 1, 4))],
+    )
+    _bars(
+        world,
+        {
+            date(2024, 1, 2): 9.0,  # 90,000 − 100,000 = −10,000
+            date(2024, 1, 3): 8.0,  # 80,000 − 100,000 = −20,000
+            date(2024, 1, 4): 18.0,  # 存入到账，180,000 + 0
+        },
+    )
+
+    world.nav.rebuild(world.account.id, date(2024, 1, 2), date(2024, 1, 4))
+    series = world.nav.series(world.account.id, date(2024, 1, 2), date(2024, 1, 4))
+
+    assert series.previous is not None and series.previous.nav == pytest.approx(-20_000.0)
+    assert series.latest is not None and series.latest.nav == pytest.approx(180_000.0)
+    assert series.day_change == pytest.approx(100_000.0)
+    assert series.day_change_pct is None
+
+
 def test_a_hong_kong_position_is_converted_at_the_daily_rate(world) -> None:
     world.ledger.buy(
         world.account.id,
