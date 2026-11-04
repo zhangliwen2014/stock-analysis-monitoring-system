@@ -210,10 +210,10 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
         (spec.name, spec.market) for spec in container.scheduler.jobs
     ]
 
-    # 库里铺到 10-24，今晚拉回 10-24 与 10-25 两根：后者是新的，前者是「当天那根重定稿」
-    # （D300，白天写进去的盘中价必须在收盘后被覆盖）。「全都已跑过」的空转跑不出这个数
+    # 库里铺到 10-24，今晚拉的是定稿窗口 10-10..10-25（D300）：那 12 个工作日全重写一遍，
+    # 其中 10-25 是新的。「全都已跑过」的空转跑不出这个数
     by_key = {(r.job, r.market): r for r in report.results}
-    assert by_key[("bars", "A")].rows_affected == 2
+    assert by_key[("bars", "A")].rows_affected == 12
     assert BarRepo(db).latest_date("A", sample.CODE) == AS_OF
 
     # 告警的档位与数值都只能来自今晚刚写进去的那一根：昨晚那根（17.06）在止损线上方，

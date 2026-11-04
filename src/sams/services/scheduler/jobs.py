@@ -48,6 +48,9 @@ from sams.storage.repos.symbol_backfills import ACTIONS
 #: 长期停牌的票回补下来仍可能不足，那种票本就不该有分位。
 INITIAL_SYNC_DAYS = 730
 
+#: 日线定稿余量（日历天）：约十个交易日，够盖过一场长假。
+SETTLE_DAYS = 14
+
 
 def _window(latest: date | None, as_of: date) -> date | None:
     """增量窗口的起点；返回 None 表示已经追平到今天，没什么可问。"""
@@ -56,14 +59,17 @@ def _window(latest: date | None, as_of: date) -> date | None:
 
 
 def _settle_window(latest: date | None, as_of: date) -> date | None:
-    """日线的增量窗口：起点是 `latest` 那一天自己，不是它的后一天（D300）。
+    """日线的增量窗口：从 `latest` 往前多回 `SETTLE_DAYS` 天（D300）。
 
-    差的那一格就是这枚修复的全部：一根 K 线写进库时值多少，取决于写它的那一刻收盘了
-    没有，而 `_window` 只往前走——白天手动跑过一次、或补采队列落下一根当日半截 K 线之后，
-    `latest + 1 > as_of` 让这一晚一只票都不问，那根盘中价从此永远是这一天的收盘价。
-    重拉一遍是幂等的（`upsert`），代价是每晚每只票多问一天。
+    与 `_window` 差的就是这一格回退。一根 K 线写进库时值多少，取决于写它的那一刻
+    收盘了没有，而 `_window` 只往前走——白天手动跑过一次、或补采队列落下一根当日
+    半截 K 线之后，`latest + 1 > as_of` 让这一晚一只票都不问，那根盘中价从此永远是
+    这一天的收盘价。回退不增加请求数（`fetch_daily` 是每票一次请求，不是每天一次），
+    重拉又是幂等的（`upsert`），所以这一条既修当下，也把自己写坏的那批历史盖回去。
     """
-    start = latest if latest else as_of - timedelta(days=INITIAL_SYNC_DAYS)
+    if latest is None:
+        return as_of - timedelta(days=INITIAL_SYNC_DAYS)
+    start = latest - timedelta(days=SETTLE_DAYS)
     return None if start > as_of else start
 
 

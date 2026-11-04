@@ -279,7 +279,11 @@ def ctx(*codes: str) -> JobContext:
     )
 
 
-def test_bars_job_is_incremental(db, settings):
+def test_the_nightly_bars_window_reopens_the_settle_margin(db, settings):
+    """窗口起点不是「库里最新一根的后一天」，而是它往前 14 个日历天（D300）。
+
+    按日历天不是交易日：长假之后要覆盖的还是那几天。
+    """
     BarRepo(db).upsert(
         sample_bars(start=date(2024, 10, 24)).filter(pl.col("date") == date(2024, 10, 24))
     )
@@ -287,12 +291,14 @@ def test_bars_job_is_incremental(db, settings):
         frame=sample_bars(start=date(2024, 10, 25)).filter(pl.col("date") == date(2024, 10, 25))
     )
     outcome = run_bars(deps(db, settings, bars=adapter), ctx("600519"))
-    assert adapter.calls == [("A", "600519", date(2024, 10, 24), AS_OF)]
+    assert adapter.calls == [
+        ("A", "600519", date(2024, 10, 24) - timedelta(days=14), AS_OF)
+    ]
     assert outcome.rows_affected == 1
     assert BarRepo(db).latest_date("A", "600519") == AS_OF
 
 
-def test_the_nightly_bars_job_repulls_the_newest_bar(db, settings):
+def test_a_bar_already_written_today_is_repulled(db, settings):
     """库里已经有今天那一根，今晚仍要把它重拉一遍（D300）。
 
     一根日线写进来时值多少，取决于写它的那一刻收盘了没有。白天手动跑过一次 `bars`
@@ -303,7 +309,7 @@ def test_the_nightly_bars_job_repulls_the_newest_bar(db, settings):
     BarRepo(db).upsert(sample_bars(start=AS_OF).filter(pl.col("date") == AS_OF))
     adapter = RecordingBarsAdapter(frame=sample_bars(start=AS_OF))
     outcome = run_bars(deps(db, settings, bars=adapter), ctx("600519"))
-    assert adapter.calls == [("A", "600519", AS_OF, AS_OF)]
+    assert adapter.calls == [("A", "600519", AS_OF - timedelta(days=14), AS_OF)]
     assert outcome.rows_affected == 1
 
 
