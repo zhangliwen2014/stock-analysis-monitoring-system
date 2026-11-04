@@ -416,6 +416,36 @@ def run_dividends(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return JobOutcome(rows, note, tuple(errors))
 
 
+def run_rate_repairs(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """把这一市场里的占位汇率（1.0000）按成交日回算（D293）。
+
+    与分红同一形状：单元是「一个账户」，市场在调用参数里，三个市场各跑一趟、各管本市场的
+    成交。排在分红之后、净值之前——补的那笔差额要进今晚的曲线，曲线必须在钱修完之后再算。
+
+    取不到汇率、或补差会把口袋扣穿的那些笔整笔不动，明天这一趟再试：这一趟不报错，
+    因为「还没修好」不是这一趟失败，而持仓卡上那句「系统会自动回算」本来就是它的去处。
+    """
+    assert ctx.market is not None  # 回算 job 只在市场 job 上登记
+    assert deps.ledger is not None and deps.sim_accounts is not None
+    users = active_users(deps.users)
+    rows = done = 0
+    errors: list[str] = []
+    for user in users:
+        for account in deps.sim_accounts.list_for(user.id):
+            try:
+                rows += deps.ledger.repair_placeholder_rates(
+                    account.id, ctx.as_of, market=ctx.market
+                )
+            except SamsError as exc:
+                errors.append(f"{user.username} {account.name}: {exc}")
+                continue
+            done += 1
+    note = f"{done} 个账户回算 {rows} 笔占位汇率" if rows else f"{done} 个账户没有占位汇率要回算"
+    if errors:
+        note += f"，{len(errors)} 个账户失败"
+    return JobOutcome(rows, note, tuple(errors))
+
+
 def run_nav(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """逐个账户重放最近 400 天的净值（S4-D §6.3）。
 
@@ -629,6 +659,8 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         # 净值重放读的是同一晚的收盘价，并且要包含刚入账的那笔派息（S4-D）
         if deps.dividends is not None and deps.sim_accounts is not None:
             jobs.append(JobSpec("dividends", DAILY, market, partial(run_dividends, deps)))
+        if deps.ledger is not None and deps.sim_accounts is not None:
+            jobs.append(JobSpec("rate-repair", DAILY, market, partial(run_rate_repairs, deps)))
         if deps.nav is not None and deps.sim_accounts is not None:
             jobs.append(JobSpec("nav", DAILY, market, partial(run_nav, deps)))
         # 新闻排在数据链之后、行业回填之前：公告与新闻同一晚落库，行业回填与它们无关；

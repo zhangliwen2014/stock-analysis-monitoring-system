@@ -199,7 +199,10 @@ def test_a_placeholder_base_rate_of_one_is_flagged_with_its_two_pieces(db, portf
     assert row.total_report == pytest.approx(-3_800.97, abs=0.01)
     assert row.price_report + row.fx_pnl == pytest.approx(row.total_report)
     assert row.rate_note is not None
-    assert "1.0000" in row.rate_note and "撤销" in row.rate_note
+    assert "1.0000" in row.rate_note
+    # 不给用户派活：这行脏数据是系统自己录的，回算由后台那一趟做（D293）
+    assert "自动回算" in row.rate_note
+    assert "撤销" not in row.rate_note
 
 
 def test_a_real_base_rate_carries_no_placeholder_note(db, portfolio) -> None:

@@ -24,6 +24,7 @@ from sams.services.f10 import F10SyncService
 from sams.services.fundamentals import FundamentalSyncService
 from sams.services.fx import FxSyncService
 from sams.services.industry import IndustryService
+from sams.services.ledger import LedgerService
 from sams.services.market_snapshot import MarketSnapshotService
 from sams.services.nav import NavService
 from sams.services.news import NewsService
@@ -132,6 +133,8 @@ class JobDeps:
     nav: NavService | None = None
     #: 账户名册：分红与净值两趟的单元是「一个账户」，按用户逐个取
     sim_accounts: SimAccountRepo | None = None
+    #: 占位汇率回算（D293）：账本写用例自己带汇率读模型，这一趟只调它
+    ledger: LedgerService | None = None
     #: 补数队列（D283）：`actions` job 开跑前把昨天没补上的行顺延回 pending，给一份新预算。
     #: 带默认值：没装这一层的部署照旧能构造 `JobDeps`，只是队列会一天一躺平
     backfills: SymbolBackfillRepo | None = None

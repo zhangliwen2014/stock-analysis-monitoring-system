@@ -11,21 +11,24 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time
 
 from sams.core import funds
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.config import Settings
 from sams.core.errors import StorageError, ValidationError
 from sams.core.version import VersionGate
-from sams.services.actors import resolve_actor
+from sams.services.actors import SYSTEM_ACTOR, resolve_actor
+from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import (
+    BUY,
     Account,
     FxTrade,
     Order,
     Position,
     SimAccountRepo,
     SimOrderRepo,
+    settled_amount,
 )
 from sams.storage.repos.theses import OBSERVING, PROPOSED, ThesisRepo
 from sams.storage.repos.users import User, UserRepo
@@ -33,6 +36,9 @@ from sams.storage.repos.users import User, UserRepo
 #: 能挂成交的立论状态：还没建仓的不能挂——那会在时间线上留下一个从未发生的「我当时买了」。
 #: 归档/失效的那两条能挂：「事后回头看，这笔是按当时的立论买的」是真实发生过的事。
 _UNBORN = (OBSERVING, PROPOSED)
+
+#: 占位汇率：D213 之前录进去的那个值。它不是汇率，是把标的币种当成了报告币种
+_PLACEHOLDER_RATE = 1.0
 
 
 class LedgerService:
@@ -45,6 +51,7 @@ class LedgerService:
         settings: Settings,
         *,
         versions: VersionGate | None = None,
+        fx: FxRepo | None = None,
     ) -> None:
         self.accounts = accounts
         self.orders = orders
@@ -54,6 +61,8 @@ class LedgerService:
         #: 盘中缓存的失效闸（§5.4）：成交与现金都读得到「现在有多少」。可选，
         #: 理由见 `RuleService.versions`
         self.versions = versions
+        #: 回算占位汇率要按成交日取汇率（D293）：同一个库上的读模型，不另找构造点
+        self.fx = fx if fx is not None else FxRepo(accounts.db)
 
     def _bump(self) -> None:
         """写面动过就 bump：盘中缓存整表失效（§5.4）。没接闸的构造点静默跳过。"""
@@ -104,6 +113,61 @@ class LedgerService:
         undone = self.orders.undo_fill(account_id, order_id, actor_id=user.id)
         self._bump()
         return undone
+
+    def repair_placeholder_rates(
+        self, account_id: str, as_of: date, *, market: str | None = None
+    ) -> int:
+        """把 D213 之前录进去的占位汇率按成交日的汇率回算，返回修好的笔数（D293）。
+
+        这种行今天的写入口已经录不出来（`record_fill` 拒 1.0），可库里那几行还带着它，
+        而后果是持仓上凭空多出一段换汇亏损。把它交给用户「撤销重录」等于让系统自己的
+        历史脏数据变成别人的手工活（与 D283 同一口径：数据不全由后台补）。
+
+        `market` 是盘后链的形状：三个市场各跑一趟，各管本市场的成交（同分红入账）。
+        两个不动的条件：成交日在汇率表里取不到（含退到最近一条也超期），或补差会把口袋
+        扣穿。都不整笔动、留给下一晚——汇率同步补齐或用户入金的那一晚它自然就好了。
+        """
+        account = self.accounts.find(account_id)
+        if account is None:
+            raise StorageError(f"账户 {account_id} 不存在")
+        wanted = canonical_market(market) if market is not None else None
+        repaired = 0
+        for order in self.orders.orders(account_id):
+            recorded = order.fx_rate_applied
+            if recorded != _PLACEHOLDER_RATE or order.currency == account.report_currency:
+                continue
+            if wanted is not None and order.market != wanted:
+                continue
+            zone = self.settings.market_cfg(order.market).zone()
+            day = order.ts.astimezone(zone).date()
+            if day > as_of:
+                continue
+            fx = self.fx.latest(day, order.currency, account.report_currency)
+            if fx is None or fx.rate == _PLACEHOLDER_RATE:
+                continue
+            args = (order.side, order.qty, order.price, order.fee)
+            delta = settled_amount(*args, fx.rate) - settled_amount(*args, recorded)
+            reason = (
+                f"回算 {day} 那笔 {order.market} {order.code} "
+                f"{'买入' if order.side == BUY else '卖出'}的结算汇率："
+                f"{recorded:.4f} → {fx.rate:.4f}（当日 {order.currency}→"
+                f"{account.report_currency}），{account.report_currency} 口袋补 {delta:+,.2f}"
+            )
+            try:
+                self.orders.repave_rate(
+                    account_id,
+                    order.id,
+                    rate=fx.rate,
+                    reason=reason,
+                    actor_id=SYSTEM_ACTOR,
+                    # 补在成交那天：余额是重算出来的，曲线也要从那一天起才对
+                    ts=datetime.combine(day, time(15, 0), tzinfo=zone),
+                )
+            except StorageError:
+                continue
+            repaired += 1
+        self._bump()
+        return repaired
 
     def convert(
         self,

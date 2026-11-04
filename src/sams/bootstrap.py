@@ -923,6 +923,7 @@ def _context_on(
         dividends=dividends,
         nav=nav,
         sim_accounts=sim_accounts,
+        ledger=ledger,
         backfills=backfills_store,
     )
     scheduler = Scheduler(

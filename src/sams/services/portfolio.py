@@ -255,14 +255,15 @@ class PortfolioService:
         )
         if pos.currency != report and rate_base == 1.0:
             # 配置里的币种两两都不是 1:1：跨币种的基准汇率记成 1.0，几乎总是录入时的
-            # 占位值。数照算（不静默改账），但这一行得自己说清那段换汇从哪来（D212）
+            # 占位值。数照算（不静默改账），但这一行得自己说清那段换汇从哪来（D212）。
+            # 修它的是后台那一趟按成交日回算（D293），不是用户的手工活：这句不许再派活
             return replace(
                 row,
                 rate_note=(
                     f"{pos.market} {pos.code} 的基准汇率记成了 1.0000"
                     f"（{price_day} 的 {pos.currency}→{report} 是 {rate_today:.4f}）："
                     f"换汇段是按这个录入值拆的，看着像多出来的一笔亏损；"
-                    f"若当时录错，撤销那笔买入并按实际汇率重记"
+                    f"系统会按成交日的汇率自动回算，补齐后这一行自己会变"
                 ),
             )
         return row

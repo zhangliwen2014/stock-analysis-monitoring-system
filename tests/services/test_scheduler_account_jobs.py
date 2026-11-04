@@ -20,6 +20,7 @@ from sams.services.scheduler.jobs import (
     build_jobs,
     run_dividends,
     run_nav,
+    run_rate_repairs,
 )
 from sams.services.scheduler.types import JobContext, JobDeps
 from sams.services.scheduler.universe import Universe
@@ -29,7 +30,7 @@ from sams.storage.repos.users import UserRepo
 AS_OF = date(2024, 10, 25)
 
 
-def _deps(db, settings, *, dividends=None, nav=None, sim_accounts=None, chain=()):
+def _deps(db, settings, *, dividends=None, nav=None, ledger=None, sim_accounts=None, chain=()):
     return JobDeps(
         settings=settings,
         registry=SimpleNamespace(chain_for=lambda market, method: chain),  # type: ignore[arg-type]
@@ -45,6 +46,7 @@ def _deps(db, settings, *, dividends=None, nav=None, sim_accounts=None, chain=()
         digest=SimpleNamespace(),  # type: ignore[arg-type]
         dividends=dividends,
         nav=nav,
+        ledger=ledger,
         sim_accounts=sim_accounts if sim_accounts is not None else SimAccountRepo(db),
     )
 
@@ -171,13 +173,20 @@ def test_nav_job_leaves_broken_accounts_in_errors(db, settings):
 
 def test_build_jobs_puts_dividends_and_nav_after_actions_and_before_rules(db, settings):
     deps = _deps(
-        db, settings, dividends=RecordingDividends(), nav=RecordingNav(), chain=("stub",)
+        db,
+        settings,
+        dividends=RecordingDividends(),
+        nav=RecordingNav(),
+        ledger=RecordingRepairs(),
+        chain=("stub",),
     )
     titles = [job.title for job in build_jobs(deps)]
 
     for market in sorted(settings.markets):
         assert titles.index(f"actions@{market}") < titles.index(f"dividends@{market}")
-        assert titles.index(f"dividends@{market}") < titles.index(f"nav@{market}")
+        assert titles.index(f"dividends@{market}") < titles.index(f"rate-repair@{market}")
+        # 回算补的那笔差额要进今晚的净值：曲线必须在钱修完之后再算
+        assert titles.index(f"rate-repair@{market}") < titles.index(f"nav@{market}")
         assert titles.index(f"nav@{market}") < titles.index(f"rules@{market}")
         assert titles.index(f"rules@{market}") < titles.index(f"digest@{market}")
 
@@ -185,4 +194,54 @@ def test_build_jobs_puts_dividends_and_nav_after_actions_and_before_rules(db, se
 def test_build_jobs_registers_neither_job_without_its_dependency(db, settings):
     titles = [job.title for job in build_jobs(_deps(db, settings))]
 
-    assert not any(title.startswith(("dividends@", "nav@")) for title in titles)
+    assert not any(
+        title.startswith(("dividends@", "nav@", "rate-repair@")) for title in titles
+    )
+
+
+class RecordingRepairs:
+    """只记「问了谁」：回算本身的用例在 `test_ledger_service.py`，这一层钉的是排班。"""
+
+    def __init__(self, *, fail_on: str | None = None, repaired: int = 1):
+        self.fail_on = fail_on
+        self.repaired = repaired
+        self.calls: list[tuple[str, date, str | None]] = []
+
+    def repair_placeholder_rates(self, account_id, as_of, *, market=None):
+        self.calls.append((account_id, as_of, market))
+        if account_id == self.fail_on:
+            raise StorageError("账户账本损坏")
+        return self.repaired
+
+
+def test_rate_repair_job_asks_every_account_about_this_market(db, settings):
+    repo, a, hk, bob_a = _accounts(db)
+    service = RecordingRepairs()
+    outcome = run_rate_repairs(_deps(db, settings, ledger=service), _ctx())
+
+    # 与分红同一形状：账户不分市场，市场在调用参数里——A 那一趟不去改港股的成交
+    assert {call[0] for call in service.calls} == {a.id, hk.id, bob_a.id}
+    assert {(call[1], call[2]) for call in service.calls} == {(AS_OF, "A")}
+    assert outcome.rows_affected == 3
+    assert "3 个账户回算 3 笔" in outcome.note
+    assert outcome.ok
+
+
+def test_rate_repair_job_leaves_one_broken_account_in_errors(db, settings):
+    repo, a, hk, bob_a = _accounts(db)
+    outcome = run_rate_repairs(_deps(db, settings, ledger=RecordingRepairs(fail_on=a.id)), _ctx())
+
+    assert outcome.rows_affected == 2
+    assert len(outcome.errors) == 1 and "alice" in outcome.errors[0]
+    assert "1 个账户失败" in outcome.note
+
+
+def test_rate_repair_job_says_so_when_there_is_nothing_to_fix(db, settings):
+    """一笔都没修也要说得清：note 里那句「没有占位汇率」是健康页唯一的读数来源。"""
+    outcome = run_rate_repairs(
+        _deps(db, settings, ledger=RecordingRepairs(repaired=0)), _ctx()
+    )
+
+    assert outcome.rows_affected == 0
+    assert "没有占位汇率要回算" in outcome.note
+    assert outcome.ok

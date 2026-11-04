@@ -7,14 +7,19 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
 from sams.core.errors import StorageError, ValidationError
 from sams.services.ledger import LedgerService
 from sams.storage.db import Database
-from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+from sams.storage.repos.fx import FxRepo
+from sams.storage.repos.ledger import (
+    Order,
+    SimAccountRepo,
+    SimOrderRepo,
+)
 from sams.storage.repos.symbols import SymbolRepo
 from sams.storage.repos.theses import ThesisRepo
 from sams.storage.repos.users import UserRepo
@@ -23,6 +28,45 @@ USER = "trader"
 PWD = "correct-horse-battery"
 #: 立论那三步要落时刻（0013 的测量日、时间线的 ts），测试里冻死它，不看真实钟表
 NOW = datetime(2024, 10, 26, 2, 0, tzinfo=UTC)
+#: 占位汇率那笔的成交时刻：HK 本地 15:00，回算按这一天去汇率表取数
+FILL_TS = datetime(2024, 6, 3, 7, 0, tzinfo=UTC)
+FILL_DAY = date(2024, 6, 3)
+
+
+def _placeholder_fill(svc: LedgerService, db: Database, account_id: str) -> Order:
+    """把一笔港股通成交还原成 D213 之前的样子：汇率两列是 1.0，CNY 也按 1.0 扣过。
+
+    `record_fill` 现在拒 1.0（它是唯一一条 INSERT 路径），存量就得手工还原。还原要连现金
+    一起改：只动汇率列，被测的是一笔本来就没扣错钱的账——补出来的差额是真的，场景是假的。
+    """
+    order = svc.buy(
+        account_id, USER, "HK", "01021", qty=10, price=400.0, fx_rate=0.92, ts=FILL_TS
+    )
+    # 占位值该扣的与当初真扣的差多少（fee=0，所以就是名义额 × (1 − 0.92)）
+    short = order.qty * order.price * (1.0 - 0.92)
+    db.execute(
+        "UPDATE sim_orders SET fx_rate_ref = 1.0, fx_rate_applied = 1.0 WHERE id = ?",
+        [order.id],
+    )
+    db.execute(
+        "UPDATE sim_cash_moves SET delta = delta - ?"
+        " WHERE account_id = ? AND kind = 'buy'",
+        [short, account_id],
+    )
+    db.execute(
+        "UPDATE sim_cash_balances SET amount = amount - ?"
+        " WHERE account_id = ? AND currency = 'CNY'",
+        [short, account_id],
+    )
+    return order
+
+
+def _adjust_rows(db: Database, account_id: str) -> list[dict]:
+    return db.query(
+        "SELECT currency, delta, reason, actor_id FROM sim_cash_moves"
+        " WHERE account_id = ? AND kind = 'adjust' ORDER BY ts",
+        [account_id],
+    ).to_dicts()
 
 
 @pytest.fixture
@@ -156,6 +200,86 @@ def test_buy_can_settle_in_the_report_currency_at_the_given_rate(svc) -> None:
     assert order.currency == "HKD"
     assert order.fx_rate_applied == pytest.approx(0.91)
     assert svc.cash(account_id) == {"CNY": pytest.approx(100_000.0 - 3_640.0)}
+
+
+def test_a_placeholder_rate_is_repaved_from_the_days_fx_rate(svc, db) -> None:
+    """存量占位汇率由后台按成交日汇率回算，并补一条说得清来处的现金流水（D293）。
+
+    测试者说这一屏「最可信」的是每条流水都带理由，那就不能改历史那行：余额是重算出来的，
+    把当初那条 buy 的数额改掉，等于抹掉「谁在什么时候因为什么动过多少钱」。
+    """
+    FxRepo(db).put(FILL_DAY, "HKD", "CNY", 0.92)
+    account_id = _funded(svc, "文-中国银河")
+    order = _placeholder_fill(svc, db, account_id)
+
+    repaired = svc.repair_placeholder_rates(account_id, date(2024, 6, 4))
+
+    assert repaired == 1
+    after = svc.orders.order(account_id, order.id)
+    assert after.fx_rate_ref == pytest.approx(0.92)
+    assert after.fx_rate_applied == pytest.approx(0.92)
+    rows = _adjust_rows(db, account_id)
+    assert len(rows) == 1
+    assert rows[0]["currency"] == "CNY"
+    # 按 1.0 扣了 4,000，按 0.92 只该扣 3,680：退 320 回 CNY 口袋
+    assert rows[0]["delta"] == pytest.approx(320.0)
+    assert rows[0]["actor_id"] == "system"
+    assert "1.0000" in rows[0]["reason"] and "0.9200" in rows[0]["reason"]
+    assert svc.cash(account_id)["CNY"] == pytest.approx(100_000.0 - 4_000.0 + 320.0)
+    # 幂等：这一笔已经不是占位值，重跑不能再补一条流水
+    assert svc.repair_placeholder_rates(account_id, date(2024, 6, 4)) == 0
+    assert len(_adjust_rows(db, account_id)) == 1
+
+
+def test_a_placeholder_rate_without_fx_history_is_left_alone(svc, db) -> None:
+    """那天前后都取不到汇率 ⇒ 一行不改、一条流水都不写。
+
+    回算的依据是成交日的汇率，不是「拿最近那个数凑」：凑出来的结算额比留着占位值
+    更难发现——屏幕上那句「汇率记成了 1.0000」至少还看得出来不对。
+    """
+    account_id = _funded(svc, "文-中国银河")
+    order = _placeholder_fill(svc, db, account_id)
+
+    assert svc.repair_placeholder_rates(account_id, date(2024, 6, 4)) == 0
+    after = svc.orders.order(account_id, order.id)
+    assert after.fx_rate_applied == pytest.approx(1.0)
+    assert _adjust_rows(db, account_id) == []
+    assert svc.cash(account_id)["CNY"] == pytest.approx(96_000.0)
+
+
+def test_a_repair_that_would_overdraw_the_account_changes_nothing(svc, db) -> None:
+    """补差会把口袋扣穿 ⇒ 汇率两列也不动：要么整笔修好，要么整笔不碰（D293）。
+
+    只改汇率不补现金是最坏的结果：持仓卡上的成本换算与现金余额开始各说一套，
+    而「查不出原因」的症状就是这么来的。
+    """
+    FxRepo(db).put(FILL_DAY, "HKD", "CNY", 2.0)
+    account_id = svc.open_account(USER, "薄口袋").id
+    svc.deposit(account_id, "CNY", 4_000.0, username=USER, reason="初始", actor_id=USER)
+    order = _placeholder_fill(svc, db, account_id)
+
+    assert svc.repair_placeholder_rates(account_id, date(2024, 6, 4)) == 0
+    after = svc.orders.order(account_id, order.id)
+    assert after.fx_rate_applied == pytest.approx(1.0)
+    assert _adjust_rows(db, account_id) == []
+    assert svc.cash(account_id)["CNY"] == pytest.approx(0.0)
+
+
+def test_a_same_currency_fill_is_not_a_placeholder_rate(svc, db) -> None:
+    """1.0 只有在「标的币种 ≠ 报告币种」时才是占位值：同币种那笔的 1.0 是真数。
+
+    只看第二条会把手工补录、迁移带进来的同币种成交一起卷进来，改的是一个本来就对的值。
+    """
+    FxRepo(db).put(FILL_DAY, "HKD", "CNY", 0.92)
+    account_id = _funded(svc, "A 户")
+    order = svc.buy(account_id, USER, "A", "601088", qty=100, price=40.0, ts=FILL_TS)
+    db.execute(
+        "UPDATE sim_orders SET fx_rate_ref = 1.0, fx_rate_applied = 1.0 WHERE id = ?",
+        [order.id],
+    )
+
+    assert svc.repair_placeholder_rates(account_id, date(2024, 6, 4)) == 0
+    assert _adjust_rows(db, account_id) == []
 
 
 def test_buy_refuses_when_cash_is_short_with_the_amount_in_the_message(svc) -> None:

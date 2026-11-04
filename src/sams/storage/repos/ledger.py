@@ -34,8 +34,10 @@ _CURRENCIES = frozenset(
 
 #: 现金流水分类（0042）。外部注入只有前三类；买卖、换汇、分红都是内部变动，
 #: 净值重放靠这条区分决定「今天该不该扣掉一笔外部流入」。
+#: `adjust` 是系统自己补的差额（占位汇率回算，D293）：它是内部变动，
+#: 不进 `deposit/withdraw` 那三个外部分类，否则 TWR 会把一次纠错读成一笔注资。
 CASH_KINDS = frozenset(
-    {"deposit", "withdraw", "fx", "buy", "sell", "fee", "dividend", "manual"}
+    {"deposit", "withdraw", "fx", "buy", "sell", "fee", "dividend", "adjust", "manual"}
 )
 #: 允许带 `ref` 的只有可幂等的自动入账：手工与交易行为带 ref 会让同一笔
 #: 被一条唯一索引悄悄拒掉，而拒的原因看起来像「库坏了」。
@@ -69,7 +71,9 @@ class Account:
     report_currency: str
     #: 录入成交时默认选中的市场（D208）：账户「平时买什么」，不是权限
     home_market: str
-    #: 开户那一刻：分红只入账户开立之后的除权日，净值起点也从这里算
+    #: 开户那一刻：屏幕上说「这个账户是哪天建的」用它。它**不是**历史起点——
+    #: 分红资格与净值曲线都按台账里最早的成交/流水判（D294），先建账再回填真实券商历史
+    #: 是本仓库支持的用法
     opened_at: datetime
 
 
@@ -472,6 +476,17 @@ def _row_to_position(row: dict) -> Position:
     )
 
 
+def settled_amount(side: str, qty: float, price: float, fee: float, rate: float) -> float:
+    """这笔成交在结算币种里的带符号金额：买入付钱（负）、卖出收钱（正），手续费算在同一侧。
+
+    `rate` 传 1.0 就是「不折算、直接从标的币种现金出」——record_fill 的两条分支差的只是
+    从哪个口袋出钱，金额公式是同一条。
+    """
+    gross = qty * price
+    notional = gross + fee if side == BUY else gross - fee
+    return -notional * rate if side == BUY else notional * rate
+
+
 class SimOrderRepo:
     """订单与持仓。`record_fill` 是唯一的成交入口。"""
 
@@ -560,12 +575,9 @@ class SimOrderRepo:
         held = existing.qty if existing else 0.0
         if side == SELL and qty > held:
             raise StorageError(f"超卖：{market} {code} 持有 {held:g}，本次要卖 {qty:g}")
-        gross = qty * price
-        if fx_rate is None:
-            cash_delta = -gross - fee if side == BUY else gross - fee
-        else:
-            settled = (gross + fee) * fx_rate if side == BUY else (gross - fee) * fx_rate
-            cash_delta = -settled if side == BUY else settled
+        cash_delta = settled_amount(
+            side, qty, price, fee, 1.0 if fx_rate is None else fx_rate
+        )
         if side == BUY:
             balances = self.accounts.cash_balances(account_id)
             if settle_currency not in balances:
@@ -668,19 +680,14 @@ class SimOrderRepo:
                 avg = basis / running if running > 0 else 0.0
                 basis -= row.qty * avg
                 running -= row.qty
-        gross = order.qty * order.price
-        if order.fx_rate_applied is None:
-            settle_currency = order.currency
-            delta = gross + order.fee if order.side == BUY else -(gross - order.fee)
-        else:
-            # 当初按汇率在报告币种里结算的，退回的也必须是报告币种（D209）
-            settle_currency = self.accounts._require(account_id).report_currency
-            rate = order.fx_rate_applied
-            delta = (
-                (gross + order.fee) * rate
-                if order.side == BUY
-                else -(gross - order.fee) * rate
-            )
+        # 当初按汇率在报告币种里结算的，退回的也必须是报告币种（D209）
+        rate = order.fx_rate_applied
+        settle_currency = (
+            order.currency if rate is None else self.accounts._require(account_id).report_currency
+        )
+        delta = -settled_amount(
+            order.side, order.qty, order.price, order.fee, 1.0 if rate is None else rate
+        )
         moment = _moment(ts)
         with self.db.transaction():
             self.db.execute("DELETE FROM sim_orders WHERE id = ?", [order_id])
@@ -705,6 +712,51 @@ class SimOrderRepo:
                 ts=moment,
             )
         return True
+
+    def repave_rate(
+        self,
+        account_id: str,
+        order_id: str,
+        *,
+        rate: float,
+        reason: str,
+        actor_id: str,
+        ts: datetime | None = None,
+    ) -> float:
+        """把一笔成交的结算汇率换成 `rate`，并补一条 `adjust` 流水把差额还回口袋（D293）。
+
+        返回这条流水的金额。**两件事必须同事务**：汇率改了而钱没补（或反过来）比整笔不修
+        更糟——持仓卡上的成本换算与现金余额开始各说一套，而那正是「查不出原因」的起点。
+        当初那条 buy/sell 流水不改：余额是重算出来的，「谁在什么时候因为什么动过多少钱」
+        这条审计线留着它才复核得动。
+        """
+        if not isfinite(rate) or rate <= 0:
+            raise ValidationError(f"汇率必须是正有限小数，收到 {rate!r}")
+        order = self.order(account_id, order_id)
+        if order is None:
+            raise StorageError(f"成交 {order_id} 不存在或不属于账户 {account_id}")
+        if order.fx_rate_applied is None:
+            raise ValidationError(
+                f"成交 {order_id} 没有结算汇率（当初直接从标的币种现金出的），无汇可回算"
+            )
+        currency = self.accounts._require(account_id).report_currency
+        args = (order.side, order.qty, order.price, order.fee)
+        delta = settled_amount(*args, rate) - settled_amount(*args, order.fx_rate_applied)
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE sim_orders SET fx_rate_ref = ?, fx_rate_applied = ? WHERE id = ?",
+                [rate, rate, order_id],
+            )
+            self.accounts.adjust_cash(
+                account_id,
+                currency,
+                delta,
+                reason=reason,
+                actor_id=actor_id,
+                ts=_moment(ts),
+                kind="adjust",
+            )
+        return delta
 
     def _check_market_of_code(self, market: str, raw_code: str, code: str) -> None:
         """一只票只该在它自己的市场里记账：A 的表单填 HK 00700 要当场拒（D206）。
