@@ -113,10 +113,11 @@ def tencent_index_symbol(market: str, code: str) -> str:
 `run_indices`（`jobs.py:359-375`）：
 
 - `_window` → `_settle_window`（D300 那个函数，不新写第二套窗口逻辑）。
-- 与 `run_bars` 同一条判据：`written == 0` **且** `summary.latest_date is None` 才计入 `missing`
+- 与 `run_bars` 同一条判据：`written == 0` **且** `summary.latest_date is None` 才计入 `empty_series`
   ——只看今晚行数会把长期停市的指数念成窟窿，而噪音的下场是没人再读这一句。
   `sync_index` 两个分支都回填了 `latest_date`，所以这一头不用自己再查库。
-- note 追加一句 `，{missing} 只库里一根指数日线都没有`。仍不进 `errors`、仍 `ok`：
+- note 追加一句 `，{N} 只一根 K 线都没有`（与 `run_bars` 那枚 D272 的话术逐字同形，
+  同一句病在一个产品里只该有一种说法）。仍不进 `errors`、仍 `ok`：
   空序列是一句要说的**事实**，不是一次失败。
 - 不排进 `symbol_backfills`：那张队列的键是 `(market, code)` 的票，指数不是票（D145 分表分键的
   同一个理由）；而 F2 的回退本身就是每晚一次的重试，不需要第二个重试机制。
@@ -139,14 +140,16 @@ def tencent_index_symbol(market: str, code: str) -> str:
 
 `tests/services/test_scheduler_jobs_data.py`：
 
-3. **改** `test_indices_job_is_incremental`（:654）的区间断言：库里最新一根 2024-10-24，
-   问出去的起点是 `date(2024, 10, 24) - timedelta(days=14)`。
+3. **改** `test_indices_job_is_incremental`（:654）：库里最新一根 2024-10-24，问出去的起点是
+   `date(2024, 10, 24) - timedelta(days=14)`；并加一句 `note == "1/1 只指数日线"`——
+   有数据的那一头不许被点名。
 4. **改** `test_indices_job_skips_an_index_already_at_as_of`（:663）——这条规格的正是 §2.2 的病，
    换成 `test_an_index_bar_written_today_is_repulled`：seed `AS_OF` 那一根，
    断言 `adapter.calls == [("A", "sh000001", AS_OF - timedelta(days=14), AS_OF)]`。
    与 `run_bars` 那一对（:282 / :301）逐字同形，不另立第三种说法。
-5. **新增** `test_an_index_with_no_bars_at_all_is_named_in_the_note`：空库、
-   一个回 0 行的替身 → `outcome.ok` 且 note 含 `1 只库里一根指数日线都没有`。
+5. **新增** `test_indices_note_names_the_indexes_with_no_bars_at_all`：空库、
+   一只抛 `EmptyResponse` 的替身 → `outcome.ok`、`errors == ()`，
+   且 `note == "1/1 只指数日线，1 只一根 K 线都没有"`。
    这一枚是 §2.3 的正身：`3/3` 不许再把空序列盖过去。
 
 `run_indices` 的 5 枚（含改动）跑完，顺手跑 `tests/services/test_scheduler_jobs_data.py`
@@ -175,7 +178,7 @@ def tencent_index_symbol(market: str, code: str) -> str:
 - **D305 指数日线也吃定稿窗口（`_settle_window`，D300 同一条）。**
   「一根 K 线写进库时值多少，取决于写它的那一刻收盘了没有」这句话对市场指数同样成立。
   每晚每市场 3 次请求，可忽略。
-- **D306 `indices` job 把「N 只库里一根指数日线都没有」写进 note（对齐 D272 的 barless 句）。**
+- **D306 `indices` job 把「N 只一根 K 线都没有」写进 note（与 D272 的 barless 句同一条话术）。**
   「没抛错」不等于「有数据」；指数不在 `symbol_backfills` 里，note 就是它唯一的点名处。
   仍算 `ok`——空序列是事实不是失败，进 `errors` 会让健康页把一次取不到数念成一次故障。
 

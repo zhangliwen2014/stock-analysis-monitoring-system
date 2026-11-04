@@ -18,7 +18,7 @@ from support_fundamentals import StubFundamentalsAdapter
 from support_valuation import financial_rows, flow_rows, valuation
 
 from sams.core.config import IndicesCfg
-from sams.core.errors import DatasourceError, RateLimited
+from sams.core.errors import DatasourceError, EmptyResponse, RateLimited
 from sams.core.version import VersionGate
 from sams.datasource.registry import AdapterRegistry
 from sams.services.corp_actions import CorpActionSyncService
@@ -652,21 +652,52 @@ def test_news_job_is_registered_for_every_market(db, settings):
 
 
 def test_indices_job_is_incremental(db, settings):
+    """起点是库里最新一根往前 14 个日历天，不是它的后一天（D305）。
+
+    与 `run_bars` 那一对（`test_the_nightly_bars_window_reopens_the_settle_margin`）同一条规矩：
+    指数与个股的日线都是「写它的那一刻收盘了没有」决定它值多少。按日历天不是交易日。
+    """
     IndexDailyRepo(db).upsert(index_rows("A", "sh000001", date(2024, 10, 24)))
     adapter = StubIndexAdapter()
     outcome = run_indices(deps(db, one_index(settings), index=adapter), ctx())
-    assert adapter.calls == [("A", "sh000001", AS_OF, AS_OF)]
+    assert adapter.calls == [
+        ("A", "sh000001", date(2024, 10, 24) - timedelta(days=14), AS_OF)
+    ]
     assert outcome.ok and outcome.rows_affected == 1
+    assert outcome.note == "1/1 只指数日线"
     assert IndexDailyRepo(db).latest_date("A", "sh000001") == AS_OF
 
 
-def test_indices_job_skips_an_index_already_at_as_of(db, settings):
-    """追平到今天就不该再问链：与 `test_fx_job_skips_a_pair_already_at_as_of` 同一条。"""
+def test_an_index_bar_written_today_is_repulled(db, settings):
+    """库里已经有今天那一根指数，今晚仍要把它重拉一遍（D305）。
+
+    原来这一枚钉的是「追平到今天就不问」（`_window` 的口径），而那一口径正是 D300 修掉的病：
+    白天手动跑过一次、或盘后第一趟落到收盘之前，那根盘中指数从此永远是「今天的收盘价」。
+    """
     IndexDailyRepo(db).upsert(index_rows("A", "sh000001", AS_OF))
     adapter = StubIndexAdapter()
     outcome = run_indices(deps(db, one_index(settings), index=adapter), ctx())
-    assert adapter.calls == []
-    assert outcome.rows_affected == 0 and outcome.errors == ()
+    assert adapter.calls == [("A", "sh000001", AS_OF - timedelta(days=14), AS_OF)]
+    assert outcome.rows_affected == 1 and outcome.errors == ()
+
+
+def test_indices_note_names_the_indexes_with_no_bars_at_all(db, settings):
+    """`1/1 只指数日线` 里那一只可能库里一根都没有——这一句必须说出来（D306）。
+
+    实机 2026-11-05：`indices@US` 每晚报 `ok · 3/3 只指数日线`、`rows_affected=0`，
+    而 `index_daily` 的 US 一段一行都没有，看板的美股大盘条于是永久空白，
+    健康页看见的却是「3/3 成功」。判据与 `run_bars` 同一条：今晚没写行**且**库里没根，
+    只看前者会把长期没有数据的指数念成每晚都缺（D272）。
+    """
+
+    class EmptyIndexAdapter(StubIndexAdapter):
+        def index_daily(self, market, code, start, end):
+            self.calls.append((market, code, start, end))
+            raise EmptyResponse("tencent", f"{code} 区间无数据")
+
+    outcome = run_indices(deps(db, one_index(settings), index=EmptyIndexAdapter()), ctx())
+    assert outcome.ok and outcome.errors == ()
+    assert outcome.note == "1/1 只指数日线，1 只一根 K 线都没有"
 
 
 def test_build_jobs_registers_symbol_master_only_with_service_and_capability(db, settings):

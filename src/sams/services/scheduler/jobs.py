@@ -12,7 +12,8 @@
 
 窗口规则：
 
-* 日线/按日估值/资金流/汇率/指数日线：库里有最新一天就从下一天起，没有就回补 730 天
+* 日线与指数日线：从库内最新一天**往前回 14 天**（定稿窗口，D300/D305），库里没有就回补 730 天；
+* 按日估值/资金流/汇率：库里有最新一天就从下一天起，没有就回补 730 天
   （汇率那一头问的是「这一对还缺哪段」，所以读的是 `FxRepo.latest_date`，不看陈旧度）；
 * 公司行为：除非已有「全历史且覆盖到今天」的确认，否则从 1990 年起；
 * 财务：每次都从 1990 年起——报告期数据是重述的，增量窗口会漏掉旧期的修正。
@@ -357,22 +358,35 @@ def run_screener(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
 
 def run_indices(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    """大盘条那几只指数：窗口按每只各自的库内最新日，与日线同一条规则。
+    """大盘条那几只指数：窗口按每只各自的库内最新日**再往前回 14 天**，与日线同一条规则（D305）。
 
     单位是「一只指数」而不是「一只票」，所以它不并进 `_DATA_JOBS` 那张按票登记的表：
     指数不在 universe 里，配置里的 `[indices]` 才是它的清单（D145）。
+    库里一根都没有的那几只单独点名（D306）——它们的下场不是报错，是大盘条少一段而健康页看着正常。
     """
     assert ctx.market is not None
     assert deps.sync.indices is not None  # 登记前查过注入，这里只兜编程错误
 
+    # 与 `run_bars` 同一条判据：今晚没写进任何行**且**库里仍一根都没有（D306）。
+    # 只看今晚的行数会每晚把同一只念成窟窿（源本来就没这一只的序列时尤其如此），
+    # 而噪音的下场是没人再读这一句。空答复不进 `errors`：那是「没有」不是「取失败」。
+    empty_series = 0
+
     def one(market: str, index_code: str) -> int:
-        start = _window(deps.sync.indices.latest_date(market, index_code), ctx.as_of)
+        nonlocal empty_series
+        start = _settle_window(deps.sync.indices.latest_date(market, index_code), ctx.as_of)
         if start is None:
             return 0
-        return deps.sync.sync_index(market, index_code, start, ctx.as_of).written
+        summary = deps.sync.sync_index(market, index_code, start, ctx.as_of)
+        if summary.written == 0 and summary.latest_date is None:
+            empty_series += 1
+        return summary.written
 
     units = [(ctx.market, ic) for ic in deps.settings.indices.for_market(ctx.market)]
-    return _collect(units, one, "指数日线")
+    outcome = _collect(units, one, "指数日线")
+    if empty_series:
+        outcome = replace(outcome, note=f"{outcome.note}，{empty_series} 只一根 K 线都没有")
+    return outcome
 
 
 def run_fx(deps: JobDeps, ctx: JobContext) -> JobOutcome:
