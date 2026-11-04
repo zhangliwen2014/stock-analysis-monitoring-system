@@ -154,7 +154,9 @@
 | F2 占位汇率后台按成交日回算 | `storage/repos/ledger.py:repave_rate` + `settled_amount`、`services/ledger.py:repair_placeholder_rates`、`services/scheduler/jobs.py:run_rate_repairs` | `bac1928` |
 | D212 持仓卡话术改为「系统自动回算」 | `services/portfolio.py` | `bac1928` |
 | §4-13/14 介质层基准行 | `tests/web/test_portfolio_attribution_web.py`、`tests/cli/test_attribution_cli.py` | `0235b0f` |
-| D296 「全部」窗口从台账最早一笔起 | `services/nav.py:curve_start`、`cli/attribution.py`、`web/pages/portfolio.py`（两处各钳一次 `created_at` 的重复消掉） | 本轮 |
+| D296 「全部」窗口从台账最早一笔起 | `services/nav.py:curve_start`、`cli/attribution.py`、`web/pages/portfolio.py`（两处各钳一次 `created_at` 的重复消掉） | `b832faa` |
+| D297 非正净值那天不进连续完整日、不当百分比分母 | `services/nav.py:_usable_as_base` + `_run_ending_at`、`services/attribution.py:_run_ending_at_last_complete` | `b832faa` |
+| 验收里钉住的 job 列表补 rate-repair | `tests/test_scheduler_acceptance.py` | `a495758` |
 
 实现里定下来的三件事，写在这里而不是只留在代码里：
 
@@ -193,10 +195,11 @@
 
 ### 实机跑出来的两条新问题（不在本轮范围，已开决策）
 
-* **D297**（任务 #376）：同一条归因输出里 `区间收益 −92,016.96%`、`区间均权 87,546.31%`。
+* **D297**（任务 #376，已在 `b832faa` 修）：同一条归因输出里 `区间收益 −92,016.96%`、`区间均权 87,546.31%`。
   根因是这个账户 2026-09-10 ~ 10-28 的净值是**负数**（先买后入金），而 `_run_ending_at_last_complete`
-  只做了真值判断，负净值照样进链乘当分母。净值起点提前（F3b）把这段暴露出来了——本轮改动自己踩出来的坑，
-  修法与非正净值日的回撤（同一段在持仓卡上印出 `max_drawdown = 1291.52`，即 129,152%）一起做。
+  只做了真值判断，负净值照样进链乘当分母。净值起点提前（F3b）把这段暴露出来了——本轮改动自己踩出来的坑。
+  修法是「只有正净值的那天能当百分比分母」这一条规则放在收连续完整日的那一步（`_usable_as_base`），
+  回撤与 TWR 因此共用同一个断点，`_twr` 里不再重复判分母；负净值那段整体不进区间，而不是被折算成一个数。
 * **任务 #377**：银河账户 2026-10-29 的 `sim_cash_moves` 里有**两条** `kind='buy'` −11,527，
   而 `sim_orders` 只剩一笔 01021——撤销/重记那条路留下的孤儿流水，CNY 口袋多扣了一次。
   与今天的回算无关（回算只新增 adjust 行），但它决定「余额能不能从流水复原」这条账能不能信。
