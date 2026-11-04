@@ -104,6 +104,20 @@ def tencent_symbol(market: str, code: str) -> str:
     raise ValueError(f"未知市场 {market}")
 
 
+def tencent_index_symbol(market: str, code: str) -> str:
+    """问腾讯要指数日线时该按哪一种写法请求（D304）。
+
+    A/HK 两边请求键与响应节点同形（`sh000001`、`hkHSI`），原样交回：指数码已经带源前缀，
+    再过一遍 `tencent_symbol` 会把 `sh000001` 归一成 `000001` 再拼成 `sz000001`，问成平安银行。
+    美股那一段实测（2026-11-05）问 `usINX` 也答，但响应的节点键写作 `us.INX`，
+    而 `parse_tencent_daily` 死认请求的那个键（D272 换来的防串号闸）——
+    把请求键也写成点号，两处同名，那道闸一个字都不用放宽。
+    """
+    if market == "US":
+        return f"us.{code.removeprefix('us')}"
+    return code
+
+
 def parse_us_hint(payload_text: str, symbol: str) -> str:
     """从 smartbox 的 `v_hint` 里挑出交易所后缀。
 
@@ -493,17 +507,17 @@ class TencentAdapter:
             raise classify_error(self.name, exc) from exc
 
     def index_daily(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
-        """指数日线：与 `daily_bars` 同一个端点，唯一差别是符号构造（D148）。
+        """指数日线：与 `daily_bars` 同一个端点，唯一差别是符号构造（D148/D304）。
 
-        指数码（sh000001/hkHSI）已带源前缀，**不过 `tencent_symbol`**——
-        再折一次会把 `sh000001` 归一成 `000001` 再拼成 `sz000001`，问成平安银行；
-        腾讯没有指数的美股那一跳按 `EmptyResponse` 答，让降级链继续问下一个源。
+        三个市场都有——写这一条时曾以为腾讯没有美股的指数，实测 `us.INX`/`us.IXIC`/`us.DJI`
+        都正常答序列（`usSPX` 不答，所以 `[indices]` 默认给的是 `usINX`）。
+        请求键按 `tencent_index_symbol` 构造，不套 `tencent_symbol`（会把指数码折成个股）。
         """
-        if market not in ("A", "HK"):
-            raise EmptyResponse("tencent", f"腾讯指数日线没有 {market} 市场")
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
         if end < start:
             raise ValueError(f"区间反向: {start} > {end}")
-        symbol = code
+        symbol = tencent_index_symbol(market, code)
         params = {
             # 逗号分隔的一串参数：symbol, 周期, 起, 止, 根数[, 复权位]
             # A 股走 fqkline，复权位必须**留空但保留**（少这一位会被接口按默认口径处理，
@@ -676,5 +690,5 @@ def _bars_for(start: date, end: date) -> int:
 source(
     "tencent",
     options=("timeout",),
-    note="腾讯 gtimg 日线 + A/HK 指数日线 + A/HK 分时 + A 股分钟K，三市场，不复权",
+    note="腾讯 gtimg 日线 + 三市场指数日线 + A/HK 分时 + A 股分钟K，不复权",
 )(TencentAdapter)

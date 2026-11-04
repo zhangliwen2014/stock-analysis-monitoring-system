@@ -335,10 +335,26 @@ def test_tencent_index_daily_hk_uses_kline_endpoint():
     assert get.calls[0][0].endswith("kline/kline")
 
 
-def test_tencent_index_daily_us_empty():
-    """腾讯没有指数的美股链：这是一句答复（EmptyResponse），不是故障。"""
-    adapter, _, _ = adapter_with(A_PAYLOAD)
-    with pytest.raises(EmptyResponse):
+def test_tencent_index_daily_us_asks_the_dotted_symbol():
+    """美股指数有日线，但请求键要写成点号形态（D304，实测 2026-11-05）。
+
+    问 `usINX` 也答，只是响应的节点键写作 `us.INX`；`parse_tencent_daily` 死认请求的那个键
+    （D272 那道「不许拿别人的序列」的闸），所以这里换请求形态而不是放宽 parser。
+    入库键仍是配置里的 `usINX`：`[indices]`、`index_daily` 的表键、大盘条的查询三处同形。
+    """
+    payload = {"code": 0, "data": {"us.INX": {"day": [["2024-01-02", "1", "2", "3", "4", "5"]]}}}
+    adapter, get, _ = adapter_with(payload)
+    out = adapter.index_daily("US", "usINX", START, END)
+    assert get.calls[0][0].endswith("kline/kline")
+    assert get.calls[0][1].startswith("us.INX,day,")
+    assert out["code"].unique().to_list() == ["usINX"]
+
+
+def test_tencent_index_daily_us_rejects_a_foreign_node():
+    """放开市场闸之后，防串号那道闸在美股段仍然生效：节点不是请求的那一只就是漂移。"""
+    payload = {"code": 0, "data": {"us.DJI": {"day": [["2024-01-02", "1", "2", "3", "4", "5"]]}}}
+    adapter, _, _ = adapter_with(payload)
+    with pytest.raises(FieldDrift):
         adapter.index_daily("US", "usINX", START, END)
 
 
