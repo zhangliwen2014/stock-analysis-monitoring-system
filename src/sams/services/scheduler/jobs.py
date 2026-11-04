@@ -55,6 +55,18 @@ def _window(latest: date | None, as_of: date) -> date | None:
     return None if start > as_of else start
 
 
+def _settle_window(latest: date | None, as_of: date) -> date | None:
+    """日线的增量窗口：起点是 `latest` 那一天自己，不是它的后一天（D300）。
+
+    差的那一格就是这枚修复的全部：一根 K 线写进库时值多少，取决于写它的那一刻收盘了
+    没有，而 `_window` 只往前走——白天手动跑过一次、或补采队列落下一根当日半截 K 线之后，
+    `latest + 1 > as_of` 让这一晚一只票都不问，那根盘中价从此永远是这一天的收盘价。
+    重拉一遍是幂等的（`upsert`），代价是每晚每只票多问一天。
+    """
+    start = latest if latest else as_of - timedelta(days=INITIAL_SYNC_DAYS)
+    return None if start > as_of else start
+
+
 def _units(ctx: JobContext) -> list[tuple[str, str]]:
     assert ctx.market is not None  # 数据 job 只在市场 job 上登记
     return [(ctx.market, code) for code in ctx.universe.codes(ctx.market)]
@@ -96,7 +108,7 @@ def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
     def one(market: str, code: str) -> int:
         nonlocal barless
-        start = _window(deps.sync.bars.latest_date(market, code), ctx.as_of)
+        start = _settle_window(deps.sync.bars.latest_date(market, code), ctx.as_of)
         if start is None:
             return 0
         summary = deps.sync.sync_daily(market, code, start, ctx.as_of)

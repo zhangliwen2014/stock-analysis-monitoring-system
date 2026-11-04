@@ -287,9 +287,24 @@ def test_bars_job_is_incremental(db, settings):
         frame=sample_bars(start=date(2024, 10, 25)).filter(pl.col("date") == date(2024, 10, 25))
     )
     outcome = run_bars(deps(db, settings, bars=adapter), ctx("600519"))
-    assert adapter.calls == [("A", "600519", date(2024, 10, 25), AS_OF)]
+    assert adapter.calls == [("A", "600519", date(2024, 10, 24), AS_OF)]
     assert outcome.rows_affected == 1
     assert BarRepo(db).latest_date("A", "600519") == AS_OF
+
+
+def test_the_nightly_bars_job_repulls_the_newest_bar(db, settings):
+    """库里已经有今天那一根，今晚仍要把它重拉一遍（D300）。
+
+    一根日线写进来时值多少，取决于写它的那一刻收盘了没有。白天手动跑过一次 `bars`
+    或补采队列落下一根当日半截 K 线之后，`_window` 看见 `latest == as_of` 就答「追平了」，
+    那根盘中价从此永远是这一天的收盘价：实机 2026-10-29 有 205 只 A 股是这种行，
+    其中 95 只与当天的收盘快照差过 0.5%，最大差 3.75%。
+    """
+    BarRepo(db).upsert(sample_bars(start=AS_OF).filter(pl.col("date") == AS_OF))
+    adapter = RecordingBarsAdapter(frame=sample_bars(start=AS_OF))
+    outcome = run_bars(deps(db, settings, bars=adapter), ctx("600519"))
+    assert adapter.calls == [("A", "600519", AS_OF, AS_OF)]
+    assert outcome.rows_affected == 1
 
 
 def test_bars_job_bumps_the_version_gate(db, settings):
