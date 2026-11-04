@@ -23,9 +23,11 @@ from support_rules import (
 )
 
 from sams.analysis.adjust import DayFactor
+from sams.core.assumptions import REFUTED
 from sams.core.config import MarketCfg
 from sams.core.errors import NotAdjustable
 from sams.services.rules.engine import SESSION_LOOKBACK_DAYS
+from sams.storage.repos.assumptions import Assumption
 from sams.storage.repos.theses import INVALIDATED, ThesisRepo
 
 #: 同一个 UTC 时刻的另一种读法：北京已经跨到 10-21 凌晨。
@@ -61,6 +63,33 @@ def test_the_action_line_names_the_kind_and_the_users_own_name(h) -> None:
     note = h.sender.sent[0].action_note
     assert "止损位到了" in note and "别让它跌过十块" in note
     assert report.raised[0].action_note == note
+
+
+def test_a_near_miss_is_not_told_it_has_been_stopped_out(h) -> None:
+    """11.64 离 11.50 还有 1.2%：这一行是「临近」，不能写「止损位到了」。
+
+    同一条报告还要说清这个价属于哪一天：`as_of` 是评估日，不是报价日。
+    """
+    h.add(params={"price": 11.50})
+    h.snapshot = snap(price=11.64, price_on=TODAY - timedelta(days=1))
+    report = h.engine().check(USER)
+    hit = report.raised[0]
+    assert hit.stage == "pre"
+    assert "临近" in hit.action_note
+    assert "止损位到了" not in hit.action_note
+    assert hit.data_on == TODAY - timedelta(days=1)
+    assert h.sender.sent[0].action_note == hit.action_note
+
+
+def test_a_gap_through_the_line_says_it_was_a_gap(h) -> None:
+    """跳空低开破位与盘中跌过去是两件事：动作那句话要说出来。"""
+    h.add(params={"price": 10.0})
+    h.snapshot = snap(price=9.4, prev_close=10.2, day_open=9.5)
+    report = h.engine().check(USER)
+    hit = report.raised[0]
+    assert hit.stage == "urgent"
+    assert "跳空" in hit.action_note
+    assert "止损位到了" not in hit.action_note
 
 
 def test_the_body_carries_the_pnl_the_constraint_and_the_reason(h) -> None:
@@ -100,6 +129,45 @@ def test_a_state_only_hit_still_reaches_the_sender(h) -> None:
     assert len(report.raised) == 1
     assert report.raised[0].value_text == "—"  # 没有数值可报，那一条照样推了出去
     assert len(h.sender.sent) == 1
+
+
+def test_a_refuted_assumption_reaches_the_sender(h) -> None:
+    """D232 P0-3：引擎把这条论名下的假设交给模板；证伪那一条要推得出去、带读数与阈值。"""
+    theses = ThesisRepo(h.db)
+    made = theses.create(
+        user_id=USER, market=MARKET, code=CODE, style="value", actor_id="u1", now=NOW
+    )
+    h.thesis = made
+    h.assumptions = (
+        Assumption(
+            id="as-1",
+            thesis_id=made.id,
+            metric="roe",
+            op=">=",
+            threshold=0.25,
+            due_on=TODAY,
+            note=None,
+            status=REFUTED,
+            evaluated_on=TODAY,
+            evaluated_value=0.20,
+            created_at=NOW,
+            updated_at=NOW,
+        ),
+    )
+    h.add(
+        kind="stop.thesis_drift",
+        name="理由没了就喊我",
+        target_type="position",
+        target_ref="*",
+        account_id="acc-1",
+        thesis_id=made.id,
+        params={},
+    )
+    h.snapshot = snap(account_id="acc-1")
+    report = h.engine().check(USER)
+    assert len(report.raised) == 1
+    assert h.sender.sent[0].value_text == "20.00%"
+    assert h.sender.sent[0].threshold_text == "≥ 25.00%"
 
 
 def test_a_cross_currency_position_shows_the_converted_number(h) -> None:
@@ -154,6 +222,26 @@ def test_a_dry_run_judges_everything_and_sends_nothing(h) -> None:
     assert len(report.raised) == 1
     assert report.raised[0].alert_id == ""
     assert h.sender.sent == [] and h.hits == [] and h.triggered == []
+
+
+def test_a_drill_run_marks_the_alert_as_a_test(h) -> None:
+    """演练（D231）：示例那一趟走真求值、真落库、真投递，但那一行带 `is_test`。
+
+    带这个标记才不进健康积压、也不挡同标的真实规则的 `no_open_alert`（D131）。
+    """
+    h.add()
+    report = h.storing().check(USER, is_test=True)
+    assert len(report.raised) == 1
+    alert = h.alerts.get(report.raised[0].alert_id)
+    assert alert is not None and alert.is_test is True
+
+
+def test_an_ordinary_run_is_not_a_test(h) -> None:
+    """调度、命令行、用户自己规则的「判一次」都不传它：默认仍是真告警。"""
+    h.add()
+    report = h.storing().check(USER)
+    alert = h.alerts.get(report.raised[0].alert_id)
+    assert alert is not None and alert.is_test is False
 
 
 def test_an_unreadable_target_is_skipped_instead_of_killing_the_run(h) -> None:
@@ -376,8 +464,11 @@ def test_market_filter_leaves_other_markets_alone(h) -> None:
     assert report.judged == 0 and h.calendar.day_calls == []
     assert h.engine().check(USER, market="A").raised
     # 大小写在这里不是排版：配置里那个市场键原样留着，而库里存的是大写。
-    # 不归一的话 `"a"` 那一趟会挑出零个对象，出门说的还是「触发 0」
-    assert h.engine().check(USER, market="a").raised
+    # 不归一的话 `"a"` 那一趟会挑出零个对象，出门说的还是「触发 0」。
+    # S1-B 之后第二趟是「状态未变」而不是再触发一次：对象确实被挑中了。
+    again = h.engine().check(USER, market="a")
+    assert again.raised == ()
+    assert "状态未变" in again.suppressed[0].reason
 
 
 # --- 除权换算（§10.2 在引擎这一头的四个形状）----------------------------------------------
@@ -504,3 +595,23 @@ def test_two_gaps_report_both_commands(h) -> None:
     assert report.raised == () and len(report.skipped) == 1
     reason = report.skipped[0].reason
     assert "ledger buy" in reason and "thesis revise" in reason
+
+
+def test_a_draft_is_judged_with_the_same_numbers_and_writes_no_rows(h) -> None:
+    """保存前试算：判出来的数与保存后真跑那一条同一套，而库里一行都没多。
+
+    这一枚钉的是「草稿走的是同一条求值路」：`preview` 若自己另搭一套算术，屏幕上那句
+    「会命中」与存进去之后的行为就会分叉——而那正是这按钮存在的理由被抽掉的那一刻。
+    """
+    draft = h.rules.build(
+        USER, kind="stop.fixed", name="草稿", target_type="symbol",
+        target_ref=f"{MARKET}/{CODE}", params={"price": 10.0},
+    )
+    report = h.engine().preview(USER, draft)
+    assert report.dry_run is True
+    hit = report.raised[0]
+    assert (hit.value_text, hit.threshold_text) == ("9.50 CNY", "10.00 CNY")
+    assert hit.alert_id == ""
+    assert h.sender.sent == [] and h.hits == [] and h.triggered == []
+    assert h.rules.list_for(USER) == []
+    assert h.states.get(USER, "draft", MARKET, CODE, None) is None

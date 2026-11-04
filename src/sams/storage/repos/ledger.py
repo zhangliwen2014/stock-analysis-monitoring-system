@@ -32,6 +32,15 @@ _CURRENCIES = frozenset(
     {"CNY", "USD", "HKD", "EUR", "JPY", "GBP", "SGD", "AUD", "CAD"}
 )
 
+#: 现金流水分类（0042）。外部注入只有前三类；买卖、换汇、分红都是内部变动，
+#: 净值重放靠这条区分决定「今天该不该扣掉一笔外部流入」。
+CASH_KINDS = frozenset(
+    {"deposit", "withdraw", "fx", "buy", "sell", "fee", "dividend", "manual"}
+)
+#: 允许带 `ref` 的只有可幂等的自动入账：手工与交易行为带 ref 会让同一笔
+#: 被一条唯一索引悄悄拒掉，而拒的原因看起来像「库坏了」。
+_REF_KINDS = frozenset({"dividend"})
+
 
 def _moment(ts: datetime | None) -> datetime:
     """成交/调现金的时刻：带时区才收，裸 datetime 一律拒。
@@ -60,6 +69,8 @@ class Account:
     report_currency: str
     #: 录入成交时默认选中的市场（D208）：账户「平时买什么」，不是权限
     home_market: str
+    #: 开户那一刻：分红只入账户开立之后的除权日，净值起点也从这里算
+    opened_at: datetime
 
 
 def _row_to_account(row: dict) -> Account:
@@ -73,6 +84,7 @@ def _row_to_account(row: dict) -> Account:
         margin_enabled=bool(row["margin_enabled"]),
         report_currency=row["report_currency"],
         home_market=row["home_market"],
+        opened_at=row["created_at"],
     )
 
 
@@ -165,6 +177,11 @@ class SimAccountRepo:
         )
         return None if rows.is_empty() else _row_to_account(rows.to_dicts()[0])
 
+    def find(self, account_id: str) -> Account | None:
+        """按 id 找账户（跨用户）：分红/净值的入口只有 `--account`，没有用户名可查。"""
+        rows = self.db.query("SELECT * FROM sim_accounts WHERE id = ?", [account_id])
+        return None if rows.is_empty() else _row_to_account(rows.to_dicts()[0])
+
     def list_for(self, user_id: str) -> list[Account]:
         rows = self.db.query(
             "SELECT * FROM sim_accounts WHERE user_id = ? ORDER BY created_at",
@@ -190,9 +207,39 @@ class SimAccountRepo:
     def cash_history(self, account_id: str) -> pl.DataFrame:
         """审计行按时间正序：倒序的流水在核对「哪一步开始对不上」时更难读。"""
         return self.db.query(
-            "SELECT currency, delta, reason, actor_id, ts FROM sim_cash_moves "
+            "SELECT currency, delta, reason, actor_id, ts, kind, ref FROM sim_cash_moves "
             "WHERE account_id = ? ORDER BY ts, id",
             [account_id],
+        )
+
+    def cash_moves(self, account_id: str, *, until=None) -> pl.DataFrame:
+        """净值重放要的那一列：日期、币种、数额与分类。
+
+        `until` 是历史上界（含当天）：净值逐日重建不读未来，与 `corp_actions.list_for`
+        的 PIT 口径同一条。不传就是全量。
+        """
+        sql = [
+            "SELECT currency, delta, kind, ref, ts, reason FROM sim_cash_moves"
+            " WHERE account_id = ?"
+        ]
+        params: list = [account_id]
+        if until is not None:
+            sql.append("AND ts <= ?")
+            params.append(until)
+        return self.db.query(" ".join(sql) + " ORDER BY ts, id", params)
+
+    def cash_ref_exists(self, account_id: str, *, kind: str, ref: str) -> bool:
+        """这笔自动入账是不是已经记过：分红重跑靠它先跳过，而不是撞唯一索引。
+
+        撞索引也能防重复，但出口是一句 `StorageError`——重跑一个已入账的区间
+        会变成一条失败记录，而它本来就该是 0 行。
+        """
+        return bool(
+            self.db.scalar(
+                "SELECT count(*) FROM sim_cash_moves"
+                " WHERE account_id = ? AND kind = ? AND ref = ?",
+                [account_id, kind, ref],
+            )
         )
 
     def adjust_cash(
@@ -204,10 +251,14 @@ class SimAccountRepo:
         reason: str,
         actor_id: str,
         ts: datetime | None = None,
+        kind: str = "manual",
+        ref: str | None = None,
     ) -> float:
         """动现金的唯一入口：余额与流水同事务，失败整段回滚。
 
         返回调整后的余额，因为调用方（成交记账）要拿它判断「这一步之后还有多少钱」。
+        `kind`/`ref` 是 0042 加的分类：不填就是 manual，净值重放会把它当作
+        「不说明来处的手工动作」，不进外部流入也不进内部交易。
         """
         if not reason or not reason.strip():
             raise ValidationError("调整现金必须给理由：审计行没有理由就不是审计")
@@ -215,6 +266,16 @@ class SimAccountRepo:
             raise ValidationError("delta 不能是 0：没动就不要留一条流水")
         if currency not in _CURRENCIES:
             raise ValidationError(f"不认识币种 {currency!r}：三字母代码，不做模糊匹配")
+        if kind not in CASH_KINDS:
+            raise ValidationError(f"不认识现金分类 {kind!r}，可选 {sorted(CASH_KINDS)}")
+        if ref is not None:
+            if not ref.strip():
+                raise ValidationError("ref 给了就不能是空白：它要承担唯一约束")
+            if kind not in _REF_KINDS:
+                raise ValidationError(
+                    f"{kind} 流水不能带 ref：只有可幂等的自动入账（{sorted(_REF_KINDS)}）"
+                    "才用引用去重"
+                )
         account = self._require(account_id)
         moment = _moment(ts)
         current = float(
@@ -231,18 +292,25 @@ class SimAccountRepo:
                 f"结果 {after:.2f}。无杠杆账户不透支（§5.4）；"
                 f"要记融资请在开户时把 margin_enabled 打开，或换一笔够钱的金额"
             )
-        with self.db.transaction():
-            self.db.execute(
-                "INSERT INTO sim_cash_moves"
-                " (id, account_id, currency, delta, reason, actor_id, ts)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [new_id(), account_id, currency, delta, reason, actor_id, moment],
-            )
-            self.db.execute(
-                "INSERT OR REPLACE INTO sim_cash_balances"
-                " (account_id, currency, amount, updated_at) VALUES (?, ?, ?, ?)",
-                [account_id, currency, after, moment],
-            )
+        try:
+            with self.db.transaction():
+                self.db.execute(
+                    "INSERT INTO sim_cash_moves"
+                    " (id, account_id, currency, delta, reason, actor_id, ts, kind, ref)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [new_id(), account_id, currency, delta, reason, actor_id, moment, kind, ref],
+                )
+                self.db.execute(
+                    "INSERT OR REPLACE INTO sim_cash_balances"
+                    " (account_id, currency, amount, updated_at) VALUES (?, ?, ?, ?)",
+                    [account_id, currency, after, moment],
+                )
+        except StorageError as exc:
+            if "Constraint" in str(exc) or "unique" in str(exc).lower():
+                raise StorageError(
+                    f"这笔 {kind} 流水已经入过账（ref={ref}）：重复写入会把这笔钱算两次"
+                ) from exc
+            raise
         return after
 
     def convert(
@@ -297,10 +365,12 @@ class SimAccountRepo:
                 ],
             )
             self.adjust_cash(
-                account_id, from_ccy, -amount, reason=reason, actor_id=actor_id, ts=moment
+                account_id, from_ccy, -amount, reason=reason, actor_id=actor_id, ts=moment,
+                kind="fx",
             )
             self.adjust_cash(
-                account_id, to_ccy, to_amt, reason=reason, actor_id=actor_id, ts=moment
+                account_id, to_ccy, to_amt, reason=reason, actor_id=actor_id, ts=moment,
+                kind="fx",
             )
         return trade
 
@@ -552,6 +622,7 @@ class SimOrderRepo:
                 reason=f"{'买入' if side == BUY else '卖出'} {code}",
                 actor_id=user_id,
                 ts=moment,
+                kind=side,
             )
         order = self.order(account_id, order_id)
         assert order is not None

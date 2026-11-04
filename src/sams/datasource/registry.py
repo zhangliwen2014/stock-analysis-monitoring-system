@@ -11,7 +11,7 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta
 from math import ceil
 
 import polars as pl
@@ -32,6 +32,7 @@ from sams.datasource.fundamentals import (
 )
 from sams.datasource.fx import empty_fx, has_fx
 from sams.datasource.minute import answers
+from sams.datasource.news import empty_news
 from sams.datasource.ratelimit import TokenBucket, call_with_backoff
 from sams.datasource.sources import build as build_adapter
 from sams.datasource.sources import known
@@ -52,6 +53,15 @@ def default_adapters() -> dict[str, BarAdapter]:
 
 #: 值得原地退避重试的错误。FieldDrift 不在其中——改版重试不会变好，只会白等 21 秒
 RETRYABLE: tuple[type[BaseException], ...] = (RateLimited, TransientError, OSError, TimeoutError)
+
+#: 连续失败到这个次数，就把这个源放一边 `COOLDOWN_S` 秒（D279）。
+#: 为什么是 10：一次判定已经是 `attempts_per_source` 个请求，10 次 = 30 个请求 + 半分钟的
+#: 退避，足够说清「它今天就是不答」；再往上加只是继续烧预算。
+COOLDOWN_AFTER_FAILURES = 10
+#: 半小时：够短，一个夜里醒来好几趟（源恢复后不必等到下一班 job）；够长，
+#: 500 只的循环不会一直撞它。冷却是「不再调用」，不是「当它不存在」——
+#: 到期后的第一次调用就是探针，成功即清零，失败即重新冷却。
+COOLDOWN_S = 1800.0
 
 
 def _terminal_error(
@@ -93,6 +103,21 @@ class Attempt:
     #: 把它抄进这里等于对调用方说不存在的事
     tries: int = 1
     error: str | None = None
+
+
+def _failure_note(attempts: list[Attempt]) -> str:
+    """链走完那句话的两堆口径（D65）：真敲过的门，和冷却里没去敲的门。
+
+    `tries == 0` 就是这次没调用（D27 把 `tries` 定成实际调用次数）。分成两堆打印是因为
+    这两堆的下一步动作相反：前一堆要看错误类型，后一堆只需要等窗口过——把它们混成一句
+    「真调用过又失败的 akshare: 429」，下一个人就会再撞 10 次去确认一件已经定性的事。
+    """
+    called = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok and a.tries)
+    aside = [a for a in attempts if not a.ok and not a.tries]
+    note = f"真调用过又失败的 {called or '（无）'}"
+    if aside:
+        note += "；本次未调用的 " + "、".join(f"{a.source}（{a.error}）" for a in aside)
+    return note
 
 
 class _SourceFailed(Exception):
@@ -278,6 +303,14 @@ class AdapterRegistry:
     #: 连续失败到阈值时发 SystemAlarm（spec §12：监控系统监控自己）
     bus: EventBus | None = None
     alarm_after_failures: int = 3
+    #: 连败到多少个冷却一个源，以及冷却多久（D279）。是两个可注入的旋钮，
+    #: 但测试刻意按默认值跑：那 10 轮循环本身就是「整夜」的缩时模型
+    cooldown_after_failures: int = COOLDOWN_AFTER_FAILURES
+    cooldown_s: float = COOLDOWN_S
+    #: 源名 → 冷却到哪一刻。**只在进程内**：连败计数本来就落库，重启后第一次失败
+    #: 就把冷却重新挂上，付得起的代价只有一轮探针；而为它加一列、加一条迁移，
+    #: 会把一个止损机制变成一份要维护的持久状态
+    cooling_until: dict[str, datetime] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # 反查「这个源名被路由到哪些市场」：健康页要说的是「我把它用在哪些市场」，
@@ -402,11 +435,26 @@ class AdapterRegistry:
         链没有立场替它们决定这个源这次表现如何。
         """
         cap = capability(method)
+        # 「链上有几个能答的源」要按这一趟的口径数，不是按健康页那套（`chain_for` 要 market）：
+        # 只剩一个时不冷却，见 `_cooling`
+        capable = sum(1 for n in self.sources_for(market) if cap.probe(self.adapter(n)))
         for name in self.sources_for(market):
             adapter = self.adapter(name)
             if not cap.probe(adapter):
                 logger.info("%s 跳过 %s（%s %s 链上没有这个能力）", cap.label, name, market, code)
                 yield _Outcome(name, "skipped", error=cap.lacking)
+                continue
+            if capable > 1 and self._cooling(name):
+                # 不走 `_mark_failure`：冷却里的跳过不是新的失败，把它计进去会让连败数
+                # 一晚上冲到四位数，而那句「连续失败 N 次」就说不出「真试过」了
+                left = int((self.cooling_until[name] - self.clock.now_utc()).total_seconds())
+                yield _Outcome(
+                    name,
+                    "failed",
+                    error=f"冷却中，还有 {left} 秒",
+                    tries=0,
+                    cause=TransientError(name, "冷却中"),
+                )
                 continue
             try:
                 frame = self._call(name, market, code, start, end, method=method, extra=extra)
@@ -495,7 +543,6 @@ class AdapterRegistry:
                 tuple(skipped),
                 empty_everywhere=True,
             )
-        detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
         if not attempts:
             raise DatasourceError(
                 "registry",
@@ -503,7 +550,7 @@ class AdapterRegistry:
                 f"链 {list(self.sources_for(market))} 里"
                 f"被跳过的源 {skipped or []}",
             )
-        raise _terminal_error(f"{market} {code} 所有源均失败 → {detail}", causes)
+        raise _terminal_error(f"{market} {code} 所有源均失败 → {_failure_note(attempts)}", causes)
 
     def fetch_actions(self, market: str, code: str, start: date, end: date) -> ActionsResult:
         """公司行为链：按同一条路由顺序走，但**只走有这个能力的源**。
@@ -574,11 +621,10 @@ class AdapterRegistry:
                 confirmed_empty_by=tuple(name for name, _ in empties),
             )
 
-        detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
         said_no = "、".join(name for name, _ in empties)
         reason = (
             f"{market} {code} 取不到公司行为。链 {list(self.sources_for(market))} 里"
-            f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}"
+            f"被跳过的源 {skipped or []}；{_failure_note(attempts)}"
             + (f"；说查无记录的 {said_no}（因为 {('、'.join(unanswered))} 没答上来，"
                f"这些「没有」还不能写成确认）" if empties else "")
         )
@@ -624,6 +670,14 @@ class AdapterRegistry:
         """公告元数据（D214/D216）。窗口交给源筛，只取最近一页。"""
         return self._fetch_frame(
             market, code, start, end, method="announcements", empty=empty_announcements()
+        )
+
+    def fetch_stock_news(
+        self, market: str, code: str, start: date, end: date
+    ) -> FrameResult:
+        """个股新闻（S3-B / D247）：与公告同一条降级链，0 行是一次可落库的答复。"""
+        return self._fetch_frame(
+            market, code, start, end, method="stock_news", empty=empty_news()
         )
 
     def _fetch_frame(
@@ -691,11 +745,10 @@ class AdapterRegistry:
                 confirmed_empty_by=tuple(empties),
             )
 
-        detail = "；".join(f"{a.source}: {a.error}" for a in attempts if not a.ok)
         said_no = "、".join(empties)
         reason = (
             f"{market} {code} 取不到{cap.label}。链 {list(self.sources_for(market))} 里"
-            f"被跳过的源 {skipped or []}；真调用过又失败的 {detail or '（无）'}"
+            f"被跳过的源 {skipped or []}；{_failure_note(attempts)}"
             + (
                 f"；说查无记录的 {said_no}（因为 {'、'.join(unanswered)} 没答上来，"
                 f"这些「没有」还不能写成确认）"
@@ -1052,6 +1105,7 @@ class AdapterRegistry:
         return frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)
 
     def _mark_ok(self, name: str) -> None:
+        self.cooling_until.pop(name, None)
         self._remember(
             SourceRecord(
                 name=name,
@@ -1060,6 +1114,18 @@ class AdapterRegistry:
                 last_ok_at=self.clock.today(),
             )
         )
+
+    def _cooling(self, name: str) -> bool:
+        """现在还在冷却里吗？到期不只是「不再冷却」——它顺手把标记清掉，
+        下一次调用就是探针（半开：不额外安排探路者，靠真实流量试一次）。
+        """
+        until = self.cooling_until.get(name)
+        if until is None:
+            return False
+        if self.clock.now_utc() >= until:
+            del self.cooling_until[name]
+            return False
+        return True
 
     def _mark_failure(self, name: str, exc: DatasourceError) -> None:
         previous = self.records[name]
@@ -1075,6 +1141,18 @@ class AdapterRegistry:
         )
         failures = self.records[name].consecutive_failures
         logger.warning("源 %s 连续失败 %d 次: %s", name, failures, exc)
+        if failures >= self.cooldown_after_failures:
+            # 出声只在新挂上冷却那一次：冷却里每次再失败都会把窗口整段重放一遍，
+            # 那是同一件事在念第二遍，一晚上念 490 遍等于没有念
+            was_cooling = self._cooling(name)
+            self.cooling_until[name] = self.clock.now_utc() + timedelta(seconds=self.cooldown_s)
+            if not was_cooling:
+                logger.warning(
+                    "源 %s 冷却 %d 秒（连续失败 %d 次），这期间链上直接换下一个源",
+                    name,
+                    int(self.cooldown_s),
+                    failures,
+                )
         # 只在跨过阈值那一次发告警：之后每次失败都通知，等于没有通知
         if self.bus is not None and failures == self.alarm_after_failures:
             self.bus.publish(

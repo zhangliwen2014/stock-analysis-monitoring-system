@@ -164,3 +164,72 @@ def test_latest_per_period_does_not_leak_across_markets(db):
     assert [row.market for row in global_rows] == [None, None]
     market_rows = repo.latest_per_period("fx", "A", limit=5)
     assert [row.market for row in market_rows] == ["A", "A"]
+
+
+def test_failed_names_for_one_period_names_each_job_once(db):
+    """摘要要说的是一句「哪些 job 没跑成」，不是每个重试一行。"""
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    bars = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(bars, status=FAILED, error="源超时")
+    retry = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(retry, status=FAILED, error="源超时（第二次）")
+    valuation = repo.start("valuation", market="A", period_key="2024-10-25")
+    repo.finish(valuation, status=FAILED, error="空答复")
+    ok = repo.start("spot", market="A", period_key="2024-10-25")
+    repo.finish(ok, status=OK)
+    other_day = repo.start("rules", market="A", period_key="2024-10-24")
+    repo.finish(other_day, status=FAILED, error="昨天的")
+    other_market = repo.start("bars", market="HK", period_key="2024-10-25")
+    repo.finish(other_market, status=FAILED, error="香港的")
+    assert repo.failed_names_for("A", "2024-10-25") == ("bars", "valuation")
+    assert repo.failed_names_for("A", "2024-10-25", exclude=("bars",)) == ("valuation",)
+
+
+def test_close_interrupted_finishes_every_running_row_and_only_those(db):
+    """进程被杀会留下一堆 `running`：新进程一启动就该把它们结掉。
+
+    库里单写者，所以「有一行 running」只有两种解释：本进程正在跑（启动时不可能），
+    或上一个进程死了没收尾。留着不结，`sams health` 就把三天前那次死掉的运行读成
+    「正在进行」，而那一行的周期再也不会被算进「这一晚哪些没跑成」。
+    """
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    orphan_a = repo.start("financials", market="A", period_key="2024-10-25")
+    orphan_hk = repo.start("flow", market="HK", period_key="2024-10-25")
+    done = repo.start("bars", market="A", period_key="2024-10-25")
+    repo.finish(done, status=OK, rows_affected=7)
+    clock.advance(hours=3)
+
+    assert repo.close_interrupted() == 2
+
+    for run_id in (orphan_a, orphan_hk):
+        row = repo.get(run_id)
+        assert row.status == FAILED
+        assert row.finished_at == datetime(2024, 10, 25, 11, 30, tzinfo=UTC)
+        assert "未收尾" in (row.error or "")
+    assert repo.get(done).status == OK
+    # 结过一次就幂等：第二次没有孤儿可结
+    assert repo.close_interrupted() == 0
+
+
+def test_running_names_the_rows_that_have_not_finished_newest_first(db):
+    """「现在还有没有人在做活」是健康读数要分开的另一半：一行 `running` 就是证据。
+
+    这一句可信的前提是上面那个测试：单写者 + 新进程启动时结孤儿，所以今天读到的
+    `running` 不可能是上一个死掉的进程留下的。顺序按开始时间新到旧——同时挂着几行时，
+    健康页要说的是「正在跑『最近那一个』」。
+    """
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    first = repo.start("bars", market="A", period_key="2024-10-25")
+    clock.advance(minutes=2)
+    repo.start("financials", market="A", period_key="2024-10-25")
+    finished = repo.start("flow", market="HK", period_key="2024-10-25")
+    repo.finish(finished, status=OK, rows_affected=1)
+
+    rows = repo.running()
+
+    assert [row.job_name for row in rows] == ["financials", "bars"]
+    assert rows[1].id == first
+    assert all(row.status == RUNNING for row in rows)

@@ -1,0 +1,3 @@
+{# 筛选开关只在打开时随表单走：默认值（估值只比正值、剔除 ST/退市）不写进 URL #}
+{% if include_negatives %}<input type="hidden" name="include_negatives" value="1">{% endif %}
+{% if include_st %}<input type="hidden" name="include_st" value="1">{% endif %}

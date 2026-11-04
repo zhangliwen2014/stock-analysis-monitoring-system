@@ -141,6 +141,54 @@ class RuleService:
         self._bump()
         return self.view(rule)
 
+    def draft(
+        self,
+        user_id: str,
+        *,
+        kind: str,
+        name: str,
+        target_type: str,
+        target_ref: str,
+        params: Mapping[str, object] | None = None,
+        filters: Mapping[str, object] | None = None,
+        account_id: str | None = None,
+        thesis_id: str | None = None,
+        severity: str | None = None,
+        channel_ids: Sequence[str] = (),
+        cooldown_min: int | None = None,
+    ) -> Rule:
+        """造一条**不落库**的规则给网页的保存前试算（R-22）。
+
+        走的是 `add` 在写库之前的那四道检查（用户、账户归属、通道、已配置的市场），
+        参数与形状的判据则在 `rules.build` 里——它与 `create` 共用同一份 `_validate`。
+        少一道都会分叉：屏幕上说「这条线会响」而保存时回一句「不认」，比没有试算更糟。
+
+        不 `_bump()`：那一响是给「写面动过」用的（§5.4 的盘中缓存失效闸）。一次试算
+        什么都没改，bump 会让盘中那一趟白白重读整张快照。
+        """
+        self._require_user(user_id)
+        self._require_account(user_id, account_id)
+        self._require_channels(user_id, channel_ids)
+        self._require_configured_market(target_type, target_ref)
+        return self.rules.build(
+            user_id,
+            kind=kind,
+            name=name,
+            target_type=target_type,
+            target_ref=target_ref,
+            params=params,
+            filters=filters,
+            account_id=account_id,
+            thesis_id=thesis_id,
+            severity=severity,
+            channel_ids=channel_ids,
+            cooldown_min=(
+                self.settings.cooldown_min if cooldown_min is None else int(cooldown_min)
+            ),
+            # 与 `add` 同一句：人此刻填的价属于此刻的价空间
+            params_on=self.clock.today(),
+        )
+
     def edit(
         self,
         user_id: str,

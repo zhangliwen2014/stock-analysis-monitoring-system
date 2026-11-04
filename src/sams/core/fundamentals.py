@@ -152,14 +152,33 @@ RATIO_BOUNDS = {
 }
 
 
-def out_of_caliber(column: str, value: float | None) -> bool:
-    """这个数在 `column` 的小数口径里不可信（D58 + D66）——口径闸的唯一出处。
+#: 个别市场里 100% 以上的 ROE 是**真实值**（D228）：美股回购把股东权益压得很小，
+#: 苹果 2025 年报 ROE=171.4%。默认的 1.0 是为「百分数没 ÷100」设的，在美股会把真实值
+#: 静默置空。放宽只针对具体市场与具体列，默认闸不动；上界仍留 5.0——171.4、35.0
+#: 这种真正没除数的写法照样被拦下。
+MARKET_RATIO_BOUNDS: dict[tuple[str, str], float] = {("US", "roe"): 5.0}
+
+
+def ratio_bound(column: str, *, market: str | None = None) -> float | None:
+    """这一列在**这个市场**的可信上界：先看市场覆盖，再落到默认闸。"""
+    if market is not None:
+        override = MARKET_RATIO_BOUNDS.get((market, column))
+        if override is not None:
+            return override
+    return RATIO_BOUNDS.get(column)
+
+
+def out_of_caliber(column: str, value: float | None, *, market: str | None = None) -> bool:
+    """这个数在 `column` 的小数口径里不可信（D58 + D66 + D228）——口径闸的唯一出处。
 
     写成函数而不是三处各写一遍 `abs(value) > bound`：仓库写入、命令行的比率参数、
     PR 的分母都在问同一个问题。漏掉的那一处的症状不是报错，是**同一个数在一侧被拦下、
     在另一侧被当成事实用掉**——`--roe-estimate 5`（= 5%）曾经就是这么走进 PR 的。
+
+    不传 `market` 时用默认上界；入库侧按行把市场带进来，才能让美股的真实高 ROE 过闸
+    而 A 股那一段死区仍然关闭。
     """
-    bound = RATIO_BOUNDS.get(column)
+    bound = ratio_bound(column, market=market)
     if bound is None or value is None:
         return False
     return abs(value) >= bound
@@ -197,6 +216,11 @@ STALE_VALUATION_DAYS = 7
 ROE_BASIS_ANNUAL = "annual"
 ROE_BASIS_LATEST = "latest"
 ROE_BASIS = (ROE_BASIS_ANNUAL, ROE_BASIS_LATEST)
+
+#: 财年不按 12-31 收尾的市场（D228）：美股公司可以 9 月末、6 月末结账，苹果的
+#: 2025 年报报告期是 2025-09-27。这些市场的「年报」认源给的报告类型（`report_type`），
+#: 不认日历日；A 股与港股仍按 12-31 判（D62 的那条结论）。
+FISCAL_YEAR_ANNUAL_MARKETS = frozenset({"US"})
 
 #: `MarketProfitRatio.basis` 的三个取值（D59）。词表放 core 而不是 analysis：命令行要按
 #: 它分支措辞，而分层守卫不许 `cli` import `analysis`——把名单挪到 analysis 里等于

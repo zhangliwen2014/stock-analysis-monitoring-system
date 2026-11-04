@@ -23,7 +23,7 @@ from datetime import date
 from sams.bootstrap import Container
 from sams.cli.common import group, iso_date, ratio_arg
 from sams.core.codes import exchange_folds_dividend_into_daily_change
-from sams.core.errors import NotAdjustable, ValidationError
+from sams.core.errors import CoverageMissing, NotAdjustable, ValidationError
 from sams.core.fundamentals import (
     BASIS_PB_ESTIMATE,
     ROE_BASIS,
@@ -334,8 +334,17 @@ def run_return(container: Container, args: argparse.Namespace) -> int:
         result = container.analysis.interval_return(
             args.market, args.code, start, end, listed_on=listed_on
         )
+    except CoverageMissing as exc:
+        # 分析层的文案只说「谁会把这活接走」，因为那句话多数落在网页上。命令行这一侧
+        # 能跑那条命令，就在这个出口把命令给它（D283）
+        hint = f"sams sync actions --market {args.market} --code {args.code}"
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "next": hint, "exit": 1})
+        else:
+            print(f"拒绝出数：{exc}\n命令行要补覆盖：{hint}")
+        return 1
     except NotAdjustable as exc:
-        # 拒绝是一种答案，不是程序出错：文案里带着下一步该跑的命令
+        # 拒绝是一种答案，不是程序出错
         if args.json:
             _emit({"status": "refused", "reason": str(exc), "exit": 1})
         else:
@@ -564,6 +573,13 @@ def run_series(container: Container, args: argparse.Namespace) -> int:
             indicators=names,
             listed_on=listed_on,
         )
+    except CoverageMissing as exc:
+        hint = f"sams sync actions --market {args.market} --code {args.code}"
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "next": hint, "exit": 1})
+        else:
+            print(f"拒绝出数：{exc}\n命令行要补覆盖：{hint}")
+        return 1
     except NotAdjustable as exc:
         # 与 `return` 同一条拒绝路：这道闸拒的原因、下一步命令，都是同一套文案在说的事
         if args.json:
@@ -754,6 +770,13 @@ def run_valuation(container: Container, args: argparse.Namespace) -> int:
         else:
             print(f"参数有误：{exc}")
         return 2
+    except CoverageMissing as exc:
+        hint = f"sams sync actions --market {args.market} --code {args.code}"
+        if args.json:
+            _emit({"status": "refused", "reason": str(exc), "next": hint, "exit": 1})
+        else:
+            print(f"拒绝出数：{exc}\n命令行要补覆盖：{hint}")
+        return 1
     except NotAdjustable as exc:
         # 没有日线就没有现价，而现价是那条式子的左边：不给一条「只有分、没有价位」的半条结论
         if args.json:

@@ -1,0 +1,71 @@
+{# 一次求值的五摞（命中/压住/判不了/这条规则没跑/都没到）。
+   检查页与建规则那一屏的「试算（不保存）」共用：两处只是从哪儿发起不同，
+   读的都是引擎那一份 `RunReport`。 #}
+<p>
+  {% if outcome.dry_run %}
+  试运行：一条告警都没写，也没投递。下面说的是「真跑会怎样」。
+  {% else %}
+  真跑：命中的告警已经写进收件箱。
+  {% endif %}
+  <span class="muted">评估日 {{ outcome.as_of }}｜看了 {{ outcome.judged }} 个对象｜没到 {{ outcome.quiet }} 个</span>
+</p>
+{% if outcome.lead %}<p class="muted">{{ outcome.lead }}</p>{% endif %}
+
+{% if outcome.raised %}
+<h2>命中（{{ outcome.raised | length }}）</h2>
+<table>
+  <tr><th>标的</th><th>阶段</th><th>现值 / 阈值</th><th>建议</th><th>告警</th></tr>
+  {% for hit in outcome.raised %}
+  <tr>
+    <td>{{ hit.name }} <span class="muted">{{ hit.market }}/{{ hit.code }}</span></td>
+    <td><span class="badge">{{ hit.stage }}</span></td>
+    <td class="num">{{ hit.value }} / {{ hit.threshold }}{% if hit.data_on %}<div class="muted">数据 {{ hit.data_on }}</div>{% endif %}</td>
+    <td>{{ hit.action }}</td>
+    <td>
+      {% if hit.alert_url %}
+      <a href="{{ hit.alert_url }}">去看告警</a>
+      {% if hit.delivery %}<div class="muted">{{ hit.delivery }}</div>{% endif %}
+      {% else %}<span class="muted">试算：真跑会写一条告警</span>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if outcome.suppressed %}
+<h2>压住（{{ outcome.suppressed | length }}）</h2>
+<ul>
+  {% for item in outcome.suppressed %}
+  <li>{{ item.market }}/{{ item.code }}（{{ item.stage }}）：{{ item.reason }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+{% if outcome.skipped %}
+<h2>判不了（{{ outcome.skipped | length }}）</h2>
+<ul>
+  {% for item in outcome.skipped %}
+  <li>{{ item.market }}/{{ item.code }}：{{ item.reason }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+{% if outcome.blocked %}
+<h2>这条规则没跑（{{ outcome.blocked | length }}）</h2>
+<ul>
+  {% for item in outcome.blocked %}
+  <li>{{ item.name }}：{{ item.reason }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+{% if not outcome.raised and not outcome.suppressed and not outcome.skipped and not outcome.blocked %}
+<p>
+  这一趟看过了：没有到触发条件。
+  {% if outcome.dry_run %}改一个数可以再试一次。{% else %}启用中的规则会在调度器下一趟继续看。{% endif %}
+</p>
+{% endif %}
+
+{% if not outcome.dry_run and outcome.raised and not outcome.has_channels %}
+<p class="flash-error">你没有配置任何通道：告警已经写进收件箱，但不会推到手机或群里。<a href="/settings">去配置通道</a>。</p>
+{% endif %}

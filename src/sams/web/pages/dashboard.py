@@ -16,14 +16,38 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
 from sams.bootstrap import AppCore, ServiceContext
-from sams.core.codes import canonical_code, canonical_market, currency_override, fits_market
+from sams.core.codes import canonical_code, canonical_market, fits_market
 from sams.core.errors import SamsError, ValidationError
 from sams.core.quotes import DELAYED, LIVE, NO_DATA, quote_state
 from sams.services.symbol_search import hinted_market, normalize_query
 from sams.web.auth import csrf_protect, require_user
+from sams.web.back import local_back
 from sams.web.display import hms, index_close_label, pct_class, state_label
+from sams.web.forms import form_data, one
+from sams.web.live_prices import board_prices
+from sams.web.quotes import QuoteView, price_unit, quote_reader
+from sams.web.quotes import market_open as _market_open
 
 router = APIRouter()
+
+#: 自由文本走 `form_data`：裸 UTF-8 的 urlencoded 体 starlette 会按 latin-1 读成乱码，
+#: 修复只在那一层（见 `web/forms.py`）。数字与代码不用它——它们是 ASCII。
+_FORM_BODY = Depends(form_data)
+
+#: 检索词能出现在哪些参数名上 = 那几张表单给自己那格取的名字（`scope` 是限额的对象，
+#: `q` 是资讯的标题筛，`target_ref` 是规则的目标）。模板守卫测试导入这一份当判据：
+#: 新增一页表单时名字没进这里，那一页就永远不出候选。
+TERM_FIELDS = ("code", "q", "target_ref", "scope")
+
+#: 面板种类 → 模板。种类是 `hx-get` 的路径段，不做查询参数（D274）：留在参数里就迟早与
+#: 某张表单的字段名撞车，而 htmx 的 `hx-vals` 撞车时吃掉的是用户刚敲进去的那串字。
+PANEL_TEMPLATES = {
+    "": "partials/symbol_search.html",
+    "nav": "partials/nav_search.html",
+    "fills": "partials/fill_candidates.html",
+    "pick": "partials/pick_candidates.html",
+}
+PANEL_KINDS = tuple(PANEL_TEMPLATES)
 
 
 def _day_start(now: datetime, tz_name: str) -> datetime:
@@ -31,51 +55,25 @@ def _day_start(now: datetime, tz_name: str) -> datetime:
     return local.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def _market_open(ctx: ServiceContext, market: str, now: datetime) -> bool:
-    """日历读不到时按休市显示：五态里「休市」最不会催人动手。
-
-    库被调度线程握着时这里会撞 `DatabaseLocked`，那是常态而不是事故：看板该继续
-    给出它能给的东西，而不是一屏 503。
-    """
-    try:
-        return ctx.calendar.is_market_open(market, now)
-    except SamsError:
-        return False
-
-
-#: 币种代码 → 现价那一格的单位（§5.4 规则 3：金额类数一律带币种）。
-#: 认不出来的币种原样上屏：写成 `SGD` 至少不撒谎，写成「元」是把两种钱说成一种。
-_CURRENCY_UNITS = {"CNY": "元", "HKD": "港元", "USD": "美元"}
-
-
-def _price_unit(ctx: ServiceContext, market: str, code: str = "") -> str:
-    """这一行现价的单位：先认标的的币种例外（B 股、双柜台），再落市场的配置币种。
-
-    折算发生在页面这一侧：模板拿到的就是「港元」，不再拿市场代码去猜币种。
-    市场从配置里撤了（自选里留着旧市场的行）时交空串——那一格只剩数字，比编一个单位诚实。
-    """
-    cfg = ctx.settings.markets.get(market)
-    currency = currency_override(market, code) or (cfg.currency if cfg else "")
-    return _CURRENCY_UNITS.get(currency, currency)
-
-
 def _quote_rows(
     ctx: ServiceContext, core: AppCore, user_id: str, now: datetime
 ) -> list[dict]:
-    """自选清单加上此刻的报价。行情板是进程级那一份，所以读它不经过线程上下文。"""
-    tz = ctx.settings.server.display_tz
+    """自选清单加上此刻的报价。
+
+    一律走统一读模型（`web/quotes.py`）：盘中是过闸的报价，休市回落库内最后一根
+    不复权日线。看板与个股页、选股页给的是同一个数、同一句「10-30 收盘」。
+    """
+    items = ctx.watchlists.list(user_id)
+    reader = quote_reader(ctx, core, now)
+    quotes: dict[tuple[str, str], QuoteView] = {}
+    for market in {item.market for item in items}:
+        codes = [item.code for item in items if item.market == market]
+        for code, view in reader.views(market, codes).items():
+            quotes[(canonical_market(market), code)] = view
     rows = []
-    for item in ctx.watchlists.list(user_id):
-        quote = core.board.get(item.market, item.code)
+    for item in items:
+        view = quotes[(canonical_market(item.market), canonical_code(item.market, item.code))]
         symbol = ctx.symbols.get(item.market, item.code)
-        state = NO_DATA
-        if quote is not None:
-            state = quote_state(
-                quote,
-                now=now,
-                market_open=_market_open(ctx, item.market, now),
-                stale_s=ctx.settings.quote_stale_s,
-            )
         master = symbol or {}
         rows.append(
             {
@@ -84,13 +82,14 @@ def _quote_rows(
                 # 主档没这一行（采集还没跑过这个市场）时名称交代码而不是空串：空白格
                 # 读起来像页面坏了，而代码本身就在那一列里站着
                 "name": master.get("name") or item.code,
-                "unit": _price_unit(ctx, item.market, item.code),
+                "unit": view.unit,
                 "note": item.note or "",
-                "price": quote.price if quote else None,
-                "pct": quote.pct_chg if quote else None,
-                "pct_class": pct_class(quote.pct_chg if quote else None),
-                "state": state_label(state),
-                "quote_at": hms(quote.ts if quote else None, tz),
+                "price": view.price,
+                "pct": view.pct,
+                "pct_class": pct_class(view.pct),
+                "state": state_label(view.state),
+                "quote_at": view.label,
+                "quote_detail": view.detail,
             }
         )
     return rows
@@ -127,8 +126,9 @@ def overview(request: Request):
     alerts_open = ctx.alerts_store.count_open(user.id)
 
     accounts = []
+    prices = board_prices(ctx, core, now)
     for account in ctx.sim_accounts.list_for(user.id):
-        summary = ctx.portfolio.summary(user.username, account.id)
+        summary = ctx.portfolio.summary(user.username, account.id, prices=prices)
         accounts.append(
             {
                 "name": summary.name,
@@ -169,9 +169,12 @@ def overview(request: Request):
 
 
 @router.get("/api/partials/quotes")
-def quotes_partial(request: Request, manage: int = 0):
+def quotes_partial(request: Request, manage: int = 0, back: str = ""):
     """行情板 fragment：`manage` 只决定那一行最右侧带不带移除表单（D166）——
-    看板不带、自选页带，同一段折法在两处复用，10 秒那一刷之后按钮还在。"""
+    看板不带、自选页带，同一段折法在两处复用，10 秒那一刷之后按钮还在。
+
+    `back` 是发起页报上来的「那一屏」（`/` 或 `/watchlist`）：这一段裸片段自己的 URL
+    不是来路，宁可不出返回链接，也不要一条把人带到裸片段的「返回」。"""
     user = require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
@@ -179,6 +182,7 @@ def quotes_partial(request: Request, manage: int = 0):
     return web.render(
         request,
         "partials/quotes.html",
+        page_url=local_back(back),
         rows=_quote_rows(ctx, web.core, user.id, now),
         manage=bool(manage),
     )
@@ -246,28 +250,75 @@ def _index_rows(ctx: ServiceContext, core: AppCore, now: datetime) -> list[dict]
 
 
 @router.get("/api/symbol-search")
-def symbol_search_partial(request: Request, code: str = "", market: str = "", scope: str = ""):
-    """候选面板：htmx 每敲一个字重来一次，空检索词回空面板，不打扰。
+def symbol_search_partial(
+    request: Request,
+    code: str = "",
+    market: str = "",
+    scope: str = "",
+    q: str = "",
+    target_ref: str = "",
+):
+    """默认那块候选面板：一行带「加入自选」。
 
-    `scope=fills` 时那一行是「填进成交表单」而不是「加入自选」（D206）：
-    同一份检索结果，两种用途各有一个模板。
+    种类在路径上的那一版见 `symbol_search_panel`；这里没有种类参数，因为「哪种面板」
+    一旦做成查询参数，就迟早与某张表单的字段名撞车（D274）。
+    """
+    return _render_candidates(
+        request,
+        "",
+        {"code": code, "q": q, "scope": scope, "target_ref": target_ref},
+        market,
+    )
+
+
+@router.get("/api/symbol-search/{kind}")
+def symbol_search_panel(
+    request: Request,
+    kind: str,
+    code: str = "",
+    market: str = "",
+    scope: str = "",
+    q: str = "",
+    target_ref: str = "",
+):
+    """指定种类的候选面板：`nav` 整行链接（S4-C）、`fills` 填进成交表单（D206）、
+    `pick` 通用「填入」，给规则/建论/限额/关键词/探源那几张字段名不同的表单。"""
+    if kind not in PANEL_TEMPLATES:
+        raise HTTPException(status_code=404, detail=f"没有这种候选面板：{kind}")
+    return _render_candidates(
+        request,
+        kind,
+        {"code": code, "q": q, "scope": scope, "target_ref": target_ref},
+        market,
+    )
+
+
+def _render_candidates(request: Request, kind: str, terms: dict[str, str], market: str):
+    """一次检索，四种面板：只有模板不同，检索、排序与「查无」的口径是同一份。
+
+    检索词取第一个非空的项。名字这么多不是留余地：htmx 只把**这个输入框自己的值，用它
+    自己的名字**发出去（实测它不自动带整张表单，所以别指望页面把词抄进另一个字段），
+    而格子的名字归各自表单的 POST 处理函数定（筛标题那格叫 `q`、规则的目标叫
+    `target_ref`、限额的对象叫 `scope`）。端点少认一个名字，那一页接线全对、屏上一行
+    候选都不出。
     """
     require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
+    query_text = next((value for value in (terms[name] for name in TERM_FIELDS) if value), "")
     rows = [
         {
             "market": c.market,
             "code": c.code,
             "name": c.name,
             "price": c.close,
-            "unit": _price_unit(ctx, c.market, c.code),
+            "unit": price_unit(ctx, c.market, c.code),
         }
-        for c in ctx.symbol_search.search(code)
+        for c in ctx.symbol_search.search(query_text)
     ]
     # 排序：检索词前缀提示的市场最前，其次表单选中的，最后其余——稳定划分，一个不丢（D141）。
     # 选着 A 搜 hk00700 时归一已经把前缀剥了，两个市场都可能命中：用户刚刚说过的那一位别输掉
-    hint = hinted_market(code)
+    hint = hinted_market(query_text)
     sel = market.strip().upper()
     hinted = [r for r in rows if hint and r["market"] == hint]
     rest = [r for r in rows if not (hint and r["market"] == hint)]
@@ -275,14 +326,16 @@ def symbol_search_partial(request: Request, code: str = "", market: str = "", sc
         r for r in rest if r["market"] != sel
     ]
     # 「查无」只说给真的查过的检索词：`%%%`、光一个市场字母在归一那步就没了，没查不许说没查到
-    query = normalize_query(code)
+    query = normalize_query(query_text)
     searched = query is not None
     return web.render(
         request,
-        "partials/fill_candidates.html" if scope == "fills" else "partials/symbol_search.html",
+        PANEL_TEMPLATES[kind],
         rows=rows,
         query=query,
         none_found=searched and not rows,
+        # 面板是异步片段，它的「这一屏」是这段端点 URL：来路由发起它的表单报上名
+        back_url=local_back(request.query_params.get("back")),
     )
 
 
@@ -319,11 +372,12 @@ def watchlist_add(
     _csrf: None = Depends(csrf_protect),
     market: str = Form(""),
     code: str = Form(""),
-    note: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
 ):
     require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
+    note = one(data, "note")
     market = market.strip().upper()
     if market not in ctx.settings.markets:
         return _watch_page(

@@ -262,5 +262,17 @@ class CorpActionRepo:
             params.append(until)
         return self.db.query(" ".join(sql) + " ORDER BY ex_date, kind", params)
 
+    def list_market(self, market: str, *, until: date | None = None) -> pl.DataFrame:
+        """一个市场的行为明细，选股批量复权时一次问完。
+
+        `until` 与 `list_for` 同义：PIT 上界由调用方给，仓库层不看现在是几点。
+        """
+        sql = ["SELECT * FROM corp_actions WHERE market = ?"]
+        params: list = [canonical_market(market)]
+        if until is not None:
+            sql.append("AND ex_date <= ?")
+            params.append(until)
+        return self.db.query(" ".join(sql) + " ORDER BY code, ex_date, kind", params)
+
     def count(self) -> int:
         return int(self.db.scalar("SELECT count(*) FROM corp_actions") or 0)

@@ -9,9 +9,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 from sams.core.errors import ValidationError
@@ -20,6 +20,10 @@ from sams.core.timeutil import format_utc_moment
 #: 三级（§11）。拼死三个而不是开放字符串：路由表按它分支，多一个取值就是漏一个分支。
 SEVERITIES = ("strong", "mid", "weak")
 STRONG, MID, WEAK = SEVERITIES
+
+#: 三档严重级别的中文名。规则列表、规则表单、告警筛选与徽标、摘要正文说的是同一套话：
+#: 一半屏幕叫「强」、另一半叫「strong」，读的人要先猜它们是不是一件事
+SEVERITY_LABELS = {"strong": "强", "mid": "中", "weak": "弱"}
 
 #: `notify_log.outcome` 的四态。后两种既不是成功也不是失败——把它们算进「失败」，
 #: 健康页就会把「你自己设了免打扰」报成「企微挂了」。
@@ -38,6 +42,10 @@ DEFAULT_ROUTE: dict[str, tuple[str, ...]] = {
 #: 它住在 core 而不是 monitor：`services/health.py` 要读它判断「库里有种通道工厂不认识」，
 #: 而 `services` 不许 import `monitor`。「有哪些通道」是域知识，不是实现细节。
 KINDS = ("wecom", "dingtalk", "pushplus", "email", "desktop", "voice")
+
+#: 摘要只走文字通道：桌面 200 字节、语音 140 字节的 `LIMITS` 连标题行都放不下，
+#: 而摘要的价值在正文那几栏，不在一句话的提示音。
+DIGEST_KINDS = ("wecom", "dingtalk", "pushplus", "email")
 
 #: `alerts.market` 里代表「这不是一只票」的那一个值（D102）。
 #: 系统告警与规则告警共用一张表，靠它与 `rule_id IS NULL` 分开；写入方（调度器的
@@ -94,6 +102,14 @@ class AlertMessage:
     intraday: bool = False
     quote_ts: datetime | None = None
     quote_source: str | None = None
+    #: 证据两列（S1-B）：这条告警判自哪根 bar、按哪个键去重。状态型命中没有
+    #: 价格日时会回落到求值日；`dedupe_key` 与正文那行逐字一致，只作审计。
+    trigger_bar_ts: date | None = None
+    dedupe_key: str = ""
+    #: 要原样写进 `payload_json` 顶层的结构化事实（S3-C 的资讯命中：kind/title/url/
+    #: keyword/published_at/source）。通道只读抬头与正文，这些事实是给收件箱、
+    #: 摘要与页面回看用的；嵌套一层会让「按 kind 找资讯告警」变成挖子树。
+    facts: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.severity not in SEVERITIES:
@@ -106,6 +122,31 @@ class AlertMessage:
                 "AlertMessage 必须说清是哪只票：`market` 与 `code` 是标题行的前两段，"
                 "空着的标题行在手机上读不成一件事"
             )
+
+
+@dataclass(frozen=True)
+class DigestMessage:
+    """一天的摘要：标题是它自己写好的那一行，不套告警的 `[市场][账户] … | 值/阈值`。
+
+    `severity` 与 `triggered_at` 只为两件事存在：免打扰窗口按前者判断（摘要按 mid），
+    按后者折时区。六个通道的 `send()` 只读 `headline` 与 `body`，所以这一型与
+    `AlertMessage` 在投递那一侧长得一样（`format_headline` 认它）。
+    """
+
+    market: str
+    as_of: date
+    title: str
+    body: str
+    triggered_at: datetime
+    severity: str = MID
+
+    def __post_init__(self) -> None:
+        if self.severity not in SEVERITIES:
+            raise ValidationError(
+                f"未知严重级别 severity={self.severity!r}：只有 {list(SEVERITIES)}"
+            )
+        if not self.market or not self.title.strip():
+            raise ValidationError("摘要必须说清是哪个市场、标题不能为空")
 
 
 @dataclass(frozen=True)
@@ -133,9 +174,15 @@ def route_for(severity: str) -> tuple[str, ...]:
     return DEFAULT_ROUTE[severity]
 
 
-def format_headline(message: AlertMessage) -> str:
+def format_headline(message: AlertMessage | DigestMessage) -> str:
     """§11 那条标题行。六个通道共用同一句：同一件事在企微和邮件里长得不一样，
-    读的人就要多花一次「这两条是不是同一条」的力气。"""
+    读的人就要多花一次「这两条是不是同一条」的力气。
+
+    摘要有自己写好的标题：把摘要也套进 `[市场][账户] … | 值/阈值`，等于在标题里
+    摆三个问号。
+    """
+    if isinstance(message, DigestMessage):
+        return message.title
     prefix = _SEVERITY_PREFIX[message.severity]
     account = message.account_name.strip() or UNKNOWN_ACCOUNT
     name = message.name.strip() or UNKNOWN_NAME
@@ -283,9 +330,10 @@ class AlertSender(Protocol):
     参数表与 `NotifyService.dispatch` 逐字对齐（`tests/core/test_notify_alert_sender.py`
     钉这一条）：差一个参数名，红的是 M3-D 挂机跑到某条规则时，而不是这里。
 
-    `is_test` 不属于引擎：它只会按 `False` 走（规则告警与系统告警都是真的）。它在端口
-    上是因为 `NotifyService.dispatch` 有这一格（`/settings/test-alert` 要按 D131 记下
-    「这条是测试」），而两份参数表差一个字就是「接得上」这句话没被钉住。
+    `is_test` 只有网页的示例演练会传 `True`（D231）：那一趟照样真求值、真落库、真投递，
+    只是 D131 的两处读数（健康积压、`no_open_alert`）不认它。调度、命令行与用户自己
+    规则的「判一次」都不传，默认仍是真告警。它在端口上原本是为 `/settings/test-alert`
+    留的，而两份参数表差一个字就是「接得上」这句话没被钉住。
     """
 
     def dispatch(

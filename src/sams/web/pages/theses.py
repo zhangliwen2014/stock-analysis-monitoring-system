@@ -19,18 +19,26 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
+from sams.core.assumptions import METRICS, OPS, metric_label, op_label, status_label
 from sams.core.errors import DatabaseLocked, SamsError, StorageError, ValidationError
 from sams.core.timeutil import format_utc_moment
 from sams.services.theses import LEVEL_ROW_COLUMNS, LEVEL_ROWS
 from sams.services.valuation import STYLE_NAMES
 from sams.storage.repos.theses import Thesis
 from sams.web.auth import csrf_protect, require_user
-from sams.web.display import moment_label
+from sams.web.back import local_back
+from sams.web.display import metric_value, moment_label
+from sams.web.forms import form_data, one
 
 router = APIRouter()
+
+#: 批注与假设备注是自由文本，走 `form_data` 折回裸 UTF-8；市场、代码、枚举仍是 Form。
+_FORM_BODY = Depends(form_data)
 
 
 def _require_own(ctx, user, thesis_id: str) -> Thesis:
@@ -106,6 +114,45 @@ def _levels_note(thesis: Thesis) -> str:
     return f"截至 {thesis.levels_on}" if thesis.levels_on is not None else "没有测量日（手填）"
 
 
+def _assumption_rows(request: Request, thesis: Thesis) -> list[dict]:
+    user = request.state.sams_user
+    ctx = request.app.state.web.contexts.current()
+    return [
+        {
+            "id": item.id,
+            "metric_label": metric_label(item.metric),
+            "op_label": op_label(item.op),
+            "threshold": metric_value(item.metric, item.threshold),
+            "due_on": item.due_on,
+            "note": item.note or "",
+            "status_label": status_label(item.status),
+            "value": metric_value(item.metric, item.evaluated_value),
+            "evaluated_on": item.evaluated_on,
+        }
+        for item in ctx.assumptions.list(user.username, thesis.id)
+    ]
+
+
+def _assumption_threshold(raw: str) -> float:
+    text = raw.strip()
+    if not text:
+        raise ValidationError("阈值不能为空：没有阈值就没有「证伪」")
+    try:
+        return float(text)
+    except ValueError:
+        raise ValidationError(f"阈值 {raw!r} 不是一个数（ROE 15% 写 0.15）") from None
+
+
+def _assumption_due(raw: str) -> date | None:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise ValidationError(f"复核日 {raw!r} 不是 YYYY-MM-DD") from None
+
+
 def _detail_page(
     request: Request, thesis: Thesis, *, error: str | None = None, status: int = 200
 ):
@@ -116,6 +163,8 @@ def _detail_page(
     """
     web = request.app.state.web
     ctx = web.contexts.current()
+    # 来路只有列表那一条链会给：给了就说「返回」，没给就报出那张表的名字（spec §3.2）
+    back = local_back(request.query_params.get("back"))
     events = [
         {
             # 措辞与 CLI 那条时间线同源：同一个瞬间在页面上与在 `sams thesis show` 里
@@ -127,13 +176,19 @@ def _detail_page(
         }
         for event in ctx.theses_store.events(thesis.user_id, thesis.id)
     ]
+    assumptions = _assumption_rows(request, thesis)
     return web.render(
         request,
         "thesis.html",
         status_code=status,
         title=f"论点 {thesis.market}/{thesis.code}",
         thesis=thesis,
+        back_url=back or "/theses",
+        back_label="← 返回" if back else "论点列表",
         events=events,
+        assumptions=assumptions,
+        metrics=METRICS,
+        ops=OPS,
         # 合法档位只有一个出处：这张表变了，下拉与被拒时那句念的都跟着变
         steps=ctx.theses.next_steps(thesis.status),
         levels=_levels(thesis),
@@ -159,10 +214,11 @@ def theses_create(
     market: str = Form(""),
     code: str = Form(""),
     style: str = Form("value"),
-    note: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
 ):
     user = require_user(request)
     ctx = request.app.state.web.contexts.current()
+    note = one(data, "note")
     try:
         # 表单值原样交出去（只 strip）：`add` 那三条路自己会归一，见模块开头
         report = ctx.theses.add(
@@ -198,11 +254,12 @@ def thesis_advance(
     thesis_id: str,
     _csrf: None = Depends(csrf_protect),
     to: str = Form(""),
-    note: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
 ):
     user = require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
+    note = one(data, "note")
     thesis = _require_own(ctx, user, thesis_id)
     steps = ctx.theses.next_steps(thesis.status)
     try:
@@ -214,6 +271,75 @@ def thesis_advance(
                 f"合法的下一步是 {'、'.join(steps) or '（没有，这是终点）'}"
             )
         ctx.theses.advance(user.username, thesis_id, to, note=note.strip() or None)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _detail_page(request, thesis, status=400, error=str(exc))
+    return RedirectResponse(f"/theses/{thesis_id}", status_code=303)
+
+
+@router.post("/theses/{thesis_id}/assumptions")
+def thesis_assumption_add(
+    request: Request,
+    thesis_id: str,
+    _csrf: None = Depends(csrf_protect),
+    metric: str = Form(""),
+    op: str = Form(""),
+    threshold: str = Form(""),
+    due_on: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    note = one(data, "note")
+    thesis = _require_own(ctx, user, thesis_id)
+    try:
+        ctx.assumptions.add(
+            user.username,
+            thesis.id,
+            metric=metric.strip(),
+            op=op.strip(),
+            threshold=_assumption_threshold(threshold),
+            due_on=_assumption_due(due_on),
+            note=note.strip() or None,
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _detail_page(request, thesis, status=400, error=str(exc))
+    return RedirectResponse(f"/theses/{thesis_id}", status_code=303)
+
+
+@router.post("/theses/{thesis_id}/assumptions/evaluate")
+def thesis_assumptions_evaluate(
+    request: Request,
+    thesis_id: str,
+    _csrf: None = Depends(csrf_protect),
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    thesis = _require_own(ctx, user, thesis_id)
+    try:
+        ctx.assumptions.evaluate(user.username, thesis.id)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _detail_page(request, thesis, status=400, error=str(exc))
+    return RedirectResponse(f"/theses/{thesis_id}", status_code=303)
+
+
+@router.post("/theses/{thesis_id}/assumptions/{assumption_id}/delete")
+def thesis_assumption_delete(
+    request: Request,
+    thesis_id: str,
+    assumption_id: str,
+    _csrf: None = Depends(csrf_protect),
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    thesis = _require_own(ctx, user, thesis_id)
+    try:
+        ctx.assumptions.remove(user.username, thesis.id, assumption_id)
     except DatabaseLocked:
         raise
     except SamsError as exc:

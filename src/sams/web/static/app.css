@@ -10,6 +10,22 @@ a { color: inherit; }
 .topbar a:hover { opacity: 1; }
 .brand { font-weight: 700; letter-spacing: 1px; }
 .nav-links { display: flex; gap: 14px; flex: 1; flex-wrap: wrap; }
+/* 导航搜索（S4-C）：结果浮在页面之上，不挤压 nav 链接 */
+.nav-search { position: relative; }
+.nav-search input { width: 230px; max-width: none; padding: 4px 8px; }
+.nav-search-results { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20;
+                      min-width: 340px; background: #fff; color: #1c1c22;
+                      border: 1px solid var(--line); border-radius: 8px;
+                      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); }
+.nav-search-results:empty { display: none; }
+.nav-hits, .nav-hits li { margin: 0; padding: 0; list-style: none; }
+.nav-hits-head { margin: 0; padding: 6px 10px; font-size: 12px; }
+.nav-hits-head + .nav-hits { border-top: 1px solid var(--line); }
+.nav-hits a { display: flex; gap: 10px; padding: 7px 10px; text-decoration: none; }
+.nav-hits a:hover { background: #f0f0f3; }
+.nav-hits .nav-hit-code { font-variant-numeric: tabular-nums; }
+.nav-hits .nav-hit-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-hits .nav-hit-price { font-variant-numeric: tabular-nums; color: var(--muted); }
 .inline-form { display: flex; gap: 8px; align-items: center; margin: 0; }
 .inline { display: inline; }   /* 复选框那一排：label 默认是块级，一格一个开关会排成一列 */
 main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
@@ -33,6 +49,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
                border-radius: 6px; padding: 8px 12px; }
 .flash-ok { color: var(--ok); background: #d1fadf; border: 1px solid #75e0a7;
             border-radius: 6px; padding: 8px 12px; }
+/* 黄色提示：说的是「这份数可能失真」，不是「操作失败」，所以既不是红也不是绿 */
+.flash-warn { color: #b54708; background: #fffaeb; border: 1px solid #fedf89;
+              border-radius: 6px; padding: 8px 12px; }
 label { display: block; margin: 10px 0; }
 input, select, textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--line);
                           border-radius: 6px; width: 100%; max-width: 420px; }
@@ -102,3 +121,17 @@ form.panel { border: 1px solid var(--line); border-radius: 8px; padding: 12px;
 button.link { border: none; background: none; color: inherit; font: inherit;
               padding: 0; cursor: pointer; }
 button.link:hover { background: none; text-decoration: underline; }
+
+/* 估值分位条（S2 / D241）：track 是 0~100 的位置刻度，20/50/80 三条刻度，
+   读数是一枚点。拒绝出数时不画条——空条会被读成「分位 0」。 */
+.percentile { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.percentile-value { font-variant-numeric: tabular-nums; }
+.percentile-strip { position: relative; width: 180px; height: 10px; flex: 0 0 auto; }
+.percentile-track { position: absolute; inset: 3px 0; border-radius: 5px; background: #e7e7ec; }
+.percentile-tick { position: absolute; top: 0; width: 1px; height: 10px; background: #b9b9c2; }
+.percentile-mark { position: absolute; top: -2px; width: 8px; height: 14px; margin-left: -4px;
+                   border-radius: 4px; background: #14141a; }
+.business-table td { vertical-align: top; }
+
+/* 限额被踩：与 flash-error 同一支红，但它是表格里的一格，不铺底色 */
+.limit-breach { color: var(--danger); font-weight: 600; }

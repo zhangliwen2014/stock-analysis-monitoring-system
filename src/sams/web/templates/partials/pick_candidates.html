@@ -1,0 +1,24 @@
+{# 通用「填入本表单」候选：规则、建论、限额、资讯关键词、探源用的都是这一份。
+
+   一行带齐三种形态（市场、裸代码、`市场/代码`），点一下由 app.js 那条共用的委派
+   监听写进**这个表单里存在的那几格**：各页要填的字段名不一样（`code`、`scope`、
+   `target_ref`），而按页各开一个 scope 就得把同一份表格抄七遍。
+   点「填入」不发请求，只改表单（与 D206 同一口径）。 #}
+{% if rows %}
+<table>
+  <tr><th>市场</th><th>代码</th><th>名称</th><th class="num">最近收盘</th><th></th></tr>
+  {% for row in rows %}
+  <tr>
+    <td>{{ row.market }}</td>
+    <td><a href="/symbol/{{ row.market }}/{{ row.code }}{% if back_url %}?back={{ back_url|urlencode }}{% endif %}">{{ row.code }}</a></td>
+    <td>{% if row.name %}<a href="/symbol/{{ row.market }}/{{ row.code }}{% if back_url %}?back={{ back_url|urlencode }}{% endif %}">{{ row.name }}</a>{% else %}—{% endif %}</td>
+    <td class="num">{{ money(row.price, row.unit) }}</td>
+    <td><button type="button" data-pick-market="{{ row.market }}" data-pick-code="{{ row.code }}"
+               data-pick-name="{{ row.name or row.code }}"
+               data-pick-ref="{{ row.market }}/{{ row.code }}">填入</button></td>
+  </tr>
+  {% endfor %}
+</table>
+{% elif none_found %}
+<p class="muted">查无「{{ query }}」——代码、拼音首字母、名称都没命中。手写代码仍可提交。</p>
+{% endif %}

@@ -531,7 +531,11 @@ def test_revise_refuses_a_stop_at_or_above_the_target(db, settings, capsys):
     assert code == 2 and data["status"] == "refused"
     assert "止损" in data["reason"]
     _, after = out(container, capsys, "show", thesis_id, "--user", USER)
-    assert "999" not in after, "拒绝不能改掉库里那一个"
+    # 只盯「止损」那一行的值：整屏 `999 not in` 会被随机 id 的十六进制串撞上（同一门概率）
+    stop_lines = [line for line in after.splitlines() if "止损" in line]
+    assert stop_lines, "show 这一屏没给出止损那一行"
+    for line in stop_lines:
+        assert "999" not in line, "拒绝不能改掉库里那一个"
 
 
 # --- U26：这一条论到底买过没有 ---------------------------------------------------------------

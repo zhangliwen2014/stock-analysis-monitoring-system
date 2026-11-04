@@ -135,7 +135,12 @@ class LedgerService:
     ) -> float:
         self._require_account(resolve_actor(self.users, username), account_id)
         balance = self.accounts.adjust_cash(
-            account_id, currency, abs(amount), reason=reason, actor_id=actor_id
+            account_id,
+            currency,
+            abs(amount),
+            reason=reason,
+            actor_id=actor_id,
+            kind="deposit",
         )
         self._bump()
         return balance
@@ -152,7 +157,12 @@ class LedgerService:
     ) -> float:
         self._require_account(resolve_actor(self.users, username), account_id)
         balance = self.accounts.adjust_cash(
-            account_id, currency, -abs(amount), reason=reason, actor_id=actor_id
+            account_id,
+            currency,
+            -abs(amount),
+            reason=reason,
+            actor_id=actor_id,
+            kind="withdraw",
         )
         self._bump()
         return balance

@@ -10,13 +10,14 @@
       {% for code in markets %}<option value="{{ code }}">{{ code }}</option>{% endfor %}
     </select>
     <input name="code" placeholder="代码 / 首字母 / 名称，如 000001、payh、平安"
-           hx-get="/api/symbol-search" hx-trigger="keyup changed delay:300ms"
+           hx-get="/api/symbol-search?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
            hx-target="#wl-candidates" hx-include="select[name=market]" hx-swap="innerHTML">
     <input name="note" placeholder="备注（可空）">
     <button type="submit">加入</button>
   </form>
   <div id="wl-candidates"></div>
-  <div id="quote-board" hx-get="/api/partials/quotes?manage=1" hx-trigger="every 10s" hx-swap="innerHTML">
+  {# `back=`：这一段每 10 秒换进去一次，裸片段自己的 URL 不是来路，发起页得报上名 #}
+  <div id="quote-board" hx-get="/api/partials/quotes?manage=1&back={{ page_url|urlencode }}" hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "partials/quotes.html" %}
   </div>
   {% if hidden %}

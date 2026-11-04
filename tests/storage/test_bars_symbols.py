@@ -120,6 +120,22 @@ def test_list_market_filters_delisted(symbols):
     assert set(symbols.list_market("A", listed_only=False)["code"]) == {"LIVE", "GONE"}
 
 
+def test_set_sector_reports_whether_it_changed_anything(symbols):
+    """回填的返回值就是「这次改了几只」：同值重写必须报 False，否则幂等无法验收。"""
+    symbols.upsert(pl.DataFrame([{"market": "A", "code": "600519", "currency": "CNY"}]))
+    assert symbols.set_sector("A", "600519", "食品饮料-饮料-白酒") is True
+    assert symbols.get("A", "600519")["sector"] == "食品饮料-饮料-白酒"
+    assert symbols.set_sector("A", "600519", "食品饮料-饮料-白酒") is False
+    assert symbols.get("A", "600519")["name"] is None, "回填只碰 sector 与 updated_at"
+    assert symbols.set_sector("A", "missing", "银行") is False
+
+
+def test_set_sector_refuses_a_blank_value(symbols):
+    symbols.upsert(pl.DataFrame([{"market": "A", "code": "600519", "currency": "CNY"}]))
+    with pytest.raises(ValidationError):
+        symbols.set_sector("A", "600519", "   ")
+
+
 def test_adj_factor_placeholder_column_is_gone(bars, db):
     """没有生产者的列会被下游当成可信口径，所以直接删掉（0003 迁移）。"""
     assert "adj_factor" not in db.query("SELECT * FROM bars_daily").columns
@@ -338,6 +354,29 @@ def test_last_closes_reads_on_the_canonical_key(bars):
     """读侧与 `load`/`latest_date` 同一条归一规则：别名查不到昨收是旧病复发。"""
     bars.upsert(support.sample_bars(market="HK", code="700"))
     got = bars.last_closes([("hk", "HK.00700")])
+    assert set(got) == {("HK", "00700")}
+
+
+def test_last_bars_carries_the_day_previous_close_and_source(bars, bars_frame):
+    """统一报价读模型要的不只是一个数：哪一天的收盘、前一天收在哪、从哪个源来（S0-E）。
+
+    只给 close，屏幕上就写不出「10-30 收盘」，也分不清这一天涨跌是相对谁算的。
+    """
+    bars.upsert(bars_frame)
+    got = bars.last_bars([("A", "600519"), ("A", "000001")])
+    ordered = bars_frame.sort("date")
+    latest = got[("A", "600519")]
+    assert latest.day == ordered["date"][-1]
+    assert latest.close == ordered["close"][-1]
+    assert latest.prev_close == ordered["close"][-2]
+    assert latest.source == "akshare"
+    assert ("A", "000001") not in got, "库里没行的票不许被编出一个 0"
+    assert bars.last_bars([]) == {}
+
+
+def test_last_bars_reads_on_the_canonical_key(bars):
+    bars.upsert(support.sample_bars(market="HK", code="700"))
+    got = bars.last_bars([("hk", "HK.00700")])
     assert set(got) == {("HK", "00700")}
 
 

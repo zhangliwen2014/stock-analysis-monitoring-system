@@ -9,14 +9,20 @@
   <h2>{{ market }} 股 · 快照</h2>
   {% if snapshot %}
   {# 范围行：快照日与票池（快照 ∩ 代码表）先说清，后面三个数相加才有个底 #}
-  <p>快照 {{ snapshot.day_label }} · 票池 {{ snapshot.pool }} 只 · 采集 {{ snapshot.taken_label }}</p>
+  <p>快照 {{ snapshot.day_label }} · 票池 {{ snapshot.pool }} 只 · 采集 {{ snapshot.taken_label }}{% if result and result.st_excluded %} · ST/退市 {{ result.st_excluded }} 只未参与{% endif %}</p>
   {% else %}
   <p class="muted">{{ market }} 股还没有全市场快照：点「立即重采」排队，或先跑
     <code>sams sync spot --market {{ market }}</code></p>
   {% endif %}
+  {% if basis_note %}<p class="muted">{{ basis_note }}</p>{% endif %}
+  {% if financial_coverage %}
+  {# 覆盖数与命中数同屏：只同步了一小撮年报时，「命中 5 只」不能被读成「没有便宜票」（D227） #}
+  <p>年报覆盖 {{ financial_coverage[0] }} / {{ financial_coverage[1] }} 只（能取到截至快照日年报的票；其余记「无数」，不是落选）</p>
+  {% endif %}
   <form method="post" action="/screen/recollect" class="inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <input type="hidden" name="market" value="{{ market }}">
+    {% include "partials/screen_switches.html" %}
     {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
     <button type="submit">立即重采</button>
   </form>
@@ -39,6 +45,7 @@
         <form method="post" action="/screen/presets" class="inline-form">
           <input type="hidden" name="csrf" value="{{ csrf }}">
           <input type="hidden" name="market" value="{{ item.market }}">
+          {% include "partials/screen_switches.html" %}
           <input type="hidden" name="name" value="{{ item.name }}">
           <input type="hidden" name="description" value="{{ item.description }}">
           {% for row in item.rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
@@ -57,6 +64,12 @@
       {% for item in markets %}<option value="{{ item }}"{% if item == market %} selected{% endif %}>{{ item }}</option>{% endfor %}
     </select>
   </label>
+  {# R-09：估值条件的两个默认闸。负 PE/PB 不是「更便宜」，ST/退市也不该混在首屏 #}
+  <p>
+    <label><input type="checkbox" name="include_negatives" value="1"{% if include_negatives %} checked{% endif %}> 包含估值为负的票（亏损/负净资产）</label>
+    <label><input type="checkbox" name="include_st" value="1"{% if include_st %} checked{% endif %}> 包含 ST/退市</label>
+  </p>
+  <p class="muted">默认估值字段（PE/PB）只比正值：负值不是更便宜，它们会列在下面「无数」里，并说清有多少只。</p>
   {% for row in rows %}
   <div class="grid">
     <label>字段
@@ -87,7 +100,7 @@
   {% for item in labels %}{{ item.label }}（{{ item.unit }}）{% if not loop.last %}；{% endif %}{% endfor %}
 </p>
 {% for counts in counts_view %}
-<p>条件 {{ counts.label }}：通过 {{ counts.passed }} / 不通过 {{ counts.failed }} / 无数 {{ counts.missing }}</p>
+<p>条件 {{ counts.label }}：通过 {{ counts.passed }} / 不通过 {{ counts.failed }} / 无数 {{ counts.missing }}{% if counts.nonpositive %}（其中 {{ counts.nonpositive }} 只因估值不为正未参与）{% endif %}</p>
 {% endfor %}
 <p>命中 {{ total }} 只{% if sort_hint %}<span class="muted"> · 按{{ sort_hint }}排序（同值按代码）</span>{% endif %}</p>
 
@@ -96,6 +109,8 @@
 <form method="post" action="/screen/watchlist" class="inline-form">
   <input type="hidden" name="csrf" value="{{ csrf }}">
   <input type="hidden" name="market" value="{{ market }}">
+  <input type="hidden" name="page" value="{{ page }}">
+  {% include "partials/screen_switches.html" %}
   {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
   <input type="hidden" name="action" value="all">
   <input type="hidden" name="confirm" value="yes">
@@ -107,21 +122,23 @@
 <form method="post" action="/screen/watchlist">
   <input type="hidden" name="csrf" value="{{ csrf }}">
   <input type="hidden" name="market" value="{{ market }}">
+  <input type="hidden" name="page" value="{{ page }}">
+  {% include "partials/screen_switches.html" %}
   {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
   <p>
     <button type="submit" name="action" value="all">全部 {{ total }} 只加自选</button>
     <button type="submit" name="action" value="checked">勾选的加自选</button>
   </p>
   <table>
-    <tr><th></th><th>代码</th><th>名称</th>{% for item in labels %}<th class="num">{{ item.label }}</th>{% endfor %}<th class="num">现价</th><th></th></tr>
+    <tr><th></th><th>代码</th><th>名称</th>{% for item in labels %}<th class="num">{{ item.label }}</th>{% endfor %}<th class="num">价格</th><th></th></tr>
     {% for row in view %}
     <tr>
-      <td><input type="checkbox" name="codes" value="{{ row.code }}"></td>
+      <td><input type="checkbox" name="codes" value="{{ row.code }}"{% if row.code in selected %} checked{% endif %}></td>
       {# 点进个股页看详情与 K 线（D211）：筛出一只票之后，下一步就是「它长什么样」 #}
-      <td><a href="/symbol/{{ market }}/{{ row.code }}">{{ row.code }}</a></td>
-      <td><a href="/symbol/{{ market }}/{{ row.code }}">{{ row.name }}</a></td>
+      <td><a href="/symbol/{{ market }}/{{ row.code }}?back={{ back_url|urlencode }}">{{ row.code }}</a></td>
+      <td><a href="/symbol/{{ market }}/{{ row.code }}?back={{ back_url|urlencode }}">{{ row.name }}</a></td>
       {% for cell in row.cells %}<td class="num">{{ cell }}</td>{% endfor %}
-      <td class="num">{{ row.price }}</td>
+      <td class="num">{{ row.price }}{% if row.price_point %}<div class="muted">{{ row.price_point }}</div>{% endif %}</td>
       <td>{% if row.held %}<span class="badge">已在自选</span>{% else %}<button type="submit" name="action" value="one:{{ row.code }}">加自选</button>{% endif %}</td>
     </tr>
     {% endfor %}
@@ -150,6 +167,7 @@
   <form method="post" action="/screen/presets" class="inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <input type="hidden" name="market" value="{{ market }}">
+    {% include "partials/screen_switches.html" %}
     {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
     <label>名字 <input name="name" maxlength="40"></label>
     <label>说明 <input name="description" maxlength="200" size="30" placeholder="为什么留这条方案（可空）"></label>
@@ -159,15 +177,30 @@
   <p class="muted">先在上面填一条条件，才能存成方案。</p>
   {% endif %}
   <table>
-    <tr><th>名字</th><th>说明</th><th>市场</th><th>条件</th><th>更新</th><th>上次跑</th><th>动作</th></tr>
+    <tr><th>名字</th><th>说明</th><th>市场</th><th>条件</th><th>更新</th><th>上次跑</th><th>自动监控</th><th>动作</th></tr>
     {% for item in presets %}
     <tr>
-      <td>{{ item.name }}</td>
+      <td><a href="/screen?preset={{ item.id }}">{{ item.name }}</a></td>
       <td class="muted">{{ item.description or "—" }}</td>
       <td>{{ item.market }}</td>
       <td>{{ item.summary }}</td>
       <td class="muted">{{ item.updated }}</td>
       <td class="muted">{{ item.last_run or "没跑过" }}</td>
+      <td>
+        {% if item.enabled %}<strong>自动监控已开启</strong>{% else %}<span class="muted">自动监控已关闭</span>{% endif %}
+        <div class="muted">名单 {{ item.members }} 只 · 上次运行 {{ item.monitored_at }}</div>
+        <div class="muted">渠道：{{ item.channels_label }}</div>
+        <form method="post" action="/screen/presets/{{ item.id }}/monitor" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <label><input type="checkbox" name="enabled" value="1"{% if item.enabled %} checked{% endif %}> 开启</label>
+          <select name="channel_ids" multiple size="3">
+            {% for channel in channels %}
+            <option value="{{ channel.id }}"{% if channel.id in item.channel_ids %} selected{% endif %}>{{ channel.name }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">保存监控</button>
+        </form>
+      </td>
       <td>
         <a href="{{ item.load_url }}">载入</a>
         <form method="post" action="/screen/presets/{{ item.id }}/run" class="inline-form">
@@ -183,6 +216,7 @@
         <form method="post" action="/screen/presets/{{ item.id }}" class="inline-form">
           <input type="hidden" name="csrf" value="{{ csrf }}">
           <input type="hidden" name="market" value="{{ market }}">
+          {% include "partials/screen_switches.html" %}
           {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
           <button type="submit">覆盖为当前条件</button>
         </form>
@@ -193,10 +227,10 @@
       </td>
     </tr>
     {% else %}
-    <tr><td colspan="7" class="muted">还没有方案。</td></tr>
+    <tr><td colspan="8" class="muted">还没有方案。</td></tr>
     {% endfor %}
   </table>
-  <p class="muted">「载入」把条件放回上面，可改后再跑，不记历史；「重跑」按今天的快照跑一次并记下结果。</p>
+  <p class="muted">「载入」把条件放回上面，可改后再跑，不记历史；「重跑」按今天的快照跑一次并记下结果；开启自动监控后，盘后每次运行只把<strong>新进名单</strong>的票推出去——第一次运行只记基线。</p>
 </section>
 
 {% if not has_conditions %}

@@ -13,18 +13,28 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
-from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from sams.bootstrap import ServiceContext
 from sams.core.codes import canonical_market
 from sams.core.errors import DatabaseLocked, SamsError, ValidationError
+from sams.core.industry import normalize_industry
+from sams.services.exposure import UNCLASSIFIED, HoldingValue, exposure
+from sams.services.limits import KIND_LABELS, KINDS
+from sams.services.nav import NAV_WINDOW_DAYS
 from sams.web.auth import csrf_protect, require_user
-from sams.web.display import moment_label
+from sams.web.display import moment_label, price_point_label
+from sams.web.forms import form_data, one
+from sams.web.live_prices import BoardPrices, board_prices
+from sams.web.quotes import market_timezone
 
 router = APIRouter()
+
+#: 账户名与现金备注是用户写的中文：走 `form_data` 折回裸 UTF-8，数字与代码仍是 Form。
+_FORM_BODY = Depends(form_data)
 
 #: 记账成功后回到这一页的那句话：303 只说明「收了」，屏幕上要有人说「记下了」
 _NOTICES = {
@@ -34,6 +44,8 @@ _NOTICES = {
     "fx": "换汇已记账。",
     "cash": "现金已调整。",
     "fill": "成交已记一笔。",
+    "limit": "限额已保存。",
+    "limit-del": "限额已删除。",
 }
 
 
@@ -229,11 +241,30 @@ def _fills(ctx: ServiceContext, account, tz: str) -> list[dict]:
     return rows
 
 
+def _industry(ctx: ServiceContext, market: str, code: str) -> str:
+    """行业的优先级：主档 `sector` → 公司概况 `industry`/`industry_csrc` → 空（归未分类）。
+
+    A 股概况覆盖最全，HK/US 大多没有：拿不到就明说没有，不按市场猜一个行业。
+    三个来源都先过 `normalize_industry`：回填写的是归一后的路径，旧行可能是全角/斜杠，
+    同一只票不能因为来源旧一点就在体检卡上多出一个行业。
+    """
+    found = ctx.symbols.get(market, code) or {}
+    sector = normalize_industry(found.get("sector"))
+    if sector:
+        return sector
+    profile = ctx.profiles_store.get(market, code)
+    if not profile.is_empty():
+        row = profile.to_dicts()[0]
+        return normalize_industry(row.get("industry") or row.get("industry_csrc"))
+    return ""
+
+
 def _account_view(
     ctx: ServiceContext,
     username: str,
     account,
     *,
+    prices: BoardPrices,
     rename_name: str | None = None,
     tz: str,
 ) -> dict:
@@ -242,7 +273,7 @@ def _account_view(
     现金（可用）与持仓市值分开给：「合计」是一个**总资产**，只把它端出来，
     读的人无法拆回还能买多少、手里那些票值多少（C1 验收 P1-3，D195）。
     """
-    summary = ctx.portfolio.summary(username, account.id)
+    summary = ctx.portfolio.summary(username, account.id, prices=prices)
     positions = [
         {
             "market": row.market,
@@ -254,10 +285,24 @@ def _account_view(
             "qty": _qty(row.qty),
             "avg_cost": row.avg_cost,
             "last_price": row.last_price,
-            # 每一行自己的行情日：停牌那一行不能借账户的「截至」显得和最新那天一样新
-            "price_day": str(row.last_price_date) if row.last_price_date else "",
+            # 「10-30 收盘」/「14:47 盘中」：价格是哪一种、落在哪一天（S0-E）。
+            # 盘中时刻按**市场**时区显示，与看板同一句
+            "price_label": (
+                price_point_label(
+                    row.price_kind,
+                    row.last_price_date,
+                    row.last_price_at,
+                    market_timezone(ctx, row.market),
+                )
+                if row.last_price is not None
+                else ""
+            ),
             "price_pnl": row.price_pnl,
             "pnl_report": row.total_report,
+            # 市值（报告币种）是体检卡的权重分子；不可换算的行没有市值，不进权重
+            "market_value": (
+                row.pnl.market_report if row.convertible and row.pnl is not None else None
+            ),
             # 报告币种合计 = 价格段 + 换汇段：两段分开给，屏幕上才能把那个数拆回去（D212）
             "price_report": row.price_report,
             "fx_report": row.fx_pnl,
@@ -265,7 +310,7 @@ def _account_view(
             "note": row.unavailable_note,
             "rate_note": row.rate_note,
         }
-        for row in ctx.portfolio.positions(username, account.id)
+        for row in ctx.portfolio.positions(username, account.id, prices=prices)
     ]
     return {
         "id": account.id,
@@ -295,6 +340,8 @@ def _account_view(
         "notes": summary.notes,
         "duplicates": ctx.portfolio.duplicate_holdings(username, account.id),
         "positions": positions,
+        # 限额（S4-E §7）：只判自定义线；没有自定义线的那一类给灰色参考值
+        "limits": ctx.limits.evaluate(username, account.id, prices=prices),
         "fills": _fills(ctx, account, tz),
         "fill_total": ctx.sim_ledger.order_rows(account.id),
     }
@@ -317,16 +364,41 @@ def _portfolio_page(
     ctx = web.contexts.current()
     markets = sorted(ctx.settings.markets)
     tz = ctx.settings.server.display_tz
+    prices = board_prices(ctx, web.core, ctx.clock.now_utc())
     accounts = [
         _account_view(
             ctx,
             user.username,
             account,
+            prices=prices,
             rename_name=(rename_form or {}).get(account.id),
             tz=tz,
         )
         for account in ctx.sim_accounts.list_for(user.id)
     ]
+    held: list[HoldingValue] = []
+    cash_report = 0.0
+    for account in accounts:
+        values = [
+            row["market_value"] for row in account["positions"] if row["market_value"] is not None
+        ]
+        cash_report += account["total"] - sum(values)
+        for row in account["positions"]:
+            if row["market_value"] is None:
+                continue
+            found = ctx.symbols.get(row["market"], row["code"]) or {}
+            held.append(
+                HoldingValue(
+                    market=row["market"],
+                    code=row["code"],
+                    name=str(found.get("name") or row["code"]),
+                    currency=row["currency"],
+                    value=row["market_value"],
+                    industry=_industry(ctx, row["market"], row["code"]),
+                )
+            )
+    book = exposure(held, cash=cash_report)
+
     theses = ctx.theses.list(user.username)
     currencies = sorted(
         {ctx.settings.report_currency, *(cfg.currency for cfg in ctx.settings.markets.values())}
@@ -370,6 +442,11 @@ def _portfolio_page(
         cash=cash_form or _cash_defaults(ctx),
         fx=fx,
         fx_hint=_rate_hint(ctx, fx["from_ccy"], fx["to_ccy"])[1],
+        exposure=book,
+        report_currency=ctx.settings.report_currency,
+        unclassified=UNCLASSIFIED,
+        limit_kinds=KINDS,
+        limit_labels=KIND_LABELS,
         account_form=account_form or {"name": "", "cash": "", "home_market": "A"},
     )
 
@@ -384,14 +461,15 @@ def portfolio_page(request: Request, notice: str = ""):
 def open_account(
     request: Request,
     _csrf: None = Depends(csrf_protect),
-    name: str = Form(""),
     cash: str = Form(""),
     home_market: str = Form("A"),
+    data: dict[str, list[str]] = _FORM_BODY,
 ):
     """网页开户：空态那句「去跑 CLI」在 `sams serve` 独占库时是一条死路（D194）。"""
     user = require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
+    name = one(data, "name")
     form = {"name": name, "cash": cash, "home_market": home_market}
     try:
         amount = _number(cash, "起始资金") if cash.strip() else 0.0
@@ -421,12 +499,13 @@ def rename_account(
     request: Request,
     account_id: str,
     _csrf: None = Depends(csrf_protect),
-    name: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
 ):
     """开户时名字打错（「中国银行」/「中国银河」）就在那张卡上改，不必重开一个户（D204）。"""
     user = require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
+    name = one(data, "name")
     try:
         ctx.ledger.rename_account(user.username, account_id, name)
     except DatabaseLocked:
@@ -466,11 +545,12 @@ def ledger_cash(
     side: str = Form("deposit"),
     currency: str = Form("CNY"),
     amount: str = Form(""),
-    reason: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
 ):
     user = require_user(request)
     web = request.app.state.web
     ctx = web.contexts.current()
+    reason = one(data, "reason")
     form = {
         "account_id": account_id,
         "side": side,
@@ -610,3 +690,137 @@ def ledger_fill(
     # 成交即登记兴趣：主档建行 + 排补数拍（D144）；表单原样交出去，归一在登记处
     ctx.symbol_interest.ensure(market, code, actor=user.username)
     return RedirectResponse("/portfolio?notice=fill", status_code=303)
+
+
+def _nav_series(ctx: ServiceContext, user, account_id: str, *, days: int):
+    """净值卡与折线读的是同一段：起点按今天倒推，终点是今天（与盘后 job 同一窗口）。"""
+    account = ctx.sim_accounts.get(user.id, account_id)
+    if account is None:
+        raise HTTPException(status_code=404)
+    end = ctx.clock.today()
+    start = end - timedelta(days=days)
+    return account, start, end, ctx.nav.series(account.id, start, end)
+
+
+@router.get("/api/partials/portfolio/nav")
+def portfolio_nav_partial(request: Request, account: str, days: int = NAV_WINDOW_DAYS):
+    """组合净值卡（S4-D §6.3）：异步局部，读数与折线共用 `/api/portfolio/{id}/nav`。"""
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    found, start, end, series = _nav_series(ctx, user, account, days=max(1, days))
+    return web.render(
+        request,
+        "partials/portfolio_nav.html",
+        account=found,
+        start=start,
+        end=end,
+        series=series,
+        # 空态那句话里的天数：说 job 覆盖多少，就得取 job 用的那个常量（D281）
+        nav_window_days=NAV_WINDOW_DAYS,
+    )
+
+
+_ATTRIBUTION_WINDOWS = ((30, "30 天"), (90, "90 天"), (0, "全部"))
+
+
+@router.get("/api/partials/portfolio/attribution")
+def portfolio_attribution_partial(request: Request, account: str, days: int = 90):
+    """业绩归因卡（S5 §5）：异步局部，与 `sams attribution` 读同一个服务、同一份话术。
+
+    `days=0` 是「全部」：起点落到开户那一天，而不是某个魔法常数——写死 400 天会让
+    一个开了两年的账户在卡上看不见前一年半。
+    """
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    found = ctx.sim_accounts.get(user.id, account)
+    if found is None:
+        raise HTTPException(status_code=404)
+    end = ctx.clock.today()
+    if days > 0:
+        start = end - timedelta(days=days)
+    else:
+        zone = ctx.settings.market_cfg(found.home_market).zone()
+        start = found.opened_at.astimezone(zone).date()
+    report = ctx.attribution.evaluate(user.username, found.id, start, end)
+    return web.render(
+        request,
+        "partials/portfolio_attribution.html",
+        account=found,
+        start=start,
+        end=end,
+        days=days,
+        windows=_ATTRIBUTION_WINDOWS,
+        report=report,
+    )
+
+
+@router.get("/api/portfolio/{account_id}/nav")
+def portfolio_nav_series(request: Request, account_id: str, days: int = NAV_WINDOW_DAYS):
+    """净值折线的序列：算不出来的那天给 null，不补 0——补出来的曲线看起来像平滑，其实是编的。"""
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    _account, start, end, series = _nav_series(ctx, user, account_id, days=max(1, min(days, 2000)))
+    note = None
+    if series.latest is None:
+        note = "这一区间没有算得出来的净值：缺价或缺汇率的那天整日不计。"
+    return JSONResponse(
+        {
+            "days": [point.day.isoformat() for point in series.days],
+            "nav": [point.nav for point in series.days],
+            "currency": series.currency,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "gap_days": series.gap_days,
+            "note": note,
+        }
+    )
+
+
+@router.post("/portfolio/limits")
+def save_limit(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    account_id: str = Form(""),
+    kind: str = Form("single"),
+    scope: str = Form(""),
+    threshold: str = Form(""),
+):
+    """页面上的红线：百分比进、小数存（0.2），与 `exposure`/`nav` 同一标度。
+
+    「作用范围」留空 = 全部账户。保存是 upsert：同一条线再存一次是改阈值，
+    不是多出一条会互相打架的线。
+    """
+    user = require_user(request)
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    try:
+        percent = _number(threshold, "红线")
+        if not 0 < percent <= 100:
+            raise ValidationError(f"红线要在 0% 与 100% 之间，收到 {percent:g}%")
+        ctx.limits.save(
+            user.username,
+            kind=kind,
+            scope=scope,
+            threshold=percent / 100.0,
+            account_id=account_id.strip() or None,
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _portfolio_page(request, status=400, error=str(exc))
+    return RedirectResponse("/portfolio?notice=limit", status_code=303)
+
+
+@router.post("/portfolio/limits/{limit_id}/delete")
+def delete_limit(
+    request: Request,
+    limit_id: str,
+    _csrf: None = Depends(csrf_protect),
+):
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    if not ctx.limits.remove(user.username, limit_id):
+        raise HTTPException(status_code=404)
+    return RedirectResponse("/portfolio?notice=limit-del", status_code=303)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import polars as pl
 
@@ -54,6 +56,46 @@ def seed(context, *rows, codes=None):
         },
     )
     SnapshotRepo(context.db).replace_day(market="A", day=DAY, taken_at=TAKEN, frame=frame)
+
+
+def seed_hk(context, *rows, codes=None):
+    codes = codes or [row["code"] for row in rows]
+    SymbolListRepo(context.db).upsert_batch(
+        "HK",
+        [
+            {"code": code, "name": code, "py_initials": code, "py_full": code, "currency": "HKD"}
+            for code in codes
+        ],
+    )
+    frame = pl.DataFrame(
+        [{"market": "HK", "taken_at": TAKEN, **row} for row in rows],
+        schema={
+            "market": pl.Utf8,
+            "taken_at": pl.Datetime("us", "UTC"),
+            **SPOT_SCHEMA,
+        },
+    )
+    SnapshotRepo(context.db).replace_day(market="HK", day=DAY, taken_at=TAKEN, frame=frame)
+
+
+def seed_us(context, *rows, codes=None):
+    codes = codes or [row["code"] for row in rows]
+    SymbolListRepo(context.db).upsert_batch(
+        "US",
+        [
+            {"code": code, "name": code, "py_initials": code, "py_full": code, "currency": "USD"}
+            for code in codes
+        ],
+    )
+    frame = pl.DataFrame(
+        [{"market": "US", "taken_at": TAKEN, **row} for row in rows],
+        schema={
+            "market": pl.Utf8,
+            "taken_at": pl.Datetime("us", "UTC"),
+            **SPOT_SCHEMA,
+        },
+    )
+    SnapshotRepo(context.db).replace_day(market="US", day=DAY, taken_at=TAKEN, frame=frame)
 
 
 def default_seed(logged_screen):
@@ -141,6 +183,37 @@ def test_a_market_whose_columns_do_not_exist_says_why_the_fields_are_greyed(logg
     assert "个字段" in response.text
 
 
+def test_technical_fields_are_only_offered_for_a_shares(logged_screen):
+    """技术面 v0 只开 A 股（D251）：港股下拉里灰着，A 股下拉里可选。
+
+    「灰着」不是 0：它说的是这只票/这个市场没有一条能过复权闸的日线，而不是指标等于零。
+    """
+    a_page = logged_screen.client.get("/screen", params={"market": "A"})
+    assert '<option value="ma20_gap" disabled' not in a_page.text
+    hk_page = logged_screen.client.get("/screen", params={"market": "HK"})
+    assert '<option value="ma20_gap" disabled' in hk_page.text
+
+
+def test_the_us_page_screens_on_the_columns_its_snapshot_actually_has(logged_screen):
+    """美股快照只验过 7 列（D226）：价格能筛，PB/市赚率灰着并说清为什么。"""
+    seed_us(
+        logged_screen.context,
+        {**snap("AAPL", pe_dyn=40.0, pb=None), "price": 348.91},
+        {**snap("F", pe_dyn=8.0, pb=None), "price": 9.5},
+    )
+    page = logged_screen.client.get(
+        "/screen",
+        params=[("market", "US"), ("f", "price"), ("o", "<="), ("v", "10")],
+    )
+    assert page.status_code == 200
+    assert "快照 2026-10-28 · 票池 2 只" in page.text
+    assert "通过 1 / 不通过 1 / 无数 0" in page.text
+    assert '<option value="price" disabled' not in page.text
+    assert '<option value="pe_ttm" disabled' not in page.text
+    assert '<option value="pb" disabled' in page.text
+    assert '<option value="pr_now" disabled' in page.text
+
+
 def test_recollect_queues_the_spot_job_and_says_so(logged_screen):
     default_seed(logged_screen)
     response = logged_screen.client.post(
@@ -193,8 +266,26 @@ def test_each_hit_links_to_its_symbol_page(logged_screen):
     default_seed(logged_screen)
     response = logged_screen.client.get("/screen", params=_condition_params())
     assert response.status_code == 200
-    assert 'href="/symbol/A/600519"' in response.text
-    assert 'href="/symbol/A/000001"' in response.text
+    assert 'href="/symbol/A/600519?back=' in response.text
+    assert 'href="/symbol/A/000001?back=' in response.text
+
+
+def test_the_hit_link_carries_the_way_back_to_the_same_result_page(logged_screen):
+    """进详情再回来，那一屏还是原来那一屏：条件、页号都跟着去、跟着回。
+
+    只把 `/screen` 当返回目标是另一种麻烦——人得把刚填的条件再填一遍，
+    「看一眼细节」就成了重做一遍选股的代价。
+    """
+    default_seed(logged_screen)
+    params = _condition_params() + [("f", "turnover_rate"), ("o", ">="), ("v", "1")]
+    response = logged_screen.client.get("/screen", params=params)
+    match = re.search(r'href="/symbol/A/000001\?back=([^"]+)"', response.text)
+    assert match is not None
+    back = parse_qs(urlsplit(unquote(match.group(1))).query)
+    assert back["market"] == ["A"]
+    assert back["f"] == ["pr_now", "turnover_rate"]
+    assert back["o"] == ["<=", ">="]
+    assert back["v"] == ["0.5", "1"]
 
 
 def test_two_conditions_are_anded_and_the_table_carries_both_values(logged_screen):
@@ -224,6 +315,75 @@ def test_an_unknown_field_is_refused_with_the_vocabulary(logged_screen):
     assert "不认识的字段" in response.text and "可选的是" in response.text
 
 
+def test_a_bad_valuation_value_names_the_field_in_chinese(logged_screen):
+    """R-09：`v=abc` 的错误要叫人看得懂——屏幕上是「市盈率(TTM)」，不是 `pe_ttm`。"""
+    response = logged_screen.client.get(
+        "/screen",
+        params=[("market", "A"), ("f", "pe_ttm"), ("o", "<="), ("v", "abc")],
+    )
+    assert response.status_code == 200
+    assert "市盈率(TTM) 的值要一个数" in response.text
+    assert "pe_ttm 的值" not in response.text
+
+
+def test_negative_valuations_are_left_out_and_the_count_is_stated(logged_screen):
+    """R-09：`PE(TTM) ≤ 8` 的首屏不能把 -72980.5 当成最便宜的那只。"""
+    seed(
+        logged_screen.context,
+        snap("600519", pe_dyn=5.0),
+        snap("000001", pe_dyn=-72980.5),
+    )
+    page = logged_screen.client.get(
+        "/screen",
+        params=[("market", "A"), ("f", "pe_ttm"), ("o", "<="), ("v", "8")],
+    )
+    assert page.status_code == 200
+    assert "600519" in page.text
+    assert "票000001" not in page.text
+    assert "估值不为正" in page.text
+    assert "其中 1 只" in page.text
+    assert 'name="include_negatives"' in page.text
+
+
+def test_the_include_negatives_toggle_brings_the_row_back(logged_screen):
+    seed(
+        logged_screen.context,
+        snap("600519", pe_dyn=5.0),
+        snap("000001", pe_dyn=-72980.5),
+    )
+    page = logged_screen.client.get(
+        "/screen",
+        params=[
+            ("market", "A"),
+            ("f", "pe_ttm"),
+            ("o", "<="),
+            ("v", "8"),
+            ("include_negatives", "1"),
+        ],
+    )
+    assert "票000001" in page.text
+    assert "估值不为正" not in page.text
+
+
+def test_st_and_delisting_rows_are_hidden_by_default_and_counted(logged_screen):
+    seed(
+        logged_screen.context,
+        snap("600519"),
+        {**snap("600001"), "name": "*ST海医", "is_st": True},
+        {**snap("600002"), "name": "退市海医", "is_st": False},
+    )
+    params = [("market", "A"), ("f", "price"), ("o", "<="), ("v", "20")]
+    page = logged_screen.client.get("/screen", params=params)
+    assert "600519" in page.text
+    assert "*ST海医" not in page.text and "退市海医" not in page.text
+    assert "ST/退市 2 只未参与" in page.text
+    assert 'name="include_st"' in page.text
+
+    shown = logged_screen.client.get("/screen", params=params + [("include_st", "1")])
+    assert "*ST海医" in shown.text and "退市海医" in shown.text
+    assert "ST/退市 2 只未参与" not in shown.text
+
+
 def test_missing_codes_are_named_with_their_class(logged_screen):
     default_seed(logged_screen)
     response = logged_screen.client.get("/screen", params=_condition_params())
@@ -246,6 +406,9 @@ def test_results_are_paginated_fifty_at_a_time_and_page_two_keeps_the_conditions
     )
     assert "第 2 / 2 页" in second.text
     assert codes[50] in second.text and codes[0] not in second.text
+    match = re.search(rf'href="/symbol/A/{codes[50]}\?back=([^"]+)"', second.text)
+    assert match is not None
+    assert "page=2" in unquote(match.group(1))
 
 
 def test_a_page_number_past_the_end_lands_on_the_last_page(logged_screen):
@@ -298,6 +461,31 @@ def test_checked_codes_are_added_and_unticked_ones_are_not(logged_screen):
     assert context.watchlists.contains(alice, "A", "600519")
     assert context.watchlists.contains(alice, "A", "000001")
     assert not context.watchlists.contains(alice, "A", "300750")
+
+
+def test_checked_add_returns_to_the_same_page_with_the_ticks(logged_screen):
+    """第 2 页勾选加自选后回到第 2 页，勾着的仍是原来那几只（R-13）。"""
+    default_seed(logged_screen)
+    response = logged_screen.client.post(
+        "/screen/watchlist",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "f": "pr_now",
+            "o": "<=",
+            "v": "0.5",
+            "action": "checked",
+            "codes": ["600519"],
+            "page": "2",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    location = response.headers["location"]
+    assert "page=2" in location and "sel=600519" in location
+    page = logged_screen.client.get(location)
+    assert page.status_code == 200
+    assert re.search(r'name="codes" value="600519" checked', page.text) is not None
 
 
 def test_add_all_first_shows_a_dry_run_and_writes_nothing(logged_screen):
@@ -431,8 +619,10 @@ def test_edit_overwrite_and_delete(logged_screen):
     )
     page = logged_screen.client.get("/screen")
     section = page.text.split("筛选方案")[1]
-    # 新名字里也含「便宜」二字：按整格比对，才分得清旧行有没有留下
-    assert "<td>很便宜</td>" in section and "<td>便宜</td>" not in section
+    # 新名字里也含「便宜」二字：按整格比对，才分得清旧行有没有留下。
+    # 名字现在是一个链接（点它回到那一屏，spec 2026-11-03-back-link §3.3），
+    # 所以「整格」是 `>` 到 `</a>` 那一段
+    assert ">很便宜</a>" in section and ">便宜</a>" not in section
     assert "只做底仓" in section and "旧说明" not in section
 
     assert (
@@ -522,6 +712,81 @@ def test_a_market_without_recipes_does_not_show_the_recipe_card(logged_screen):
     assert "推荐选股组合" not in page.text
 
 
+def test_the_hk_page_says_the_annual_is_taken_by_report_date_and_a_page_does_not(
+    logged_screen,
+):
+    """港股年报没有披露日（D215）：屏幕必须说清它按报告期取；A 股仍按已披露日挡。"""
+    seed_hk(logged_screen.context, snap("00700", pe_dyn=12.8))
+    logged_screen.context.financials_store.upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "HK",
+                    "code": "00700",
+                    "report_date": date(2025, 12, 31),
+                    "published_date": None,
+                    "profit_yoy": 0.1585,
+                    "source": "eastmoney_hk_f10",
+                }
+            ],
+            schema_overrides={"published_date": pl.Date},
+        )
+    )
+    page = logged_screen.client.get(
+        "/screen",
+        params=[("market", "HK"), ("f", "peg"), ("o", "<="), ("v", "1")],
+    )
+    assert page.status_code == 200
+    assert "报告期 ≤ 快照日" in page.text
+    assert "通过 1 / 不通过 0 / 无数 0" in page.text
+    assert "00700" in page.text
+
+    default_seed(logged_screen)
+    a_page = logged_screen.client.get(
+        "/screen",
+        params=[("market", "A"), ("f", "peg"), ("o", "<="), ("v", "1")],
+    )
+    assert "报告期 ≤ 快照日" not in a_page.text
+
+
+def test_the_hk_page_reports_annual_coverage_so_a_short_list_is_not_misread(
+    logged_screen,
+):
+    """「PEG ≤ 2 命中 1 只」旁边没有覆盖数，就会被读成「港股没有便宜票」（D227）。"""
+    seed_hk(
+        logged_screen.context,
+        snap("00700", pe_dyn=12.8),
+        snap("01021", pe_dyn=8.0),
+    )
+    logged_screen.context.financials_store.upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "HK",
+                    "code": "00700",
+                    "report_date": date(2025, 12, 31),
+                    "published_date": None,
+                    "profit_yoy": 0.1585,
+                    "source": "eastmoney_hk_f10",
+                }
+            ],
+            schema_overrides={"published_date": pl.Date},
+        )
+    )
+    page = logged_screen.client.get(
+        "/screen",
+        params=[("market", "HK"), ("f", "peg"), ("o", "<="), ("v", "1")],
+    )
+    assert "年报覆盖 1 / 2 只" in page.text
+    assert "不是落选" in page.text
+
+    pe_page = logged_screen.client.get(
+        "/screen",
+        params=[("market", "HK"), ("f", "pe_ttm"), ("o", "<="), ("v", "30")],
+    )
+    assert "年报覆盖" not in pe_page.text
+
+
 def test_another_users_preset_is_a_404_without_saying_whose_it_is(logged_screen):
     other = logged_screen.context.users.create("bob", "correct-horse-battery")
     foreign = logged_screen.context.screener_presets.create(
@@ -552,7 +817,7 @@ def test_running_a_preset_records_the_basket_for_that_day(logged_screen):
         data={"csrf": logged_screen.csrf},
         follow_redirects=False,
     )
-    strategy = preset_strategy_id(preset.name, preset.conditions)
+    strategy = preset_strategy_id(preset.id, preset.conditions)
     records = logged_screen.context.scan_store.recent(market="A", strategy_id=strategy, limit=1)
     assert records and records[0]["date"] == DAY
     assert {hit["code"] for hit in records[0]["hits"]} == {"600519", "000001"}

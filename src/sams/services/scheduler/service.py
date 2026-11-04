@@ -44,14 +44,14 @@ from pathlib import Path
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import SamsError, SchedulerBusy, ValidationError
-from sams.services.scheduler.beatfile import write_beat
+from sams.services.scheduler.beatfile import BeatFile, pid_is_gone, read_beat, write_beat
 from sams.services.scheduler.due import CalendarView, Due, due_for, local_today, period_key
 from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S, stale_at
 from sams.services.scheduler.report import ScheduleData, collect
 from sams.services.scheduler.runner import JobRunner, RunResult
 from sams.services.scheduler.types import JobSpec
 from sams.services.scheduler.universe import Universe, UniverseBuilder
-from sams.storage.repos.task_runs import FAILED, HeartbeatRepo, TaskRunRepo
+from sams.storage.repos.task_runs import FAILED, Heartbeat, HeartbeatRepo, TaskRunRepo
 from sams.storage.repos.users import UserRepo
 
 logger = logging.getLogger("sams.services.scheduler.service")
@@ -322,6 +322,11 @@ class Scheduler:
         self._claim()
         # 认领之后先打一拍：文件从第一轮开始就该存在，而不是等第一个 job 走到
         self._beat()
+        # 单写者：走到这里就没有别的进程在写库，那么库里挂着的 `running` 只能是上一个
+        # 进程被杀留下的。不结，健康读数就把一次死掉的运行念成「正在进行」。
+        closed = self.runs.close_interrupted()
+        if closed:
+            logger.info("上一进程留下 %d 行未收尾的执行，已结为失败", closed)
         ticks = 0
         try:
             try:
@@ -350,6 +355,7 @@ class Scheduler:
         finally:
             # 正常退出要把文件带走：留下一个越来越旧的文件，会把「我停了」说成「我卡住了」。
             # 被 SIGKILL 的那一种留得下，那正是「没人正常收尾」的证据
+            self._release()
             self._drop_beat_file()
 
     def schedule_data(self) -> ScheduleData:
@@ -370,6 +376,19 @@ class Scheduler:
             return
         self.heartbeats.beat(self._beat_id)
         self._write_beat_file()
+
+    def _release(self) -> None:
+        """这个循环收工时把心跳标成已停，下一次启动不必等 5 分钟过期。
+
+        失败只记一笔：收工路径上不该再抛，留一个新鲜的行最多让下一次启动多等一会儿。
+        """
+        if self._beat_id is None:
+            return
+        try:
+            self.heartbeats.stop(self._beat_id)
+        except SamsError as exc:
+            logger.warning("心跳停止标记没写进去（%s）：下一次启动要等它过期", exc)
+        self._beat_id = None
 
     def _write_beat_file(self) -> None:
         try:
@@ -397,20 +416,46 @@ class Scheduler:
         `Scheduler` 去跑常驻循环」。它挡不住另一个操作系统进程：库文件上的锁先就让
         第二个进程连不上（`DatabaseLocked`，D111），那一类重复启动在走到这句守卫之前
         就已经炸在连接上。
+
+        「年龄没到阈值」不等于「还在跳」：被 SIGKILL 的那个进程不会标停自己那一行，
+        于是五分钟内起来的进程会拒绝认领——而它这辈子只试这一次，屏幕上什么都正常，
+        夜里一个 job 都不跑。所以先问库旁那一拍写的那个 pid 还在不在；不在就接管，
+        并把那一行结掉，免得它看起来像第二个还在跳的循环。读不到那个文件、或它比表里
+        这一拍还旧（说明它写的不是当前这个主人），都退回「等阈值」这一侧。
         """
         if self._beat_id is not None:
             # 同一个实例再次进循环：上一轮自己认领的那一行不能把自己拒在外面
             return
         latest = self.heartbeats.latest()
-        if latest is not None:
+        if latest is not None and latest.stopped_at is None:
             age = (self.clock.now_utc() - latest.beat_at).total_seconds()
             if not stale_at(age):
-                raise SchedulerBusy(
-                    f"另一个调度器（{latest.id}）{int(age)} 秒前还有心跳："
-                    "同一份库上跳两个循环会把同一个周期各跑一遍，而 `task_runs` 里"
-                    "那一行是「这个周期跑过没有」的唯一依据（D98）"
+                gone = self._gone_owner(latest)
+                if gone is None:
+                    raise SchedulerBusy(
+                        f"另一个调度器（{latest.id}）{int(age)} 秒前还有心跳："
+                        "同一份库上跳两个循环会把同一个周期各跑一遍，而 `task_runs` 里"
+                        "那一行是「这个周期跑过没有」的唯一依据（D98）"
+                    )
+                logger.warning(
+                    "心跳只有 %d 秒，但写它的那个进程（pid %s）已经不在了：接管这一份库",
+                    int(age),
+                    gone.pid,
                 )
+                self.heartbeats.stop(latest.id)
         self._beat_id = self.heartbeats.start(note=f"tick={self.settings.scheduler_tick_s}s")
+
+    def _gone_owner(self, row: Heartbeat) -> BeatFile | None:
+        """那一拍写下的进程**明确**不在了，就把它交出来；判不了就回 `None`。
+
+        只有 `pid_is_gone` 说「没了」才算接管证据：判不准时退回「等阈值」那一侧，
+        把不确定说成可以抢，比多等三百秒危险得多。文件读不到、或它比表里这一拍还旧
+        （写的不是当前这个主人），同样不算证据。
+        """
+        beat = read_beat(self.beat_path)
+        if beat is None or beat.beat_at < row.beat_at:
+            return None
+        return beat if pid_is_gone(beat.pid) is True else None
 
     def _selected(self, only_job: str | None, only_market: str | None) -> tuple[JobSpec, ...]:
         chosen = tuple(

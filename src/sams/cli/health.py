@@ -9,7 +9,7 @@ from sams.bootstrap import Container
 from sams.cli.common import EXIT_LOCKED, advertised_url, stamp
 from sams.core.config import Settings
 from sams.core.errors import DatabaseLocked
-from sams.services.scheduler.beatfile import beat_path, read_beat
+from sams.services.scheduler.beatfile import beat_path, pid_is_gone, read_beat
 from sams.services.scheduler.heartbeat import stale_at
 from sams.services.sources import capability_labels
 
@@ -199,6 +199,12 @@ def _print_schedule(report) -> None:
     「未接入」也要占一行而不是让这一节消失——缺席会被读成「调度器好好的」。
     过期那一句之外，同一件事还进 `show` 的最后一行：屏幕上那句给人读，那个码给
     不盯屏幕的人读。
+
+    「过期」这句话在这里不需要第二个解释：这一屏的读者**能打开库**，而没有进程握着库时
+    就不可能有常驻循环在跑（DuckDB 单写者，D111），所以那一拍没翻就是没人再打。
+    `/healthz` 那个同进程的读者才可以拿「还挂着一趟没收尾的执行」当活证据——
+    在进程外，那几行是上一个进程留下的孤儿（D275），这里把它们点出来只为了说清
+    「为什么这一晚一个 job 都没跑」。
     """
     print("[调度]")
     if report.schedule_unmigrated:
@@ -217,7 +223,12 @@ def _print_schedule(report) -> None:
     if data.never_started:
         print("  从未启动（`sams run start` 启动常驻调度器）")
     elif data.stale:
-        print(f"  ⚠ 心跳已经 {_age(data.beat_age_s)}没更新：常驻调度器可能已经停了")
+        line = f"  ⚠ 心跳已经 {_age(data.beat_age_s)}没更新：常驻调度器可能已经停了"
+        if data.running:
+            hung = "、".join(f"「{job.name}」已 {_age(job.age_s)}" for job in data.running[:3])
+            more = f" 等 {len(data.running)} 行" if len(data.running) > 3 else ""
+            line += f"（库里还挂着没收尾的执行：{hung}{more}，下一次启动会结掉它们）"
+        print(line)
     else:
         print(f"  心跳 {_age(data.beat_age_s)}前 · 管理员 {data.admins} 名")
     if data.admins == 0:
@@ -391,9 +402,9 @@ def show_locked(
     """库被另一个进程握着时的那一屏（D111）：只说还读得到的事实。
 
     DuckDB 单写者，连只读连接也打不开（1.5.6 实测），所以这一屏**不是**一份缩水的
-    健康报告：它读不到表、源、日历、账本。能读的只有库旁那一拍，而且那一拍只证明
-    「一个 `sams run start` 还活着」——一条长采集占着库时，这里必须说「不知道」，
-    不能借「没有文件」推出「它死了」。
+    健康报告：它读不到表、源、日历、账本。能读的只有库旁那一拍，加上那个 pid 现在还
+    在不在——而这两句就够把「正在跑一趟长的」与「写它的进程已经没了」分开说。
+    一条长采集占着库时，这里必须说「不知道」，不能借「没有文件」推出「它死了」。
 
     退出码 3 与 1 分开：1 是「读到了，而且有故障」，3 是「读不到，所以不知道」。
     `settings` 给出时多指一条路：`/healthz` 走 HTTP，不受这把文件锁影响。
@@ -409,10 +420,23 @@ def show_locked(
         # 时钟回拨会让年龄为负：报「未来的一拍」没有意义，折成 0
         age = max(0, int((moment - beat.beat_at).total_seconds()))
         if stale_at(age):
-            print(
-                f"  ⚠ 心跳已经 {_age(age)}没更新：占着库的那个进程可能已经卡住或退出"
-                "（锁还没释放）"
-            )
+            # 过期有两种解释，而这一屏能给的是「那个 pid 还在不在」：单写者模型下这是硬的
+            gone = pid_is_gone(beat.pid)
+            if gone is True:
+                print(
+                    f"  ⚠ 心跳已经 {_age(age)}没更新，而写它的进程（PID {beat.pid}）已经不在了："
+                    "锁不会自己释放，这一份库现在没人写"
+                )
+            elif gone is False:
+                print(
+                    f"  心跳已经 {_age(age)}没更新，但 PID {beat.pid} 还在："
+                    "多半是某一趟采集比阈值长（这一趟之内不补拍），不是调度器停了"
+                )
+            else:
+                print(
+                    f"  ⚠ 心跳已经 {_age(age)}没更新，PID {beat.pid} 的存活判不出来："
+                    "「停了」与「正在跑一趟长的」这里分不出"
+                )
         else:
             print(f"  心跳 {_age(age)}前 · PID {beat.pid}（常驻循环还在写）")
     if settings is not None:

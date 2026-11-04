@@ -48,6 +48,7 @@ def test_migration_seeds_sources_and_chains(repo):
         # 日线链看不见它，报价链上它是腾讯之后的第二个故障域
         # eastmoney_f10 / eastmoney_hk_f10 只报概况、公告与港股指标（D214–D216）：
         # 排在旧链之后，不改变现有日线与报价链的顺序
+        # eastmoney_us_f10 只报美股财务（D228）：排在美股现有链尾，不改变报价链
         "A": (
             "akshare",
             "eastmoney",
@@ -65,9 +66,9 @@ def test_migration_seeds_sources_and_chains(repo):
             "eastmoney_hk_f10",
             "sina_quote",
         ),
-        "US": ("yfinance", "tencent", "sina_quote"),
+        "US": ("yfinance", "tencent", "sina_quote", "eastmoney_us_f10"),
     }
-    assert len(repo.list()) == 10
+    assert len(repo.list()) == 11
 
 
 def test_seeded_kinds_match_names(repo):
@@ -77,7 +78,7 @@ def test_seeded_kinds_match_names(repo):
 
 def test_migrations_are_idempotent_for_the_seed(repo):
     apply_migrations(repo.db)
-    assert len(repo.list()) == 10
+    assert len(repo.list()) == 11
 
 
 def test_upsert_and_get_roundtrip_with_options(repo):

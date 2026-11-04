@@ -6,7 +6,9 @@
 文件新 = 那个进程还在写；文件旧 = 它可能卡住或已经死了（锁不会自己释放）。
 
 文件只回答「谁」与「什么时候」，不复制任何业务数：多一个字段就多一份需要跟库里
-对账的账。写用同目录临时文件 + `os.replace`，读者要么看见上一拍、要么看见这一拍，
+对账的账。「那个人还在不在」不写进文件，也不缓存：它是 `pid_is_gone` 现问内核的一句话，
+而这一句在单写者模型下正好是「有没有别人在写这份库」的证据（D276）。
+写用同目录临时文件 + `os.replace`，读者要么看见上一拍、要么看见这一拍，
 不会看见一个写到一半的时间戳。
 """
 
@@ -69,3 +71,21 @@ def read_beat(path: Path | None) -> BeatFile | None:
     if beat_at.tzinfo is None:
         return None
     return BeatFile(pid=pid, beat_at=beat_at)
+
+
+def pid_is_gone(pid: int) -> bool | None:
+    """这个 pid 是否**明确**不在了；`None` 是「判不了」，不是「在」也不是「不在」。
+
+    只有 `ProcessLookupError` 说得清「没了」。`PermissionError` 是「在，但不是我的进程」
+    ——把它读成「没了」会让接管逻辑抢下一个还活着的调度器的库；连参数都递不进内核的
+    那种（超范围的整数）什么都没证明，只能说不知道。
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except (OSError, OverflowError, ValueError):
+        return None
+    return False

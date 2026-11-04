@@ -14,8 +14,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from sams.analysis.valuation.scoring import item_label
+from sams.core.assumptions import REFUTED, format_value, metric_label, op_label
 from sams.core.rules import HIT, PRE, URGENT, Verdict, tier_of
 from sams.services.rules.snapshot import Snapshot
+from sams.storage.repos.assumptions import Assumption
 from sams.storage.repos.theses import HIT_STOP, INVALIDATED, Thesis
 
 #: 「快到了」那一档有多近：现价离止损线不到 3% 就报 `pre`（§10.2 点名的那个刻度）。
@@ -33,6 +35,9 @@ class Ask:
     #: 这条规则挂着的那条论（若有）。模板读它的价位与状态时**只**从这里读，不自己去查库：
     #: `Snapshot` 已经查过一次，两次之间规则还能被改
     thesis: Thesis | None = None
+    #: 这条论名下的假设台账（D232 P0-3）。判「理由还在不在」读它，读不到就是空——
+    #: 空表示「这条论还没写过假设」，模板退回分项基线那一套
+    assumptions: tuple[Assumption, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -314,11 +319,15 @@ _DEAD_STATUSES = (INVALIDATED, HIT_STOP)
 
 
 def stop_thesis_drift(ask: Ask) -> Outcome:
-    """`stop.thesis_drift`：打分掉档 / 赔率崩塌 / 论已被判死——三条里任意一条成立即报。
+    """`stop.thesis_drift`：假设证伪 / 赔率崩塌 / 论已被判死——三条里任意一条成立即报。
 
     这一条与 `thesis.drift`（T-11，周复检掉档）读同一份基线，但**级别不同、时机不同**：
     那一头的意义是「每周有一次人来看一眼」，所以只有掉档；这一头是止损位的替代判断，
     所以论一旦被判死（状态）也立刻算数——价格还没跌，而记账的理由已经没了。
+
+    写了假设台账的论（D232 P0-3）**不再比合成分**：买之前写下的那几条假设才是判据，
+    分项分只是它们的合成，两处都说「变了」时只有前者说得清是哪一条变了。没有台账的论
+    照旧比基线分——那是老论唯一有的东西。
 
     三个数都读不到时不是「没触发」而是 `why_not` 有话：`Outcome` 的两句话在这里最值钱。
     """
@@ -339,20 +348,33 @@ def stop_thesis_drift(ask: Ask) -> Outcome:
     if thesis.status in _DEAD_STATUSES:
         findings.append(f"这条论已被记为 {thesis.status}：账上写着的理由已经没了")
 
-    base_tier = tier_of(thesis.baseline_score)
-    new_tier = tier_of(snapshot.score)
-    if base_tier is None:
-        unknowns.append("这条论没有建仓时的基线分：掉档与否判不了")
-    elif new_tier is None:
-        unknowns.append("有建仓时的基线分，这一趟却没合成出新分数（掉档判不了）")
-    elif new_tier < base_tier:
-        findings.append(
-            f"打分从 {thesis.baseline_score:g} 掉到 {snapshot.score:g}"
-            f"（{base_tier} 档 → {new_tier} 档）"
-        )
-        value, threshold = snapshot.score, thesis.baseline_score
-        value_text = f"{snapshot.score:g} 分"
-        threshold_text = f"{thesis.baseline_score:g} 分"
+    if ask.assumptions:
+        for item in ask.assumptions:
+            if item.status != REFUTED:
+                continue
+            bound = f"{op_label(item.op)} {format_value(item.metric, item.threshold)}"
+            reading = format_value(item.metric, item.evaluated_value)
+            findings.append(
+                f"假设「{metric_label(item.metric)} {bound}」已被证伪，读到 {reading}"
+            )
+            if value is None:
+                value, threshold = item.evaluated_value, item.threshold
+                value_text, threshold_text = reading, bound
+    else:
+        base_tier = tier_of(thesis.baseline_score)
+        new_tier = tier_of(snapshot.score)
+        if base_tier is None:
+            unknowns.append("这条论没有建仓时的基线分：掉档与否判不了")
+        elif new_tier is None:
+            unknowns.append("有建仓时的基线分，这一趟却没合成出新分数（掉档判不了）")
+        elif new_tier < base_tier:
+            findings.append(
+                f"打分从 {thesis.baseline_score:g} 掉到 {snapshot.score:g}"
+                f"（{base_tier} 档 → {new_tier} 档）"
+            )
+            value, threshold = snapshot.score, thesis.baseline_score
+            value_text = f"{snapshot.score:g} 分"
+            threshold_text = f"{thesis.baseline_score:g} 分"
 
     if thesis.reward_risk is None:
         unknowns.append("这条论没有记下赔率：崩塌与否判不了")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 from dataclasses import replace
 
@@ -87,15 +88,23 @@ def start(settings: Settings, args: argparse.Namespace) -> int:
             plaintext = "" if server.tls_certfile else "（未启用 TLS：同网段可明文查看流量）"
             logger.warning("已允许局域网访问：%s%s", advertised_url(server), plaintext)
         contexts = ThreadContexts(parts.core)
-        uvicorn.run(
-            create_app(runtime, core=parts.core, contexts=contexts),
-            host=server.host,
-            port=server.port,
-            workers=1,
-            reload=False,
-            ssl_certfile=server.tls_certfile,
-            ssl_keyfile=server.tls_keyfile,
-        )
+        # uvicorn 优雅停机后会把 SIGTERM 恢复成进服务前的处理器再抬一次：默认处理器
+        # 在那一刻直接结束进程，下面 `finally` 的停线程与心跳标记都走不到（实机撞到过：
+        # 重启时调度线程被自己上一世的新鲜心跳挡死）。跑服务期间 uvicorn 自己接管信号，
+        # 优雅停机照旧；抬起来的那一次落空。
+        previous_sigterm = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            uvicorn.run(
+                create_app(runtime, core=parts.core, contexts=contexts),
+                host=server.host,
+                port=server.port,
+                workers=1,
+                reload=False,
+                ssl_certfile=server.tls_certfile,
+                ssl_keyfile=server.tls_keyfile,
+            )
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         return 0
     except KeyboardInterrupt:
         # Ctrl-C 是正常的停机方式：屏幕不该多一段 traceback

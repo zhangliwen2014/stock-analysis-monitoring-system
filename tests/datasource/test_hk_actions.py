@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from datetime import date
 
 import polars as pl
@@ -15,12 +17,24 @@ import pytest
 from sams.core.errors import DatasourceError, FieldDrift
 from sams.datasource.akshare_hk import (
     AkshareHkAdapter,
+    akshare_hk_payout,
     expand_payout,
     parse_scheme,
 )
 from sams.datasource.sources import known
 
 EX = date(2024, 5, 17)
+
+#: 2026-11-01 实测 `ak.stock_hk_dividend_payout_em("03690")`：0 行、列齐全
+LIVE_COLUMNS = [
+    "最新公告日期",
+    "财政年度",
+    "分红方案",
+    "分配类型",
+    "除净日",
+    "截至过户日",
+    "发放日",
+]
 
 
 def payout(*schemes: str, ex_dates: list[date] | None = None) -> pl.DataFrame:
@@ -189,6 +203,29 @@ def test_a_stock_that_never_paid_out_also_answers_empty():
         "HK", "00700", date(1990, 1, 1), date(2024, 12, 31)
     )
     assert out.is_empty()
+
+
+def test_a_zero_row_payout_response_keeps_its_columns(monkeypatch):
+    """「从没派息」的 0 行必须带着列回来：那是源答了「没有」，不是源改版。
+
+    实测 03690（美团）与 01021 东财各回 0 行 7 列。压成无列的空帧后
+    `required_columns` 把它读成 FieldDrift，于是这只正常票每晚失败一次，而公司行为
+    覆盖永远确认不下来——复权闸接着把库里已有的 85 根 K 线一起挡掉。
+    """
+    import pandas as pd
+
+    monkeypatch.setitem(
+        sys.modules,
+        "akshare",
+        types.SimpleNamespace(
+            stock_hk_dividend_payout_em=lambda symbol: pd.DataFrame(columns=LIVE_COLUMNS)
+        ),
+    )
+
+    frame = akshare_hk_payout("03690")
+
+    assert frame.is_empty()
+    assert "除净日" in frame.columns, "列丢了，读取层就分不出「查过，没有」和「没查成」"
 
 
 def test_an_unpriceable_action_reaches_the_repo_with_its_note():

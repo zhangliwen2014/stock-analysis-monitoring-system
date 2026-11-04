@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
@@ -18,7 +19,7 @@ from support import FrozenClock
 from support_scheduler import FakeCalendar
 
 from sams.core.errors import CalendarSourceError, SchedulerBusy, StorageError, ValidationError
-from sams.services.scheduler.beatfile import BeatFile, read_beat
+from sams.services.scheduler.beatfile import BeatFile, read_beat, write_beat
 from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
 from sams.services.scheduler.report import STREAK_DISPLAY_PERIODS, collect
 from sams.services.scheduler.runner import RunResult
@@ -385,7 +386,8 @@ def test_a_broken_beat_file_does_not_stop_the_loop(db, settings, tmp_path, caplo
 
 def test_the_beat_goes_out_before_the_selection(db, settings):
     """一个 job 都没选出的那一轮，那一拍也已经打出去了：选 job 失败同样是
-    「循环还在转」的一轮。挪到选取之后，读的那一侧就把它与「进程停了」混成一个。"""
+    「循环还在转」的一轮。挪到选取之后，读的那一侧就把它与「进程停了」混成一个。
+    循环收工时这一行标成已停，之后的手工 tick 不会把它打回「活着」。"""
     clock = FrozenClock(MOMENT)
     scheduler, heartbeats, _ = make(
         db, settings, (job_spec("bars", "A"),), RecordingRunner(), clock=clock
@@ -396,7 +398,23 @@ def test_the_beat_goes_out_before_the_selection(db, settings):
     with pytest.raises(ValidationError, match="没有匹配"):
         scheduler.tick(as_of=FRIDAY, only_job="nope")
 
-    assert heartbeats.latest().beat_at == MOMENT + timedelta(seconds=30)
+    # 循环已经收工，那一行带着停止标记停在最后一拍；手工 tick 不再把它打回「活着」
+    latest = heartbeats.latest()
+    assert latest.beat_at == MOMENT
+    assert latest.stopped_at == MOMENT
+
+
+def test_a_clean_exit_frees_the_single_instance_guard(db, settings):
+    """正常退出之后，下一次启动不必等心跳过期。
+
+    守卫的用意是挡「同一份库上同时跳两个循环」，不是挡「我停过又起来」。
+    库里那一行没有停止标记时，刚退出的循环与还活着的循环长得一模一样。
+    """
+    first, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+    assert first.run_forever(max_ticks=1) == 1
+
+    second, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+    assert second.run_forever(max_ticks=1) == 1
 
 
 def test_run_forever_beats_on_every_tick(db, settings):
@@ -463,18 +481,17 @@ def test_the_same_scheduler_can_start_its_loop_again(db, settings):
     scheduler, heartbeats, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
 
     scheduler.run_forever(max_ticks=1)
-    claimed = heartbeats.latest().id
+    first = heartbeats.latest().id
     scheduler.run_forever(max_ticks=1)
 
-    # 再次进循环不与自己抢心跳，也不另起一行
-    assert heartbeats.latest().id == claimed
+    # 上一次循环收工已标停，再进循环认领新的一行而不是复用旧行
+    assert heartbeats.latest().id != first
 
 
 def test_a_second_daemon_is_refused(db, settings):
-    first, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
+    """守卫挡的是「还在跳」的那一个：一行刚打过、没有停止标记的心跳。"""
+    HeartbeatRepo(db, clock=FrozenClock(MOMENT)).start(note="tick=60s")
     second, _, _ = make(db, settings, (job_spec("bars", "A"),), RecordingRunner())
-
-    first.run_forever(max_ticks=1)
 
     with pytest.raises(SchedulerBusy, match="心跳"):
         second.run_forever(max_ticks=1)
@@ -664,6 +681,59 @@ def test_schedule_data_turns_stale_after_the_threshold(db, settings):
     assert data.stale is True
 
 
+def test_a_stale_beat_with_a_run_in_progress_is_not_read_as_stopped(db):
+    """心跳过期有两种解释：循环停了，或者只是**某一趟 job 比阈值长**——这一趟之内不补拍。
+
+    夜里一次基本面清扫轻松跑过五分钟，而 `/healthz` 与 `sams health` 都在那一段时间里
+    报「调度器可能死了」。库里挂着 `running` 就是「还在做活」的证据（单写者 + 启动时结
+    孤儿，见 `close_interrupted`），所以读数必须把这一句带出来，而不是只报一个年龄。
+    """
+    clock = FrozenClock(MOMENT)
+    HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(seconds=400))).start(note="tick=60s")
+    runs = TaskRunRepo(db, clock=FrozenClock(MOMENT - timedelta(seconds=300)))
+    runs.start("financials", market="A", period_key="2024-10-25")
+
+    data = collect(
+        runs=TaskRunRepo(db, clock=clock),
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        users=UserRepo(db),
+        specs=(),
+        clock=clock,
+    )
+
+    assert data.stale is True
+    assert [(job.name, job.market, job.age_s) for job in data.running] == [
+        ("financials", "A", 300)
+    ]
+    assert data.busy is True
+    assert data.may_be_stopped is False
+
+
+def test_a_running_row_older_than_six_hours_is_crash_evidence(db):
+    """超过六小时还没收尾的那一行不是「还在做活」，是崩溃留下的（D105）。
+
+    不做这一道区分，那句反证会被一行死数据永久供着：一个真死了的进程，只要死前挂着
+    一行 `running`，健康页就永远说它「正在跑」。同一个数在 runner 那边也判一次，
+    两边必须一起翻。
+    """
+    clock = FrozenClock(MOMENT)
+    HeartbeatRepo(db, clock=FrozenClock(MOMENT - timedelta(seconds=400))).start(note="tick=60s")
+    runs = TaskRunRepo(db, clock=FrozenClock(MOMENT - timedelta(hours=7)))
+    runs.start("financials", market="A", period_key="2024-10-25")
+
+    data = collect(
+        runs=TaskRunRepo(db, clock=clock),
+        heartbeats=HeartbeatRepo(db, clock=clock),
+        users=UserRepo(db),
+        specs=(),
+        clock=clock,
+    )
+
+    assert data.stale is True
+    assert data.busy is False
+    assert data.may_be_stopped is True
+
+
 def test_schedule_data_without_a_heartbeat_is_not_stale(db):
     data = reading(db)
 
@@ -811,3 +881,88 @@ def test_tick_consumes_backfill_after_manual_requests(db, settings):
 
     assert consumer.moments == [report.now]  # 那一拍的 moment 原样交出去
     assert [call[0] for call in runner.calls] == ["bars"]  # 周期 job 照常跑
+
+
+def test_run_forever_closes_the_rows_the_previous_process_left_open(db, settings, caplog):
+    """常驻循环一启动就把库里挂着的 `running` 结掉。
+
+    DuckDB 单写者：能走到「认领心跳」这一步，就说明没有别的进程在写，那些行只能是
+    上一个进程被杀时留下的。不结的话 `sams health` 会把一次三天前死掉的运行读成
+    「正在进行」，而那一行的周期永远进不了摘要那句「这一晚哪些没跑成」。
+    """
+    clock = FrozenClock(MOMENT)
+    scheduler, _, runs = make(
+        db, settings, (job_spec("bars", "A"),), RecordingRunner(), clock=clock
+    )
+    orphan = runs.start("financials", market="A", period_key="2024-10-24")
+
+    with caplog.at_level(logging.INFO):
+        scheduler.run_forever(max_ticks=1)
+
+    closed = runs.get(orphan)
+    assert closed.status == FAILED
+    assert "未收尾" in (closed.error or "")
+    assert "1 行" in caplog.text
+
+
+def test_a_fresh_beat_left_by_a_dead_process_is_taken_over(db, settings, tmp_path):
+    """被杀的那个进程不会标停自己的心跳：新进程不能因为它「72 秒前还在跳」就永久放弃。
+
+    `serve` 停机时调度线程正卡在一个 job 里，`join` 超时、进程退出，那一行就停在
+    `stopped_at IS NULL`。重启如果只比年龄，五分钟内起来的进程会拒绝认领，而它这一辈子
+    都不会再试第二次——屏幕上一切正常，夜里一个 job 都不会跑。库旁那一拍带着 pid，
+    那个进程不在了就是证据。
+    """
+    path = tmp_path / "sams.duckdb.heartbeat.json"
+    clock = FrozenClock(MOMENT)
+    dead = subprocess.Popen(["sleep", "0"])
+    dead.wait()
+    write_beat(path, pid=dead.pid, beat_at=clock.now_utc())
+    predecessor = HeartbeatRepo(db, clock=clock).start(note="tick=60s")
+
+    scheduler, heartbeats, _ = make(
+        db, settings, (job_spec("bars", "A"),), RecordingRunner(), clock=clock, beat_path=path
+    )
+    assert scheduler.run_forever(max_ticks=1) == 1
+
+    latest = heartbeats.latest()
+    assert latest.id != predecessor
+    # 那一行被结掉，而不是留成「还在跳」的第二个人：接管要说得出前一个已经不在
+    assert db.scalar("SELECT stopped_at FROM scheduler_heartbeats WHERE id = ?", [predecessor])
+
+
+def test_a_beat_file_older_than_the_row_is_not_evidence_about_the_owner(db, settings, tmp_path):
+    """那个文件比表里这一拍还旧，说明它写的不是当前这个主人（比如他写文件失败了）。
+
+    此时接管等于把「读不到活证据」当成「读到了死证据」——正是 D100 要挡的那两个循环。
+    """
+    path = tmp_path / "sams.duckdb.heartbeat.json"
+    clock = FrozenClock(MOMENT)
+    dead = subprocess.Popen(["sleep", "0"])
+    dead.wait()
+    write_beat(path, pid=dead.pid, beat_at=clock.now_utc() - timedelta(minutes=2))
+    HeartbeatRepo(db, clock=clock).start(note="tick=60s")
+    scheduler, _, _ = make(
+        db, settings, (job_spec("bars", "A"),), RecordingRunner(), clock=clock, beat_path=path
+    )
+
+    with pytest.raises(SchedulerBusy, match="心跳"):
+        scheduler.run_forever(max_ticks=1)
+
+
+def test_a_pid_the_kernel_cannot_answer_about_is_not_takeover_evidence(db, settings, tmp_path):
+    """内核答不了的那个 pid（连参数都递不进去）什么都没证明：多等三百秒比抢错安全。
+
+    `pid_is_gone` 分三种结论，接管只认「明确没了」那一种。把「判不准」也算成证据的话，
+    这扇门就会在下一个奇怪的 pid 上重新打开，而门后面站着的是两个循环各跑一遍同一周期。
+    """
+    path = tmp_path / "sams.duckdb.heartbeat.json"
+    clock = FrozenClock(MOMENT)
+    write_beat(path, pid=2**31, beat_at=clock.now_utc())
+    HeartbeatRepo(db, clock=clock).start(note="tick=60s")
+    scheduler, _, _ = make(
+        db, settings, (job_spec("bars", "A"),), RecordingRunner(), clock=clock, beat_path=path
+    )
+
+    with pytest.raises(SchedulerBusy, match="心跳"):
+        scheduler.run_forever(max_ticks=1)

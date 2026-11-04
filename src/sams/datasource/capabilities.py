@@ -22,6 +22,7 @@ from sams.datasource.fx import has_fx
 from sams.datasource.index_daily import has_index_daily
 from sams.datasource.listed_date import has_listed_date
 from sams.datasource.minute import has_minute_bars, has_minute_series
+from sams.datasource.news import has_stock_news
 from sams.datasource.quote import has_quotes
 from sams.datasource.spot import has_market_snapshot
 from sams.datasource.symbol_list import has_symbol_list
@@ -50,6 +51,8 @@ CAPABILITIES: dict[str, Capability] = {
         label="公司概况", lacking="不提供公司概况", probe=has_profile
     ),
     "announcements": Capability(label="公告", lacking="不提供公告", probe=has_announcements),
+    # 个股新闻（S3-B / D247）：v0 只接 A 股；无源的市场在 job 与页面上说「未接入」
+    "stock_news": Capability(label="个股新闻", lacking="不提供个股新闻", probe=has_stock_news),
     # 主档的一格，不是一类数据：它不走 `_walk`（没有窗口，也不记源健康），
     # 但「哪个源能给」仍然只在这里答一次，好让 `chain_for` 与目录用同一份判据
     "listed_date": Capability(label="上市日期", lacking="不提供上市日期", probe=has_listed_date),

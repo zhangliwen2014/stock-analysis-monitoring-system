@@ -13,6 +13,8 @@ from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage
 from sams.services.rules.engine import RuleEngine
 from sams.services.rules.snapshot import Snapshot, Target
+from sams.storage.repos.alert_mutes import MuteRepo
+from sams.storage.repos.alert_states import AlertStateRepo
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.rules import RuleRepo
@@ -63,6 +65,7 @@ class RecordingSender:
         channel_ids=(),
         rule_id=None,
         account_id=None,
+        is_test=False,
     ) -> str:
         self.sent.append(message)
         return f"alert-{len(self.sent)}"
@@ -89,6 +92,7 @@ class StoringSender:
         channel_ids=(),
         rule_id=None,
         account_id=None,
+        is_test=False,
     ) -> str:
         if self.raises is not None:
             raise self.raises
@@ -108,19 +112,24 @@ class StoringSender:
             action_note=message.action_note,
             triggered_at=message.triggered_at,
             channel_ids=list(channel_ids),
+            is_test=is_test,
             extra={"body": message.body},
+            trigger_bar_ts=message.trigger_bar_ts,
+            dedupe_key=message.dedupe_key or None,
         )
         self.sent.append(message)
         return alert.id
 
 
 class StubData:
-    """`RuleData` 的替身：引擎只用到 `expand` / `holdings` / `thesis_for` / `read`。"""
+    """`RuleData` 的替身：引擎只用到 `expand` / `holdings` / `thesis_for` / `read`，
+    外加 D232 之后要读的 `assumptions_for`。"""
 
-    def __init__(self, snapshot: Snapshot, holdings=(), thesis=None) -> None:
+    def __init__(self, snapshot: Snapshot, holdings=(), thesis=None, assumptions=()) -> None:
         self.snapshot = snapshot
         self.held = list(holdings)
         self.thesis = thesis
+        self.assumed = tuple(assumptions)
         #: 装上它，`read` 就抛：一条挂了错代码的规则不该把整趟拖崩
         self.read_raises: Exception | None = None
         #: 记下每次日线读数落在哪天：盘中那一趟的日期应当跟着报价走（§5.3）
@@ -141,6 +150,9 @@ class StubData:
 
     def thesis_for(self, target: Target):
         return self.thesis
+
+    def assumptions_for(self, target: Target):
+        return self.assumed
 
     def read(self, target: Target, *, as_of: date, position=None) -> Snapshot:
         self.as_of_seen.append(as_of)
@@ -189,6 +201,8 @@ class Harness:
         self.settings = settings
         self.rules = RuleRepo(db, clock=FixedClock())
         self.alerts = AlertRepo(db, clock=FixedClock())
+        self.states = AlertStateRepo(db, clock=FixedClock())
+        self.mutes = MuteRepo(db, clock=FixedClock())
         self.fx = FxRepo(db)
         self.sender = RecordingSender()
         self.hits: list[RuleHit] = []
@@ -201,16 +215,19 @@ class Harness:
         self.snapshot = snap()
         self.held: list = []
         self.thesis = None
+        self.assumptions: tuple = ()
         self.read_raises: Exception | None = None
         #: `seed_hit` 默认挂在哪条规则上：`add()` 每建一条就把它改成那一条的 id
         self.added_id = "r-seed"
 
     def engine(self, *, sender=None, cache=None) -> RuleEngine:
-        data = StubData(self.snapshot, self.held, self.thesis)
+        data = StubData(self.snapshot, self.held, self.thesis, self.assumptions)
         data.read_raises = self.read_raises
         return RuleEngine(
             rules=self.rules,
             alerts=self.alerts,
+            states=self.states,
+            mutes=self.mutes,
             data=data,
             calendar=self.calendar,
             fx=self.fx,

@@ -1,0 +1,66 @@
+{# 业绩归因（S5 §3/§5）：这段时间的收益是谁带来的。
+
+   三个数字必须分开印：价格段、换汇段、分红。合成一个「贡献」就把「港币跌了」和
+   「股票跌了」说成同一件事，而这两件事该做的决定完全不同。
+   各票贡献直接相加之和与区间收益对不上时，差多少印多少，不静默配平（D265）。 #}
+
+{% set base = "/api/partials/portfolio/attribution?account=" ~ account.id %}
+<section class="card" id="attribution">
+  <h2>业绩归因
+    <span class="muted">{{ account.name }} · {{ start }} ~ {{ end }}</span>
+  </h2>
+  <div class="chart-bar">
+    <span class="chart-group" role="group" aria-label="窗口">
+      {% for value, label in windows %}
+      {% set on = value == days %}
+      <a hx-get="{{ base }}&days={{ value }}" hx-target="#attribution" hx-swap="outerHTML"
+         href="?days={{ value }}"
+         {% if on %}aria-current="true" class="on"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </span>
+  </div>
+
+  {% if report.skipped %}
+  <p class="muted">{{ report.skipped }}</p>
+  {% else %}
+  {% if report.rows %}
+  <table>
+    <tr>
+      <th>标的</th><th class="num">区间均权</th><th class="num">贡献</th>
+      <th class="num">价格段</th><th class="num">换汇段</th><th class="num">分红</th>
+    </tr>
+    {% for row in report.rows %}
+    <tr>
+      <td><a href="/symbol/{{ row.market }}/{{ row.code }}?back=/portfolio">{{ row.name }}</a>
+        <span class="muted">{{ row.market }} {{ row.code }}</span></td>
+      <td class="num">{{ ratio_pct(row.weight) }}</td>
+      <td class="num">{{ ratio_pct(row.contribution) }}</td>
+      <td class="num">{{ ratio_pct(row.price_part) }}</td>
+      <td class="num">{% if row.fx_part %}{{ ratio_pct(row.fx_part) }}{% else %}—{% endif %}</td>
+      <td class="num">{% if row.dividend_part %}{{ ratio_pct(row.dividend_part) }}{% else %}—{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">这段时间没有持仓变动，也没有可归因的价格变动。</p>
+  {% endif %}
+
+  {% if report.industries %}
+  <p class="muted">按行业：
+    {% for group in report.industries %}{{ group.label }} {{ ratio_pct(group.contribution) }}
+      {%- if not loop.last %} · {% endif %}{% endfor %}</p>
+  {% endif %}
+
+  <p>区间收益 {{ ratio_pct(report.window_return) }}
+    <span class="muted">{{ report.start }} ~ {{ report.end }}，共 {{ report.days }} 天
+      {% if report.dropped_days %}；丢弃缺口 {{ report.dropped_days }} 天，缺口前后各算各的{% endif %}</span></p>
+  <p>基准 {% if report.benchmark and report.benchmark.label %}{{ report.benchmark.label }}{% else %}—{% endif %}
+    {{ ratio_pct(report.benchmark.value if report.benchmark else None) }}
+    · 超额 {{ ratio_pct(report.excess) }}
+    {% if report.benchmark and report.benchmark.note %}
+    <span class="muted">{{ report.benchmark.note }}</span>{% endif %}</p>
+  <p class="muted">残差 {{ ratio_pct(report.residual) }}：{{ report.residual_note }}</p>
+  <p class="muted chart-caption">换汇段是持仓币种兑「{{ report.currency }}」的变动，与持仓卡的「价格段/换汇段」
+    各锚各的时点（那边锚买入日，这里锚窗口起点），所以数值不等、方向应一致。</p>
+  {% endif %}
+</section>

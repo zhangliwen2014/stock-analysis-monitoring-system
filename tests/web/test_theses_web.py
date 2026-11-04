@@ -40,8 +40,9 @@ def test_theses_list_and_create(logged):
     assert detail.status_code == 200
     # 立论那句话落在开局那条事件的 note 上（`Thesis` 这条 dataclass 没有 note 字段）
     assert "低估值银行" in detail.text
-    # 列表那一行指的是刚建的这一条：链接与标的写法都在同一张 <a> 上
-    assert f'/theses/{created[0].id}">A/600036' in logged.client.get("/theses").text
+    # 列表那一行指的是刚建的这一条：链接与标的写法都在同一张 <a> 上。
+    # `?back=/theses` 是详情顶上那条「← 返回」的去处（spec 2026-11-03-back-link）
+    assert f'/theses/{created[0].id}?back=/theses">A/600036' in logged.client.get("/theses").text
 
 
 def test_thesis_detail_links_the_symbol_and_shows_the_opening_note(logged):

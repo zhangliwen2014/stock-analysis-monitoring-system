@@ -75,7 +75,7 @@ def add_to(subparsers) -> None:
         "spot",
         help="全市场选股：在一天的全市场快照上跑一组 AND 条件，无数出局的票逐个点名",
     )
-    spot.add_argument("--market", required=True, help="A")
+    spot.add_argument("--market", required=True, help="A / HK / US")
     spot.add_argument(
         "--where",
         required=True,
@@ -87,6 +87,16 @@ def add_to(subparsers) -> None:
     )
     spot.add_argument("--day", help="YYYY-MM-DD，默认最近一天的快照")
     spot.add_argument("--limit", type=int, help="命中最多列这么多行（总数照报）")
+    spot.add_argument(
+        "--include-negatives",
+        action="store_true",
+        help="负 PE/PB（亏损或净资产为负）也参与比较；默认记「无数」，不算便宜",
+    )
+    spot.add_argument(
+        "--include-st",
+        action="store_true",
+        help="ST/退市也进票池；默认剔除，并把剔除数报出来",
+    )
     spot.add_argument("--json", action="store_true", help="机器可读输出（含 exit）")
     spot.set_defaults(handler=run_spot_screen)
 
@@ -116,7 +126,8 @@ def run_pr(container: Container, args: argparse.Namespace) -> int:
     return _print(scan, code)
 
 
-_WHERE = re.compile(r"^\s*([a-z_]+)\s*(>=|<=|==|>|<|=)\s*(.+?)\s*$")
+#: 字段名里带数字（`ma20_gap`、`rsi14`）：只认字母的写法会把整个技术面挡在门外
+_WHERE = re.compile(r"^\s*([a-z_][a-z0-9_]*)\s*(>=|<=|==|>|<|=)\s*(.+?)\s*$")
 
 
 def parse_where(text: str) -> Condition:
@@ -159,6 +170,8 @@ def run_spot_screen(container: Container, args: argparse.Namespace) -> int:
             conditions,
             day=iso_date(args.day) if args.day else None,
             limit=args.limit,
+            positive_only=not args.include_negatives,
+            include_st=args.include_st,
         )
     except SamsError as exc:
         # 只兜 ValidationError 会让库打不开一类错误冒到顶层：`--json` 的下游拿到空 stdin
@@ -190,15 +203,36 @@ def _print_spot(result, code: int) -> int:
         f"票池 {result.universe_size} 只（代码表 {result.market_size} 只；"
         f"快照里不在代码表 {result.snapshot_only} 只；代码表里快照缺 {result.list_only} 只）"
     )
+    if result.st_excluded:
+        print(f"ST/退市 {result.st_excluded} 只未参与（--include-st 可纳入）")
+    if result.basis_note:
+        print(f"⇒ {result.basis_note}")
+    if result.financial_coverage:
+        covered, pool = result.financial_coverage
+        print(
+            f"年报覆盖 {covered} / {pool} 只"
+            "（能取到截至快照日年报的票；其余记「无数」，不是落选）"
+        )
+    if result.technical_coverage:
+        covered, pool = result.technical_coverage
+        print(
+            f"技术面覆盖 {covered} / {pool} 只"
+            "（已确认公司行为区间、日线够长的票；其余记「无数」，不按裸价算）"
+        )
     specs = {item.name: item for item in fields_for(result.market)}
     for counts in result.fields:
         spec = specs[counts.field]
+        extra = (
+            f"（其中 {counts.nonpositive} 只因估值不为正未参与）"
+            if counts.nonpositive
+            else ""
+        )
         print(
             f"条件 {counts.field} {counts.op} {_spot_value(counts.value)}"
             f"（{spec.label}，{spec.unit}）：通过 {counts.passed} / "
-            f"不通过 {counts.failed} / 无数 {counts.missing}"
+            f"不通过 {counts.failed} / 无数 {counts.missing}{extra}"
         )
-    print(f"命中 {result.total_hits} 只（按 {result.fields[0].field} 升序）：")
+    print(f"命中 {result.total_hits} 只（按 {result.order_note}）：")
     for hit in result.hits:
         values = "  ".join(
             f"{specs[name].label} {_cell(hit.values.get(name))}" for name in hit.values
@@ -446,6 +480,9 @@ def _spot_payload(result, code: int) -> dict:
         "market_size": result.market_size,
         "snapshot_only": result.snapshot_only,
         "list_only": result.list_only,
+        "positive_only": result.positive_only,
+        "include_st": result.include_st,
+        "st_excluded": result.st_excluded,
         "fields": [
             {
                 "field": item.field,
@@ -454,6 +491,7 @@ def _spot_payload(result, code: int) -> dict:
                 "passed": item.passed,
                 "failed": item.failed,
                 "missing": item.missing,
+                "nonpositive": item.nonpositive,
             }
             for item in result.fields
         ],
@@ -472,6 +510,17 @@ def _spot_payload(result, code: int) -> dict:
             for missing_group in result.missing
         ],
         "note": result.note,
+        "basis_note": result.basis_note,
+        "financial_coverage": (
+            list(result.financial_coverage)
+            if result.financial_coverage is not None
+            else None
+        ),
+        "technical_coverage": (
+            list(result.technical_coverage)
+            if result.technical_coverage is not None
+            else None
+        ),
     }
 
 

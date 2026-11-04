@@ -146,6 +146,8 @@ class Run:
         self.engine = RuleEngine(
             rules=container.rules_store,
             alerts=container.alerts_store,
+            states=container.alert_states,
+            mutes=container.alert_mutes,
             data=container.rule_data,
             calendar=container.calendar,
             fx=container.fx_store,

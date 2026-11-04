@@ -27,6 +27,7 @@ from sams.monitor.queue import (
     AlertQueue,
     NotifyWorker,
     QueuedAlertSender,
+    QueuedDigestSender,
     SystemAlarmRelay,
 )
 from sams.monitor.router import NotifyService
@@ -36,17 +37,28 @@ from sams.services.analysis import AnalysisService
 from sams.services.annotation_context import AnnotationContextProvider
 from sams.services.annotation_prune import AnnotationPruner
 from sams.services.annotations import AnnotationService
+from sams.services.assumptions import AssumptionService
 from sams.services.attachments import AttachmentService, attachments_root
+from sams.services.attribution import AttributionService
+from sams.services.business import BusinessProfileService
 from sams.services.calendar import CalendarService
 from sams.services.corp_actions import CorpActionSyncService
+from sams.services.decision import DecisionService
+from sams.services.digest import DigestService
+from sams.services.dividends import DividendService
 from sams.services.f10 import F10Service, F10SyncService
 from sams.services.fundamentals import FundamentalService, FundamentalSyncService
 from sams.services.fx import FxSyncService
 from sams.services.health import HealthService
+from sams.services.industry import IndustryService
 from sams.services.intraday import IntradayMonitor
 from sams.services.ledger import LedgerService
+from sams.services.limits import LimitService
 from sams.services.market_snapshot import MarketSnapshotService
 from sams.services.minute import MinuteService
+from sams.services.nav import NavService
+from sams.services.news import NewsService
+from sams.services.peers import PeerService
 from sams.services.portfolio import PortfolioService
 from sams.services.prune import PruneReport, PruneService
 from sams.services.quotes import QuoteBoard, QuoteService
@@ -70,36 +82,49 @@ from sams.services.scheduler.types import JobDeps, JobSpec
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.services.screen import ScreenService
 from sams.services.screener import ScreenerService
+from sams.services.screener_monitor import ScreenerMonitorService
 from sams.services.sources import SourceAdminService
 from sams.services.symbol_interest import SymbolInterest
 from sams.services.symbol_master import SymbolMasterSyncService
 from sams.services.symbol_search import SymbolSearchService
 from sams.services.sync import SyncService
+from sams.services.technical import TechnicalService
 from sams.services.theses import ThesisService
 from sams.services.valuation import ValuationService
 from sams.storage.crypto import Cipher, cipher_for
 from sams.storage.db import Database
 from sams.storage.migrate import applied, apply_migrations, pending
 from sams.storage.repos.admin_access import AdminAccessRepo
+from sams.storage.repos.alert_mutes import MuteRepo
+from sams.storage.repos.alert_states import AlertStateRepo
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.annotations import AnnotationRepo
 from sams.storage.repos.app_settings import AppSettingsRepo
+from sams.storage.repos.assumptions import AssumptionRepo
 from sams.storage.repos.attachments import AttachmentRepo
 from sams.storage.repos.bars import BarRepo
+from sams.storage.repos.business import CompanyBusinessRepo
 from sams.storage.repos.calendar import CalendarRepo
 from sams.storage.repos.channels import ChannelRepo
 from sams.storage.repos.chart_prefs import ChartPrefRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.data_sources import DataSourceRepo
+from sams.storage.repos.digests import DigestRepo
 from sams.storage.repos.f10 import AnnouncementRepo, CompanyProfileRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.fx import FxRepo
+from sams.storage.repos.holding_nav import HoldingNavRepo
 from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
+from sams.storage.repos.limits import LimitRepo
+from sams.storage.repos.nav import NavRepo
+from sams.storage.repos.news import NewsRepo
+from sams.storage.repos.news_keywords import NewsHitRepo, NewsKeywordRepo
 from sams.storage.repos.quotes import QuoteHealthRepo, QuoteRepo
 from sams.storage.repos.rules import RuleRepo
 from sams.storage.repos.scan_results import ScanResultRepo
+from sams.storage.repos.screener_hits import ScreenerHitRepo
 from sams.storage.repos.screener_presets import ScreenerPresetRepo
 from sams.storage.repos.sessions import SessionRepo
 from sams.storage.repos.snapshots import SnapshotRepo
@@ -204,13 +229,21 @@ class ServiceContext:
     flow_store: FundingFlowRepo
     #: 公司概况（D214）：一票一行，页面的资料块与 `sync profile` 写的是同一张表
     profiles_store: CompanyProfileRepo
+    #: 核心业务六字段（S2 / D240）：全库共享的公司事实，`confirmed_by` 只留痕
+    company_business_store: CompanyBusinessRepo
     #: 公告元数据（D216）：只给看，正文与 PDF 留外链
     announcements_store: AnnouncementRepo
+    #: 个股新闻（S3-B / D244）：按 `(source, item_id)` 幂等，只存标题/摘要/原文链接
+    news_store: NewsRepo
+    #: 资讯关键词（S3-C / D245）：用户级、市场级、可选代码级；`/news` 的增删走它
+    news_keywords_store: NewsKeywordRepo
     scan_store: ScanResultRepo
     #: 全市场快照（D175）：盘后 `spot` job 整日覆盖写，选股屏读最近一天
     snapshot_store: SnapshotRepo
     #: 筛选方案（D182）：条件与名字都在这一张表，页面六个动作只经它
     screener_presets: ScreenerPresetRepo
+    #: 方案名单（S4-B / D255）：新进/退出按这一张表算，页面读它显示「名单 N 只」
+    screener_hits: ScreenerHitRepo
     #: 图表偏好（D193）：周期条顺序与均线窗口，一行一人
     chart_prefs: ChartPrefRepo
     #: 快照同步用例（D174）：票池、取数、定日、点名缺答都在它那一头
@@ -232,13 +265,23 @@ class ServiceContext:
     #: 个股资料（D214）：写侧两条链与读侧四块档案；后者只给页面看，不参与计算
     f10_sync: F10SyncService
     f10: F10Service
+    #: 个股新闻同步（S3-B / D247）：调度 job 与 `sams sync news` 共用
+    news: NewsService
     #: 汇率那条链：没有市场维度，所以它不跟着 `sync`/`fundamental_sync` 走市场路由
     fx_sync: FxSyncService
     #: 代码表周同步（D141）：调度器登记的 job 与 CLI 走的就是这一份
     symbol_master_sync: SymbolMasterSyncService
+    #: 行业回填（S2 / D236）：概况 → 主档 `sector`，不联网；调度与 CLI 共用一个服务
+    industry: IndustryService
+    #: 同业对比（S2 / D237–D239）：只读上面那几个仓库，不联网、不落库
+    peers: PeerService
+    #: 核心业务六字段（S2 / D240）：草稿 + 确认，全库共享
+    business: BusinessProfileService
     fundamentals: FundamentalService
     screen: ScreenService
     screener: ScreenerService
+    #: 方案自动监控（S4-B）：盘后 job 与页面的「立即跑」共用，新命中走告警中心
+    screener_monitor: ScreenerMonitorService
     analysis: AnalysisService
     #: 分钟粒度（计划 B）：只读、不落库，所以没有 sync 那条写侧
     minute: MinuteService
@@ -246,10 +289,25 @@ class ServiceContext:
     valuation: ValuationService
     #: 观点的生命周期：它吃上面那个仓库与那份估值读数（spec §9.1）
     theses: ThesisService
+    #: 证伪台账：一条假设属于某条 thesis，归属经 `theses` 校验（D232 P0-3）
+    assumptions_store: AssumptionRepo
+    assumptions: AssumptionService
+    #: 决策卡 v0（S1-A）：一张卡把报价、估值读数、账本与论点折成四态结论
+    decision: DecisionService
     #: 账本的写用例：一次成交跨订单/持仓/现金/流水四张表，入口只有这一个（§5.4）
     ledger: LedgerService
     #: 持仓与汇总的读用例：它只读账本，不改账本
     portfolio: PortfolioService
+    #: 分红入账（S4-D §6.2）：盘后 job 与 CLI 补账共用，重跑不重复入账
+    dividends: DividendService
+    #: 净值重建与读数（S4-D §6.3）：盘后 job 写、持仓页读的是同一套口径
+    nav: NavService
+    nav_store: NavRepo
+    #: 业绩归因（S5 §3）：持仓页那张归因卡与 `sams attribution` 读同一份报告
+    attribution: AttributionService
+    #: 组合限额（S4-E §7）：持仓页的红/灰/无法判定与摘要尾行读的是同一份红线
+    limits: LimitService
+    limits_store: LimitRepo
     #: SIM 的账户仓库：`accounts` 这个名字属于用户账号服务（`AccountService`），
     #: 两个都对得上名字的东西放在一起一定会被误用，所以这里带 `sim_` 前缀
     sim_accounts: SimAccountRepo
@@ -257,6 +315,9 @@ class ServiceContext:
     sim_ledger: SimOrderRepo
     channels_store: ChannelRepo
     alerts_store: AlertRepo
+    #: 跃迁去重的当前状态与单票静音（S1-B）：引擎读写，网页的静音按钮也读写
+    alert_states: AlertStateRepo
+    alert_mutes: MuteRepo
     #: 批注仓库：`annotations` 那个名字留给服务（与 `theses_store`/`rules_store` 同一命名法）
     annotations_store: AnnotationRepo
     #: 批注用例：五类目标的归属校验在这里，仓库只认「这一行是不是你的」
@@ -303,6 +364,9 @@ class ServiceContext:
     #: 盘中节拍器：同样只有盘中线程那一份被 `run_forever`
     intraday: IntradayMonitor
     task_runs: TaskRunRepo
+    #: 每日收盘摘要（S1-C）：仓库给 `/digest` 读，服务给调度 job 与手动补跑共用
+    digests_store: DigestRepo
+    digest: DigestService
     heartbeats: HeartbeatRepo
     #: 保留策略（D116）：CLI 与 serve 的常驻维护（以及计划 3 的 admin 健康页）共用这一份
     prune: PruneService
@@ -357,6 +421,20 @@ class _NotifyAlertSender:
             account_id=account_id,
             is_test=is_test,
         ).alert_id
+
+
+class _NotifyDigestSender:
+    """把摘要 id 交给同步投递（没有通知线程的上下文，例如 `sams run once`）。
+
+    队列版在 `monitor.queue.QueuedDigestSender`：调度线程只落行与入队，
+    网络重试不占用那条线程。
+    """
+
+    def __init__(self, notify: NotifyService) -> None:
+        self._notify = notify
+
+    def __call__(self, digest_id: str) -> None:
+        self._notify.deliver_digest(digest_id)
 
 
 def _registry(
@@ -479,11 +557,17 @@ def _context_on(
     # 个股资料（D214）：概况一票一行、公告按 art_code 幂等，正文与 PDF 不进来
     profiles_store = CompanyProfileRepo(database)
     announcements_store = AnnouncementRepo(database)
+    # 个股新闻（S3-B / D244）：与公告分成两张表，去重键是 (source, item_id)
+    news_store = NewsRepo(database, clock=clock)
+    # 核心业务六字段（S2 / D240）：一票 × 一字段，空值不落行
+    company_business_store = CompanyBusinessRepo(database)
     scan_store = ScanResultRepo(database)
     snapshot_store = SnapshotRepo(database)
     screener_presets = ScreenerPresetRepo(database, clock=clock)
+    screener_hits = ScreenerHitRepo(database)
     chart_prefs = ChartPrefRepo(database, clock=clock)
     theses_store = ThesisRepo(database)
+    assumptions_store = AssumptionRepo(database)
     source_health = SourceHealthRepo(database)
     data_sources = DataSourceRepo(database)
     quotes_store = QuoteRepo(database)
@@ -525,14 +609,24 @@ def _context_on(
     )
     fx_store = FxRepo(database)
     portfolio = PortfolioService(sim_accounts, sim_orders, bars, fx_store, users, clock=clock)
+    # 分红入账与净值（S4-D）：分红只写现金流水，净值逐日重放账本并整段覆盖 `nav_daily`
+    dividends = DividendService(sim_accounts, sim_orders, corp_actions, cfg)
+    nav_store = NavRepo(database)
+    nav = NavService(
+        sim_accounts, sim_orders, bars, fx_store, corp_actions, calendar, cfg, store=nav_store
+    )
     channels_store = ChannelRepo(database, cipher=cipher, clock=clock)
     alerts_store = AlertRepo(database, clock=clock)
+    alert_states_store = AlertStateRepo(database, clock=clock)
+    alert_mutes_store = MuteRepo(database, clock=clock)
+    digests_store = DigestRepo(database, clock=clock)
     notify = NotifyService(
         channels_store,
         alerts_store,
         users,
         bus=event_bus,
         factory=notifier_factory if notifier_factory is not None else build_notifier_factory(),
+        digests=digests_store,
     )
 
     watchlists = WatchlistRepo(database)
@@ -547,15 +641,36 @@ def _context_on(
         theses=theses_store,
         watchlists=watchlists,
         settings=cfg,
+        assumptions=assumptions_store,
     )
     # 规则告警与系统告警共用这一个 sender：DND、通道选择、`notify_log` 那一行都住在
     # `NotifyService` 那一头，一个组装根里留两条发送路径，迟早一条带上这些而另一条不带
     sender = (
         QueuedAlertSender(notify, queue) if queue is not None else _NotifyAlertSender(notify)
     )
+    # 选股能力只有一份：手动跑与盘后监控读的是同一个服务，否则同一条件两条路径
+    # 可能给出不同的一篮票（S4-B）
+    screener = ScreenerService(
+        snapshot_store,
+        symbol_list_store,
+        financials_store,
+        technical=TechnicalService(bars, corp_actions, corp_actions_coverage, symbols),
+    )
+    screener_monitor = ScreenerMonitorService(
+        screener_presets,
+        screener,
+        screener_hits,
+        scan_store,
+        alert_mutes_store,
+        sender,
+        base_url=cfg.server.public_base_url,
+        clock=clock,
+    )
     rule_engine = RuleEngine(
         rules=rules_store,
         alerts=alerts_store,
+        states=alert_states_store,
+        mutes=alert_mutes_store,
         data=rule_data,
         calendar=calendar,
         fx=fx_store,
@@ -654,6 +769,8 @@ def _context_on(
         symbol_list=symbol_list_store,
         backfills=backfills_store,
         markets=cfg.markets,
+        coverage=corp_actions_coverage,
+        clock=clock,
     )
     symbol_search = SymbolSearchService(symbol_list_store, bars)
     symbol_master_sync = SymbolMasterSyncService(registry, symbol_list_store, cfg.markets)
@@ -667,6 +784,53 @@ def _context_on(
         registry, financials_store, valuation_store, flow_store, symbols
     )
     f10_sync = F10SyncService(registry, profiles_store, announcements_store, clock=clock)
+    # 关键词命中与资讯告警（S3-C / D246）：与规则告警共用同一个 sender，
+    # 否则 DND、通道选择与 notify_log 会在资讯这条路上各缺一块
+    news_keywords_store = NewsKeywordRepo(database, clock=clock)
+    news_hits_store = NewsHitRepo(database, clock=clock)
+    news = NewsService(
+        registry,
+        news_store,
+        announcements=announcements_store,
+        keywords=news_keywords_store,
+        hits=news_hits_store,
+        mutes=alert_mutes_store,
+        sender=sender,
+        clock=clock,
+    )
+    # 行业回填不联网：它只读今晚刚落库的概况，所以不需要 registry
+    industry = IndustryService(profiles_store, symbols)
+    # 组合限额（S4-E §7）：读权重与净值现算，不落「今天超没超」的结果——
+    # 阈值随时可改，落一份快照只会让屏幕在改线之后还说旧结论
+    limits_store = LimitRepo(database)
+    limits = LimitService(
+        limits_store,
+        users,
+        sim_accounts,
+        portfolio,
+        industry,
+        nav,
+        symbols,
+        cfg,
+        clock=clock,
+    )
+    # 业绩归因（S5 §3）：只读已落库的净值与每票日价值，不联网、不在自己手里算价
+    attribution = AttributionService(
+        users,
+        sim_accounts,
+        nav_store,
+        HoldingNavRepo(database),
+        industry,
+        symbols,
+        index_daily_store,
+        cfg,
+        calendar=calendar,
+    )
+    peers = PeerService(
+        profiles_store, symbols, valuation_store, financials_store, snapshot_store, clock=clock
+    )
+    # 核心业务（S2 / D240）：草稿来自概况摘要与同业那句代理话，保存只写 company_business
+    business = BusinessProfileService(company_business_store, profiles_store, peers, clock=clock)
     fx_sync = FxSyncService(registry, fx_store)
     universe_builder = UniverseBuilder(
         users=users,
@@ -687,6 +851,28 @@ def _context_on(
         cfg, quotes, calendar, universe_builder, clock=clock, on_poll=on_poll
     )
     task_runs = TaskRunRepo(database, clock=clock)
+    # 每日收盘摘要（S1-C）：正文只读已落库的告警与任务记录；投递在 serve 里入队，
+    # 没有通知线程的上下文（CLI）同步发
+    digest = DigestService(
+        settings=cfg,
+        users=users,
+        watchlists=watchlists,
+        theses=theses_store,
+        accounts=sim_accounts,
+        orders=sim_orders,
+        alerts=alerts_store,
+        mutes=alert_mutes_store,
+        digests=digests_store,
+        task_runs=task_runs,
+        news_hits=news_hits_store,
+        limits=limits,
+        send=(
+            QueuedDigestSender(notify, queue)
+            if queue is not None
+            else _NotifyDigestSender(notify)
+        ),
+        clock=clock,
+    )
     heartbeats = HeartbeatRepo(database, clock=clock)
     prune = PruneService(
         database,
@@ -695,6 +881,21 @@ def _context_on(
         heartbeats=heartbeats,
         backfills=backfills_store,
         annotations=annotation_pruner,
+        clock=clock,
+    )
+    # 证伪台账（D232 P0-3b）：调度与论点页读的是同一个服务，判一天的口径只有一份
+    assumption_service = AssumptionService(
+        assumptions_store, theses_store, fundamentals, users, clock=clock
+    )
+    decision = DecisionService(
+        valuation,
+        bars,
+        calendar,
+        sim_accounts,
+        sim_orders,
+        watchlists,
+        theses_store,
+        assumptions_store,
         clock=clock,
     )
     deps = JobDeps(
@@ -712,6 +913,17 @@ def _context_on(
         versions=versions,
         symbol_master=symbol_master_sync,
         snapshots=market_snapshot_sync,
+        assumptions=assumption_service,
+        alerts=sender,
+        symbols=symbols,
+        digest=digest,
+        industry=industry,
+        news=news,
+        screener_monitor=screener_monitor,
+        dividends=dividends,
+        nav=nav,
+        sim_accounts=sim_accounts,
+        backfills=backfills_store,
     )
     scheduler = Scheduler(
         cfg,
@@ -729,7 +941,7 @@ def _context_on(
         # 所有上下文共用同一只队列：只有调度线程跑循环，但谁都能往里放请求
         requests=core.requests,
         # 补数队列的每拍消费者（D144）：四入口排的行由调度线程按拍吃掉
-        backfill=BackfillConsumer(sync, backfills_store, cfg),
+        backfill=BackfillConsumer(sync, corp_action_sync, backfills_store, cfg),
     )
 
     return ServiceContext(
@@ -753,9 +965,13 @@ def _context_on(
         flow_store=flow_store,
         profiles_store=profiles_store,
         announcements_store=announcements_store,
+        news_store=news_store,
+        news_keywords_store=news_keywords_store,
+        company_business_store=company_business_store,
         scan_store=scan_store,
         snapshot_store=snapshot_store,
         screener_presets=screener_presets,
+        screener_hits=screener_hits,
         chart_prefs=chart_prefs,
         snapshots=market_snapshot_sync,
         theses_store=theses_store,
@@ -773,13 +989,18 @@ def _context_on(
         fundamental_sync=fundamental_sync,
         f10_sync=f10_sync,
         f10=f10,
+        news=news,
         fx_sync=fx_sync,
         symbol_master_sync=symbol_master_sync,
+        industry=industry,
+        peers=peers,
+        business=business,
         fundamentals=fundamentals,
         screen=ScreenService(
             financials_store, valuation_store, symbols, scan_store, clock=clock
         ),
-        screener=ScreenerService(snapshot_store, symbol_list_store, financials_store),
+        screener=screener,
+        screener_monitor=screener_monitor,
         analysis=analysis,
         minute=minute,
         valuation=valuation,
@@ -794,12 +1015,23 @@ def _context_on(
             orders=sim_orders,
             versions=versions,
         ),
+        assumptions_store=assumptions_store,
+        assumptions=assumption_service,
+        decision=decision,
         ledger=ledger,
         portfolio=portfolio,
+        dividends=dividends,
+        nav=nav,
+        nav_store=nav_store,
+        limits=limits,
+        limits_store=limits_store,
+        attribution=attribution,
         sim_accounts=sim_accounts,
         sim_ledger=sim_orders,
         channels_store=channels_store,
         alerts_store=alerts_store,
+        alert_states=alert_states_store,
+        alert_mutes=alert_mutes_store,
         annotations_store=annotations_store,
         annotations=annotations,
         attachments_store=attachments_store,
@@ -821,6 +1053,8 @@ def _context_on(
         quotes=quotes,
         intraday=intraday,
         task_runs=task_runs,
+        digests_store=digests_store,
+        digest=digest,
         heartbeats=heartbeats,
         prune=prune,
         scheduler=scheduler,

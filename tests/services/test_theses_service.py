@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 
 import pytest
@@ -21,6 +22,7 @@ from support_valuation import CODE, make_container
 
 from sams.bootstrap import build_container
 from sams.core.errors import StorageError, ValidationError
+from sams.core.fundamentals import BASIS_PE
 from sams.storage.repos.theses import (
     ARCHIVED,
     INVALIDATED,
@@ -77,6 +79,31 @@ def test_add_stores_exactly_the_levels_the_valuation_gave(db, settings):
     assert thesis.reward_risk == pytest.approx(plan.odds.value)
     assert report.unavailable is None
     assert report.valuation is not None
+
+
+def test_add_records_the_method_behind_the_levels(db, settings):
+    """价位的来路要跟着行落库：以后换口径时，旧行还认得出自己是按哪套方法算的。"""
+    container = build(db, settings)
+    thesis = container.theses.add(USER, "A", CODE).thesis
+    assert thesis.plan_version == "decision-v0"
+    method = json.loads(thesis.plan_method)
+    assert method["entry"] == "near_fair_low"
+    assert method["stop"] == "pct"
+    assert method["target"] == "near"
+    assert method["basis"] == BASIS_PE
+    assert method["as_of"] == "2024-10-26"
+
+
+def test_a_thesis_without_a_plan_keeps_both_method_columns_empty(db, settings):
+    """没有计划可 backing 的行不留版本号：手填价位不是一次读数。"""
+    container = build(db, settings)
+    thesis = container.theses.add(USER, "A", "600000").thesis
+    assert thesis.plan_version is None and thesis.plan_method is None
+    revised = container.theses.revise(
+        USER, thesis.id, stop_price=10.0, target_price=12.0
+    ).thesis
+    assert revised.stop_price == 10.0
+    assert revised.plan_version is None and revised.plan_method is None
 
 
 def test_add_starts_proposed_when_asked(db, settings):

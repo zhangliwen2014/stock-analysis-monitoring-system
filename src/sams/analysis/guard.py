@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Protocol
 import polars as pl
 
 from sams.core.codes import daily_price_limit
-from sams.core.errors import NotAdjustable
+from sams.core.errors import CoverageMissing, NotAdjustable
 
 if TYPE_CHECKING:
     from sams.analysis.adjust import DayFactor
@@ -93,14 +93,18 @@ def require_coverage(
 
     拒绝文案把「为什么不能直接算」写全：裸价区间涨跌在「没查过」那种情况下是一个错数，
     而调用方此刻正打算把它当成收益写进快照。
+
+    文案里不许出现命令行（D283）：这句话大多落在网页上，而网页用户没有终端——`sams serve`
+    占着库的时候，连真有终端的人跑 `sams sync actions` 也只会拿到 `DatabaseLocked`。
+    命令行那一侧在自己的出口补提示，这里只说「谁会把这活接走」。
     """
     span = is_covered(spans, start=start, end=end)
     if span is None:
-        raise NotAdjustable(
+        raise CoverageMissing(
             f"{market}/{code} 的 {start}~{end} 没有公司行为覆盖确认："
             "`corp_actions` 里 0 行既可能是这只票从没分过红，也可能是没查过它，"
-            "裸价区间涨跌在第二种情况下是错数。先跑 `sams sync actions --market "
-            f"{market} --code {code}`"
+            "裸价区间涨跌在第二种情况下是错数，所以这里不给数。"
+            "打开这只票的页面会把它登记进后台补采队列，补完这里自动出数。"
         )
     return span
 

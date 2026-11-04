@@ -2,8 +2,9 @@
 
 源给 ROE 与营收/利润同比，但**不给披露日**。这条缺口决定了这些行的用途（D215）：
 照常入 `financials`，`published_date` 留 NULL；`load_as_of` / `history` 认的是
-`published_date <= as_of`，所以它们不进入 PR、选股与「已披露」判断，只供个股页看数。
-拿报告期加天数去猜披露日，等于往回开时间机器（D61）。
+`published_date <= as_of`，所以它们不进入 PR 与「已披露」判断。选股这一侧只对港股
+开了一个口子：PEG 的净利同比按「报告期 ≤ 快照日」的最新一期年报取，并在结果上
+写明这条口径（D225）。拿报告期加天数去猜披露日，等于往回开时间机器（D61）。
 """
 
 from __future__ import annotations

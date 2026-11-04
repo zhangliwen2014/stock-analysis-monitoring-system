@@ -6,8 +6,13 @@ from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import pytest
+import support_valuation as world
+from fastapi.testclient import TestClient
+from support import FrozenClock
 
 from sams.core.quotes import Quote
+from sams.storage.repos.financials import FinancialRepo
+from sams.web.auth import sign
 from sams.web.display import moment_label
 
 #: 三只种子共用的假档案：改名字/币种时不用挨个函数找
@@ -15,7 +20,7 @@ _NAME = "贵州茅台"
 _CURRENCY = "CNY"
 
 
-def _seed(logged, market="A", code="600519"):
+def _seed(logged, market="A", code="600519", coverage=True):
     logged.context.symbols.upsert(
         pl.DataFrame({"market": [market], "code": [code], "name": [_NAME], "currency": [_CURRENCY]})
     )
@@ -23,7 +28,9 @@ def _seed(logged, market="A", code="600519"):
     # 「一定有未记录的公司行为」而整段拒绝出数。这里要的是「库里有几根能画的线」，
     # 所以给三根涨幅正常的价。
     last = date.today()
-    closes = [1490.0, 1500.0, 1510.0]
+    # 最后一根收盘与 `_seed_quote` 的 1500 对齐：休市时统一读模型回落这根收盘，
+    # 页面上那一格仍是 1,500.00，不会因为测试跑在周六就变成另一天的价
+    closes = [1480.0, 1490.0, 1500.0]
     logged.context.bars.upsert(
         pl.DataFrame(
             {
@@ -41,14 +48,16 @@ def _seed(logged, market="A", code="600519"):
         )
     )
     # 覆盖确认也要给：`series()` 读完日线还会查那道调整闸，没确认过的区间它不肯出数
-    logged.context.corp_actions_coverage.record(
-        market,
-        code,
-        covered_from=date(2000, 1, 1),
-        covered_to=last,
-        full_history=True,
-        src="akshare",
-    )
+    # （`coverage=False` 种的正是专家实测里那 6 只蓝筹的形状：有日线、从没查过公司行为）
+    if coverage:
+        logged.context.corp_actions_coverage.record(
+            market,
+            code,
+            covered_from=date(2000, 1, 1),
+            covered_to=last,
+            full_history=True,
+            src="akshare",
+        )
 
 
 def _seed_dividend(logged):
@@ -112,6 +121,23 @@ def _seed_quote(web, market="A", code="600519"):
     )
 
 
+def _login(client, web):
+    """冻在过去的那台 app 里登录：会话校验用注入时钟，心跳校验却拿真钟比。"""
+    response = client.post(
+        "/login",
+        data={"username": "alice", "password": "correct-horse-battery"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    # `auth._active_ok` 拿 `sams_active` 与真钟比：时钟冻在过去时，登录写下的心跳在真钟
+    # 眼里早已过期，下一次请求就被踢回登录页。按真钟重打一次心跳，会话本身依旧由注入
+    # 时钟验证（`SessionRepo.verify`）。
+    client.cookies.set(
+        "sams_active",
+        sign(web.core.settings.secret_key, f"{datetime.now(UTC).isoformat()}:fresh"),
+    )
+
+
 def test_symbol_page_needs_a_configured_market_and_a_real_row(logged):
     assert logged.client.get("/symbol/XX/1").status_code == 404
     assert logged.client.get("/symbol/A/999999").status_code == 404
@@ -157,6 +183,20 @@ def test_symbol_page_shows_quote_bars_rules_and_theses(logged):
     # 图本体改由 chart 局部按需拉（D158）：首屏里从此是局部的 URL，bars 的 URL 在局部渲染时才出现
     assert "/api/partials/chart?market=A&code=600519" in page.text
     assert moment_label(triggered, logged.context.settings.server.display_tz) in page.text
+
+
+def test_the_chart_caption_says_how_far_the_data_runs(logged):
+    """图注要标截止日（S0-E）：报价那一格写着「10-30 收盘」，图却可能停得更早。
+
+    分钟档与分时没有这一句：分时自己带当天日期，分钟 K 的日期在横轴上。
+    """
+    _seed(logged)
+    latest = logged.context.bars.latest_date("A", "600519")
+    assert latest is not None
+    daily = logged.client.get("/api/partials/chart?market=A&code=600519&period=day").text
+    assert f"数据截至 {latest:%Y-%m-%d}" in daily
+    minute = logged.client.get("/api/partials/chart?market=A&code=600519&period=m5").text
+    assert "数据截至" not in minute
 
 
 def test_symbol_page_normalises_a_loose_code(logged):
@@ -299,16 +339,18 @@ def test_unconfigured_market_never_falls_back(logged):
     assert logged.client.get("/symbol/XX/1").status_code == 404
 
 
-def test_no_queued_backfill_says_so(logged):
-    """主档早有、只是从没排过补数：这一档不许说「下一拍会自动补」——没排队就是没排队，
-    按钮才是这一档真正有效的出路（D146 评审）。"""
+def test_a_bare_symbol_page_now_always_says_queued(logged):
+    """D283 之后，「主档有、日线没、且从没排过队」这一档在**打开页面**这条路上走不到了：
+    渲染前先登记，所以页面说「已排队」时队列里必须真有一条日线待补行——话与队列不许各说各的。
+    「立即排一拍」那颗按钮仍留在页上（D146：网页用户要有一个可点的出路，不是只有一句说明）。"""
     logged.context.symbols.upsert(
         pl.DataFrame({"market": ["A"], "code": ["600036"], "name": ["招行"], "currency": ["CNY"]})
     )
     page = logged.client.get("/symbol/A/600036")
     assert page.status_code == 200
-    assert "下一拍会自动补" not in page.text
-    assert "没有排队" in page.text
+    assert "没有排队" not in page.text
+    assert "已排队，下一拍自动开始" in page.text
+    assert logged.context.backfills_store.open_for("A", "600036") is not None
     assert "/symbol/A/600036/sync" in page.text
 
 
@@ -354,6 +396,42 @@ def test_sync_button_requires_csrf(logged):
         "/symbol/A/600519/sync", data={"csrf": "bogus"}, follow_redirects=False
     )
     assert response.status_code == 403
+
+
+def test_the_symbol_page_shows_the_way_back_it_was_given(logged):
+    """从选股结果进来时，屏上要有一条能回去的路：那一串里带着原来的条件与页号。
+
+    浏览器后退不是这条路——选股页的结果只在 URL 里，人再点一次导航就回到空条件，
+    「看一眼」于是变成「重选一遍」。
+    """
+    _seed(logged)
+    back = "/screen?market=A&f=pr_now&o=%3C%3D&v=0.5"
+    page = logged.client.get("/symbol/A/600519", params={"back": back})
+    assert page.status_code == 200
+    assert 'href="/screen?market=A&amp;f=pr_now&amp;o=%3C%3D&amp;v=0.5"' in page.text
+    assert "← 返回" in page.text
+
+
+def test_a_back_value_that_leaves_this_site_is_not_a_link(logged):
+    """`back` 是一枚会写进 href 的外来串：协议、`//host`、反斜杠都不许变成链接。"""
+    _seed(logged)
+    for back in ("https://evil.example/x", "//evil.example/x", "javascript:alert(1)", "/\\evil"):
+        page = logged.client.get("/symbol/A/600519", params={"back": back})
+        assert page.status_code == 200
+        assert "← 返回" not in page.text, back
+
+
+def test_sync_keeps_the_way_back(logged):
+    """「立即排一拍」的 303 回本页：回程路上不能把来时的路弄丢。"""
+    _seed_list_row(logged)
+    response = logged.client.post(
+        "/symbol/A/600519/sync",
+        params={"back": "/screen?market=A"},
+        data={"csrf": logged.csrf},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/symbol/A/600519?back=%2Fscreen%3Fmarket%3DA"
 
 
 def test_bars_api_falls_back_too(logged):
@@ -561,3 +639,162 @@ def test_chart_partial_requires_a_login(web_app):
     )
     assert response.status_code == 303
     assert response.headers["location"].startswith("/login")
+
+
+def test_the_symbol_page_offers_a_decision_card_even_when_data_is_thin(logged):
+    """三根日线只够画图，不够出结论：卡片要在，且明说缺的是哪道闸。"""
+    _seed(logged)
+    _seed_quote(logged)
+    page = logged.client.get("/symbol/A/600519")
+    assert page.status_code == 200
+    assert 'id="decision"' in page.text
+    assert "证据不足" in page.text
+    assert "日线只有 3 根" in page.text
+
+
+def test_a_fully_backed_symbol_page_shows_the_decision_conclusion(make_app):
+    """A 股的完整那一屏：报价 13.0 在买入区里、R_low 过 2 ⇒ 可分批建仓。"""
+    moment = datetime(2024, 10, 28, 2, tzinfo=UTC)  # 上海 10:00，盘中
+    web = make_app(clock=FrozenClock(moment))
+    ctx = web.contexts.current()
+    ctx.users.create("alice", "correct-horse-battery", is_admin=True)
+    world.seed(ctx.db)
+    FinancialRepo(ctx.db).upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "A",
+                    "code": world.CODE,
+                    "report_date": date(2024, 6, 30),
+                    "published_date": date(2024, 8, 30),
+                    "roe": world.ROE_NOW,
+                    "source": "akshare",
+                }
+            ]
+        )
+    )
+    ctx.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": [world.CODE],
+                "name": ["中国神华"],
+                "currency": ["CNY"],
+            }
+        )
+    )
+    web.core.board.update(
+        "A",
+        [Quote(market="A", code=world.CODE, ts=moment, price=13.0, source="tencent")],
+        now=moment,
+        error=None,
+    )
+    with TestClient(web.app) as client:
+        _login(client, web)
+        page = client.get(f"/symbol/A/{world.CODE}")
+    assert page.status_code == 200
+    assert "可分批建仓" in page.text
+    assert "买入口径" in page.text
+    # 模板里的 `>` 经 Jinja 转义成 `&gt;`：断言转义后的那一行，才是在钉屏幕上看到的东西
+    assert "R 3.4 ~ &gt;10" in page.text
+    assert "合理区间 12.93 元~19.40 元" in page.text
+
+
+def test_a_hk_symbol_page_says_the_valuation_chain_is_missing(make_app):
+    moment = datetime(2024, 10, 28, 2, tzinfo=UTC)
+    web = make_app(clock=FrozenClock(moment))
+    ctx = web.contexts.current()
+    ctx.users.create("alice", "correct-horse-battery", is_admin=True)
+    world.seed(ctx.db, market="HK", code="00700")
+    ctx.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"],
+                "code": ["00700"],
+                "name": ["腾讯控股"],
+                "currency": ["HKD"],
+            }
+        )
+    )
+    with TestClient(web.app) as client:
+        _login(client, web)
+        page = client.get("/symbol/HK/00700")
+    assert page.status_code == 200
+    assert "缺估值链" in page.text
+    assert "证据不足" in page.text
+    # 没有失效价就不许摆「买入口径」：港美这一版连止损都只能来自论点
+    assert "买入口径" not in page.text
+
+
+def test_the_focus_day_reaches_the_chart_and_survives_the_toggles(logged):
+    """S1-B 的「跳回触发 bar」：focus 从告警详情一路透传到图上。
+
+    个股页首屏只有一条 htmx 拉图表的 URL，所以 focus 得先出现在那条 URL 里；
+    图局部换周期/换指标是另一趟 htmx，那些链接也得把 focus 带下去。
+    """
+    _seed(logged)
+    day = "2026-10-30"
+    page = logged.client.get(
+        "/symbol/A/600519", params={"focus": day, "back": "/alerts/abc"}
+    )
+    assert page.status_code == 200
+    assert f"focus={day}" in page.text
+
+    partial = logged.client.get(
+        "/api/partials/chart",
+        params={"market": "A", "code": "600519", "focus": day},
+    ).text
+    assert f'data-focus="{day}"' in partial
+    # 视图 / 周期 / 主图 / 副图四排开关都保留着它
+    assert partial.count(f"focus={day}") >= 4
+
+
+def test_a_malformed_focus_is_ignored_not_a_400(logged):
+    """focus 只是视图参数：为一个拼错的日期回 400，等于在「想回到现场」时拦人。"""
+    _seed(logged)
+
+    page = logged.client.get("/symbol/A/600519", params={"focus": "not-a-day"})
+    assert page.status_code == 200
+    assert "focus=not-a-day" not in page.text
+
+    partial = logged.client.get(
+        "/api/partials/chart",
+        params={"market": "A", "code": "600519", "focus": "../../etc/passwd"},
+    )
+    assert partial.status_code == 200
+    assert 'data-focus=""' in partial.text
+
+
+def test_a_coverage_refusal_degrades_the_card_not_the_whole_page(logged):
+    """复权闸拒的是那一个数，不该把整页拖走（专家实测：15 只蓝筹里 6 只整页 400）。
+
+    这一条还钉住 D283 那句话本身的成立条件：卡片说「打开这只票的页面会把它登记进后台
+    补采队列」，如果打开页面得到的是一个错误页，这句话就是做不到的承诺。
+    要凑够 300 根才走得到那道闸：日线不足时决策卡先按「数据不足」退回，压根没读过复权。
+    """
+    _seed(logged, coverage=False)
+    last = date.today() - timedelta(days=4)
+    closes = [1000.0 * (1.001**offset) for offset in range(320)]
+    logged.context.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * 320,
+                "code": ["600519"] * 320,
+                "date": [last - timedelta(days=offset) for offset in reversed(range(320))],
+                "close": list(reversed(closes)),
+                "volume": [100.0] * 320,
+                "source": ["akshare"] * 320,
+            }
+        )
+    )
+
+    page = logged.client.get("/symbol/A/600519")
+    assert page.status_code == 200, page.text[:600]
+    text = page.text
+    assert "没有公司行为覆盖确认" in text
+    # 页面其余部分照常：这只票确实有日线、有主档
+    assert _NAME in text
+    assert "决策" in text
+    # 那句承诺此刻是真的：这一趟渲染走完，队列里就有一条待补的公司行为
+    row = logged.context.backfills_store.open_for("A", "600519", kind="actions")
+    assert row is not None

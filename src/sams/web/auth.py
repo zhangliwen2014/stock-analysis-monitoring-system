@@ -13,7 +13,7 @@ import logging
 import secrets
 import threading
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -163,7 +163,8 @@ def _active_ok(request: Request) -> bool:
     except ValueError:
         return False
     idle = timedelta(minutes=request.app.state.web.core.settings.server.idle_timeout_min)
-    return datetime.now(UTC) - moment <= idle
+    now = request.app.state.web.core.clock.now_utc()
+    return now - moment <= idle
 
 
 def require_admin(request: Request):

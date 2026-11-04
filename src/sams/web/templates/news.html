@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}资讯{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>资讯 <span class="muted">{{ market_label }}</span></h1>
+  <form method="get" action="/news" class="filters">
+    <select name="market">
+      {% for value, label in market_options %}
+      <option value="{{ value }}"{% if value == market %} selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <input type="text" name="q" value="{{ q }}" placeholder="代码或名称"
+           hx-get="/api/symbol-search/pick?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
+           hx-target="#news-q-candidates"
+           hx-include="select[name=market]" hx-swap="innerHTML">
+    {% if code %}<input type="hidden" name="code" value="{{ code }}">{% endif %}
+    <label class="inline-form"><input type="checkbox" name="hits" value="1"{% if only_hits %} checked{% endif %}> 只看命中</label>
+    <button type="submit">筛选</button>
+    <div id="news-q-candidates"></div>
+    {% if code %}<a href="/news?market={{ market }}">清除代码过滤</a>{% endif %}
+  </form>
+  <p class="muted">
+    自选、持仓与观察 · 最近 {{ window_days }} 天 · 数据截至 {{ as_of }}
+    {% if not covered %}· {{ market_label }}新闻源未接入（v0 只接 A 股）{% endif %}
+  </p>
+</section>
+
+{# 关键词（S3-C / D245）：只对保存之后新入库的资讯生效；没有通道就只进摘要。
+   命中与推送都从这里才有生产者，页面只做增删，不改命中历史 #}
+<details class="card" {% if keyword_error %}open{% endif %}>
+  <summary>资讯关键词（{{ keywords|length }}）</summary>
+  <p class="muted">
+    按标题与摘要做包含匹配；关键词只对<b>保存之后</b>新入库的资讯生效，改词不会回扫历史。
+    不选通道 = 只进每日摘要。
+  </p>
+  {% if keyword_error %}<p class="flash-error">{{ keyword_error }}</p>{% endif %}
+  <form method="post" action="/news/keywords" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="market" value="{{ market }}">
+    <label>关键词 <input name="keyword" size="16" value="{{ keyword_draft.keyword }}" placeholder="比如：回购"></label>
+    <label>只盯一只（可空） <input name="code" size="10" value="{{ keyword_draft.code }}" placeholder="留空 = 本市场全部"
+           hx-get="/api/symbol-search/pick?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
+           hx-target="#keyword-candidates"
+           hx-include="[name=market]" hx-swap="innerHTML"></label>
+    {% if channels %}
+    <span>推送到
+      {% for channel in channels %}
+      <label><input type="checkbox" name="channel_ids" value="{{ channel.id }}"{% if channel.id in keyword_draft.channels %} checked{% endif %}> {{ channel.name }}</label>
+      {% endfor %}
+    </span>
+    {% else %}
+    <span class="muted">还没有推送通道：关键词只进摘要。</span>
+    {% endif %}
+    <button type="submit">保存关键词</button>
+    <div id="keyword-candidates"></div>
+  </form>
+  {% if keywords %}
+  <table>
+    <tr><th>关键词</th><th>范围</th><th>推送</th><th>保存于</th><th></th></tr>
+    {% for row in keywords %}
+    <tr>
+      <td>{{ row.keyword }}</td>
+      <td>{{ row.scope }}</td>
+      <td>{{ row.channels }}</td>
+      <td class="muted">{{ row.at }}</td>
+      <td>
+        <form method="post" action="/news/keywords/{{ row.id }}/delete" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="market" value="{{ market }}">
+          {% if code %}<input type="hidden" name="code" value="{{ code }}">{% endif %}
+          <button type="submit">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">这个市场还没有关键词。</p>
+  {% endif %}
+</details>
+
+{% if empty_message %}
+<section class="card"><p class="muted">{{ empty_message }}</p></section>
+{% else %}
+  {% for label, rows in groups %}
+  <section class="card">
+    <h2>{{ label }}</h2>
+    <ul class="news-feed">
+      {% for row in rows %}
+      <li>
+        <span class="muted">{{ row.when }}</span>
+        <span class="badge">{{ row.kind_label }}</span>
+        <a href="/symbol/{{ row.market }}/{{ row.code }}?back={{ page_url|urlencode }}">{{ row.code }} {{ row.name }}</a>
+        <a href="{{ row.url }}" target="_blank" rel="noopener">{{ row.title }}</a>
+        <span class="muted">{{ row.source }}</span>
+        {% if row.matched %}<span class="badge">命中：{{ row.matched|join("、") }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endfor %}
+
+  {% if pages > 1 %}
+  <section class="card">
+    {% if prev_url %}<a href="{{ prev_url }}">← 上一页</a>{% endif %}
+    <span class="muted">第 {{ page }} / {{ pages }} 页</span>
+    {% if next_url %}<a href="{{ next_url }}">下一页 →</a>{% endif %}
+  </section>
+  {% endif %}
+{% endif %}
+{% endblock %}

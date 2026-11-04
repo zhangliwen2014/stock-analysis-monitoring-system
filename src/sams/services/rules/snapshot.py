@@ -27,6 +27,7 @@ from sams.core.quotes import Quote, cross_baseline, local_day
 from sams.services._fold import before_last, fold, fold_to_price_basis, high_water, last
 from sams.services.analysis import AnalysisService, SeriesRead
 from sams.services.valuation import ValuationService
+from sams.storage.repos.assumptions import Assumption, AssumptionRepo
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.ledger import Account, Position, SimAccountRepo, SimOrderRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -149,6 +150,7 @@ class RuleData:
         theses: ThesisRepo,
         watchlists: WatchlistRepo,
         settings: Settings,
+        assumptions: AssumptionRepo | None = None,
     ) -> None:
         self.valuation = valuation
         self.analysis = analysis
@@ -159,6 +161,9 @@ class RuleData:
         self.theses = theses
         self.watchlists = watchlists
         self.settings = settings
+        #: 假设台账（D232 P0-3）：只有 `stop.thesis_drift` 读它。默认 None 让老装配照旧能跑，
+        #: 那种部署的漂移判据退回分项基线那一套
+        self.assumptions = assumptions
 
     # --- 展开 ---------------------------------------------------------------------------
 
@@ -212,6 +217,12 @@ class RuleData:
         if target.thesis_id is None:
             return None
         return self.theses.get(target.user_id, target.thesis_id)
+
+    def assumptions_for(self, target: Target) -> tuple[Assumption, ...]:
+        """这条论名下的假设；没有仓库或没有论时是空元组（模板据此退回基线判据）。"""
+        if self.assumptions is None or target.thesis_id is None:
+            return ()
+        return tuple(self.assumptions.list_for(target.thesis_id))
 
     def _thesis_of_rule(self, rule) -> Thesis | None:
         return self.theses.get(rule.user_id, rule.thesis_id or rule.target_ref)

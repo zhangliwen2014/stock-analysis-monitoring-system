@@ -26,6 +26,11 @@ from sams.storage.ids import new_id
 #: 只有这一种条件（§10.4：`expression` 是 M5 的事）
 CONDITION_KIND = "template"
 
+#: 草稿（`build`）的 id：一条永远不落库的规则不该有一枚看起来能查的 uuid。
+#: 引擎拿 `rule.id` 查 `alert_states` 与冷却，这个哨兵让「它昨天响过」在草稿上恒为假——
+#: 试算问的正是「这条线第一次响会怎样」
+DRAFT_ID = "draft"
+
 _COLUMNS = (
     "id, user_id, account_id, name, enabled, target_type, target_ref, kind,"
     " condition_kind, params_json, filters_json, cooldown_min, severity, channel_ids,"
@@ -157,6 +162,69 @@ class RuleRepo:
 
     # --- 写 -----------------------------------------------------------------------------
 
+    def build(
+        self,
+        user_id: str,
+        *,
+        kind: str,
+        name: str,
+        target_type: str,
+        target_ref: str,
+        params: Mapping[str, object] | None = None,
+        filters: Mapping[str, object] | None = None,
+        account_id: str | None = None,
+        thesis_id: str | None = None,
+        severity: str | None = None,
+        channel_ids: Sequence[str] = (),
+        cooldown_min: int = 30,
+        enabled: bool = True,
+        condition_kind: str = CONDITION_KIND,
+        params_on: date | None = None,
+    ) -> Rule:
+        """按 `create` 同一套判据装配一条**不落库**的规则（网页的保存前试算，R-22）。
+
+        判据不许有第二份：`_validate` 是创建与更新共用的那一道，草稿要是自己另写一套，
+        分叉的样子是「试算说这条线会响，保存时服务层说不行」。
+
+        id 是 `DRAFT_ID` 而不是一个新 uuid：引擎拿 `rule.id` 查状态与冷却，一个每次都不
+        一样的 id 会让人以为试算读到了历史。它的含义写在常量那里。
+        """
+        checked = self._validate(
+            user_id=user_id,
+            name=name,
+            kind=kind,
+            target_type=target_type,
+            target_ref=target_ref,
+            params=params,
+            filters=filters,
+            account_id=account_id,
+            thesis_id=thesis_id,
+            severity=severity,
+            channel_ids=channel_ids,
+            cooldown_min=cooldown_min,
+            condition_kind=condition_kind,
+        )
+        return Rule(
+            id=DRAFT_ID,
+            user_id=checked["user_id"],
+            name=checked["name"],
+            kind=checked["kind"],
+            enabled=bool(enabled),
+            target_type=checked["target_type"],
+            target_ref=checked["target_ref"],
+            params=checked["params"],
+            filters=checked["filters"],
+            cooldown_min=checked["cooldown_min"],
+            severity=checked["severity"],
+            channel_ids=checked["channel_ids"],
+            account_id=checked["account_id"],
+            thesis_id=checked["thesis_id"],
+            condition_kind=checked["condition_kind"],
+            # 与 `create` 同一个口径：`None` 说的是「不知道哪天填的」，不是「今天填的」
+            # （见 `Rule.params_on`）。想要「此刻的价空间」的调用方自己盖今天那一日
+            params_on=params_on,
+        )
+
     def create(
         self,
         user_id: str,
@@ -176,10 +244,10 @@ class RuleRepo:
         condition_kind: str = CONDITION_KIND,
         params_on: date | None = None,
     ) -> Rule:
-        checked = self._validate(
-            user_id=user_id,
-            name=name,
+        draft = self.build(
+            user_id,
             kind=kind,
+            name=name,
             target_type=target_type,
             target_ref=target_ref,
             params=params,
@@ -189,7 +257,9 @@ class RuleRepo:
             severity=severity,
             channel_ids=channel_ids,
             cooldown_min=cooldown_min,
+            enabled=enabled,
             condition_kind=condition_kind,
+            params_on=params_on,
         )
         rule_id = new_id()
         now = self.clock.now_utc()
@@ -201,21 +271,21 @@ class RuleRepo:
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 rule_id,
-                checked["user_id"],
-                checked["account_id"],
-                checked["name"],
-                bool(enabled),
-                checked["target_type"],
-                checked["target_ref"],
-                checked["kind"],
-                checked["condition_kind"],
-                json.dumps(checked["params"], ensure_ascii=False),
-                json.dumps(checked["filters"], ensure_ascii=False),
-                checked["cooldown_min"],
-                checked["severity"],
-                json.dumps(checked["channel_ids"], ensure_ascii=False),
-                checked["thesis_id"],
-                params_on,
+                draft.user_id,
+                draft.account_id,
+                draft.name,
+                draft.enabled,
+                draft.target_type,
+                draft.target_ref,
+                draft.kind,
+                draft.condition_kind,
+                json.dumps(draft.params, ensure_ascii=False),
+                json.dumps(draft.filters, ensure_ascii=False),
+                draft.cooldown_min,
+                draft.severity,
+                json.dumps(draft.channel_ids, ensure_ascii=False),
+                draft.thesis_id,
+                draft.params_on,
                 now,
                 now,
             ],

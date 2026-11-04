@@ -177,3 +177,25 @@ def test_jobdeps_carries_a_gate_by_default():
         users=None,
     )
     assert isinstance(deps.versions, VersionGate)
+
+
+def test_a_draft_for_the_preview_bumps_nothing(db, settings):
+    """一次试算没改任何写面：动盘中缓存的那一响因此也不许动。
+
+    「保存前试算」按每小时被点几次来算是常态，而 bump 的代价是盘中那一趟把整张快照重读
+    一遍。草稿不落库（`test_rules_maintenance` 钉那一半），这一枚钉的是缓存那一半。
+    """
+    gate = VersionGate()
+    service = make_service(db, settings, gate)
+    uid = service.users.create(NAME, PWD).id
+    base = gate.snapshot()
+    draft = service.draft(
+        uid,
+        kind="stop.fixed",
+        name="草稿",
+        target_type="symbol",
+        target_ref="A/601088",
+        params={"price": 10.0},
+    )
+    assert draft.id == "draft"
+    assert gate.snapshot() == base

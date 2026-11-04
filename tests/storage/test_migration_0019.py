@@ -1,7 +1,7 @@
 """0019：盘中报价的形状 + 测试告警 + 清理对象的索引。
 
 这一枚只验形状与默认值：四个价格列可空、`is_test` 在旧行与新行上都读得到 False、
-`sina_quote` 排在每个市场链末位。行为契约分别在 `test_quotes_repo.py`（Task 8）
+`sina_quote` 排在每个市场**报价链**末位。行为契约分别在 `test_quotes_repo.py`（Task 8）
 与 `test_prune.py`（Task 13）。
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 
+from sams.datasource.sources import known
 from sams.storage.db import Database
 from sams.storage.migrate import MIGRATIONS_DIR, apply_migrations
 from sams.storage.repos.data_sources import DataSourceRepo
@@ -29,16 +30,21 @@ def test_0019_adds_quote_columns_and_health_table(db):
     assert "quote_source_health" in db.table_names()
 
 
-def test_0019_seeds_sina_quote_at_the_end_of_every_market(db):
+def test_0019_seeds_sina_quote_at_the_end_of_every_markets_quote_chain(db):
     repo = DataSourceRepo(db)
     row = repo.get("sina_quote")
     assert row is not None and row.kind == "sina_quote"
-    # 这一枚只钉 0019 的位置约定：后面再插什么源，sina_quote 仍得是各链末位
-    assert {market: chain[-1] for market, chain in repo.chains().items()} == {
-        "A": "sina_quote",
-        "HK": "sina_quote",
-        "US": "sina_quote",
-    }
+    # 这一枚钉的是 0019 的位置约定：sina_quote 是每个市场上**最后一个提供报价的源**。
+    # 后面再排只报别的能力的源（0030 的美股财务源就排在它后面）不破坏这句——
+    # 按能力过滤后，报价链的末位仍然是它。
+    catalog = known()
+    for market, chain in repo.chains().items():
+        quote_chain = [
+            name
+            for name in chain
+            if "quote" in catalog[repo.get(name).kind].capabilities
+        ]
+        assert quote_chain and quote_chain[-1] == "sina_quote", market
 
 
 def test_is_test_defaults_to_false_on_new_rows(db):

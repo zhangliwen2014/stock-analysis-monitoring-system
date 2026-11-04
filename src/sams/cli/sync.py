@@ -29,6 +29,8 @@ DEFAULT_FUNDAMENTALS_START = DEFAULT_ACTIONS_START
 #: 手动补公告时多留一些余量：盘后 job 每晚问最近 30 天，手敲这一条的人通常是在补
 #: 更早的缺口。源一次最多给 100 条，这个窗口只裁剪那一页
 DEFAULT_ANNOUNCEMENTS_DAYS = 365
+#: 新闻与盘后 job 同一个窗口：搜索接口只给最近一页，拉更长的窗口也拿不到更早的
+DEFAULT_NEWS_DAYS = 30
 
 #: 命令行上的名字 → （服务方法名, 给人看的种类名）。`flow` 而不是 `funding_flow`：
 #: 命令要短，而名字对不上服务层这件事由这张表一次性承担，不在各处猜
@@ -62,7 +64,18 @@ def add_to(subparsers) -> None:
     for name, (_, label) in FUNDAMENTAL_KINDS.items():
         parser = actions.add_parser(name, help=f"{label}（按各源能力路由）")
         parser.add_argument("--market", required=True, help="A / HK / US")
-        parser.add_argument("--code", required=True, action="append", help="可多次传入")
+        if name == "financials":
+            # 选股看全市场，而调度的那条只采用户并集：普查得有自己的入口（D227），
+            # 否则补覆盖要往 `--code` 里塞几千次
+            pool = parser.add_mutually_exclusive_group(required=True)
+            pool.add_argument("--code", action="append", help="可多次传入")
+            pool.add_argument(
+                "--all",
+                action="store_true",
+                help="按代码表在市的全部票逐只同步（一次人工普查，不挂调度）",
+            )
+        else:
+            parser.add_argument("--code", required=True, action="append", help="可多次传入")
         parser.add_argument("--start", help=f"YYYY-MM-DD，默认 {DEFAULT_FUNDAMENTALS_START}")
         parser.add_argument("--end", help="YYYY-MM-DD，默认今天")
         parser.set_defaults(handler=run_fundamental)
@@ -85,11 +98,29 @@ def add_to(subparsers) -> None:
     announcements.add_argument("--end", help="YYYY-MM-DD，默认今天")
     announcements.set_defaults(handler=run_announcements)
 
+    news = actions.add_parser(
+        "news", help="个股新闻（最近一页；v0 只接 A 股，链接指向原文）"
+    )
+    news.add_argument("--market", required=True, help="A / HK / US")
+    news.add_argument("--code", required=True, action="append", help="可多次传入")
+    news.add_argument(
+        "--start", help=f"YYYY-MM-DD，默认 {DEFAULT_NEWS_DAYS} 天前"
+    )
+    news.add_argument("--end", help="YYYY-MM-DD，默认今天")
+    news.set_defaults(handler=run_news)
+
+    industry = actions.add_parser(
+        "industry",
+        help="行业回填（公司概况 → 主档 sector；不联网，重复执行只报变更数）",
+    )
+    industry.add_argument("--market", required=True, help="A / HK / US")
+    industry.set_defaults(handler=run_industry)
+
     spot = actions.add_parser(
         "spot",
         help="全市场快照（一个市场的一次横截面；盘后自动跑的那条同源）",
     )
-    spot.add_argument("--market", required=True, help="A（本期只接 A 股）")
+    spot.add_argument("--market", required=True, help="A / HK / US")
     spot.add_argument("--day", help="YYYY-MM-DD，默认按报价时刻的众数日")
     spot.add_argument(
         "--code", action="append", help="只采这几只（试跑用；默认=代码表里全部在市）"
@@ -114,35 +145,80 @@ def run_fundamental(container: Container, args: argparse.Namespace) -> int:
     method, label = FUNDAMENTAL_KINDS[args.action]
     start = iso_date(args.start) if args.start else DEFAULT_FUNDAMENTALS_START
     end = iso_date(args.end) if args.end else container.clock.today()
-    for code in args.code:
-        summary = getattr(container.fundamental_sync, method)(args.market, code, start, end)
+    sweep = getattr(args, "all", False)
+    if sweep:
+        codes = container.symbol_list_store.active_codes(args.market)
+        if not codes:
+            # 空票池照样「跑完 0 只」会让人以为覆盖已经补齐：先说清票池从哪来
+            raise SamsError(
+                f"代码表里 {args.market} 没有在市票：先跑 "
+                f"`sams run once --job symbol_master --market {args.market}`"
+            )
+    else:
+        codes = list(args.code)
+    written = empty = 0
+    listed_filled = 0
+    listed_gaps: dict[str, int] = {}
+    failed: list[str] = []
+    for code in codes:
+        try:
+            summary = getattr(container.fundamental_sync, method)(args.market, code, start, end)
+        except SamsError as exc:
+            # 几千只的普查不能因为一只超时就整批重来：失败进汇总，其余照跑
+            failed.append(code)
+            print(f"{code:<10} {label}  失败：{exc}")
+            continue
         line = f"{code:<10} {label}  源={summary.source or '—'} 取回={summary.fetched}"
         if summary.empty:
+            empty += 1
             # 「这几家都说了没有」不是「取回 0 条」：前者的下一步是接受，后者的下一步是查源
             line += (
                 f" 入库=0  链上每个有能力的源都说查无记录"
                 f"（{'+'.join(summary.confirmed_empty_by)}）"
             )
         else:
+            written += 1
             line += f" 入库={summary.written}"
         if summary.degraded:
             line += f" [降级: {_trail(summary.attempts)}]"
         print(line)
         # 上市日期是主档的一格（U18）：填上了读的人少敲一次 `--listed-on`，
-        # 没填上要说清为什么——它不是基本面失败的那一半，所以不打断上面那一行
+        # 没填上要说清为什么——它不是基本面失败的那一半，所以不打断上面那一行。
+        # 全市场普查里这条理由按市场只差一句话：逐票打出来会淹掉真正的取数结果。
         if summary.listed_on is not None:
-            print(f"           主档上市日期={summary.listed_on}（下次读数不用再传 --listed-on）")
+            listed_filled += 1
+            if not sweep:
+                print(
+                    f"           主档上市日期={summary.listed_on}"
+                    "（下次读数不用再传 --listed-on）"
+                )
         elif summary.listed_on_note:
-            print(f"           {summary.listed_on_note}")
+            if sweep:
+                # 按原因聚合、数只数：全市场普查里同一句话可能重复几千次
+                listed_gaps[summary.listed_on_note] = (
+                    listed_gaps.get(summary.listed_on_note, 0) + 1
+                )
+            else:
+                print(f"           {summary.listed_on_note}")
         for name, reason in summary.skipped:
             print(f"           跳过 {name}：{reason}")
-    return 0
+    if sweep:
+        print(
+            f"合计 {len(codes)} 只：有数据 {written}，查无记录 {empty}，失败 {len(failed)}"
+        )
+        if listed_filled:
+            print(f"上市日期：本次填上 {listed_filled} 只（主档那一格原来是空的）")
+        # 句子本身已经以「上市日期没填上：」开头，再加前缀会印成两句一样的话
+        for note, count in listed_gaps.items():
+            suffix = f"（{count} 只）" if count > 1 else ""
+            print(f"{note}{suffix}")
+    return 1 if failed else 0
 
 
 def run_profile(container: Container, args: argparse.Namespace) -> int:
     """公司概况一票一行：给锁在里面的代码各问一次，重复执行行数不变。"""
     for code in args.code:
-        _print_f10(container.f10_sync.sync_profile(args.market, code))
+        _print_sync(container.f10_sync.sync_profile(args.market, code))
     return 0
 
 
@@ -157,11 +233,33 @@ def run_announcements(container: Container, args: argparse.Namespace) -> int:
     if start > end:
         raise ValidationError(f"--start {start} 在 --end {end} 之后：区间反了")
     for code in args.code:
-        _print_f10(container.f10_sync.sync_announcements(args.market, code, start, end))
+        _print_sync(container.f10_sync.sync_announcements(args.market, code, start, end))
     return 0
 
 
-def _print_f10(summary) -> None:
+def run_industry(container: Container, args: argparse.Namespace) -> int:
+    """行业回填与盘后 job 走同一个服务：这里只把「扫了几只、改了几只」写成一句。"""
+    report = container.industry.backfill(args.market)
+    print(f"{report.market}  {report.note}")
+    return 0
+
+
+def run_news(container: Container, args: argparse.Namespace) -> int:
+    """最近一页新闻。默认 30 天；重跑同一晚输出「入库=0」。"""
+    end = iso_date(args.end) if args.end else container.clock.today()
+    start = (
+        iso_date(args.start)
+        if args.start
+        else end - timedelta(days=DEFAULT_NEWS_DAYS)
+    )
+    if start > end:
+        raise ValidationError(f"--start {start} 在 --end {end} 之后：区间反了")
+    for code in args.code:
+        _print_sync(container.news.sync(args.market, code, start, end))
+    return 0
+
+
+def _print_sync(summary) -> None:
     line = f"{summary.code:<10} {summary.kind}  源={summary.source or '—'} 取回={summary.fetched}"
     if summary.empty:
         # 「每个有能力的源都说查无记录」不是「取回 0 条」：前者的下一步是接受，

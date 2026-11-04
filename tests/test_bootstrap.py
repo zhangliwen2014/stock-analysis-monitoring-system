@@ -104,7 +104,7 @@ def test_registry_chain_comes_from_the_database(migrated):
                 "eastmoney_hk_f10",
                 "sina_quote",
             ),
-            "US": ("yfinance", "tencent", "sina_quote"),
+            "US": ("yfinance", "tencent", "sina_quote", "eastmoney_us_f10"),
         }
         assert built.registry.chain_for("HK", "daily_bars") == ("yfinance", "tencent")
         assert built.registry.chain_for("HK", "corp_actions") == ("yfinance", "akshare_hk")
@@ -113,11 +113,12 @@ def test_registry_chain_comes_from_the_database(migrated):
         assert built.registry.chain_for("A", "quote") == ("tencent", "sina_quote")
         assert built.registry.chain_for("HK", "quote") == ("tencent", "sina_quote")
         assert built.registry.chain_for("US", "quote") == ("tencent", "sina_quote")
-        # F10（D214）：US 的链上没有概况/公告源；港股财务多一个只服务它的源
+        # F10（D214）：US 的链上没有概况/公告源；港股与美股的财务各有一个只服务它的源
         assert built.registry.chain_for("A", "company_profile") == ("eastmoney_f10",)
         assert built.registry.chain_for("HK", "announcements") == ("eastmoney_f10",)
         assert built.registry.chain_for("US", "company_profile") == ()
         assert built.registry.chain_for("HK", "financials") == ("eastmoney_hk_f10",)
+        assert built.registry.chain_for("US", "financials") == ("eastmoney_us_f10",)
     finally:
         built.close()
 
@@ -523,7 +524,12 @@ def test_healthz_probes_never_touch_a_thread_context_connection(migrated):
         payload = parts.runtime.healthz()
 
         assert payload["status"] == "ok"
-        assert payload["scheduler"] == {"beat_age_s": None, "stale": False}
+        assert payload["scheduler"] == {
+            "beat_age_s": None,
+            "stale": False,
+            "busy": False,
+            "running": [],
+        }
         assert payload["db"] == {"ok": True, "error": None}
     finally:
         parts.close()

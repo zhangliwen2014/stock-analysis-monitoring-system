@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}事件与复检{% endblock %}
+{% block content %}
+<h1>事件与复检</h1>
+<p class="muted">我的标的 {{ symbol_count }} 只（自选 + 持仓 + 推进中的论点）；截至 {{ as_of }}，回看 {{ window_days }} 天。</p>
+
+<section class="card">
+  <h2>最近披露 <span class="muted">{{ disclosures|length }} 条</span></h2>
+  {% if disclosures %}
+  <table>
+    <tr><th>披露日</th><th class="num">距今</th><th>标的</th><th>报告期</th></tr>
+    {% for item in disclosures %}
+    <tr>
+      <td>{{ item.published_date }}</td>
+      <td class="num">{{ item.days_since }} 天</td>
+      <td><a href="/symbol/{{ item.market }}/{{ item.code }}?back=/calendar">{{ item.name }}</a>
+        <span class="muted">{{ item.market }}/{{ item.code }}</span></td>
+      <td>{{ item.report_date }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">最近 {{ window_days }} 天没有已披露的财报。</p>
+  {% endif %}
+  {% if unpublished %}
+  <p class="muted note">这些标的库里有财报、但披露日未入库（港股/美股常见），判断不了最近一次披露：
+    {% for item in unpublished %}{{ item.name }}（{{ item.market }}/{{ item.code }}）{% if not loop.last %}、{% endif %}{% endfor %}
+  </p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>最近公告 <span class="muted">{{ announcements|length }} 条</span></h2>
+  {% if announcements %}
+  <table>
+    <tr><th>公告日</th><th class="num">距今</th><th>标的</th><th>标题</th></tr>
+    {% for item in announcements %}
+    <tr>
+      <td>{{ item.published_on }}</td>
+      <td class="num">{{ item.days_since }} 天</td>
+      <td><a href="/symbol/{{ item.market }}/{{ item.code }}?back=/calendar">{{ item.name }}</a></td>
+      <td>{% if item.url %}<a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">最近 {{ window_days }} 天没有公告。公告目前只覆盖 A 股与港股。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>预告</h2>
+  <p class="muted">财报预约披露日（预计）：预计披露日未接入——没有可靠数据源就不接，这里不编造未来日历；未来除权除息日同样不猜。采集接上之后，这里才会出现「未来 4 周」。</p>
+</section>
+{% endblock %}

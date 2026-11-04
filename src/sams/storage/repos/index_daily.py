@@ -93,3 +93,19 @@ class IndexDailyRepo:
         if value is None:
             return None
         return value.date() if isinstance(value, datetime) else value
+
+    def closes(
+        self, market: str, index_code: str, *, start: date, end: date
+    ) -> list[tuple[date, float]]:
+        """区间内已有的 (日期, 收盘)，按日升序：归因的基准只问「这几天有几根」。
+
+        返回空 = 这几天根本没落库（未同步或该市场无数据源），调用方要把它读成
+        「取不到」而不是「基准为 0」。
+        """
+        rows = self.db.query(
+            "SELECT date, close FROM index_daily"
+            " WHERE market = ? AND index_code = ? AND date BETWEEN ? AND ? AND close IS NOT NULL"
+            " ORDER BY date",
+            [market, index_code, start, end],
+        )
+        return [(row["date"], float(row["close"])) for row in rows.to_dicts()]

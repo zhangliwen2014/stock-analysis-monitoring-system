@@ -14,7 +14,7 @@ from typing import Protocol
 
 import polars as pl
 
-from sams.core.codes import canonical_code
+from sams.core.codes import canonical_code, is_beijing
 from sams.core.errors import (
     DatasourceError,
     EmptyResponse,
@@ -77,19 +77,23 @@ def code_in_market(market: str, code: str) -> str:
     return canonical
 
 
-#: 沪市号段首位；其余（0/1/2/3 开头）归深市。B 股 900 在沪、200 在深，这条已经分对
+#: 沪市号段首位；其余（0/2/3 开头）归深市。北交所先由 `is_beijing` 分走，
+#: 所以这里剩下的 `9` 只有沪市 B 股（900）
 _SH_FIRST = "569"
 
 
 def a_share_symbol(code: str) -> str:
-    """A 股代码 → 带交易所前缀的 symbol（`sh600519` / `sz000001`）。
+    """A 股代码 → 带交易所前缀的 symbol（`sh600519` / `sz000001` / `bj920020`）。
 
     新浪与腾讯都要这个形态，规则放公共件里：放在任一个适配器里，另一个就得反向 import
-    它——同层横串正是分层守卫要挡的东西。
+    它——同层横串正是分层守卫要挡的东西。东财那一族要的数字编号与 `SH/SZ/BJ` 后缀
+    也从这三格推，交易所只判一次。
     """
     symbol = canonical_code("A", code)
     if not symbol.isdigit() or len(symbol) != 6:
         raise ValueError(f"A 股代码应为 6 位数字，收到 {code!r}")
+    if is_beijing(symbol):
+        return f"bj{symbol}"
     return f"{'sh' if symbol[0] in _SH_FIRST else 'sz'}{symbol}"
 
 

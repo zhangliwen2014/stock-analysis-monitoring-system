@@ -1,0 +1,48 @@
+{# 同业对比（S2 / D237–D239）：自己固定第一行；中位只算同业。
+   市值只来自快照的亿元（D239），估值行超过 30 天或缺失的票不进同业。
+   未覆盖/未披露不摆一张空表：先说清楚是哪一档、下一步做什么。 #}
+
+<section class="card" id="peers">
+  <h2>同业对比
+    {% if report.industry %}
+    <span class="muted">{{ report.industry }}{% if report.level_used %} · {{ report.level_used }}行业{% endif %} · 截至 {{ report.as_of }}</span>
+    {% endif %}
+  </h2>
+  {% if report.state in ("not_covered", "not_disclosed") %}
+  <p class="muted">{{ missing_label(report.position_missing) }}：{{ report.position or report.notes[0] }}</p>
+  {% else %}
+  <table>
+    <tr>
+      <th>公司</th>
+      <th class="num">市值（亿元）</th>
+      <th class="num">PE</th>
+      <th class="num">PB</th>
+      <th class="num">ROE</th>
+      <th class="num">营收（亿元）</th>
+    </tr>
+    {% for row in report.rows %}
+    <tr{% if row.is_self %} class="self"{% endif %}>
+      <td><a href="/symbol/{{ market }}/{{ row.code }}?back={{ origin_url|urlencode }}">{{ row.name }}</a>{% if row.is_self %} <span class="muted">（自己）</span>{% endif %}</td>
+      <td class="num">{{ "%.1f"|format(row.market_cap) if row.market_cap is not none else "—" }}</td>
+      <td class="num">{% if row.pe_ttm is not none %}{{ "%.2f"|format(row.pe_ttm) }}{% else %}— <span class="muted">{{ missing_label(row.pe_missing) }}</span>{% endif %}</td>
+      <td class="num">{% if row.pb is not none %}{{ "%.2f"|format(row.pb) }}{% else %}— <span class="muted">{{ missing_label(row.pb_missing) }}</span>{% endif %}</td>
+      <td class="num">{{ ratio_pct(row.roe, 2) }}</td>
+      <td class="num">{{ "%.1f"|format(row.revenue / 100000000) if row.revenue is not none else "—" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <p>
+    同业中位（不含自己）：
+    PE {{ "%.2f"|format(report.pe.value) if report.pe.value is not none else "— " ~ missing_label(report.pe.missing_kind) }}（n={{ report.pe.samples }}）
+    · PB {{ "%.2f"|format(report.pb.value) if report.pb.value is not none else "— " ~ missing_label(report.pb.missing_kind) }}（n={{ report.pb.samples }}）
+    · ROE {{ ratio_pct(report.roe.value, 2) }}（n={{ report.roe.samples }}）
+  </p>
+  {% if report.position %}<p>{{ report.position }}</p>{% endif %}
+  {% if report.notes %}
+  <ul class="muted">
+    {% for note in report.notes %}<li>{{ note }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% endif %}
+</section>

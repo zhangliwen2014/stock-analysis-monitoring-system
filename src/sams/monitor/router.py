@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from sams.core.errors import SamsError, StorageError, ValidationError
 from sams.core.events import EventBus, NotifyFailed
 from sams.core.notify import (
+    DIGEST_KINDS,
     FAILED,
     LIMITS,
     NO_CHANNEL,
@@ -29,6 +30,7 @@ from sams.core.notify import (
     STRONG,
     SUPPRESSED,
     AlertMessage,
+    DigestMessage,
     NotifyResult,
     PushContext,
     format_annotation_context,
@@ -40,6 +42,7 @@ from sams.monitor.env import DESKTOP, VOICE, LocalEnv
 from sams.monitor.notifiers import Notifier, build_notifier_factory, probe_message
 from sams.storage.repos.alerts import Alert, AlertRepo
 from sams.storage.repos.channels import Channel, ChannelRepo
+from sams.storage.repos.digests import DigestRepo
 from sams.storage.repos.users import User, UserRepo
 
 logger = logging.getLogger("sams.monitor.router")
@@ -67,6 +70,8 @@ def _message_from(alert: Alert) -> AlertMessage:
         intraday=alert.intraday,
         quote_ts=alert.quote_ts,
         quote_source=alert.quote_source,
+        trigger_bar_ts=alert.trigger_bar_ts,
+        dedupe_key=alert.dedupe_key or "",
     )
 
 
@@ -127,10 +132,12 @@ class NotifyService:
         attempts: int = 3,
         env: LocalEnv | None = None,
         context_provider: Callable[[Alert], PushContext | None] | None = None,
+        digests: DigestRepo | None = None,
     ) -> None:
         self.channels = channels
         self.alerts = alerts
         self.users = users
+        self.digests = digests
         self.bus = bus
         self._factory = factory if factory is not None else build_notifier_factory()
         self.sleep = sleep
@@ -177,10 +184,13 @@ class NotifyService:
             triggered_at=message.triggered_at,
             channel_ids=list(channel_ids),
             extra={"body": message.body},
+            facts=message.facts,
             is_test=is_test,
             intraday=message.intraday,
             quote_ts=message.quote_ts,
             quote_source=message.quote_source,
+            trigger_bar_ts=message.trigger_bar_ts,
+            dedupe_key=message.dedupe_key or None,
         )
 
     def deliver_existing(
@@ -229,6 +239,58 @@ class NotifyService:
                 "abandon 必须带原因：那一句话在屏幕上的「为什么没发出去」要能指到一件事"
             )
         self.alerts.record(alert_id, None, NO_CHANNEL, error=text, attempts=0)
+
+    def deliver_digest(self, digest_id: str) -> DeliveryReport:
+        """把一条摘要送到用户默认的文字通道；结局写回摘要行，不写 `notify_log`。
+
+        摘要是长文：desktop/voice 的字节预算装不下，也不该把「发不出去」伪装成
+        「已发送」。没有启用的文字通道时明确记 `no_channel`，而不是退回到任何一条
+        能发短消息的通道。
+        """
+        digests = self._require_digests()
+        digest = digests.get_by_id(digest_id)
+        if digest is None:
+            raise StorageError(f"摘要 {digest_id} 不存在：发送必须落在一条真实摘要上")
+        user = self.users.get(digest.user_id)
+        if user is None:
+            reason = f"没有用户 {digest.user_id}：摘要没有接收人就不能发"
+            digests.mark_delivery(digest.id, NO_CHANNEL, error=reason)
+            return DeliveryReport("", None, NO_CHANNEL, reason, 0)
+        message = DigestMessage(
+            market=digest.market,
+            as_of=digest.as_of,
+            title=digest.title,
+            body=digest.body,
+            triggered_at=digest.created_at,
+        )
+        dnd = self._dnd_note(user, message)
+        if dnd:
+            digests.mark_delivery(digest.id, SUPPRESSED, error=dnd)
+            return DeliveryReport("", None, SUPPRESSED, dnd, 0)
+        node = self._text_channel(user)
+        if node is None:
+            reason = (
+                f"用户 {user.username} 名下没有启用的文字通道"
+                f"（{'、'.join(DIGEST_KINDS)}）；摘要是长文，桌面通知与语音装不下，"
+                "不降级到它们。修法：在「设置 → 通知通道」里加一个文字通道"
+            )
+            digests.mark_delivery(digest.id, NO_CHANNEL, error=reason)
+            return DeliveryReport("", None, NO_CHANNEL, reason, 0)
+        report = self._attempt(node, message)
+        digests.mark_delivery(digest.id, report.outcome, error=report.error)
+        return report
+
+    def abandon_digest(self, digest_id: str, *, reason: str) -> None:
+        """摘要入队失败时的那一句：行留下了，网页上要能看到为什么没推。"""
+        text = (reason or "").strip()
+        if not text:
+            raise ValidationError("abandon_digest 必须带原因：那一行没有正文可看")
+        self._require_digests().mark_delivery(digest_id, NO_CHANNEL, error=text)
+
+    def fail_digest(self, digest_id: str, *, error: str) -> None:
+        """通知线程处理摘要时出了预期外的错：写成 `failed`，不带走线程。"""
+        text = (error or "").strip() or "投递出了预期外的错"
+        self._require_digests().mark_delivery(digest_id, FAILED, error=text[:400])
 
     def dispatch(
         self,
@@ -337,6 +399,23 @@ class NotifyService:
             raise ValidationError(f"没有用户 {user_id}")
         return user
 
+    def _require_digests(self) -> DigestRepo:
+        if self.digests is None:
+            raise StorageError("摘要仓库未装配：这条路由只能发告警，不能发摘要")
+        return self.digests
+
+    def _text_channel(self, user: User) -> Channel | None:
+        """摘要只走文字通道：默认的那条优先，否则第一条启用的。"""
+        enabled = [
+            node
+            for node in self.channels.list_for(user.id)
+            if node.enabled and node.kind in DIGEST_KINDS
+        ]
+        return next(
+            (node for node in enabled if node.is_default),
+            enabled[0] if enabled else None,
+        )
+
     def _require(self, channel_id: str, *, user_id: str | None) -> Channel:
         node = self.channels.show(channel_id, user_id=user_id)
         if node is None:
@@ -347,7 +426,7 @@ class NotifyService:
     def _build(self, kind: str, config: Mapping[str, object]) -> Notifier:
         return self._factory(kind, dict(config))
 
-    def _dnd_note(self, user: User, message: AlertMessage) -> str:
+    def _dnd_note(self, user: User, message: AlertMessage | DigestMessage) -> str:
         """在免打扰里就该压制的那一句原因；不该压制时空串。
 
         `strong` 不受挡：止损会落在北京 22:00（美股时段），而那正是唯一一条
@@ -478,7 +557,9 @@ class NotifyService:
             )
         return report
 
-    def _attempt(self, node: Channel, message: AlertMessage) -> DeliveryReport:
+    def _attempt(
+        self, node: Channel, message: AlertMessage | DigestMessage
+    ) -> DeliveryReport:
         """真正的发送 + 退避。探针与真实告警共用这一个循环，唯一的区别是**调用方**要不要
         往 `notify_log` 写一行：探针不写（它不是一条告警的投递），但它一样会
         `mark_ok`/`mark_error`——一次真发过的尝试值得改变这条通道在健康页上的状态。

@@ -1,21 +1,97 @@
 {% extends "base.html" %}
 {% block title %}{{ market }}/{{ code }}{% endblock %}
 {% block content %}
+{% if back_url %}<p><a href="{{ back_url }}">← 返回</a></p>{% endif %}
 <section class="card">
   <h1>{{ symbol.get("name") or code }} <span class="muted">{{ market }}/{{ code }}</span></h1>
   <p>
-    <strong class="num">{{ money(price, symbol.get("currency")) }}</strong>
+    <strong class="num">{{ money(price, quote_unit) }}</strong>
     <span class="{{ pct_class }}">{{ pct(quote_pct) }}</span>
     <span class="badge">{{ state }}</span>
     <span class="muted">{{ quote_at }}</span>
+    {% if quote_detail %}<span class="muted">· {{ quote_detail }}</span>{% endif %}
   </p>
-  <div hx-get="/api/partials/chart?market={{ market }}&code={{ code }}" hx-trigger="load"
+  <div hx-get="/api/partials/chart?market={{ market }}&code={{ code }}{% if focus %}&focus={{ focus|urlencode }}{% endif %}" hx-trigger="load"
        hx-swap="outerHTML"><p class="muted">图加载中…</p></div>
+</section>
+
+{# 决策卡 v0（S1-A）：六格 + 三条证据，放在行情之后、图表与资料之前。
+   每个数字旁边都带着它自己的 as-of 与来处；闸门没过时只出「证据不足」，不拿半个计划冒充结论。 #}
+<section class="card" id="decision">
+  <h2>决策 <span class="muted">{{ decision.plan_version }}</span></h2>
+  <table>
+    <tr>
+      <th>标的状态</th>
+      <td>
+        {% if decision.held %}
+          {% for item in decision.held %}{{ item.account_name }}：{{ item.qty }} 股 @ {{ money(item.avg_cost, quote_unit) }}{% if not loop.last %}；{% endif %}{% endfor %}
+        {% else %}未持仓{% endif %}
+        · {{ "在自选" if decision.watched else "不在自选" }}
+        {% if decision.thesis %}· 论点 {{ decision.thesis.status }}{% endif %}
+        {% if decision.refuted %}· 已证伪 {{ decision.refuted|length }} 条{% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>现价与价值区间</th>
+      <td>
+        {{ money(decision.quote.price, quote_unit) }}
+        <span class="muted">{{ decision.quote.label }}</span>
+        {% if decision.fair_low is not none and decision.fair_high is not none %}
+        · 合理区间 {{ money(decision.fair_low, quote_unit) }}~{{ money(decision.fair_high, quote_unit) }}（{{ decision.price_vs_fair }}）
+        {% elif decision.degraded %}· 缺估值链
+        {% else %}· 合理区间没有算出来{% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>失效价</th>
+      <td>
+        {% if decision.stop is not none %}
+        {{ money(decision.stop, quote_unit) }}
+        <span class="muted">{{ decision.stop_method }}{% if decision.stop_distance_pct is not none %} · 距现价 {{ percent(decision.stop_distance_pct) }}{% endif %}</span>
+        <span class="muted">· {{ "持仓口径" if decision.held else ("论点口径" if decision.degraded else "买入口径") }}</span>
+        {% else %}—{% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>目标区间</th>
+      <td>
+        {% if decision.target_low is not none and decision.target_high is not none %}
+        {{ money(decision.target_low, quote_unit) }}~{{ money(decision.target_high, quote_unit) }}
+        <span class="muted">· 计入 R 的是 {{ money(decision.target_used, quote_unit) }}</span>
+        {% else %}—{% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>赔率区间</th>
+      <td>
+        {% if decision.odds.valid %}
+        R {{ odds_range_text(decision.odds.low, decision.odds.high) }}
+        <span class="muted">· 买卖合计已扣成本；R_low ≥ 2 才给「可分批建仓」</span>
+        {% else %}<span class="muted">{{ decision.odds.reason or "R 留空" }}</span>{% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>结论</th>
+      <td><strong>{{ decision.conclusion }}</strong> <span class="muted">{{ decision.reason }}</span></td>
+    </tr>
+  </table>
+  <ul class="muted decision-evidence">
+    {% for item in decision.evidence %}<li>{{ item.label }}：{{ item.text }}</li>{% endfor %}
+  </ul>
 </section>
 
 {# 资料块在图之后、空态之前（D214）：四张表四条读法，不让 K 线等它 #}
 <div hx-get="/api/partials/f10?market={{ market }}&code={{ code }}" hx-trigger="load"
      hx-swap="outerHTML"><p class="muted">资料加载中…</p></div>
+
+{# 基本面深度（S2）：核心业务 → 同业 → 估值位置。三块各自异步，
+   任何一块慢或失败都不挡 K 线；顺序与 spec §8.1 一致。 #}
+<div hx-get="/api/partials/business?market={{ market }}&code={{ code }}{% if back_url %}&back={{ back_url|urlencode }}{% endif %}"
+     hx-trigger="load" hx-swap="outerHTML"><p class="muted">核心业务加载中…</p></div>
+<div hx-get="/api/partials/peers?market={{ market }}&code={{ code }}" hx-trigger="load"
+     hx-swap="outerHTML"><p class="muted">同业对比加载中…</p></div>
+<div hx-get="/api/partials/valuation?market={{ market }}&code={{ code }}" hx-trigger="load"
+     hx-swap="outerHTML"><p class="muted">估值位置加载中…</p></div>
 
 {% if no_bars %}{# 空态与 404 说两件不同的事：这里是「有这只票、数还没来」（D146） #}
 <section class="card">
@@ -23,7 +99,7 @@
   {# deferred 那一档不挂「立即排一拍」：队行还开着（open_key 非空），enqueue 必返回 False，
      按钮点了队列纹丝不动——摆了就是骗人点（D146 评审） #}
   {% if not backfill_deferred %}
-  <form method="post" action="/symbol/{{ market }}/{{ code }}/sync" class="inline-form">
+  <form method="post" action="/symbol/{{ market }}/{{ code }}/sync{% if back_url %}?back={{ back_url|urlencode }}{% endif %}" class="inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <button type="submit">立即排一拍</button>
   </form>
@@ -56,7 +132,7 @@
   <ul>
     {% for item in theses %}
     <li>
-      <a href="/theses/{{ item.thesis.id }}">{{ item.thesis.status }}</a>
+      <a href="/theses/{{ item.thesis.id }}?back={{ page_url|urlencode }}">{{ item.thesis.status }}</a>
       <span class="muted">{{ item.note or "" }}</span>
     </li>
     {% endfor %}
@@ -71,7 +147,7 @@
     <tr><th>时刻</th><th>规则</th><th>档位</th><th>状态</th></tr>
     {% for alert in alerts %}
     <tr>
-      <td><a href="/alerts/{{ alert.id }}">{{ alert.at }}</a></td>
+      <td><a href="/alerts/{{ alert.id }}?back={{ page_url|urlencode }}">{{ alert.at }}</a></td>
       <td>{{ alert.rule_name }}</td>
       <td>{{ alert.stage }}</td>
       <td>{{ alert.status }}</td>

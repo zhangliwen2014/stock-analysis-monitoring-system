@@ -349,8 +349,50 @@ def test_health_page_shows_the_runtime_readout(logged):
     assert "陈旧" not in page.text
 
 
+def test_health_page_names_the_job_that_is_running_now(logged):
+    """过期 + 有一趟正在跑：这一屏要说得出「在做什么」，而不是报一个停了。
+
+    夜里一次基本面清扫轻松跑过五分钟，那一段时间里健康页每刷一次都是「陈旧」。
+    误报看多了，人就不再看这一屏——所以那一句必须换成「正在跑『谁』、已多久」。
+    """
+    logged.runtime.healthz = lambda: {
+        "status": "ok",
+        "db": {"ok": True, "error": None},
+        "scheduler": {
+            "beat_age_s": 400,
+            "stale": True,
+            "busy": True,
+            "running": [{"job": "financials", "market": "A", "age_s": 300}],
+        },
+        "intraday": {},
+        "version": "0.0.0+test",
+        "uptime_s": 5,
+    }
+    page = logged.client.get("/admin/health")
+    assert page.status_code == 200
+    assert "financials" in page.text
+    assert "不补拍" in page.text, "要说出「这一趟之内不补拍」这个原因，不能只把 ⚠ 抹掉"
+    assert "可能已经停了" not in page.text
+
+
+def test_health_page_says_a_stale_beat_with_nothing_running_may_be_stopped(logged):
+    """过期 + 一趟都没挂着：这才是「可能停了」那一句，屏幕上不许有别的解释。"""
+    logged.runtime.healthz = lambda: {
+        "status": "degraded",
+        "db": {"ok": True, "error": None},
+        "scheduler": {"beat_age_s": 400, "stale": True, "busy": False, "running": []},
+        "intraday": {},
+        "version": "0.0.0+test",
+        "uptime_s": 5,
+    }
+    page = logged.client.get("/admin/health")
+    assert "可能已经停了" in page.text
+    assert "financials" not in page.text
+
+
 def test_health_page_folds_the_intraday_moment_and_surfaces_every_error(logged):
     """C4/C5：读数是普通 dict，`stale` 可能缺席而换成了 `error`；盘中那一行有自己的 `ok`。"""
+
     ctx = logged.context
     poll = datetime(2026, 10, 23, 7, 30, tzinfo=UTC)
     logged.runtime.healthz = lambda: {

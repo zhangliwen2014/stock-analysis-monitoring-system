@@ -34,10 +34,12 @@ logger = logging.getLogger("sams.services.fundamentals")
 
 #: 上市日期那一格问的是哪条能力链（D38 的那份判据，不在这里另列谁能给）
 _LISTED_KIND = "listed_date"
-#: 三种「这一格还是空的」，各自的下一步不同（与 `_missing_roe_reason` 同一规矩）
+#: 三种「这一格还是空的」，各自的下一步不同（与 `_missing_roe_reason` 同一规矩）。
+#: 措辞里刻意不带代码：全市场普查时这几句按原因聚合成一行（差一个代码就是几千行噪声），
+#: 而单票同步里这句话就印在那只票那一行下面，代码不缺。
 NO_MASTER_ROW = (
-    "上市日期没填上：主档里还没有 {market} {code} 这一行，无处可写——"
-    "先 `sams sync daily --market {market} --code {code} --start … --end …`"
+    "上市日期没填上：主档里还没有这一行，无处可写——"
+    "先 `sams sync daily --market {market} --code <代码> --start … --end …`"
 )
 NO_CAPABLE_SOURCE = "上市日期没填上：{market} 的链上没有能给上市日期的源"
 NO_ANSWER = "上市日期没填上：{detail}"
@@ -154,7 +156,7 @@ class FundamentalSyncService:
         """
         symbol = self.symbols.get(market, code)
         if symbol is None:
-            return None, NO_MASTER_ROW.format(market=market, code=code)
+            return None, NO_MASTER_ROW.format(market=market)
         if symbol.get("listed_on") is not None:
             return None, ""
         chain = self.registry.chain_for(market, _LISTED_KIND)

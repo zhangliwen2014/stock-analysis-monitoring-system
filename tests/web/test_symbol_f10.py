@@ -211,7 +211,7 @@ def test_partial_renders_the_four_cards_for_a_share(logged_f10):
         in text
     )
     # A 股不摆港股那句披露日脚注：它是一条真实的口径，不是缺口（D215）
-    assert "不参与选股与市赚率" not in text
+    assert "不参与市赚率 PR" not in text
 
 
 def test_symbol_page_loads_the_f10_partial(logged_f10):
@@ -224,7 +224,7 @@ def test_a_market_without_a_source_says_so_instead_of_empty_tables(logged_f10):
     _symbol(logged_f10.context, "US", "AAPL", "苹果", "USD")
     text = logged_f10.client.get("/api/partials/f10?market=US&code=AAPL").text
     assert "美股的这条链上还没有公司概况的源" in text
-    assert "美股的这条链上还没有公告的源" in text
+    assert "美股的新闻源未接入；这条链上也没有公告的源" in text
     # 不摆一张空表：概况卡里不该出现简介那一段
     assert "公司简介" not in text
 
@@ -235,6 +235,20 @@ def test_a_source_without_local_data_prints_the_command(logged_f10):
     assert "本地还没有这只票的概况" in text
     assert "sams sync profile --market A --code 600519" in text
     assert "sams sync announcements --market A --code 600519" in text
+
+
+def test_the_dividend_card_queues_the_backfill_instead_of_a_command(logged_f10):
+    """分红卡不再印命令行（D283）：读这句话的人在浏览器里，他没有终端。
+
+    「已排进后台补采队列」不是安慰话：打开个股页那一刻 `SymbolInterest` 真的排了那一行，
+    所以这句只在真的排过之后才允许出现在屏幕上。
+    """
+    _symbol(logged_f10.context)
+    assert logged_f10.client.get("/symbol/A/600519").status_code == 200
+    text = logged_f10.client.get("/api/partials/f10?market=A&code=600519").text
+    assert "sams sync actions" not in text
+    assert "补采" in text
+    assert logged_f10.context.backfills_store.open_for("A", "600519", kind="actions") is not None
 
 
 def test_hk_page_normalises_the_code_for_the_same_material(logged_f10):
@@ -258,7 +272,7 @@ def test_hk_financials_carry_the_no_published_date_footnote(logged_f10):
         "/api/partials/f10?market=HK&code=00700&view=table"
     ).text
     assert "未给" in text
-    assert "不参与选股与市赚率" in text
+    assert "不参与市赚率 PR" in text and "D225" in text
     assert "9.97%" in text
 
 
@@ -417,7 +431,7 @@ def test_financials_table_view_keeps_the_hk_footnote(logged_f10):
         "/api/partials/f10/financials"
         "?market=HK&code=00700&period_type=annual&view=table"
     ).text
-    assert "不参与选股与市赚率" in text
+    assert "不参与市赚率 PR" in text and "D225" in text
     # 港股报表是原币列示（多为人民币）：金额与每股都不能挂 HKD 说成港元
     assert "报表原币" in text
     assert "亿元（HKD）" not in text

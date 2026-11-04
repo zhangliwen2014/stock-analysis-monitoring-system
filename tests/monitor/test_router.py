@@ -170,6 +170,31 @@ def test_no_channel_at_all_is_written_as_no_channel(world):
     assert row.channel_id is None and row.outcome == NO_CHANNEL
 
 
+def test_message_facts_are_persisted_at_the_payload_top_level(world):
+    """资讯命中走同一条 `dispatch`（D246）：`kind/url` 要在重放、队列与页面上
+    都读得到，所以必须真的落进 `alerts.payload_json`，不能只活在内存的消息上。"""
+    user = world.user()
+    world.add(user.id, "wecom", "群 A")
+    result = world.notify.dispatch(
+        msg(
+            rule_name="资讯",
+            stage="hit",
+            facts={
+                "kind": "news",
+                "url": "https://example.test/N1",
+                "title": "贵州茅台：关于回购股份的公告",
+            },
+        ),
+        user_id=user.id,
+        rule_id=None,
+    )
+    row = world.alerts.get(result.alert_id)
+    assert row is not None and row.rule_id is None
+    assert row.payload["kind"] == "news"
+    assert row.payload["url"] == "https://example.test/N1"
+    assert row.payload["title"] == "贵州茅台：关于回购股份的公告"
+
+
 def test_no_channel_guidance_points_at_the_settings_page(world):
     """网页上已经能加通道（`/settings` 的通知通道），而这句话原先只给 CLI 三步、
     最后一步「在规则里选它」在没有任何通道时压根没有那一格。指向设置页。"""

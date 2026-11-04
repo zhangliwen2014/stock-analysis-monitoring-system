@@ -15,10 +15,12 @@ from datetime import UTC, date, datetime
 
 import polars as pl
 from support import FrozenClock, StubAdapter
+from support_valuation import financial_rows
 
 import sams.cli as cli
 from sams.bootstrap import build_container
 from sams.datasource.spot import SPOT_SCHEMA
+from sams.storage.repos.financials import FinancialRepo
 from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
 
@@ -159,6 +161,58 @@ def test_limit_must_be_positive(db, settings, capsys):
     assert "正整数" in capsys.readouterr().out
 
 
+def test_the_coverage_sentence_rides_with_the_annual_condition_and_in_json(
+    db, settings, capsys
+):
+    """只看快照列时不背年报覆盖；读到年报列时，命中数旁边必须有「覆盖 x / y」（D227）。"""
+    container = container_for(db, settings, snap("600519"), snap("000001"))
+    FinancialRepo(db).upsert(financial_rows(code="600519"))
+    capsys.readouterr()
+    assert run(container, ["screen", "spot", "--market", "A", "--where", "roe>=0.1"]) == 0
+    out = capsys.readouterr().out
+    assert "年报覆盖 1 / 2 只" in out
+    assert "不是落选" in out
+
+    run(container, ["screen", "spot", "--market", "A", "--where", "pe_ttm<=20", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["financial_coverage"] is None
+
+
+def test_negative_valuations_and_st_rows_sit_out_unless_asked(db, settings, capsys):
+    """R-09：命令行与网页同一个默认——负 PE 不是便宜，ST/退市默认不出现。"""
+    container = container_for(
+        db,
+        settings,
+        snap("600519", pe_dyn=5.0),
+        snap("000001", pe_dyn=-72980.5),
+        {**snap("600001", pe_dyn=4.0), "name": "*ST海医", "is_st": True},
+    )
+    capsys.readouterr()
+    assert run(container, ["screen", "spot", "--market", "A", "--where", "pe_ttm<=8"]) == 0
+    out = capsys.readouterr().out
+    assert "通过 1 / 不通过 0 / 无数 1" in out
+    assert "估值不为正" in out
+    assert "ST/退市 1 只未参与" in out
+    assert "*ST海医" not in out
+
+    capsys.readouterr()
+    argv = [
+        "screen",
+        "spot",
+        "--market",
+        "A",
+        "--where",
+        "pe_ttm<=8",
+        "--include-negatives",
+        "--include-st",
+    ]
+    assert run(container, argv) == 0
+    out = capsys.readouterr().out
+    assert "通过 3 / 不通过 0 / 无数 0" in out
+    assert "*ST海医" in out
+    assert "ST/退市" not in out
+
+
 def test_json_carries_three_counts_and_the_missing_groups(db, settings, capsys):
     container = container_for(
         db, settings, snap("600519", pe_dyn=5.0), snap("000001", pe_dyn=-5.0)
@@ -171,3 +225,15 @@ def test_json_carries_three_counts_and_the_missing_groups(db, settings, capsys):
     assert payload["fields"][0]["missing"] == 1
     assert payload["missing"][0]["codes"] == ["000001"]
     assert payload["hits"][0]["code"] == "600519"
+
+
+def test_field_names_with_digits_are_not_rejected_as_bad_syntax(db, settings, capsys):
+    """`ma20_gap` / `rsi14` 带数字：解析器把它们当非法写法，CLI 就进不了技术面字段。"""
+    container = container_for(db, settings, snap("600519", pe_dyn=5.0))
+    capsys.readouterr()
+    code = run(container, ["screen", "spot", "--market", "A", "--where", "ma20_gap>0"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "读不出来" not in out
+    # 没有日线可算：技术面字段记「无数」，不静默丢掉
+    assert "通过 0 / 不通过 0 / 无数 1" in out

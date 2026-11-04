@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime
 from uuid import uuid4
 
@@ -51,6 +52,20 @@ COLUMNS = (
 
 #: 除 close 之外的数值列：出现 NaN/Inf 时置空而不是丢整行——缺成交量不该陪葬一根有效 K 线
 _OPTIONAL_NUMERIC = ("open", "high", "low", "volume", "amount")
+
+
+@dataclass(frozen=True)
+class LastBar:
+    """一只票库内最后一根不复权日线：统一报价读模型回落时的那一格（S0-E）。
+
+    `prev_close` 是前一天收盘而不是报价源给的前收：回落价与涨跌幅必须出自同一套
+    不复权序列，否则「10-30 收盘 +0.1%」里的两个数可能来自两个源。
+    """
+
+    day: date
+    close: float
+    prev_close: float | None
+    source: str
 
 
 def _prepare(df: pl.DataFrame) -> pl.DataFrame:
@@ -197,18 +212,48 @@ class BarRepo:
         一次 `arg_max` 聚合问完，不按票循环——候选十条就是十次查询的旧路，
         面板是每敲一个字都要重画的。键按读侧同一条规则归一（与 `load`/`latest_date` 一致）。
         """
+        return {key: bar.close for key, bar in self.last_bars(pairs).items()}
+
+    def last_bars(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], LastBar]:
+        """一批 (市场, 代码) 的最后一根日线：值 + 日期 + 前收 + 源（S0-E）。
+
+        统一报价读模型在休市/停更时回落到这里；日期与源必须一起回来，屏幕上才写得出
+        「10-30 收盘」和「不复权 · 源」，而不是把一个不知道哪天、不知道哪来的数当现价。
+        键与 `last_closes` 同一套归一规则。
+        """
         if not pairs:
             return {}
         keys = [(canonical_market(m), canonical_code(m, c)) for m, c in pairs]
         marks = ", ".join("(?, ?)" for _ in keys)
         params = [v for pair in keys for v in pair]
         rows = self.db.query(
-            f"SELECT market, code, arg_max(close, date) AS close FROM bars_daily"
-            f" WHERE adjust = ? AND (market, code) IN ({marks})"
-            f" GROUP BY market, code",
+            f"""
+            SELECT market, code, date, close, prev_close, source FROM (
+                SELECT market, code, date, close, source,
+                       lag(close) OVER (PARTITION BY market, code ORDER BY date) AS prev_close,
+                       row_number() OVER (
+                           PARTITION BY market, code ORDER BY date DESC
+                       ) AS rank
+                FROM bars_daily
+                WHERE adjust = ? AND (market, code) IN ({marks})
+            )
+            WHERE rank = 1
+            """,
             [ADJUST, *params],
         )
-        return {(r["market"], r["code"]): float(r["close"]) for r in rows.to_dicts()}
+        out: dict[tuple[str, str], LastBar] = {}
+        for row in rows.to_dicts():
+            day = row["date"]
+            if isinstance(day, datetime):
+                day = day.date()
+            prev = row["prev_close"]
+            out[(row["market"], row["code"])] = LastBar(
+                day=day,
+                close=float(row["close"]),
+                prev_close=None if prev is None else float(prev),
+                source=row["source"] or "",
+            )
+        return out
 
     def count(self, market: str | None = None, code: str | None = None) -> int:
         # 与 load/latest_date 同一个口径过滤，否则行数会算进库里另一套复权序列

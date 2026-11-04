@@ -224,7 +224,13 @@ class HealthReport:
     def schedule_stale(self) -> bool:
         """有过心跳且已经过期：退出码里只有这一条算「它可能死了」（D101）。
         从未启动不是事故、没接入与还没迁移更不是，所以这里既不读 `never_started`，
-        也不读 `schedule_unmigrated`。"""
+        也不读 `schedule_unmigrated`。
+
+        这里**不看**「有没有一趟还在跑」，与 `/healthz` 的判据不一样，理由是读者不同：
+        这一份报告是进程外的那一个读的，而它能打开库就说明没有进程握着这把锁
+        （DuckDB 单写者，连只读连接都会被拒，D111）——所以库里挂着的 `running`
+        在这里是上一个进程留下的孤儿，不是「还在做活」的证据。
+        """
         return self.schedule is not None and self.schedule.stale
 
 

@@ -195,6 +195,20 @@ def test_the_guarded_entry_refuses_where_the_bare_primitive_would_answer():
         adjusted_series("A", "600000", frame, actions(), coverage=[], today=D3)
 
 
+def test_the_coverage_refusal_does_not_send_the_reader_to_a_terminal():
+    """拒绝文案里不许出现命令行（D283）。
+
+    这句话是给网页用户看的：他没有终端，而 `sams serve` 占着库的时候，终端里那条
+    `sams sync actions` 也只会拿到 `DatabaseLocked`。命令行那一侧自己会补上提示。
+    """
+    frame = bars(100.0, 99.0)
+    with pytest.raises(NotAdjustable) as caught:
+        adjusted_series("A", "600000", frame, actions(), coverage=[], today=D3)
+    message = str(caught.value)
+    assert "sams " not in message
+    assert "补采" in message
+
+
 def test_every_price_column_carries_the_factor_not_just_the_close():
     """ATR/BOLL/KDJ/周月重采样都吃 high/low。只给收盘价等于请每个指标自己再乘一遍，
     而最顺手的错法是把裸 high 直接喂进去——那些数看起来完全正常。"""

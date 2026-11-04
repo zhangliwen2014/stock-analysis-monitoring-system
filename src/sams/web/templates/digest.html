@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}每日摘要{% endblock %}
+{% block content %}
+<h1>每日摘要</h1>
+<p class="muted">每个交易日收盘后一条，只说变化；没有变化的日子也会落一行，只是不推送。</p>
+{% if digests %}
+<table>
+  <tr><th>交易日</th><th>市场</th><th>摘要</th><th>投递</th></tr>
+  {% for item in digests %}
+  <tr>
+    <td>{{ item.as_of }}</td>
+    <td>{{ item.market }}</td>
+    <td><a href="/digest/{{ item.id }}?back={{ page_url|urlencode }}">{{ item.title }}</a>{% if item.has_changes %}<span class="badge">有变化</span>{% endif %}</td>
+    <td>{{ item.delivery }}{% if item.error %}<span class="muted">（{{ item.error }}）</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">还没有每日摘要：第一个交易日收盘后（A/HK 收盘后 30 分钟、US 收盘后 60 分钟）才会有第一条。</p>
+{% endif %}
+{% endblock %}

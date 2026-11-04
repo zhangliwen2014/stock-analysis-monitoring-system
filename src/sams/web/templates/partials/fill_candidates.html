@@ -5,8 +5,8 @@
   {% for row in rows %}
   <tr>
     <td>{{ row.market }}</td>
-    <td>{{ row.code }}</td>
-    <td>{{ row.name or "—" }}</td>
+    <td><a href="/symbol/{{ row.market }}/{{ row.code }}{% if back_url %}?back={{ back_url|urlencode }}{% endif %}">{{ row.code }}</a></td>
+    <td>{% if row.name %}<a href="/symbol/{{ row.market }}/{{ row.code }}{% if back_url %}?back={{ back_url|urlencode }}{% endif %}">{{ row.name }}</a>{% else %}—{% endif %}</td>
     <td class="num">{{ money(row.price, row.unit) }}</td>
     <td><button type="button" data-fill-market="{{ row.market }}" data-fill-code="{{ row.code }}">填入</button></td>
   </tr>

@@ -31,20 +31,20 @@ from fastapi.responses import RedirectResponse
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import DatabaseLocked, SamsError, StorageError, ValidationError
 from sams.core.notify import SEVERITIES
-from sams.core.quotes import quote_state
 from sams.core.rules import FILTER_KEYS, RULE_KINDS, Template, template_for
+from sams.services.rules.engine import RunReport
 from sams.storage.repos.rules import Rule
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import (
+    delivery_label,
     filter_label,
-    hms,
     moment_label,
     money,
     state_label,
     target_type_label,
 )
 from sams.web.forms import filter_flags, form_data, many, one, param_fields, raw_params
-from sams.web.pages.dashboard import _market_open, _price_unit
+from sams.web.quotes import QuoteView, quote_reader
 
 router = APIRouter()
 
@@ -75,7 +75,14 @@ _NOTICES = {
     "updated": "规则已更新。",
     "on": "规则已启用。",
     "off": "规则已停用。",
+    "removed": "规则已删除。",
 }
+
+#: 阶段的中文名：`STAGES` 那三个词是引擎的词汇，屏幕上要让不看代码的人读得懂
+_STAGE_LABELS = {"pre": "临近", "hit": "命中", "urgent": "紧急"}
+
+#: 示例表单没有自选可借时的兜底代码。只当默认值：库里有没有一根 K 线由结果页说
+_DEMO_CODES = {"A": "600519", "HK": "00700", "US": "AAPL"}
 
 #: 选 kind 那一屏的分组（专家验收 P2-2）：十四项裸枚举按用途分成五段。
 #: 前缀是 kind 的点号前那一段，不在表里的前缀归「其他」——新加一组时忘了登记，
@@ -89,12 +96,15 @@ _KIND_GROUPS = (
 )
 
 
-def _param_value(value: object) -> str:
-    """参数在屏上的写法：`1200.0` 印成 `1200`——`params_json` 读回来永远是 float。"""
+def _param_value(value: object, *, percent: bool = False) -> str:
+    """参数在屏上的写法：`1200.0` 印成 `1200`——`params_json` 读回来永远是 float。
+
+    `percent` 参数在库里是小数（0.08），屏上按百分数写（8）：两处口径只有这一处换算。
+    """
     if isinstance(value, bool):
         return str(value)
     if isinstance(value, (int, float)):
-        return f"{value:g}"
+        return f"{value * 100:g}" if percent else f"{value:g}"
     return str(value)
 
 
@@ -107,11 +117,11 @@ def _condition(rule: Rule) -> str:
         if value is None:
             continue
         text = (
-            ",".join(_param_value(piece) for piece in value)
+            ",".join(_param_value(piece, percent=param.percent) for piece in value)
             if isinstance(value, list)
-            else _param_value(value)
+            else _param_value(value, percent=param.percent)
         )
-        unit = f" {param.unit}" if param.unit else ""
+        unit = "%" if param.percent else (f" {param.unit}" if param.unit else "")
         parts.append(f"{param.label} {text}{unit}")
     return template.label + ("（" + "，".join(parts) + "）" if parts else "")
 
@@ -152,34 +162,138 @@ def _target_url(rule: Rule) -> str:
         return ""
 
 
-def _quote(ctx, core, rule: Rule, *, now, tz: str) -> dict:
-    """列表里那一格现价：进程级行情板，不查日线。板子空就写「无行情」。
-
-    一行写坏的引用（旧行、手改过的库）不该把整张列表变成 500：
-    那一格留空，规则本身照常显示。
-    """
+def _symbol_target(rule: Rule) -> tuple[str, str] | None:
+    """这条规则挂在哪只票上（归一后的一对）；写坏的引用与不挂标的的规则都交 `None`。"""
     if rule.target_type != "symbol":
-        return {"price": "", "at": "", "state": ""}
+        return None
     try:
         market, sep, code = rule.target_ref.partition("/")
         if not sep:
-            return {"price": "", "at": "", "state": ""}
+            return None
         market = canonical_market(market)
-        code = canonical_code(market, code)
+        return market, canonical_code(market, code)
     except SamsError:
+        return None
+
+
+def _quote(rule: Rule, quotes: dict[tuple[str, str], QuoteView]) -> dict:
+    """列表里那一格价：与看板、个股页同一套读模型（S0-E）。
+
+    盘中是过闸的报价，休市回落库内最后一根不复权收盘，并把「10-30 收盘」写在屏幕上。
+    一行写坏的引用（旧行、手改过的库）不该把整张列表变成 500：那一格留空，规则照常显示。
+    """
+    target = _symbol_target(rule)
+    view = quotes.get(target) if target is not None else None
+    if view is None:
         return {"price": "", "at": "", "state": ""}
-    quote = core.board.get(market, code)
-    state = quote_state(
-        quote,
-        now=now,
-        market_open=_market_open(ctx, market, now),
-        stale_s=ctx.settings.quote_stale_s,
-    )
+    if view.price is None:
+        # 没有价时说市场此刻是什么状态（休市/无行情），比一整格空白更能解释自己
+        return {"price": "", "at": "", "state": state_label(view.state)}
     return {
-        "price": money(quote.price, _price_unit(ctx, market, code)) if quote else "",
-        "at": hms(quote.ts, tz) if quote else "",
-        # 休市优先于「没行情」：周末看到空着的那一格不是故障（`quote_state` 的五态顺序）
-        "state": state_label(state),
+        "price": money(view.price, view.unit),
+        "at": view.label,
+        "state": state_label(view.state),
+    }
+
+
+def _draft_symbol(target_type: str, target_ref: str) -> tuple[str, str] | None:
+    """这一屏正在填的引用指着哪只票（归一后的一对）；集合、论与写坏的引用交 `None`。"""
+    if target_type != "symbol":
+        return None
+    market, sep, code = target_ref.strip().partition("/")
+    if not sep:
+        return None
+    try:
+        return canonical_market(market), canonical_code(market, code)
+    except SamsError:
+        return None
+
+
+def _line_notes(template: Template, values: dict[str, str], view: QuoteView) -> dict[str, str]:
+    """把填着的那几个**绝对价**换算成「这条线在现价哪一侧、差多少」。
+
+    只换算 `unit == "元"` 的参数，百分比那一格一律不动——`stop.pct` 的 8% 说的是**成本**
+    下浮 8%，`stop.trailing` 的基准是持仓期最高价，`tp.tiered` 的分档是成本到目标价的进度。
+    拿现价乘一下印在旁边，说的是「你的线在这儿」而引擎算的是另一个数，这类错要到除权日
+    才露出来。那几格的相对关系由试算给（引擎成对交出 `value_text` 与 `threshold_text`）。
+
+    说的是位置，不是结论：「已经破了」是这条线的算术，而这一趟真跑会出哪一档（pre/hit/
+    urgent）还要过除权换算、过滤器、冷却与状态跃迁四道闸——那句话归试算。
+    """
+    price = view.price
+    if not price or price <= 0:
+        return {}
+    out: dict[str, str] = {}
+    for spec in template.params:
+        if spec.unit != "元":
+            continue
+        raw = (values.get(f"param_{spec.name}") or "").strip()
+        try:
+            line = float(raw)
+        except ValueError:
+            continue
+        if line <= 0:
+            continue
+        gap = (line - price) / price * 100
+        if abs(gap) < 0.005:
+            where = "这条线就是现价"
+        elif gap > 0:
+            where = f"这条线在现价上方 {gap:.2f}%"
+        else:
+            where = f"这条线在现价下方 {abs(gap):.2f}%"
+        out[spec.name] = f"{spec.label} {money(line, view.unit)}：{where}"
+    return out
+
+
+def _price_panel(ctx, reader, template: Template, values: dict[str, str]) -> dict:
+    """表单上方那一格：这一屏挂的那只票此刻是多少钱，或者为什么说不清（R-22）。
+
+    读的是 `web/quotes.py` 那一份统一模型——盘中是过闸的报价，休市回落库内最后一根
+    不复权收盘。列表页早就在印这一格（`_quote`），而「建规则」那一屏没有：人对着一个
+    空框敲止损价，敲完保存才在列表里看见「现价 11.64、线 11.50」——那条线是不是他想画的
+    那个位置，只有事后才知道。
+
+    挂在集合或论上没有「这一只的现价」，那句话也说得出：它解释的是这一格为什么是空的。
+    """
+    target_type = values.get("target_type", "")
+    target_ref = values.get("target_ref", "")
+    if not target_type:
+        return {"text": "", "lines": {}}
+    pair = _draft_symbol(target_type, target_ref)
+    if pair is None:
+        if target_type == "symbol":
+            return {
+                "text": (
+                    f"对象引用要写成 市场/代码（例如 A/600519）——"
+                    f"「{target_ref.strip()}」读不出一只票"
+                ),
+                "lines": {},
+            }
+        return {
+            "text": (
+                f"这条挂在{target_type_label(target_type)}上：没有单一现价，"
+                "试算会逐只给出现值"
+            ),
+            "lines": {},
+        }
+    market, code = pair
+    view = reader.view(market, code)
+    if view.price is None:
+        # 没有价的时候说清此刻是什么状态，并把该跑的那条同步命令交出去（与示例同一句话）
+        return {
+            "text": (
+                f"{market}/{code} 库里还没有日线：先跑 "
+                f"sams sync daily --market {market} --code {code}，或换一只票。"
+                f"（{state_label(view.state)}）"
+            ),
+            "lines": {},
+        }
+    master = ctx.symbols.get(market, code) or {}
+    name = str(master.get("name") or "")
+    head = f"{name} {market}/{code}" if name else f"{market}/{code}"
+    return {
+        "text": f"{head} 现价 {money(view.price, view.unit)}｜{view.label}｜{view.detail}",
+        "lines": _line_notes(template, values, view),
     }
 
 
@@ -204,12 +318,42 @@ def _values(data: dict[str, list[str]]) -> dict[str, str]:
     return values
 
 
-def _param_text(value: object) -> str:
+def _posted_params(template: Template, data: dict[str, list[str]]) -> dict[str, object]:
+    """表单里的参数原文 → 交给服务的值：百分数换算成小数只在这一个口。
+
+    错在百分数上就在这里说百分数：`validate_params` 收的是小数，它的
+    「不能高于 0.9」对着一个敲了 99 的人说，读起来像在讲另一条规则。
+    """
+    raw = raw_params(template, data)
+    specs = {param.name: param for param in template.params}
+    out: dict[str, object] = {}
+    for name, value in raw.items():
+        spec = specs[name]
+        if not spec.percent:
+            out[name] = value
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            raise ValidationError(f"{spec.label}要的是百分数，收到 {value!r}") from None
+        if spec.maximum is not None and number > spec.maximum * 100:
+            raise ValidationError(
+                f"{spec.label}不能高于 {spec.maximum * 100:g}%（收到 {number:g}）"
+            )
+        if spec.minimum is not None and number < spec.minimum * 100:
+            raise ValidationError(
+                f"{spec.label}不能低于 {spec.minimum * 100:g}%（收到 {number:g}）"
+            )
+        out[name] = number / 100
+    return out
+
+
+def _param_text(value: object, *, percent: bool = False) -> str:
     """一个参数在提示里的写法。列表折回逗号串（`0.5,1.0`）：`str([0.5, 1.0])` 带着空格
     和方括号，人照着它再敲一遍会被 `_as_tiers` 拒——提示得是表单自己读得懂的东西。"""
     if isinstance(value, list):
         return ",".join(_param_value(piece) for piece in value)
-    return "" if value is None else _param_value(value)
+    return "" if value is None else _param_value(value, percent=percent)
 
 
 def _stored_values(rule: Rule) -> dict[str, str]:
@@ -228,7 +372,14 @@ def _stored_values(rule: Rule) -> dict[str, str]:
 
 def _stored_hints(rule: Rule) -> dict[str, str]:
     """库里那份参数：只当提示渲染（键是参数名），不落进任何一个输入框。"""
-    return {key: text for key, value in rule.params.items() if (text := _param_text(value))}
+    specs = {param.name: param for param in template_for(rule.kind).params}
+    out: dict[str, str] = {}
+    for key, value in rule.params.items():
+        spec = specs.get(key)
+        text = _param_text(value, percent=bool(spec and spec.percent))
+        if text:
+            out[key] = f"{text}%" if spec is not None and spec.percent else text
+    return out
 
 
 def _mount(rule: Rule) -> str:
@@ -246,12 +397,28 @@ def _mount(rule: Rule) -> str:
     return "｜".join(parts)
 
 
+def _demo_symbol(ctx, user) -> tuple[str, str]:
+    """示例表单的默认标的：自选里第一只在配置市场中的票，其次 A 股那只最常被问到的。
+
+    只负责默认值，不保证库里有日线——没有时结果页会说该跑哪条同步命令；替用户
+    挑一只「一定有数据」的票需要一次全表扫描，而这个表单本来就可以手改。
+    """
+    markets = set(ctx.settings.markets)
+    for item in ctx.watchlists.list(user.id):
+        if item.market in markets:
+            return item.market, item.code
+    market = "A" if "A" in markets else (sorted(markets)[0] if markets else "A")
+    return market, _DEMO_CODES.get(market, "")
+
+
 def _list_page(
     request: Request,
     *,
     error: str | None = None,
     status: int = 200,
     notice: str = "",
+    demo_market: str | None = None,
+    demo_code: str | None = None,
 ):
     user = request.state.sams_user
     web = request.app.state.web
@@ -264,6 +431,17 @@ def _list_page(
     # 一趟聚合：每条规则最近一次响在哪天、响过几次。求值时刻没有落库（见设计文档），
     # 这一格回答的是它的一半：从没响过与昨天响过是两句不同的话
     last_by_rule = ctx.alerts_store.last_by_rule(user.id)
+    # 报价也一趟取完：逐条规则各查一次日线，同一只票会被读很多遍
+    reader = quote_reader(ctx, web.core, now)
+    batches: dict[str, set[str]] = {}
+    for view in views:
+        target = _symbol_target(view.rule)
+        if target is not None and target[0] in ctx.settings.markets:
+            batches.setdefault(target[0], set()).add(target[1])
+    quotes: dict[tuple[str, str], QuoteView] = {}
+    for market, codes in batches.items():
+        for code, quote_view in reader.views(market, sorted(codes)).items():
+            quotes[(market, code)] = quote_view
     rows = []
     for view in views:
         rule = view.rule
@@ -275,7 +453,7 @@ def _list_page(
                 "condition": _condition(rule),
                 "target": _target_text(ctx, rule),
                 "target_url": _target_url(rule),
-                "quote": _quote(ctx, web.core, rule, now=now, tz=tz),
+                "quote": _quote(rule, quotes),
                 "last_at": moment_label(last[0], tz) if last else "从未",
                 "last_count": last[1] if last else 0,
             }
@@ -284,6 +462,8 @@ def _list_page(
         (heading, [row for row in rows if row["rule"].enabled is wanted])
         for heading, wanted in (("启用", True), ("已停用", False))
     ]
+    if demo_market is None or demo_code is None:
+        demo_market, demo_code = _demo_symbol(ctx, user)
     return web.render(
         request,
         "rules.html",
@@ -291,6 +471,94 @@ def _list_page(
         title="规则",
         groups=[(heading, items) for heading, items in groups if items],
         notice=notice,
+        error=error,
+        demo_market=demo_market,
+        demo_code=demo_code,
+        demo_markets=sorted(ctx.settings.markets),
+    )
+
+
+def _outcome_rows(ctx, user, report: RunReport, *, lead: str = "") -> dict:
+    """一次求值的五摞，压成能进任何一屏的那一份（`partials/rule_outcome.html` 的入参）。
+
+    列表页的「判一次」和表单页的「试算（不保存）」问的是同一件事——这一趟判出了什么，
+    差别只在**从哪儿发起**：一处只需要那一格结果，另一处要在同一屏继续改那几个数。
+    五摞的排法、投递那句、空结果那句写两遍，改一摞的措辞就要记得改两处。
+
+    `lead` 是这一趟的来路说明（试算那句「按最新收盘判，没读盘中报价」）：检查页留空，
+    因为它上面已经有「试运行 / 真跑」那一段了。
+    """
+    written = [hit.alert_id for hit in report.raised if hit.alert_id]
+    outcomes = ctx.alerts_store.latest_outcomes(written)
+    return {
+        "lead": lead,
+        "dry_run": report.dry_run,
+        "as_of": report.as_of.isoformat(),
+        "judged": report.judged,
+        "quiet": report.quiet,
+        "raised": [
+            {
+                "name": hit.name,
+                "market": hit.market,
+                "code": hit.code,
+                "stage": _STAGE_LABELS.get(hit.stage, hit.stage),
+                "value": hit.value_text,
+                "threshold": hit.threshold_text,
+                "action": hit.action_note,
+                "data_on": hit.data_on.isoformat() if hit.data_on else "",
+                "alert_url": f"/alerts/{hit.alert_id}" if hit.alert_id else "",
+                "delivery": (
+                    delivery_label(outcomes.get(hit.alert_id, "")) if hit.alert_id else ""
+                ),
+            }
+            for hit in report.raised
+        ],
+        "suppressed": [
+            {
+                "market": item.market,
+                "code": item.code,
+                "stage": _STAGE_LABELS.get(item.stage, item.stage),
+                "reason": item.reason,
+            }
+            for item in report.suppressed
+        ],
+        "skipped": [
+            {"market": item.market, "code": item.code, "reason": item.reason}
+            for item in report.skipped
+        ],
+        "blocked": [{"name": item.rule_name, "reason": item.reason} for item in report.blocked],
+        # 没有通道时告警只落在收件箱：这一句在两个出口都是要紧话（试算命中了却没人推）
+        "has_channels": bool(ctx.channels_store.list_for(user.id)),
+    }
+
+
+def _check_page(
+    request: Request,
+    *,
+    rule: Rule,
+    report: RunReport,
+    demo: dict | None = None,
+    status: int = 200,
+    error: str = "",
+):
+    """一次求值的出口（D231）。五摞与 `sams rule check` 同源，只是换成人话上屏。
+
+    真跑的那几行要再读一次投递结果：告警进收件箱与消息离开进程是两件事，
+    「写了」与「发出去了」在这一页必须分得开（`/alerts` 那一列读的也是这份聚合）。
+    """
+    web = request.app.state.web
+    ctx = web.contexts.current()
+    outcome = _outcome_rows(ctx, request.state.sams_user, report)
+    return web.render(
+        request,
+        "rule_check.html",
+        status_code=status,
+        title="规则求值",
+        rule=rule,
+        condition=_condition(rule),
+        target=_target_text(ctx, rule),
+        outcome=outcome,
+        demo=demo or {},
         error=error,
     )
 
@@ -323,6 +591,9 @@ def _picker_page(
         kind_groups=_kind_groups(),
         values=values,
         filters={},
+        # 选 kind 那一屏还没有参数，也没有可报价的标的：那一格由 `_form_page` 填
+        panel={},
+        outcome={},
         error=error,
         rule_id=None,
     )
@@ -340,15 +611,23 @@ def _form_page(
     bound: str | None = None,
     ticks: Sequence[str] = (),
     hints: dict[str, str] | None = None,
+    outcome: dict | None = None,
 ):
     user = request.state.sams_user
     web = request.app.state.web
     ctx = web.contexts.current()
+    # 现价那一格：与列表、看板、个股页同一份读模型，进这一屏读一次（R-22）
+    reader = quote_reader(ctx, web.core, web.core.clock.now_utc())
+    # 只敲代码没带市场前缀时不猜：那一格解释的是为什么这一屏给不出价
+    panel = _price_panel(ctx, reader, template, values)
     # 模板不收的那一格连名单都不读：`stop.fixed` 那一屏既不要账户也不要论，
     # 那两次查询读回来没人看
     given: dict[str, object] = {
         # 通道这一份每次都要读：有没有那一格由它判（见 `_CHANNELS_OFFERED`）
         "channels": ctx.channels_store.list_for(user.id),
+        "panel": panel,
+        # 「试算（不保存）」的那五摞：从 `_preview` 来，其余出口都是空的
+        "outcome": outcome or {},
     }
     if template.needs_position:
         given["accounts"] = ctx.sim_accounts.list_for(user.id)
@@ -391,6 +670,120 @@ def _own_view(ctx, user, rule_id: str):
         raise
     except StorageError:
         raise HTTPException(status_code=404) from None
+
+
+def _preview(request: Request, data: dict[str, list[str]], rule_id: str | None = None):
+    """保存前试算（R-22 的另一半）：拿刚填的那几个数判一次，表单留在同一屏。
+
+    一趟都不写。引擎那一份 `preview()` 把 `dry_run` 写死成 `True`（不是参数），所以这里
+    没有「忘了传只读开关」这种错法；草稿的 id 是 `DRAFT_ID` 那个哨兵，昨天响过什么查不到，
+    于是这一趟回答的正是「这条线第一次响会怎样」。
+
+    校验与保存同一套：新建走 `RuleService.draft`（`add` 的四道归属闸 + `RuleRepo.build`
+    走的就是 `create` 那一份 `_validate`），编辑走「库里那份 + 刚敲的那几格」的合并，
+    与 `rule_edit` 同一口径。两处各判一次，被拒时都是原样回到表单那 400 而不是 500。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    values = _values(data)
+    filters = filter_flags(data)
+    view = _own_view(ctx, user, rule_id) if rule_id is not None else None
+    stored = view.rule if view is not None else None
+    if stored is not None:
+        # 编辑那一张表不渲染挂载对象（那一格改不动，见 `_mount`），交回来的这两项是空的。
+        # 按库里那份补上，否则点一次试算反而把 GET 那一屏的现价弄丢：现价那一格读的
+        # 正是 `values` 里的引用
+        values["target_type"] = stored.target_type
+        values["target_ref"] = stored.target_ref
+    kind = stored.kind if stored is not None else one(data, "kind")
+    try:
+        template = template_for(kind)
+    except SamsError as exc:
+        return _picker_page(request, values=values, error=str(exc), status=400)
+    raw_name = one(data, "name")
+    severity = one(data, "severity") or None
+    channels = many(data, "channel_ids")
+    try:
+        # 冷却那一格在这一趟里也要能敲错（`_cooldown` 折的是 `ValidationError`）：
+        # 与 `rule_create` / `rule_edit` 同一处兜底，回到表单而不是一屏 500
+        cooldown = _cooldown(one(data, "cooldown_min"))
+        if stored is None:
+            target_type = one(data, "target_type").strip()
+            target_ref = one(data, "target_ref").strip()
+            thesis_id = one(data, "thesis_id") or None
+            if target_type == "thesis" and thesis_id:
+                # 与 `rule_create` 同一句：挂在论上时下拉选中的那条就是挂载对象
+                target_ref = thesis_id
+            draft = ctx.rule_service.draft(
+                user.id,
+                kind=kind,
+                name=raw_name,
+                target_type=target_type,
+                target_ref=target_ref,
+                params=_posted_params(template, data),
+                filters=filters,
+                account_id=one(data, "account_id") or None,
+                thesis_id=thesis_id,
+                severity=severity,
+                channel_ids=channels,
+                cooldown_min=cooldown,
+            )
+        else:
+            touched = _posted_params(template, data)
+            draft = ctx.rule_service.draft(
+                user.id,
+                kind=stored.kind,
+                name=raw_name,
+                # 挂载对象、账户、论在编辑态都改不动（`_mount` 说的那句话），照旧交回去
+                target_type=stored.target_type,
+                target_ref=stored.target_ref,
+                # 整包合并而不是「没答过就交 None」：试算要的是一份能判的草稿，
+                # 空框说的是「这一项不改」= 库里那份还生效，而不是「按模板默认值判」
+                params={**dict(stored.params), **touched},
+                filters=filters,
+                account_id=stored.account_id,
+                thesis_id=stored.thesis_id,
+                severity=severity or stored.severity,
+                channel_ids=channels,
+                cooldown_min=stored.cooldown_min if cooldown is None else cooldown,
+            )
+        report = ctx.rule_engine.preview(user.id, draft)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _form_page(
+            request,
+            template=template,
+            values=values,
+            filters=filters,
+            error=str(exc),
+            status=400,
+            rule_id=rule_id,
+            bound=_mount(stored) if stored is not None else None,
+            hints=_stored_hints(stored) if stored is not None else None,
+            ticks=channels,
+        )
+    return _form_page(
+        request,
+        template=template,
+        values=values,
+        filters=filters,
+        error=None,
+        status=200,
+        rule_id=rule_id,
+        bound=_mount(stored) if stored is not None else None,
+        hints=_stored_hints(stored) if stored is not None else None,
+        ticks=channels,
+        outcome=_outcome_rows(
+            ctx,
+            user,
+            report,
+            lead=(
+                "这次试算读的是最新一根日线收盘，没读盘中报价："
+                "保存后调度器会按实时报价继续看。"
+            ),
+        ),
+    )
 
 
 @router.get("/rules")
@@ -457,7 +850,7 @@ def rule_create(
             target_type=target_type,
             target_ref=target_ref,
             # 只交填了的那几项：缺的由 `validate_params` 补默认值，必填的那一个由它拒
-            params=raw_params(template, data),
+            params=_posted_params(template, data),
             filters=filters,
             account_id=one(data, "account_id") or None,
             thesis_id=thesis_id,
@@ -542,7 +935,7 @@ def rule_edit(
         # 这一判据要接得上人，靠的是编辑页的参数框空着起步（见 `rule_edit_page`）：
         # 预填之下每个框都「交了」，这一规矩在真实路径上永远不为空。
         # 命令行 `rule edit` 合的就是这一份规矩（`cli/rule.py`）。
-        touched = raw_params(template, data)
+        touched = _posted_params(template, data)
         params = {**dict(view.rule.params), **touched} if touched else None
         # 没渲染过那一格 = 没人答过 = 不动；渲染了而一个不勾 = 一句答案 = 改回默认路由
         channels = many(data, "channel_ids") if _CHANNELS_OFFERED in data else None
@@ -594,3 +987,149 @@ def rule_toggle(request: Request, rule_id: str, _csrf: None = Depends(csrf_prote
     return RedirectResponse(
         f"/rules?notice={'off' if view.rule.enabled else 'on'}#{rule_id}", status_code=303
     )
+
+
+@router.post("/rules/{rule_id}/check")
+def rule_check(
+    request: Request,
+    rule_id: str,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """试算 / 判一次（D231）。只有明写 `mode=real` 才真跑。
+
+    缺省按试算：回车落在第一个按钮上（试算），拼错一个词也不该替人写出告警。
+    点名一条规则会绕过 `enabled`（引擎 `_select` 的既有语义）：停用的规则也看得到
+    「如果开着会判出什么」，结果页会另说一句它当前是停用的。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    view = _own_view(ctx, user, rule_id)
+    dry = one(data, "mode").strip() != "real"
+    try:
+        report = ctx.rule_engine.check(user.id, rule_id=rule_id, dry_run=dry)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _list_page(request, status=400, error=str(exc))
+    return _check_page(request, rule=view.rule, report=report)
+
+
+@router.post("/rules/preview")
+def rule_preview(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """新建那一屏的「试算（不保存）」（R-22）。判的是刚敲的那几个数，一条都不写。"""
+    return _preview(request, data)
+
+
+@router.post("/rules/{rule_id}/edit/preview")
+def rule_edit_preview(
+    request: Request,
+    rule_id: str,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """编辑那一屏的「试算（不保存）」：库里那份 + 刚敲的那几格，与保存同一口径。"""
+    return _preview(request, data, rule_id=rule_id)
+
+
+@router.post("/rules/demo")
+def rule_demo(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """一键示例（D231）：建一条必然命中的停用规则，并以演练告警真跑一次。
+
+    止损线设在最新收盘上方 1%：`stop.fixed` 的判据是「现价 < 线」，所以这一趟一定
+    命中。用户因此看得到「规则 → 命中 → 收件箱 → 投递」整条链，而不必等下一个
+    交易时段。规则停用，调度器不会反复响它；演练告警带 `is_test`（D131）。
+
+    没有日线时一条规则都不建：一条永远判不了的示例比没有示例更难查。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    market_raw = one(data, "market").strip()
+    code_raw = one(data, "code").strip()
+    try:
+        if not market_raw or not code_raw:
+            raise ValidationError("示例要一只票：市场和代码都填上")
+        market = canonical_market(market_raw)
+        code = canonical_code(market, code_raw)
+    except SamsError as exc:
+        return _list_page(
+            request, status=400, error=str(exc), demo_market=market_raw, demo_code=code_raw
+        )
+    price = ctx.bars.last_closes([(market, code)]).get((market, code))
+    if not price or price <= 0:
+        return _list_page(
+            request,
+            status=400,
+            error=(
+                f"{market}/{code} 在库里还没有日线：先跑 "
+                f"sams sync daily --market {market} --code {code}，或换一只票。"
+            ),
+            demo_market=market,
+            demo_code=code,
+        )
+    line = round(price * 1.01, 4)
+    if line <= price:
+        line = round(price + 0.01, 4)
+    symbol = ctx.symbols.get(market, code) or {}
+    label = str(symbol.get("name") or code)
+    try:
+        view = ctx.rule_service.add(
+            user.id,
+            kind="stop.fixed",
+            name=f"示例·{label} 跌破 {_param_value(line)} 即报",
+            target_type="symbol",
+            target_ref=f"{market}/{code}",
+            params={"price": line},
+            filters={},
+            enabled=False,
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _list_page(
+            request, status=400, error=str(exc), demo_market=market, demo_code=code
+        )
+    try:
+        report = ctx.rule_engine.check(
+            user.id, rule_id=view.rule.id, dry_run=False, is_test=True
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _list_page(
+            request,
+            status=400,
+            error=f"示例规则已建好，但这一趟没跑成：{exc}",
+            demo_market=market,
+            demo_code=code,
+        )
+    return _check_page(
+        request, rule=view.rule, report=report, demo={"price": price, "line": line}
+    )
+
+
+@router.post("/rules/{rule_id}/remove")
+def rule_remove(request: Request, rule_id: str, _csrf: None = Depends(csrf_protect)):
+    """删除（D231）。网页上只从示例结果页调用；普通规则的删除仍走命令行。
+
+    派生规则删不掉（服务层 `remove` 的那句话，§9.2）：它们只能停用，留一条能查到的
+    记录。这里不替它降级成「停用」——那会把用户点的一个动作悄悄换成另一个。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    _own_view(ctx, user, rule_id)
+    try:
+        ctx.rule_service.remove(user.id, rule_id)
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _list_page(request, status=400, error=str(exc))
+    return RedirectResponse("/rules?notice=removed", status_code=303)

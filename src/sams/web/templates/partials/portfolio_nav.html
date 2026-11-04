@@ -1,0 +1,44 @@
+{# 组合净值（S4-D §6.3）：一天一行地重放账本。
+   算不出来的那天不画点、也不写 0：缺价或缺汇率的整日标成缺口，TWR 与回撤只在连续性完整日上算。 #}
+
+<section class="card" id="nav">
+  <h2>组合净值
+    <span class="muted">{{ account.name }} · {{ start }} ~ {{ end }}</span>
+  </h2>
+  {% if series.latest is none %}
+  <p class="muted">这一区间还没有算得出来的净值：缺价或缺汇率的那一天整日不计。
+    盘后 job 每晚重建最近 {{ nav_window_days }} 天，也可以跑 <code>sams nav rebuild --account {{ account.id }}</code>。</p>
+  {% else %}
+  <table>
+    <tr>
+      <th class="num">最新净值</th><th class="num">当日变动</th>
+      <th class="num">区间 TWR</th><th class="num">最大回撤</th><th class="num">缺口</th>
+    </tr>
+    <tr>
+      <td class="num">{{ money(series.latest.nav, series.currency) }}
+        <span class="muted">{{ series.latest.day }}</span></td>
+      <td class="num">
+        {% if series.day_change is none %}—{% else %}
+        {{ money(series.day_change, series.currency) }}
+        {% if series.day_change_pct is not none %}<span class="muted">{{ ratio_pct(series.day_change_pct) }}</span>{% endif %}
+        {% endif %}
+      </td>
+      <td class="num">{{ ratio_pct(series.twr) }}</td>
+      <td class="num">{{ ratio_pct(series.max_drawdown) }}</td>
+      <td class="num">{{ series.gap_days }} 天</td>
+    </tr>
+  </table>
+  <p class="muted">
+    TWR {% if series.twr_start %}自 {{ series.twr_start }} 起{% if series.gap_days %}（缺口 {{ series.gap_days }} 天，缺口前后各算各的）{% endif %}{% else %}还没有连续两天可以比{% endif %}；
+    外部流入（存入 − 取出）不计入收益，当日变动已扣掉当天注资。
+  </p>
+  <p class="muted">最大回撤按净值峰谷，不是按 TWR：大额注资会让两者长得完全不一样。</p>
+  {% if series.split_warning %}
+  <p class="flash-warn">{{ series.split_warning }}</p>
+  {% endif %}
+  <p class="muted chart-caption">净值 {{ series.currency }}；停牌沿用最近收盘，超过 5 个交易日无更新记缺价。</p>
+  <div data-chart-kind="nav"
+       data-chart-url="/api/portfolio/{{ account.id }}/nav"
+       style="width:100%;height:240px"></div>
+  {% endif %}
+</section>

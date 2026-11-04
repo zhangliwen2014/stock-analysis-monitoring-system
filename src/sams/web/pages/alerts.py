@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -30,6 +30,7 @@ from fastapi.responses import PlainTextResponse, RedirectResponse
 from sams.core.codes import canonical_market
 from sams.core.errors import Conflict, DatabaseLocked, SamsError, ValidationError
 from sams.core.notify import SEVERITIES, SYSTEM_MARKET
+from sams.storage.repos.alert_mutes import MUTE_KIND_LABELS, MUTE_KINDS
 from sams.storage.repos.alerts import (
     ACKNOWLEDGED,
     ACTION_KINDS,
@@ -42,6 +43,7 @@ from sams.storage.repos.alerts import (
     Alert,
 )
 from sams.web.auth import audit, csrf_protect, require_user
+from sams.web.back import local_back
 from sams.web.display import (
     EVENT_ACTION_LABELS,
     action_label,
@@ -92,6 +94,33 @@ DEFER_CHOICES = (("1h", "1 小时"), ("3h", "3 小时"), (DEFER_OPEN, "明天开
 #: `/settings/test-alert` 的 303——成功不再整页重渲染，刷新也就不会重提交
 INBOX_TEST_ALERT_NOTICE = "已发出这条测试告警：详情里看得见投递记录"
 _INBOX_NOTICES = frozenset({INBOX_TEST_ALERT_NOTICE})
+
+
+def _local_next(raw: str) -> str:
+    """批量已读之后回哪一页：只有收件箱自己的路径。
+
+    `next` 会原样进 303 的 Location。放行外站等于把「标几条已读」变成一次开放跳转，
+    所以只认 `/alerts` 与 `/alerts?...`；其余一律折回收件箱。
+    """
+    value = (raw or "").strip()
+    if not (value == "/alerts" or value.startswith("/alerts?")):
+        return "/alerts"
+    parts = urlsplit(value)
+    if parts.scheme or parts.netloc or "\\" in value:
+        return "/alerts"
+    return value
+
+
+def _count(query, name: str) -> int | None:
+    """回显里的两个数：只认非负整数，其余当作没给（不把 query 原文印上屏）。"""
+    text = (query.get(name) or "").strip()
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _day_bound(value: str, tz_name: str, *, end: bool = False) -> datetime | None:
@@ -188,6 +217,13 @@ def _row(alert: Alert, tz: str, delivery: str = "") -> dict:
         "rule_name": alert.rule_name,
         "value_text": str(payload.get("value_text") or ""),
         "threshold_text": str(payload.get("threshold_text") or ""),
+        # 资讯命中（D246）：`kind=news` 的行要认得出、点得到原文；
+        # 价格规则告警的 payload 没有这三格，模板照旧印「值 / 阈值」
+        "kind": str(payload.get("kind") or ""),
+        "title": str(payload.get("title") or ""),
+        "url": str(payload.get("url") or ""),
+        # 选股新命中（S4-B / D256）：列表点开要看的是这只票的现场，不是 /screen 重选一遍
+        "symbol_url": _symbol_url(alert, payload),
         "status": alert.status,
         # 测试告警（D131）在列表里也得认得出来：`monitor/router.py` 那句
         # 「收件箱里带『测试』徽标」说的就是这一格，不是详情页
@@ -195,7 +231,17 @@ def _row(alert: Alert, tz: str, delivery: str = "") -> dict:
         # 「你让它稍后提醒」在列表里也要认得出来：稍后不改状态，这一格是它唯一的痕迹
         "deferred": moment_label(alert.deferred_until, tz) if alert.deferred_until else "",
         "delivery": delivery_label(delivery) if delivery else "",
+        # 批量已读只勾还挂着的那一行：终态行没有可标的东西，给个框只是让人白勾
+        "can_ack": alert.status == NEW,
     }
+
+
+def _symbol_url(alert: Alert, payload: dict) -> str:
+    """选股告警的落点。`payload.symbol_url` 是发送时写下的一条；老行没这一格时
+    按 `(market, code)` 现拼——两个都是这一行自己的字段，不靠猜。"""
+    if str(payload.get("kind") or "") != "screen" or not alert.code:
+        return ""
+    return str(payload.get("symbol_url") or "") or f"/symbol/{alert.market}/{alert.code}"
 
 
 def _page_url(target: int, chosen: dict[str, str]) -> str:
@@ -215,6 +261,9 @@ def _list_page(
     has_more: bool,
     markets: tuple[tuple[str, str], ...],
     notice: str = "",
+    ack_notice: str = "",
+    muted_keys: frozenset[tuple[str, str]] = frozenset(),
+    ack_next: str = "/alerts",
 ):
     web = request.app.state.web
     return web.render(
@@ -225,6 +274,11 @@ def _list_page(
         chosen=chosen,
         page=page,
         notice=notice,
+        ack_notice=ack_notice,
+        # 分组标题的「已静音」徽标：一次取全、页内比对，不逐组查库
+        muted_keys=muted_keys,
+        # 批量已读后回这一页：筛过的列表不该因为标了几条已读就被洗回全量
+        ack_next=ack_next,
         prev_url=_page_url(page - 1, chosen) if page > 1 else "",
         next_url=_page_url(page + 1, chosen) if has_more else "",
         # 空列表那句话由页码决定：越界的那一页说「没有命中的告警」是假话
@@ -236,6 +290,27 @@ def _list_page(
         severities=SEVERITIES,
         markets=markets,
     )
+
+
+def _news_facts(payload: dict, tz: str) -> dict:
+    """资讯告警的原文三格（D246）：链接、标题、来源与发布时刻。
+
+    发布时刻存的是 ISO（UTC），这一屏按 `display_tz` 折一次再上屏；存坏了就原样印，
+    不能让一条坏 payload 把详情页整页打空。
+    """
+    published = ""
+    raw = payload.get("published_at")
+    if raw:
+        try:
+            published = moment_label(datetime.fromisoformat(str(raw)), tz)
+        except ValueError:
+            published = str(raw)
+    return {
+        "news_url": str(payload.get("url") or ""),
+        "news_title": str(payload.get("title") or ""),
+        "news_source": str(payload.get("source") or ""),
+        "news_published": published,
+    }
 
 
 def _detail_page(
@@ -256,12 +331,27 @@ def _detail_page(
     user = request.state.sams_user
     web = request.app.state.web
     ctx = web.contexts.current()
+    # 来路只有列表那一条链会给：给了就说「返回」，没给就报出那张表的名字（spec §3.2）
+    back = local_back(request.query_params.get("back"))
     alert = ctx.alerts_store.get(request.path_params["alert_id"], user_id=user.id)
     if alert is None:
         raise HTTPException(status_code=404, detail="没有这条告警")
     tz = ctx.settings.server.display_tz
     payload = alert.payload
     extra = payload.get("extra") or {}
+    # 证据链（S1-B）：这条告警由哪根 bar 判出来。没有就是没有，不拿今天猜
+    trigger_bar_ts = alert.trigger_bar_ts
+    trigger_url = ""
+    if trigger_bar_ts is not None and alert.market != SYSTEM_MARKET:
+        trigger_url = (
+            f"/symbol/{alert.market}/{alert.code}?"
+            + urlencode(
+                {"focus": trigger_bar_ts.isoformat(), "back": f"/alerts/{alert.id}"}
+            )
+            + "#chart"
+        )
+    # 静音是票级、按类别分开的（D249）：这一屏回答「这只票哪几类静着」
+    mutes = ctx.alert_mutes.scopes(user.id, alert.market, alert.code)
     deliveries = [
         {
             # 那一列到秒：同一条告警的三次尝试只差几秒，只到分钟会印成一模一样的一列
@@ -316,17 +406,41 @@ def _detail_page(
         status_code=status_code,
         title=f"告警 {alert.market}/{alert.code}",
         alert=alert,
+        back_url=back or "/alerts",
+        back_label="← 返回" if back else "告警列表",
         deliveries=deliveries,
         dispatch=dispatch,
         value_text=str(payload.get("value_text") or ""),
         threshold_text=str(payload.get("threshold_text") or ""),
         action_note=str(payload.get("action_note") or ""),
         body=str(extra.get("body") or ""),
+        kind=str(payload.get("kind") or ""),
+        **_news_facts(payload, tz),
         triggered_at=moment_label(alert.triggered_at, tz, seconds=True),
         handled_at=moment_label(alert.handled_at, tz, seconds=True),
         deferred=moment_label(alert.deferred_until, tz) if alert.deferred_until else "",
         intraday=bool(payload.get("intraday")),
         quote_source=str(payload.get("quote_source") or ""),
+        trigger_bar_ts=trigger_bar_ts.isoformat() if trigger_bar_ts else "",
+        trigger_url=trigger_url,
+        # 系统告警不挂规则、不会走引擎那一趟：给它一个静音按钮只是让人按下一个
+        # 谁都不会读的键（静音只在 `RuleEngine._one` 里被问）
+        mutable=alert.market != SYSTEM_MARKET,
+        mutes=[
+            {
+                "kind": mute.kind,
+                "label": MUTE_KIND_LABELS[mute.kind],
+                "at": moment_label(mute.created_at, tz, seconds=True),
+                "note": mute.note,
+                "button": (
+                    "取消静音"
+                    if mute.kind == "all"
+                    else f"解除{MUTE_KIND_LABELS[mute.kind]}静音"
+                ),
+            }
+            for mute in mutes
+        ],
+        mute_kinds=[(kind, MUTE_KIND_LABELS[kind]) for kind in MUTE_KINDS],
         # 闭环动作区：已读只在 new 出现；处置/忽略/稍后在 new 与 acknowledged 都可按（§6.3）
         can_act=alert.status in (NEW, ACKNOWLEDGED),
         can_ack=alert.status == NEW,
@@ -417,6 +531,14 @@ def inbox(request: Request):
     notice = request.query_params.get("notice") or ""
     if notice not in _INBOX_NOTICES:
         notice = ""
+    # 批量已读的回显只由两个整数拼出来（原文一概不上屏）：缺一个就整句不说
+    acked = _count(query, "acked")
+    skipped = _count(query, "skipped")
+    ack_notice = (
+        f"已标已读 {acked} 条，跳过 {skipped} 条"
+        if acked is not None and skipped is not None
+        else ""
+    )
     return _list_page(
         request,
         groups=groups,
@@ -425,6 +547,11 @@ def inbox(request: Request):
         has_more=has_more,
         markets=markets,
         notice=notice,
+        ack_notice=ack_notice,
+        muted_keys=frozenset(
+            (mute.market, mute.code) for mute in ctx.alert_mutes.list_for(user.id)
+        ),
+        ack_next=_page_url(page, chosen),
     )
 
 
@@ -641,6 +768,73 @@ def ack(request: Request, _csrf: None = Depends(csrf_protect)):
     except Conflict as exc:
         return _detail_page(request, status_code=409, error=str(exc))
     audit(request, action="alert.ack", target=alert.id, ok=True)
+    return RedirectResponse(f"/alerts/{alert.id}", status_code=303)
+
+
+@router.post("/alerts/ack")
+def ack_many(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """批量已读（S1-B）：一条命令按一个用户、一批 id 走，逐条条件更新。
+
+    `next` 由页面带来（当前筛过的这一页），只认本站 `/alerts` 路径——它直接进
+    303 的 Location，放行外站就是一次开放跳转。勾选里夹着已读/终态行时跳过，
+    整批照常成功：一个人标几条已读，不该被另一条刚被别人处置的行拖住。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    acked, skipped = ctx.alerts_store.acknowledge_many(user.id, data.get("ids", []))
+    target = _local_next(one(data, "next"))
+    sep = "&" if "?" in target else "?"
+    location = f"{target}{sep}{urlencode({'acked': acked, 'skipped': skipped})}"
+    audit(request, action="alert.ack_many", target="-", ok=True, detail=f"{acked}/{skipped}")
+    return RedirectResponse(location, status_code=303)
+
+
+@router.post("/alerts/{alert_id}/mute")
+def mute(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """单票静音：键是（用户, 市场, 代码），讲的是「这只票别再烦我」，不是这一条告警。"""
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    alert = _require_own(ctx, request.path_params["alert_id"], user.id)
+    note = one(data, "note").strip()
+    kind = one(data, "kind").strip() or "all"
+    ctx.alert_mutes.add(user.id, alert.market, alert.code, note=note, kind=kind)
+    audit(
+        request,
+        action="alert.mute",
+        target=alert.id,
+        ok=True,
+        detail=f"{alert.market}/{alert.code}/{kind}",
+    )
+    return RedirectResponse(f"/alerts/{alert.id}", status_code=303)
+
+
+@router.post("/alerts/{alert_id}/unmute")
+def unmute(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """解除一类静音：不补发静音期间的历史（那几趟的跃迁在引擎里已经记成发生过）。"""
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    alert = _require_own(ctx, request.path_params["alert_id"], user.id)
+    kind = one(data, "kind").strip() or "all"
+    ctx.alert_mutes.remove(user.id, alert.market, alert.code, kind=kind)
+    audit(
+        request,
+        action="alert.unmute",
+        target=alert.id,
+        ok=True,
+        detail=f"{alert.market}/{alert.code}/{kind}",
+    )
     return RedirectResponse(f"/alerts/{alert.id}", status_code=303)
 
 

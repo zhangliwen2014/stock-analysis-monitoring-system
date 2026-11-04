@@ -76,6 +76,20 @@ def test_the_guard_is_inclusive_and_the_roe_ceiling_is_one(fin, db):
     assert stored_roe(db, "600003") == [None], "3.5 正是「3.5%」忘 ÷100 的形状"
 
 
+def test_us_roe_above_one_hundred_percent_survives_the_caliber_gate(fin, db):
+    """D228：回购把股东权益压小，美股 100% 以上的 ROE 是真实值。
+
+    苹果 2025 年报 ROE=171.4%，A 股那条 1.0 的闸会把它当成「百分数没 ÷100」静默置空。
+    美股的上界放宽到 5.0：171.4 与 35.0 这种真正没除数的写法仍然被拦下，
+    A 股的 1.0 不动（D66 的死区结论对 A 股仍成立）。
+    """
+    assert RATIO_BOUNDS["roe"] == 1.0, "默认闸不动"
+    fin.upsert(pl.DataFrame([fin_row(market="US", code="AAPL", roe=1.714224497448)]))
+    fin.upsert(pl.DataFrame([fin_row(market="US", code="MSFT", roe=35.0)]))
+    assert stored_roe(db, "AAPL") == [1.714224497448], "171% 是真实值，不是口径错"
+    assert stored_roe(db, "MSFT") == [None], "35.0 仍是漏了 ÷100 的形状"
+
+
 def test_the_growth_columns_keep_a_wider_ceiling_but_the_same_inclusive_guard(fin, db):
     """增速与 ROE 不同：+500% 的营收增速是小基数公司的正常数字，所以上界留 5.0；
     但判据同样含边界——一道闸有两种判据比一种判据统一更危险。"""

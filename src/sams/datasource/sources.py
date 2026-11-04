@@ -38,6 +38,8 @@ _NOT_ADAPTERS = frozenset(
         "minute",
         "fundamentals",
         "f10",
+        # 资讯的列集与空帧（S3-B / D244）：适配器在 `eastmoney_f10` 里实现能力
+        "news",
         "listed_date",
         "fx",
         "quote",

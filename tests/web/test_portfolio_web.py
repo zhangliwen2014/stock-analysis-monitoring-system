@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import date
+import re
+from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import polars as pl
 import pytest
+from fastapi.testclient import TestClient
+from support import FrozenClock
+
+from sams.core.quotes import Quote
 
 
 def _user_id(web, username="alice") -> str:
@@ -89,6 +95,9 @@ def test_fill_buy_then_sell_roundtrip(logged):
     assert logged.context.backfills_store.open_for("A", "600519") is not None
     page = logged.client.get("/portfolio")
     assert "/symbol/A/600519" in page.text
+    # 持仓行的「决策」直达个股页的决策卡，不用再自己找入口。
+    # 锚点排在 `?back=` 之后（浏览器会丢掉 `#` 后面的一切，写反了返回就没了）
+    assert "/symbol/A/600519?back=/portfolio#decision" in page.text
     data["side"] = "sell"
     data["qty"] = "40"
     assert logged.client.post("/ledger/fill", data=data, follow_redirects=False).status_code == 303
@@ -99,7 +108,8 @@ def test_fill_buy_then_sell_roundtrip(logged):
 
 def test_the_same_fill_posted_twice_queues_the_backfill_once(logged):
     """浏览器重交（或人连点两次保存）是同一笔成交的第二趟：登记兴趣挂钩再走一遍，
-    主档那一步要么没建、要么原样不动，补数队列靠 `open_key` 去重只许留一条。"""
+    主档那一步要么没建、要么原样不动，补数队列靠 `open_key`（含 kind）去重，
+    每种 kind 只许留一条——D283 起一票会同时排 `bars` 与 `actions`，那是两行不是一行。"""
     account_id = _open_account(logged)
     data = {
         "csrf": logged.csrf, "account_id": account_id, "market": "A",
@@ -111,9 +121,11 @@ def test_the_same_fill_posted_twice_queues_the_backfill_once(logged):
     assert logged.client.post("/ledger/fill", data=data, follow_redirects=False).status_code == 303
     # 第二次 enqueue 被去重闸退回：开放队列里还是这一条
     assert logged.context.backfills_store.open_for("A", "600519") is not None
-    assert logged.context.db.scalar(
-        "SELECT count(*) FROM symbol_backfills WHERE market = 'A' AND code = '600519'"
-    ) == 1
+    counts = logged.context.db.query(
+        "SELECT kind, count(*) AS n FROM symbol_backfills "
+        "WHERE market = 'A' AND code = '600519' GROUP BY kind"
+    )
+    assert dict(zip(counts["kind"], counts["n"], strict=True)) == {"bars": 1, "actions": 1}
     # 主档没被第二趟动过：行还是那一行
     assert logged.context.symbols.get("A", "600519") == master
 
@@ -394,7 +406,7 @@ def test_a_position_row_carries_the_day_of_its_own_price(logged):
     )
     page = logged.client.get("/portfolio").text
     # 账户头那句「截至」也带这一天；这一条要钉的是持仓行自己那一格
-    assert 'class="muted quote-day">2026-10-20' in page
+    assert 'class="muted quote-label">10-20 收盘' in page
 
 
 def test_a_symbol_held_in_two_accounts_is_named_under_each_of_them(logged):
@@ -537,9 +549,10 @@ def test_filling_a_hk_code_under_the_a_market_is_refused_with_the_hint(logged):
 def test_the_fill_form_has_a_live_candidate_panel(logged):
     _open_account(logged)
     page = logged.client.get("/portfolio")
-    assert 'hx-get="/api/symbol-search"' in page.text
+    # 面板种类在路径上：留一个 `hx-vals` 在格子上，它就有可能吃掉这格敲进去的检索词。
+    # `?back=` 是这一屏报给自己的来路（spec 2026-11-03-back-link）：种类仍在路径段上
+    assert 'hx-get="/api/symbol-search/fills?back=/portfolio"' in page.text
     assert 'id="fill-candidates"' in page.text
-    assert 'hx-vals=\'{"scope": "fills"}\'' in page.text
 
 
 # --- 换汇：港股通买入的资金来源（D207） ---------------------------------------------
@@ -556,7 +569,7 @@ def _convert(web, account_id, **over):
 
 def test_the_fx_form_prefills_the_latest_stored_rate(logged):
     logged.context.fx_store.put(
-        date.today(), "HKD", "CNY", 0.92, source="akshare"
+        logged.context.clock.today(), "HKD", "CNY", 0.92, source="akshare"
     )
     _open_account(logged)
     page = logged.client.get("/portfolio")
@@ -634,7 +647,10 @@ def _hk_account(logged, *, hkd: float = 0.0, home: str = "HK") -> str:
 
 
 def _seed_hkd_rate(logged, rate: float = 0.91) -> None:
-    logged.context.fx_store.put(date.today(), "HKD", "CNY", rate, source="manual")
+    # 与页面同一条日期口径：汇率按注入的时钟种，不按这台机器的本地日历
+    # （本地比 UTC 快时，00:00–08:00 之间 `date.today()` 是「明天」）
+    today = logged.context.clock.today()
+    logged.context.fx_store.put(today, "HKD", "CNY", rate, source="manual")
 
 
 def test_a_hk_buy_with_a_rate_settles_in_cny(logged):
@@ -768,3 +784,199 @@ def test_a_historical_base_rate_of_one_is_named_on_its_row(logged):
     page = logged.client.get("/portfolio")
     assert "基准汇率记成了 1.0000" in page.text
     assert "3,800.97 CNY" in page.text
+
+
+# ---- 盘中现价（D232）：页面那一层按 quote_state 过闸，行上标「现价/收盘」 ----
+
+
+def _next_open_morning() -> datetime:
+    """下一个周三 10:30（北京）：冻结在这一刻，替身日历的 09:30–15:00 是开着的。"""
+    now = datetime.now(UTC)
+    moment = (now + timedelta(days=(2 - now.weekday()) % 7)).replace(
+        hour=2, minute=30, second=0, microsecond=0
+    )
+    if moment <= now:
+        moment += timedelta(days=7)
+    return moment
+
+
+def _clocked_logged(make_app, moment: datetime, *, market="A"):
+    web = make_app(clock=FrozenClock(moment))
+    ctx = web.contexts.current()
+    ctx.users.create("alice", "correct-horse-battery", is_admin=True)
+    client = TestClient(web.app)
+    client.__enter__()
+    login = client.post(
+        "/login",
+        data={"username": "alice", "password": "correct-horse-battery"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 303, login.text
+    csrf = client.cookies.get("sams_csrf").rpartition(".")[0]
+    return SimpleNamespace(
+        client=client,
+        core=web.core,
+        contexts=web.contexts,
+        context=ctx,
+        csrf=csrf,
+        moment=moment,
+    )
+
+
+def _push_quote(logged, *, price: float, seconds_ago: int = 5) -> None:
+    logged.core.board.update(
+        "A",
+        [
+            Quote(
+                market="A",
+                code="600519",
+                ts=logged.moment - timedelta(seconds=seconds_ago),
+                price=price,
+                source="tencent",
+            )
+        ],
+        now=logged.moment,
+        error=None,
+    )
+
+
+def _buy_maotai(logged, *, on: date) -> str:
+    account_id = _open_account(logged)
+    _seed_close(logged, close=120.0, on=on)
+    response = logged.client.post(
+        "/ledger/fill",
+        data={
+            "csrf": logged.csrf,
+            "account_id": account_id,
+            "market": "A",
+            "code": "600519",
+            "side": "buy",
+            "qty": "100",
+            "price": "100",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    return account_id
+
+
+def test_the_portfolio_uses_the_live_price_and_says_so(make_app):
+    """盘中跌/涨要按现价算：拿昨收做风控，是 D232 里最贵的一条。"""
+    logged = _clocked_logged(make_app, _next_open_morning())
+    _buy_maotai(logged, on=logged.moment.date())
+    _push_quote(logged, price=130.0)
+    page = logged.client.get("/portfolio").text
+    assert "130.00" in page
+    # 「现价」这个词退出屏幕：这一格是「盘中」的那一个价，时刻在它旁边（S0-E）
+    assert "盘中" in page
+    assert "203,000.00" in page  # 190,000 现金 + 13,000 市值
+
+
+def test_a_stale_quote_falls_back_to_the_close_and_says_close(make_app):
+    """十分钟前的价没有资格叫现价：回落收盘，并把「这是收盘」写在行上。"""
+    logged = _clocked_logged(make_app, _next_open_morning())
+    _buy_maotai(logged, on=logged.moment.date())
+    _push_quote(logged, price=130.0, seconds_ago=600)
+    page = logged.client.get("/portfolio").text
+    assert "120.00" in page
+    assert "收盘" in page
+    assert "202,000.00" in page
+
+
+def test_with_the_market_closed_the_row_is_a_close_not_a_live_price(make_app):
+    """周六 10:30：板子上还留着周五收盘，但它不是现价。"""
+    saturday = _next_open_morning() + timedelta(days=3)
+    logged = _clocked_logged(make_app, saturday)
+    _buy_maotai(logged, on=saturday.date())
+    _push_quote(logged, price=130.0)
+    page = logged.client.get("/portfolio").text
+    assert "120.00" in page
+    assert "收盘" in page
+
+
+def test_the_dashboard_total_follows_the_live_price(make_app):
+    """看板与持仓页不能一个按现价、一个按昨收：同一笔账，两套价。"""
+    logged = _clocked_logged(make_app, _next_open_morning())
+    _buy_maotai(logged, on=logged.moment.date())
+    _push_quote(logged, price=130.0)
+    page = logged.client.get("/").text
+    assert "203,000.00" in page
+
+
+# ---- 组合体检（D232）：跨账户合并，权重对 NAV，行业缺失单独标 ----
+
+
+def _two_accounts_same_stock(logged):
+    for name in ("甲户", "乙户"):
+        account_id = _open_account(logged, name=name)
+        logged.client.post(
+            "/ledger/fill",
+            data={
+                "csrf": logged.csrf,
+                "account_id": account_id,
+                "market": "A",
+                "code": "600519",
+                "side": "buy",
+                "qty": "100",
+                "price": "100",
+            },
+            follow_redirects=False,
+        )
+    _seed_close(logged, close=100.0)
+
+
+def test_the_exposure_card_merges_accounts_and_weighs_against_nav(logged):
+    """两只账户各 20 万、同一只票各 1 万：合并后这只票占 NAV 的 5%，现金 95%。"""
+    _two_accounts_same_stock(logged)
+    page = logged.client.get("/portfolio").text
+    assert "组合体检" in page
+    assert "5.00%" in page
+    assert "95.00%" in page
+    assert page.count("有效只数") == 1
+    assert re.search(
+        r'<th class="num">有效只数</th>.*?<td class="num">1\.0</td>', page, re.S
+    )
+
+
+def test_the_exposure_card_names_the_industry_when_it_is_known(logged):
+    _two_accounts_same_stock(logged)
+    logged.context.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["600519"],
+                "name": ["贵州茅台"],
+                "currency": ["CNY"],
+                "sector": ["白酒"],
+            }
+        )
+    )
+    page = logged.client.get("/portfolio").text
+    assert "白酒" in page
+
+
+def test_the_exposure_industry_uses_the_same_normalization_as_the_backfill(logged):
+    """持仓页的兜底与回填必须同一口径：否则同一只票在两屏上分进两个行业。"""
+    _two_accounts_same_stock(logged)
+    logged.context.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"],
+                "code": ["600519"],
+                "name": ["贵州茅台"],
+                "currency": ["CNY"],
+                "sector": ["食品饮料／饮料／白酒"],
+            }
+        )
+    )
+    page = logged.client.get("/portfolio").text
+    assert "食品饮料-饮料-白酒" in page
+    assert "食品饮料／饮料／白酒" not in page
+
+
+def test_a_missing_industry_is_unclassified_and_said_out_loud(logged):
+    """行业数据没有就说「未分类」，不能标成「其他」——那是另一个判断。"""
+    _two_accounts_same_stock(logged)
+    page = logged.client.get("/portfolio").text
+    assert "未分类" in page
+    assert "没有行业数据" in page

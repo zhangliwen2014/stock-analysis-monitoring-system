@@ -79,15 +79,111 @@ def test_registry_and_page_vocabulary_are_the_same_object():
     assert "pr_now" not in {f.name for f in fields_for("HK")}
 
 
-def test_annual_financial_quality_fields_are_a_only_and_read_as_decimals():
-    """D222：七个年报字段只供 A 股；比率都是小数（0.35 = 35%），流动比率才是倍。"""
+def test_hk_gets_the_verified_snapshot_columns_and_the_annual_financial_fields():
+    """港股快照只有 57/58 等已与东财对过的格子（D188）；年报字段来自东财港股指标源。
+
+    PEG 对港股开放：快照里的 PE(TTM) 与年报净利同比都在。股息率与 ROIC 这条源不给，
+    仍只供 A（D228）。
+    """
+    names = {f.name for f in fields_for("HK")}
+    assert {
+        "price",
+        "pct_chg",
+        "amount",
+        "amplitude",
+        "pe_ttm",
+        "pb",
+        "market_cap",
+        "float_cap",
+        "peg",
+        "roe",
+        "revenue_yoy",
+        "profit_yoy",
+        "gross_margin",
+        "net_margin",
+        "roa",
+        "debt_ratio",
+        "current_ratio",
+    } <= names
+    assert names & {
+        "pe_dyn",
+        "pr_now",
+        "turnover_rate",
+        "volume_ratio",
+        "dividend_yield",
+        "roic",
+    } == set()
+    assert validate("HK", [Condition("peg", "<=", 1.0)])
+    assert validate("HK", [Condition("roe", ">=", 0.15)])
+    peg = {item.name: item for item in FIELDS}["peg"]
+    assert peg.markets == frozenset({"A", "HK", "US"})
+    assert "港股" in peg.note and "美股" in peg.note
+
+
+def test_us_gets_the_snapshot_columns_and_the_annual_fields_its_source_provides():
+    """美股快照 39/37/43/44/45 与新浪逐项对过；PB 没找到可核对的位置（D226）。
+
+    东财美股 F10 给年报指标，但没有可核对的披露日（D228）：年报字段按报告期取。
+    股息率与 ROIC 这条源不给，词表不为它们编数。
+    """
+    names = {f.name for f in fields_for("US")}
+    assert {
+        "price",
+        "pct_chg",
+        "amount",
+        "amplitude",
+        "pe_ttm",
+        "market_cap",
+        "float_cap",
+        "peg",
+        "roe",
+        "revenue_yoy",
+        "profit_yoy",
+        "gross_margin",
+        "net_margin",
+        "roa",
+        "debt_ratio",
+        "current_ratio",
+    } <= names
+    assert names & {
+        "pb",
+        "pe_dyn",
+        "pr_now",
+        "turnover_rate",
+        "volume_ratio",
+        "dividend_yield",
+        "roic",
+    } == set()
+    assert validate("US", [Condition("price", "<=", 10.0)])
+    assert validate("US", [Condition("pe_ttm", "<=", 15.0)])
+    assert validate("US", [Condition("roe", ">=", 0.15)])
+
+
+def test_the_annual_quality_fields_are_shared_by_three_markets_but_two_stay_a_only():
+    """D222 + D228：八个年报字段三个市场都有；比率都是小数（0.35 = 35%），流动比率才是倍。
+
+    股息率与 ROIC 港股、美股两条源都不给，留在 A 股——词表说「能选」就等于引擎认，
+    没有数的那一列必须灰着。
+    """
     by_name = {item.name: item for item in FIELDS}
-    names = {"dividend_yield", "gross_margin", "net_margin", "roa", "roic", "debt_ratio"}
-    assert names <= set(by_name)
-    assert all(by_name[name].markets == frozenset({"A"}) for name in names)
-    assert all("小数" in by_name[name].unit for name in names)
+    shared = {
+        "roe",
+        "revenue_yoy",
+        "profit_yoy",
+        "gross_margin",
+        "net_margin",
+        "roa",
+        "debt_ratio",
+        "current_ratio",
+    }
+    assert shared <= set(by_name)
+    assert all(
+        by_name[name].markets == frozenset({"A", "HK", "US"}) for name in shared
+    )
+    assert all("小数" in by_name[name].unit for name in shared - {"current_ratio"})
     assert by_name["current_ratio"].unit == "倍"
-    assert by_name["current_ratio"].markets == frozenset({"A"})
+    assert by_name["dividend_yield"].markets == frozenset({"A"})
+    assert by_name["roic"].markets == frozenset({"A"})
 
 
 def test_peg_declares_its_financial_input_and_a_missing_reason():
@@ -96,6 +192,14 @@ def test_peg_declares_its_financial_input_and_a_missing_reason():
     assert peg.source == "derived" and peg.column == "peg"
     assert peg.needs == ("profit_yoy",)
     assert "净利同比" in peg.missing_note
+
+
+def test_roe_declares_the_inputs_of_its_fallback_formula():
+    """ROE 仍是财务列（源给了就用源值），但引擎要先带进两个兜底输入（D228）。"""
+    roe = {item.name: item for item in FIELDS}["roe"]
+    assert roe.source == "financials"
+    assert roe.needs == ("roa", "debt_ratio")
+    assert "ROA" in roe.note and "资产负债率" in roe.note
 
 def test_fields_declare_their_sensible_sort_direction():
     """D224：首批条件决定名单顺序；质量/成长降序，估值/负债升序，中性字段保持升序。"""

@@ -17,7 +17,7 @@ from sams.cli.health import show
 from sams.core.quotes import QuoteSourceRecord
 from sams.services.health import HealthReport, NotifyData
 from sams.services.scheduler.heartbeat import HEARTBEAT_STALE_S
-from sams.services.scheduler.report import JobHealth, ScheduleData
+from sams.services.scheduler.report import JobHealth, RunningJob, ScheduleData
 from sams.storage.repos.task_runs import Heartbeat, TaskRun
 
 MOMENT = datetime(2024, 10, 25, 15, 30, tzinfo=UTC)
@@ -68,13 +68,20 @@ def run_for(
     return JobHealth(name=name, market=market, period=period, latest=run, streak=streak)
 
 
-def reading(*, age: int | None, admins: int = 2, jobs: tuple[JobHealth, ...] = ()):
+def reading(
+    *,
+    age: int | None,
+    admins: int = 2,
+    jobs: tuple[JobHealth, ...] = (),
+    running: tuple[RunningJob, ...] = (),
+):
     """一份读数。`age=None` 就是「还没有那一拍」那一格（`never_started`）。"""
     return ScheduleData(
         heartbeat=None if age is None else beat(age),
         beat_age_s=age,
         admins=admins,
         jobs=jobs,
+        running=running,
     )
 
 
@@ -119,6 +126,31 @@ def test_beat_exactly_at_the_threshold_is_stale_and_exit_1(invoke) -> None:
     code, text = invoke(report_with(schedule=reading(age=HEARTBEAT_STALE_S)))
     assert code == 1, "「它可能已经停了」必须让读退出码的人拿到非零"
     assert "常驻调度器可能已经停了" in text
+
+
+def test_a_stale_beat_names_the_hanging_rows_without_trusting_them_as_life(invoke) -> None:
+    """这一屏能打开库，就说明没有进程握着它：那几行 `running` 是上一个进程留下的孤儿。
+
+    把 `/healthz` 那句「正在跑『X』、这一趟之内不补拍」照抄到这里，等于把一次已经死掉的
+    运行说成还在做活，而退出码回到 0：夜里的 job 一个都没跑，读退出码的那个人却收到
+    「一切正常」。孤儿要点名——它是「为什么这一晚没跑成」最直接的线索。
+    """
+    code, text = invoke(
+        report_with(
+            schedule=reading(
+                age=HEARTBEAT_STALE_S + 40,
+                running=(
+                    RunningJob(
+                        name="actions", market="A", period_key="2024-10-25", age_s=300
+                    ),
+                ),
+            )
+        )
+    )
+    assert code == 1
+    assert "可能已经停了" in text
+    assert "「actions」" in text
+    assert "不补拍" not in text
 
 
 def test_one_second_under_the_threshold_is_fresh_and_exit_0(invoke) -> None:

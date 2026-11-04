@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 
 import polars as pl
+import pytest
 
 
 def _seed(ctx):
@@ -163,11 +164,40 @@ def test_unit_follows_currency_override(logged):
     assert "300.00 元" in body and "港元" not in body
 
 
-def test_fill_scope_offers_a_button_that_fills_the_trade_form(logged):
+def test_fill_panel_offers_a_button_that_fills_the_trade_form(logged):
     """录入成交的代码格要的是「把这行填进表单」，不是「加入自选」：同一个检索，
     两种用途（D206）。"""
     _seed(logged.context)
-    body = logged.client.get("/api/symbol-search?code=payh&scope=fills").text
+    body = logged.client.get("/api/symbol-search/fills?code=payh").text
     assert "平安银行" in body and "填入" in body
     assert 'data-fill-market="A"' in body and 'data-fill-code="000001"' in body
     assert "/watchlist/add" not in body
+
+
+def test_pick_panel_carries_every_shape_a_form_field_can_want(logged):
+    """规则、建论、限额、关键词、探源都要「点一行填进本表单」，而它们要写的字段各不相同：
+    `code`（裸代码）、`scope`（限额的对象）、`target_ref`（规则写 `A/600519`）。
+    一行把三种形态都带上，接线的每一页只取自己那一格，不必再为每页做一个面板种类。"""
+    _seed(logged.context)
+    body = logged.client.get("/api/symbol-search/pick?code=payh").text
+    assert "平安银行" in body and "填入" in body
+    assert 'data-pick-market="A"' in body
+    assert 'data-pick-code="000001"' in body
+    assert 'data-pick-ref="A/000001"' in body
+    # 资讯那格搜的是标题里的名字，不是代码：不带名称就得再为它单开一个面板
+    assert 'data-pick-name="平安银行"' in body
+    assert "/watchlist/add" not in body
+
+
+@pytest.mark.parametrize("field", ["code", "q", "target_ref", "scope"])
+def test_the_pick_panel_reads_the_term_whatever_the_form_calls_that_box(logged, field):
+    """候选面板不该要求每张表单把它的格子改叫 `code`。
+
+    那几张表单的字段名是它们自己 POST 处理函数定的（资讯筛标题叫 `q`、规则的目标叫
+    `target_ref`、限额的对象叫 `scope`）。htmx 只会把**这个输入框自己的值**用**它自己的
+    名字**发出去，端点少认一个名字，那一页接线看着对、屏上一行候选都不出。
+    """
+    _seed(logged.context)
+    body = logged.client.get(f"/api/symbol-search/pick?{field}=payh").text
+    assert "平安银行" in body, f"{field} 里的检索词被丢了"
+    assert 'data-pick-code="000001"' in body

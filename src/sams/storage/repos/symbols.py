@@ -19,7 +19,7 @@ from datetime import date
 import polars as pl
 
 from sams.core.codes import canonical_code, canonical_market
-from sams.core.errors import StorageError
+from sams.core.errors import StorageError, ValidationError
 from sams.storage.db import Database
 from sams.storage.repos._keys import normalize_keys
 
@@ -114,6 +114,25 @@ class SymbolRepo:
             "UPDATE symbols SET listed_on = ?, updated_at = now() "
             "WHERE market = ? AND code = ? AND listed_on IS NULL",
             [day, canonical_market(market), canonical_code(market, code)],
+        )
+        return bool(written)
+
+    def set_sector(self, market: str, code: str, sector: str) -> bool:
+        """只写 `sector` 与 `updated_at`；返回值是「这次真的改了吗」。
+
+        行业回填每晚报一次，同值重写必须报 False——否则「回填了几只」这个数
+        就变成「扫过几只」，幂等与变更都验不出来。空值拒绝：清空会让持仓页的
+        行业分组凭空消失，而那不是一次回填该做的事。
+        """
+        market = canonical_market(market)
+        code = canonical_code(market, code)
+        text = (sector or "").strip()
+        if not text:
+            raise ValidationError("sector 不能为空：没有行业时不要回填，保留主档旧值")
+        written = self.db.scalar(
+            "UPDATE symbols SET sector = ?, updated_at = now() "
+            "WHERE market = ? AND code = ? AND (sector IS NULL OR sector <> ?)",
+            [text, market, code, text],
         )
         return bool(written)
 

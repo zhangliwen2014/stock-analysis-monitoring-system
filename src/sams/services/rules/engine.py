@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Protocol
@@ -29,13 +30,24 @@ from sams.core.errors import NotAdjustable, SamsError, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage, AlertSender
 from sams.core.quotes import Quote, local_day, source_label
-from sams.core.rules import RULE_KINDS, Verdict, escalates, is_intraday, template_for
+from sams.core.rules import (
+    HIT,
+    PRE,
+    RULE_KINDS,
+    URGENT,
+    Verdict,
+    escalates,
+    is_intraday,
+    template_for,
+)
 from sams.services.rules.anchor import move_prices
 from sams.services.rules.cache import CacheKey, SnapshotCache
 from sams.services.rules.filters import Gate, OpenAlert, run_filters
 from sams.services.rules.notes import Fx, constraint_lines, holding_pnl
 from sams.services.rules.snapshot import RuleData, Snapshot, Target, apply_quote
 from sams.services.rules.templates import TABLE, Ask
+from sams.storage.repos.alert_mutes import MuteRepo
+from sams.storage.repos.alert_states import AlertStateRepo
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.fx import FxRepo
 from sams.storage.repos.ledger import Position
@@ -75,6 +87,14 @@ _FAMILY = {
 
 DEFAULT_ACTION = "按这条规则处置"
 
+#: 同一家族里「快到了」与「跳空过去了」不能共用「位到了」那句话：止损 pre 说成
+#: 「已跌到」会让用户以为系统判了命中，而 urgent 与 hit 的处置本来也不同。
+#: 只挂这两档；其余 kind/家族退回家族那一句。
+_STAGE_ACTIONS = {
+    ("stop", PRE): "临近止损线，先复核这笔要不要动",
+    ("stop", URGENT): "跳空跌破止损线，按处置计划动这笔",
+}
+
 
 def _quote_line(quote: Quote, zone: ZoneInfo | None) -> str:
     """正文第二行（D120/D134）：报价的时刻与来源，市场本地时区，秒级。
@@ -107,6 +127,9 @@ class Raised:
     value_text: str
     threshold_text: str
     action_note: str
+    #: 这个价属于哪一天（报价或收盘的本地日）。`RunReport.as_of` 是求值日，不是数据日：
+    #: 周末重跑时两者差着交易日，屏幕上必须分开写。
+    data_on: date | None = None
 
 
 @dataclass(frozen=True)
@@ -161,10 +184,19 @@ class RunReport:
         return len(self.raised) + len(self.suppressed) + len(self.skipped) + self.quiet
 
 
-def action_for(kind: str, name: str) -> str:
-    """§11 标题行里那句「要做什么」：动词按 kind 定，尾巴挂用户自己起的名。"""
+def action_for(kind: str, name: str, stage: str = HIT) -> str:
+    """§11 标题行里那句「要做什么」：动词按 kind 定，尾巴挂用户自己起的名。
+
+    `stage` 参与选词只为止损的两个非命中档：`pre` 还没破、`urgent` 是跳空破。
+    其余家族的动作与档位无关（分档止盈的 `pre` 是「到了中间一档」，不是「快到了」）。
+    """
     family = kind.split(".", 1)[0]
-    head = ACTIONS.get(kind) or _FAMILY.get(family) or DEFAULT_ACTION
+    head = (
+        ACTIONS.get(kind)
+        or _STAGE_ACTIONS.get((family, stage))
+        or _FAMILY.get(family)
+        or DEFAULT_ACTION
+    )
     return f"{head}（{name}）"
 
 
@@ -209,6 +241,8 @@ class RuleEngine:
         *,
         rules: RuleRepo,
         alerts: AlertRepo,
+        states: AlertStateRepo,
+        mutes: MuteRepo,
         data: RuleData,
         calendar,
         fx: FxRepo,
@@ -220,6 +254,8 @@ class RuleEngine:
     ) -> None:
         self.rules = rules
         self.alerts = alerts
+        self.states = states
+        self.mutes = mutes
         self.data = data
         self.calendar = calendar
         self.fx = fx
@@ -241,9 +277,14 @@ class RuleEngine:
         rule_id: str | None = None,
         intraday: bool = False,
         quotes: QuoteView | None = None,
+        is_test: bool = False,
     ) -> RunReport:
         """一趟同步求值。调度器的 `rules` job 按市场跑（传 `market`），CLI 那一趟不传，
         而本函数不知道自己被调了几次——一次还是三个市场，是调用方的事。
+
+        `is_test` 只给网页的示例演练（D231）：它照样真求值、真落库、真投递，只是
+        落下那一行带测试标记（D131 的健康积压与 `no_open_alert` 都不读它）。调度、
+        命令行与用户自己规则的「判一次」一律不传，默认仍是真告警。
 
         `market` 是对象级子集：过滤在展开之后做——规则的目标可以是 `*` 那种
         「我的全部持仓」，展开之前问不出「这里面哪些属于 HK」。大小写先归一（D46）：
@@ -263,13 +304,62 @@ class RuleEngine:
             )
         if market is not None:
             market = canonical_market(market)
+        return self._judge(
+            self._select(user_id, rule_id, intraday=intraday),
+            day=day,
+            now=now,
+            market=market,
+            dry_run=dry_run,
+            quotes=quotes,
+            is_test=is_test,
+        )
+
+    def preview(
+        self,
+        user_id: str,
+        rule: Rule,
+        *,
+        as_of: date | None = None,
+        market: str | None = None,
+    ) -> RunReport:
+        """拿一条**没落库**的草稿判一次（R-22 的保存前试算）。`dry_run` 不在参数表上。
+
+        一个能被调用方忘掉的「只读开关」不是承诺：这一扇门只会以 `dry_run=True` 运行，
+        引擎在那条路上一处写都不做（状态翻回 clear、静音期间的状态、`alert_states`
+        全在 `if not dry_run` 之后）。草稿的 id 是 `DRAFT_ID`，`states.get` 恒为空，
+        所以屏幕上看到的是「这条线第一次响会怎样」，而不是「它昨天响过所以今天被吞了」。
+
+        走收盘那一趟的口径（`intraday=False`、不给行情板）：板由调度线程喂，页面拿它做
+        预览会把「还没轮到轮询」读成「这只票没价」。盘中另有它自己那一趟。
+        """
+        if market is not None:
+            market = canonical_market(market)
+        return self._judge(
+            [rule],
+            day=as_of if as_of is not None else self.clock.today(),
+            now=self.clock.now_utc(),
+            market=market,
+            dry_run=True,
+        )
+
+    def _judge(
+        self,
+        selected: Sequence[Rule],
+        *,
+        day: date,
+        now: datetime,
+        market: str | None = None,
+        dry_run: bool = False,
+        quotes: QuoteView | None = None,
+        is_test: bool = False,
+    ) -> RunReport:
+        """对这几条规则走一趟。`check` 与 `preview` 共用，差别只在名单怎么来。"""
         raised: list[Raised] = []
         suppressed: list[Suppressed] = []
         skipped: list[Skipped] = []
         blocked: list[Blocked] = []
         quiet = 0
         cache = _Cache()
-        selected = self._select(user_id, rule_id, intraday=intraday)
         for rule in selected:
             try:
                 targets = self.data.expand(rule)
@@ -294,6 +384,7 @@ class RuleEngine:
                     dry_run=dry_run,
                     cache=cache,
                     quotes=quotes,
+                    is_test=is_test,
                 )
                 if isinstance(fate, Raised):
                     raised.append(fate)
@@ -380,6 +471,7 @@ class RuleEngine:
         dry_run: bool,
         cache: _Cache,
         quotes: QuoteView | None = None,
+        is_test: bool = False,
     ) -> Raised | Suppressed | Skipped | None:
         quote: Quote | None = None
         zone: ZoneInfo | None = None
@@ -435,7 +527,14 @@ class RuleEngine:
         if isinstance(verdict, Skipped):
             return verdict
         if verdict is None:
-            return None  # 判过了，没到
+            # 判过了、没到：把状态翻回 clear，跌回去再跌破时才有一声新的。
+            # dry-run 与演练都不写库——前者是只读承诺，后者不参与去重。
+            if not dry_run and not is_test:
+                self.states.clear(
+                    rule.user_id, rule.id, snapshot.market, snapshot.code,
+                    snapshot.account_id,
+                )
+            return None
         reason = run_filters(
             rule.filters,
             snapshot=snapshot,
@@ -444,19 +543,60 @@ class RuleEngine:
             built=built,
         )
         if reason:
+            # 过滤器挡下的那次确实命中了；不写状态，窗口过后还能再判一次
             return self._suppressed(rule, snapshot, verdict, reason)
+        # 演练（D231）绕过状态与静音：人点了「示例」，就该看见一条真的送出去
+        if is_test:
+            if dry_run:
+                return self._raised("", rule, snapshot, verdict, now)
+            return self._dispatch(
+                rule, snapshot, verdict, built, now, quote=quote, is_test=True
+            )
+        bar_ts, dedupe_key = self._evidence(rule, snapshot, day)
+        if self.mutes.get(
+            rule.user_id, snapshot.market, snapshot.code, kind="rule"
+        ) is not None:
+            # 静音期间状态照记：解除后不补发静音期间已经发生过的跃迁
+            if not dry_run:
+                self.states.set(
+                    rule.user_id, rule.id, snapshot.market, snapshot.code,
+                    snapshot.account_id,
+                    state=verdict.stage, bar_ts=bar_ts, value_text=verdict.value_text,
+                )
+            return self._suppressed(
+                rule, snapshot, verdict,
+                f"静音：{snapshot.market}/{snapshot.code} 已静音，状态记为 "
+                f"{verdict.stage}；解除后不补发",
+            )
         cooled = self._cooldown(rule, snapshot, verdict, now)
         if cooled:
             return self._suppressed(rule, snapshot, verdict, cooled)
+        last = self.states.get(
+            rule.user_id, rule.id, snapshot.market, snapshot.code, snapshot.account_id
+        )
+        if last is not None and last.state == verdict.stage:
+            return self._suppressed(
+                rule, snapshot, verdict,
+                f"状态未变：上一趟已是 {verdict.stage}，同一状态不重复推送",
+            )
         if dry_run:
             return self._raised("", rule, snapshot, verdict, now)
         try:
-            return self._dispatch(rule, snapshot, verdict, built, now, quote=quote)
+            raised = self._dispatch(
+                rule, snapshot, verdict, built, now, quote=quote, is_test=False,
+                bar_ts=bar_ts, dedupe_key=dedupe_key,
+            )
         except SamsError as exc:
             # 端口后面是 `NotifyService.dispatch`：它会抛 `StorageError`（库写不进）与
             # `ValidationError`（用户不存在），两者都在 `SamsError` 底下。兜住它们意味着
             # 「这一条这一趟没有结论」（落进 skipped），而不是「这一趟结束了」。
             return self._skipped(rule, snapshot.market, snapshot.code, f"送不出去：{exc}")
+        # 写出成功才记状态：送不出去的那条下一趟还要能重试（与事件同一条纪律）
+        self.states.set(
+            rule.user_id, rule.id, snapshot.market, snapshot.code, snapshot.account_id,
+            state=verdict.stage, bar_ts=bar_ts, value_text=verdict.value_text,
+        )
+        return raised
 
     def _verdict(
         self, rule: Rule, target: Target, snapshot: Snapshot, evaluate, params: dict
@@ -471,7 +611,14 @@ class RuleEngine:
         """
         thesis = self.data.thesis_for(target)
         try:
-            outcome = evaluate(Ask(snapshot=snapshot, params=params, thesis=thesis))
+            outcome = evaluate(
+                Ask(
+                    snapshot=snapshot,
+                    params=params,
+                    thesis=thesis,
+                    assumptions=self.data.assumptions_for(target),
+                )
+            )
         except KeyError as exc:
             # 那一行是**上一个版本的模板**写的：老行要么缺了模板要的那个键，要么带着模板
             # 词表里已经没有了的取值（`stop_ma` 查 `_MA_LINES` 就是后面那种）。
@@ -597,17 +744,33 @@ class RuleEngine:
 
     # --- 投递 ---------------------------------------------------------------------------
 
+    @staticmethod
+    def _evidence(rule: Rule, snapshot: Snapshot, day: date) -> tuple[date, str]:
+        """这条告警的证据：判自哪根 bar、按哪个键去重。
+
+        `price_on` 是这个价属于哪天；状态型命中没有价格，回落到本次求值的本地日。
+        去重键与正文那行逐字一致（`_body` 的最后一行），只作审计，不参与判定。
+        """
+        bar_ts = snapshot.price_on if snapshot.price_on is not None else day
+        account = snapshot.account_id or "-"
+        return bar_ts, f"{rule.id}|{snapshot.market}|{snapshot.code}|{account}"
+
     def _dispatch(
         self, rule: Rule, snapshot: Snapshot, verdict: Verdict, built, now: datetime,
-        *, quote: Quote | None = None,
+        *, quote: Quote | None = None, is_test: bool = False,
+        bar_ts: date | None = None, dedupe_key: str = "",
     ) -> Raised:
-        message = self._message(rule, snapshot, verdict, built, now, quote=quote)
+        message = self._message(
+            rule, snapshot, verdict, built, now, quote=quote,
+            bar_ts=bar_ts, dedupe_key=dedupe_key,
+        )
         alert_id = self.sender.dispatch(
             message,
             user_id=rule.user_id,
             channel_ids=rule.channel_ids,
             rule_id=rule.id,
             account_id=snapshot.account_id,
+            is_test=is_test,
         )
         self.bus.publish(
             RuleHit(
@@ -651,7 +814,8 @@ class RuleEngine:
             severity=rule.severity,
             value_text=verdict.value_text,
             threshold_text=verdict.threshold_text,
-            action_note=action_for(rule.kind, rule.name),
+            action_note=action_for(rule.kind, rule.name, verdict.stage),
+            data_on=snapshot.price_on,
         )
 
     def _skipped(self, rule: Rule, market: str, code: str, reason: str) -> Skipped:
@@ -685,7 +849,8 @@ class RuleEngine:
 
     def _message(
         self, rule: Rule, snapshot: Snapshot, verdict: Verdict, built, now: datetime,
-        *, quote: Quote | None = None,
+        *, quote: Quote | None = None, bar_ts: date | None = None,
+        dedupe_key: str = "",
     ) -> AlertMessage:
         return AlertMessage(
             market=snapshot.market,
@@ -697,12 +862,14 @@ class RuleEngine:
             rule_name=rule.name,
             value_text=verdict.value_text,
             threshold_text=verdict.threshold_text,
-            action_note=action_for(rule.kind, rule.name),
+            action_note=action_for(rule.kind, rule.name, verdict.stage),
             stage=verdict.stage,
             body=self._body(rule, built, snapshot, verdict, quote=quote),
             intraday=quote is not None,
             quote_ts=quote.ts if quote is not None else None,
             quote_source=quote.source if quote is not None else None,
+            trigger_bar_ts=bar_ts,
+            dedupe_key=dedupe_key,
         )
 
     def _body(

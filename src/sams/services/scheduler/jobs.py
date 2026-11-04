@@ -21,12 +21,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date, timedelta
+from dataclasses import replace
+from datetime import date, datetime, timedelta
 from functools import partial
 
+from sams.core.assumptions import format_value, metric_label, op_label
 from sams.core.errors import DatasourceError, SamsError
+from sams.core.notify import STRONG, AlertMessage
 from sams.core.timeutil import HISTORY_START
 from sams.services.actors import active_users
+from sams.services.assumptions import Refutation
+from sams.services.nav import NAV_WINDOW_DAYS
+from sams.services.news import NEWS_MARKETS, NEWS_WINDOW_DAYS
 from sams.services.scheduler.due import DAILY, FX, MONTHLY, WEEKLY
 from sams.services.scheduler.types import (
     JobContext,
@@ -34,6 +40,7 @@ from sams.services.scheduler.types import (
     JobOutcome,
     JobSpec,
 )
+from sams.storage.repos.symbol_backfills import ACTIONS
 
 #: 首次见到一只票时回补多久：对齐 PR 分位的样本地板 `MIN_SAMPLES = 250`
 #: （`analysis/valuation/percentile.py`：少于它，「分位说的是抽样噪声而不是估值位置」）。
@@ -75,30 +82,52 @@ def _collect(
 
 
 def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """按只跑日线，并把「库里一根 K 线都没有」的那几只单独说出来。
+
+    链上一个字都没回不是失败（D43：停牌、新股、区间过短都可能是 0 行），所以它不进
+    `errors`；但它也不是「这只票有日线」。合进分子里的后果是页面上没有 K 线的票在
+    健康页被读成成功——那 24 只北交所代码就是这么藏了两周的（D272）。
+
+    判据取「今晚没写进任何行**且**库里仍没有一根日线」，不只看今晚的行数：后者每天会把
+    几十只停牌票念成窟窿，而噪音的下场是没人再读这一句。哪几只不在这里列——空答复不标记
+    补数完成，第二天仍留在 `symbol_backfills` 队列里，那才是点名的那一处。
+    """
+    barless = 0
+
     def one(market: str, code: str) -> int:
+        nonlocal barless
         start = _window(deps.sync.bars.latest_date(market, code), ctx.as_of)
         if start is None:
             return 0
-        return deps.sync.sync_daily(market, code, start, ctx.as_of).written
+        summary = deps.sync.sync_daily(market, code, start, ctx.as_of)
+        if summary.written == 0 and summary.latest_date is None:
+            barless += 1
+        return summary.written
 
     outcome = _collect(_units(ctx), one, "日线")
+    if barless:
+        outcome = replace(outcome, note=f"{outcome.note}，{barless} 只一根 K 线都没有")
     if outcome.rows_affected > 0:
         deps.versions.bump("bars")
     return outcome
 
 
 def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    # 昨天没补上的行今天重新有预算：这一下是 consumer 那句「等今晚」唯一的兑现（D283）
+    rearmed = (
+        deps.backfills.rearm_deferred(ACTIONS) if deps.backfills is not None else 0
+    )
+    covered = deps.corp_actions.coverage
+
     def one(market: str, code: str) -> int:
-        covered = deps.corp_actions.coverage.for_code(market, code)
-        if any(
-            row.full_history and row.covered_to is not None and row.covered_to >= ctx.as_of
-            for row in covered
-        ):
+        if covered.full_history_confirmed(market, code, ctx.as_of):
             # 全历史源已经确认到今天：再拉一遍只会得到同一批行
             return 0
         return deps.corp_actions.sync_actions(market, code, HISTORY_START, ctx.as_of).written
 
     outcome = _collect(_units(ctx), one, "公司行为")
+    if rearmed:
+        outcome = replace(outcome, note=f"{outcome.note}，{rearmed} 条顺延的补采重新排队")
     if outcome.rows_affected > 0:
         # 公司行为改的是复权口径：缓存的日线读数同样作废
         deps.versions.bump("bars")
@@ -164,6 +193,42 @@ def run_announcements(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return _collect(_units(ctx), one, "公告")
 
 
+def run_news(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """最近 30 天的个股新闻：按只隔离；无源的市场写「未接入」而不是记一次失败。
+
+    港美也登记（D247）：健康页要看见这一趟跑过——「这个市场没有新闻源」与
+    「job 没登记」是两件事。A 股链上一个能取新闻的源都没有时同样跳过。
+    """
+    assert ctx.market is not None  # 新闻 job 只在市场 job 上登记
+    assert deps.news is not None  # 登记前查过注入，这里只兜编程错误
+    if ctx.market not in NEWS_MARKETS or not _has(deps, ctx.market, "stock_news"):
+        return JobOutcome(note=f"{ctx.market} 新闻源未接入，跳过")
+
+    start = ctx.as_of - timedelta(days=NEWS_WINDOW_DAYS)
+
+    def one(market: str, code: str) -> int:
+        return deps.news.sync(market, code, start, ctx.as_of).written
+
+    return _collect(_units(ctx), one, "新闻")
+
+
+def run_industry(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """行业回填：单元是整个市场，读的是今晚刚入库的概况，不联网（D236）。
+
+    它排在数据链之后、`spot` 之前。港美也登记：回填 0 行是合法结果，健康页
+    照样看得见这一趟跑过——「这个市场没有概况源」与「job 没登记」是两件事。
+    """
+    assert ctx.market is not None  # 行业 job 只在市场 job 上登记
+    assert deps.industry is not None
+    try:
+        report = deps.industry.backfill(ctx.market)
+    except SamsError as exc:
+        return JobOutcome(
+            note=f"{ctx.market} 行业回填失败", errors=(f"{ctx.market}: {exc}",)
+        )
+    return JobOutcome(rows_affected=report.changed, note=f"{ctx.market} {report.note}")
+
+
 #: 数据 job 的登记表：能力名（= 适配器方法名）→ job 名与实现。
 #: 缺能力的市场不登记（D106）：HK/US 没有按报告期的财务源，每天一条失败会把真故障淹掉
 _DATA_JOBS = (
@@ -225,6 +290,22 @@ def run_spot(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     if report.skipped:
         note += f"，源没答 {len(report.skipped)} 只"
     return JobOutcome(rows_affected=report.rows, note=note)
+
+
+def run_screener(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """逐方案重跑启用的选股方案，只把新进名单的票推出去（S4-B）。
+
+    排在 `spot` 之后：方案里的技术面条件读的是当晚刚落的快照；排在此处也让
+    `digest` 看得到今晚的选股告警。一个方案失败不带走其余，也不带走摘要。
+    """
+    assert ctx.market is not None  # 监控 job 只在市场 job 上登记
+    assert deps.screener_monitor is not None
+    summary = deps.screener_monitor.run_market(ctx.market)
+    return JobOutcome(
+        rows_affected=summary.new_codes,
+        note=summary.note,
+        errors=summary.errors,
+    )
 
 
 def run_indices(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -300,6 +381,70 @@ def run_calendar(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return JobOutcome(rows, note, tuple(errors))
 
 
+def run_dividends(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """把这一市场截至今晚的应得派息逐账户入账（S4-D §6.2）。
+
+    排在数据链之后：`actions` 先落库，这一趟才看得见今晚新入库的除权日。重跑不重复
+    入账——服务先查 `(account_id, kind, ref)` 再写，所以补账与每晚这一趟走同一条路。
+
+    `warnings` 不进 `errors`：缺 `cash_per_share` 的那种行是源的窟窿，不是这一趟失败；
+    它进 note 的数量，明细在 `sams portfolio dividends` 的输出里。
+    """
+    assert ctx.market is not None  # 分红 job 只在市场 job 上登记
+    assert deps.dividends is not None and deps.sim_accounts is not None
+    users = active_users(deps.users)
+    rows = posted = warnings = done = 0
+    errors: list[str] = []
+    for user in users:
+        for account in deps.sim_accounts.list_for(user.id):
+            try:
+                report = deps.dividends.post(account.id, ctx.as_of, market=ctx.market)
+            except SamsError as exc:
+                errors.append(f"{user.username} {account.name}: {exc}")
+                continue
+            rows += report.rows
+            posted += report.skipped_existing
+            warnings += len(report.warnings)
+            done += 1
+    note = f"{done} 个账户入账 {rows} 笔分红"
+    if posted:
+        note += f"，{posted} 笔已入过账"
+    if warnings:
+        note += f"，{warnings} 笔缺每股派息"
+    if errors:
+        note += f"，{len(errors)} 个账户失败"
+    return JobOutcome(rows, note, tuple(errors))
+
+
+def run_nav(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """逐个账户重放最近 400 天的净值（S4-D §6.3）。
+
+    排在分红之后：今晚入账的那笔派息要出现在今晚的净值里。也只跑「本市场是它的
+    主场市场」的账户——三个市场各跑一趟，账户却只该重建一次，否则后一趟覆盖前一趟，
+    行数还翻三倍。重建是整段覆盖，重跑同一段写同样的行。
+    """
+    assert ctx.market is not None  # 净值 job 只在市场 job 上登记
+    assert deps.nav is not None and deps.sim_accounts is not None
+    start = ctx.as_of - timedelta(days=NAV_WINDOW_DAYS)
+    users = active_users(deps.users)
+    days = done = 0
+    errors: list[str] = []
+    for user in users:
+        for account in deps.sim_accounts.list_for(user.id):
+            if account.home_market != ctx.market:
+                continue
+            try:
+                days += deps.nav.rebuild(account.id, start, ctx.as_of)
+            except SamsError as exc:
+                errors.append(f"{user.username} {account.name}: {exc}")
+                continue
+            done += 1
+    note = f"{done} 个账户重建 {days} 天净值"
+    if errors:
+        note += f"，{len(errors)} 个账户失败"
+    return JobOutcome(days, note, tuple(errors))
+
+
 def run_rules(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """只评估这个市场的对象；每用户一趟，一个用户失败不带走其余（`errors` 与行数并存）。
 
@@ -358,9 +503,113 @@ def run_recheck(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return JobOutcome(rows, note, tuple(errors))
 
 
+def run_assumptions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """每天把每个启用用户「我的论点」下的假设判一次；只有刚翻成证伪的发告警。
+
+    判是每票一次读库，告警是每人每次一条：一条被证伪的假设改变的是「还买不买」，
+    归在 strong。数据不足的那几条只计数（`checked`），不进告警——那不是证据。
+    """
+    assert ctx.market is not None  # 证伪 job 只在市场 job 上登记
+    assert deps.assumptions is not None and deps.alerts is not None
+    triggered_at = deps.assumptions.clock.now_utc()
+    users = active_users(deps.users)
+    checked = sent = done = 0
+    errors: list[str] = []
+    for user in users:
+        try:
+            report = deps.assumptions.evaluate_user(
+                user.username, on=ctx.as_of, market=ctx.market
+            )
+        except SamsError as exc:
+            errors.append(f"{user.username}: {exc}")
+            continue
+        checked += report.checked
+        done += 1
+        for hit in report.refuted:
+            message = _refutation_message(
+                hit, triggered_at=triggered_at, name=_symbol_name(deps, hit)
+            )
+            try:
+                deps.alerts.dispatch(message, user_id=user.id, rule_id=None)
+            except SamsError as exc:
+                errors.append(f"{user.username} {hit.market} {hit.code}: {exc}")
+            else:
+                sent += 1
+    note = f"{done}/{len(users)} 个用户判了 {checked} 条假设，新证伪 {sent}"
+    if errors:
+        note += f"，{len(errors)} 处失败"
+    return JobOutcome(sent, note, tuple(errors))
+
+
+def run_digest(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    """每晚给启用用户写一条收盘摘要；一人失败不带走其余。
+
+    摘要读的是这一晚已经落库的告警与 `task_runs`，所以它必须排在 `rules` 与
+    `assumptions` 之后——先写摘要再判规则，正文里就永远没有今晚的变化。
+
+    用户没有该市场的持仓/自选/观察时 `run` 返回 `digest=None`：不写空气摘要，
+    也不推送。`rows_affected` 只数真正新写下的行，重跑因此是 0。
+    """
+    assert ctx.market is not None  # 摘要只在市场 job 上登记
+    assert deps.digest is not None
+    users = active_users(deps.users)
+    written = pushed = done = 0
+    errors: list[str] = []
+    for user in users:
+        try:
+            outcome = deps.digest.run(user, ctx.market, as_of=ctx.as_of)
+        except SamsError as exc:
+            errors.append(f"{user.username}: {exc}")
+            continue
+        written += int(outcome.created)
+        pushed += int(outcome.pushed)
+        done += 1
+    note = f"{done}/{len(users)} 个用户：写入 {written} 条、推送 {pushed} 条"
+    if errors:
+        note += f"，{len(errors)} 个用户失败"
+    return JobOutcome(written, note, tuple(errors))
+
+
+def _symbol_name(deps: JobDeps, hit: Refutation) -> str:
+    if deps.symbols is None:
+        return ""
+    found = deps.symbols.get(hit.market, hit.code)
+    return str(found.get("name") or "") if found is not None else ""
+
+
+def _refutation_message(
+    hit: Refutation, *, triggered_at: datetime, name: str
+) -> AlertMessage:
+    """正文里带论点页的地址：收到告警的人下一步就是去改那条观点，而不是再找一遍。"""
+    reading = format_value(hit.metric, hit.value)
+    threshold = f"{op_label(hit.op)} {format_value(hit.metric, hit.threshold)}"
+    return AlertMessage(
+        market=hit.market,
+        code=hit.code,
+        severity=STRONG,
+        triggered_at=triggered_at,
+        name=name,
+        rule_name="证伪台账",
+        value_text=reading,
+        threshold_text=threshold,
+        stage="证伪",
+        action_note="到论点页复核这条假设",
+        body=(
+            f"{hit.on} 读到 {metric_label(hit.metric)} {reading}，"
+            f"没守住「{metric_label(hit.metric)} {threshold}」。\n"
+            f"论点：/theses/{hit.thesis_id}"
+        ),
+    )
+
+
 def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
     """注册顺序就是同一个 tick 里的执行顺序：
-    每个市场：代码表 → 数据链 → 指数 → 周复检 → 规则；然后汇率；最后日历。
+
+    每个市场：代码表 → 数据链 → 分红 → 净值 → 行业回填 → 快照 → 方案监控 → 指数 →
+    周复检 → 证伪台账 → 规则 → 摘要；然后汇率；最后日历。
+
+    证伪台账排在数据链之后：它比的是今晚刚入库的那一期财报；排在规则之前没有依赖，
+    只是让「同一晚先判假设、再判价位规则」这个读法固定下来。
 
     周复检排在规则之前说的是**同一晚之内**：`thesis.drift` 读的是复检写下的
     `baseline_items`，没有它就只拿到「这条论还没有分项基线」那一句。先复检，那条论当晚
@@ -376,13 +625,36 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         for method, name, run in _DATA_JOBS:
             if _has(deps, market, method):
                 jobs.append(JobSpec(name, DAILY, market, partial(run, deps)))
+        # 分红与净值都排在数据链之后：`actions` 先落库，分红才看得见今晚的除权日；
+        # 净值重放读的是同一晚的收盘价，并且要包含刚入账的那笔派息（S4-D）
+        if deps.dividends is not None and deps.sim_accounts is not None:
+            jobs.append(JobSpec("dividends", DAILY, market, partial(run_dividends, deps)))
+        if deps.nav is not None and deps.sim_accounts is not None:
+            jobs.append(JobSpec("nav", DAILY, market, partial(run_nav, deps)))
+        # 新闻排在数据链之后、行业回填之前：公告与新闻同一晚落库，行业回填与它们无关；
+        # 无源的港美也登记，job 里写「未接入」而不是从注册表里消失（D247）
+        if deps.news is not None:
+            jobs.append(JobSpec("news", DAILY, market, partial(run_news, deps)))
+        # 行业回填读的是上面那批概况：排在数据链之后，才回填得到今晚的行业
+        if deps.industry is not None:
+            jobs.append(JobSpec("industry", DAILY, market, partial(run_industry, deps)))
         # 快照排在数据链之后：它读的是当天收盘价，与日线那批互不依赖，但都在盘后完成
         if deps.snapshots is not None and _has(deps, market, "market_snapshot"):
             jobs.append(JobSpec("spot", DAILY, market, partial(run_spot, deps)))
+        # 方案监控读的是当晚刚落的快照，排在 spot 之后；先于 rules/digest，
+        # 今晚的新命中才进得了同一晚的规则链与摘要（S4-B）
+        if deps.screener_monitor is not None:
+            jobs.append(JobSpec("screener", DAILY, market, partial(run_screener, deps)))
         if deps.sync.indices is not None and _has(deps, market, "index_daily"):
             jobs.append(JobSpec("indices", DAILY, market, partial(run_indices, deps)))
         jobs.append(JobSpec("recheck", WEEKLY, market, partial(run_recheck, deps)))
+        if deps.assumptions is not None and deps.alerts is not None:
+            jobs.append(
+                JobSpec("assumptions", DAILY, market, partial(run_assumptions, deps))
+            )
         jobs.append(JobSpec("rules", DAILY, market, partial(run_rules, deps)))
+        if deps.digest is not None:
+            jobs.append(JobSpec("digest", DAILY, market, partial(run_digest, deps)))
     jobs.append(JobSpec("fx", FX, None, partial(run_fx, deps)))
     for market in sorted(deps.settings.markets):
         jobs.append(JobSpec("calendar", MONTHLY, market, partial(run_calendar, deps)))

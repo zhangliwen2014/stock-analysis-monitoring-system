@@ -98,6 +98,17 @@ def lot_size_of(market: str) -> int | None:
     return None
 
 
+#: 北交所号段：43 / 83 / 87 / 88 是原新三板挂牌过来的，92 是 2024 年起的新股段。
+#: 按两位判而不是按首位：`92` 与沪市 B 股 `900` 首位相同，一位判据会把北交所问成沪市
+#: ——东财对问错交易所的代码回 `data: null`，症状是「这只票从来没交易过」而不是一条报错（D272）。
+BEIJING_PREFIXES = ("43", "83", "87", "88", "92")
+
+
+def is_beijing(code: str) -> bool:
+    """这只 A 股是不是北交所：涨跌幅口径与问数据时带哪个交易所标签都跟着它走。"""
+    return code.startswith(BEIJING_PREFIXES)
+
+
 #: 创业板与科创板：±20%（新股前五日不设限，那是另一回事，由调用方按「跳过开头几根」处理）
 _WIDE_LIMIT_PREFIXES = ("30", "68")
 
@@ -132,8 +143,7 @@ def daily_price_limit(market: str, code: str) -> float | None:
         return None
     if code.startswith(_WIDE_LIMIT_PREFIXES):
         return 0.20
-    # 北交所：43 / 83 / 87 / 88 / 92 开头，±30%
-    if code.startswith(("43", "83", "87", "88", "92")):
+    if is_beijing(code):  # 北交所 ±30%
         return 0.30
     if code.startswith(("60", "00")):
         return 0.10

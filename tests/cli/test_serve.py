@@ -7,6 +7,7 @@ uvicorn 在这一层换成记录参数的替身：真起一个 HTTP 服务属于
 from __future__ import annotations
 
 import logging
+import signal
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -62,6 +63,7 @@ def started(monkeypatch):
 
     def fake_run(app, **kwargs):
         seen["app"] = app
+        seen["sigterm"] = signal.getsignal(signal.SIGTERM)
         seen.update(kwargs)
 
     monkeypatch.setattr(serve, "build_serve", lambda settings: parts)
@@ -128,6 +130,22 @@ def test_tls_files_go_to_uvicorn_and_the_advertised_url_is_https(settings, start
     assert seen["ssl_certfile"] == "cert.pem"
     assert seen["ssl_keyfile"] == "key.pem"
     assert "https://127.0.0.1:8765" in capsys.readouterr().out
+
+
+def test_uvicorn_cannot_skip_the_finally_with_its_sigterm_rerase(settings, started):
+    """uvicorn 优雅停机会把 SIGTERM 恢复成原处理器再抬一次；默认处理器直接结束进程，
+    `finally`（停线程、给心跳标停）再也走不到——实机重启撞到过调度线程被自己上一世挡死。
+
+    跑 uvicorn 时把 SIGTERM 设成忽略，抬起来的那一次就落空；uvicorn 自己运行期间
+    仍会临时接管，优雅停机不受影响。
+    """
+    _, seen = started
+    before = signal.getsignal(signal.SIGTERM)
+
+    assert serve.start(settings, args()) == 0
+
+    assert seen["sigterm"] is signal.SIG_IGN
+    assert signal.getsignal(signal.SIGTERM) is before, "跑完要恢复，别把测试进程的信号改了"
 
 
 def test_a_crashed_server_still_stops_the_threads_and_closes(settings, monkeypatch):

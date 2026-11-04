@@ -129,15 +129,7 @@ class CorpActionsCoverageRepo:
         """这只票的所有确认记录（各源一条）。判定归 analysis 层，这里只给事实。"""
         market, code = _norm(market, code)
         return [
-            CoverageRecord(
-                market=row["market"],
-                code=row["code"],
-                covered_from=_as_date(row["covered_from"]),
-                covered_to=_as_date(row["covered_to"]),
-                full_history=bool(row["full_history"]),
-                src=row["src"],
-                fetched_at=row["fetched_at"],
-            )
+            _record(row)
             for row in self.db.query(
                 "SELECT * FROM corp_actions_coverage WHERE market = ? AND code = ? "
                 "ORDER BY src",
@@ -145,8 +137,43 @@ class CorpActionsCoverageRepo:
             ).to_dicts()
         ]
 
+    def full_history_confirmed(self, market: str, code: str, as_of: date) -> bool:
+        """有没有一个源确认过「这只票的历史我给全了，一直给到 `as_of` 及以后」。
+
+        今晚盘后的 `actions` job 与登记兴趣的 `SymbolInterest` 吃的是同一个判据（D283），
+        所以这里只留一份定义：两处各写一遍，一处放宽一处收紧时，症状不是报错，
+        而是队列永不结案、或者每次渲染都重排一条。
+        """
+        return any(
+            row.full_history and row.covered_to is not None and row.covered_to >= as_of
+            for row in self.for_code(market, code)
+        )
+
+    def for_market(self, market: str) -> dict[str, list[CoverageRecord]]:
+        """整个市场的确认记录，按代码分组：选股要一次问完几百只票，不能逐票查。"""
+        rows = self.db.query(
+            "SELECT * FROM corp_actions_coverage WHERE market = ? ORDER BY code, src",
+            [canonical_market(market)],
+        ).to_dicts()
+        grouped: dict[str, list[CoverageRecord]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["code"]), []).append(_record(row))
+        return grouped
+
     def count(self) -> int:
         return int(self.db.scalar("SELECT count(*) FROM corp_actions_coverage") or 0)
+
+
+def _record(row: dict) -> CoverageRecord:
+    return CoverageRecord(
+        market=row["market"],
+        code=row["code"],
+        covered_from=_as_date(row["covered_from"]),
+        covered_to=_as_date(row["covered_to"]),
+        full_history=bool(row["full_history"]),
+        src=row["src"],
+        fetched_at=row["fetched_at"],
+    )
 
 
 def _touches(existing: CoverageRecord, start: date, end: date) -> bool:

@@ -16,8 +16,9 @@ import pytest
 from sams.core.errors import DatabaseLocked
 from sams.core.quotes import Quote
 from sams.core.rules import FILTER_KEYS
+from sams.services.rules.engine import Blocked, Raised, RuleEngine, RunReport, Skipped, Suppressed
 from sams.storage.repos.rules import RuleRepo
-from sams.web.display import hms, moment_label
+from sams.web.display import hm, moment_label
 
 
 def _alice_id(logged) -> str:
@@ -84,7 +85,7 @@ def _edit_rule_data(logged, **overrides) -> dict:
 
 
 def _seed_quote(logged, price: float = 1330.71) -> Quote:
-    """主档 + 行情板各一条：列表上的名称与现价都从这两处读，不查历史日线。"""
+    """主档 + 行情板各一条：名称读主档，价走统一读模型（板上过期时回落最后收盘）。"""
     logged.context.symbols.upsert(
         pl.DataFrame(
             {
@@ -184,6 +185,37 @@ def test_create_bumps_the_rules_version_and_redirects(logged):
     # 没勾的三个开关也是答案的一部分：漏一个键仓库会按「未设置」补 False，
     # 所以这里断的是「勾了的那一个真的进去了」
     assert rule.filters["no_open_alert"] is True
+
+
+def test_a_trailing_stop_takes_percent_and_stores_a_fraction(logged):
+    """R-19：表单收 8（百分数），库里存 0.08；列表再把 0.08 写回 8%。"""
+    account = _open_account(logged)
+    data = {
+        "csrf": logged.csrf, "kind": "stop.trailing", "name": "回撤 8%",
+        "target_type": "position", "target_ref": "*", "account_id": account,
+        "severity": "strong", "cooldown_min": "30", "param_pct": "8",
+    }
+    response = logged.client.post("/rules/new", data=data, follow_redirects=False)
+    assert response.status_code == 303, response.text
+    rule = next(
+        view.rule for view in logged.context.rule_service.list(_alice_id(logged))
+        if view.rule.name == "回撤 8%"
+    )
+    assert rule.params["pct"] == pytest.approx(0.08)
+    assert "回撤比例 8%" in logged.client.get("/rules").text
+
+
+def test_a_trailing_stop_refuses_over_90_percent_in_percent_words(logged):
+    account = _open_account(logged)
+    data = {
+        "csrf": logged.csrf, "kind": "stop.trailing", "name": "回撤 99%",
+        "target_type": "position", "target_ref": "*", "account_id": account,
+        "severity": "strong", "cooldown_min": "30", "param_pct": "99",
+    }
+    response = logged.client.post("/rules/new", data=data)
+    assert response.status_code == 400
+    assert "不能高于 90%" in response.text
+    assert "99" in response.text
 
 
 def test_missing_required_param_shows_the_error_and_does_not_bump(logged):
@@ -655,9 +687,9 @@ def test_the_list_answers_what_each_rule_is_waiting_for(logged):
     text = page.text
     assert "贵州茅台" in text and "A/600519" in text
     assert "下穿指定价" in text and "价位 1200 元" in text
-    # 现价、单位、报价时刻：行情板里的那个价，不是另一条日线
+    # 现价、单位、时刻：与看板同一套读模型，时刻按**市场**时区写到分钟（S0-E）
     assert "1,330.71" in text and "元" in text
-    assert hms(quote.ts, logged.context.settings.server.display_tz) in text
+    assert hm(quote.ts, logged.context.settings.markets["A"].tz) in text
     # 上次响：库里真有那一行才写；没有的写「从未」，不编一个求值时刻
     assert "上次响" in text
     assert moment_label(alert.triggered_at, logged.context.settings.server.display_tz) in text
@@ -746,3 +778,246 @@ def test_the_form_speaks_chinese_about_targets_and_filters(logged):
         "已有未处理告警时不重复推",
     ):
         assert explanation in text, explanation
+
+
+# --- 试算 / 判一次 / 示例（D231）--------------------------------------------------------
+
+
+def _report(
+    logged, *, dry_run: bool, raised=(), suppressed=(), skipped=(), blocked=(), quiet=0
+) -> RunReport:
+    return RunReport(
+        as_of=date(2026, 10, 30),
+        now=logged.core.clock.now_utc(),
+        dry_run=dry_run,
+        rules=1,
+        raised=tuple(raised),
+        suppressed=tuple(suppressed),
+        skipped=tuple(skipped),
+        blocked=tuple(blocked),
+        quiet=quiet,
+    )
+
+
+def _raised(logged, *, alert_id: str = "a-1", rule_id: str = "r-1") -> Raised:
+    return Raised(
+        alert_id=alert_id,
+        rule_id=rule_id,
+        rule_name="止损",
+        user_id=_alice_id(logged),
+        market="A",
+        code="600519",
+        name="贵州茅台",
+        account_id=None,
+        stage="hit",
+        severity="strong",
+        value_text="1330.71 CNY",
+        threshold_text="1400.00 CNY",
+        action_note="止损位到了（止损）",
+        data_on=date(2026, 10, 30),
+    )
+
+
+def _fake_check(monkeypatch, report: RunReport, seen: dict):
+    def fake(self, user_id, **kwargs):
+        seen["user_id"] = user_id
+        seen.update(kwargs)
+        return report
+
+    monkeypatch.setattr(RuleEngine, "check", fake)
+
+
+def test_a_real_check_links_to_the_alert_it_wrote(logged, monkeypatch):
+    """「判一次」是真跑：命中的那一行要能点进收件箱，不是只印一句成功。"""
+    rule_id = _add(logged)
+    seen: dict = {}
+    _fake_check(monkeypatch, _report(logged, dry_run=False, raised=[_raised(logged)]), seen)
+    page = logged.client.post(
+        f"/rules/{rule_id}/check", data={"csrf": logged.csrf, "mode": "real"}
+    )
+    assert page.status_code == 200
+    assert seen["rule_id"] == rule_id
+    assert seen["dry_run"] is False
+    # 用户自己的规则不传 is_test：默认仍是真的告警
+    assert seen.get("is_test", False) is False
+    assert "贵州茅台" in page.text and "1330.71" in page.text
+    assert 'href="/alerts/a-1"' in page.text
+
+
+def test_a_trial_run_says_it_wrote_nothing_and_has_no_alert_link(logged, monkeypatch):
+    """试算是安全的默认值：一条告警都不写，也就没有可点的详情。"""
+    rule_id = _add(logged)
+    seen: dict = {}
+    page_report = _report(logged, dry_run=True, raised=[_raised(logged, alert_id="")])
+    _fake_check(monkeypatch, page_report, seen)
+    page = logged.client.post(
+        f"/rules/{rule_id}/check", data={"csrf": logged.csrf, "mode": "dry"}
+    )
+    assert page.status_code == 200
+    assert seen["dry_run"] is True
+    assert "试运行" in page.text
+    assert 'href="/alerts/' not in page.text
+    assert "真跑会写一条告警" in page.text
+
+
+def test_each_hit_shows_the_day_its_price_belongs_to(logged, monkeypatch):
+    """评估日是 10-30，报价日可能是更早的 bar：两句话都要在页面上。"""
+    rule_id = _add(logged)
+    _fake_check(monkeypatch, _report(logged, dry_run=True, raised=[_raised(logged)]), {})
+    page = logged.client.post(
+        f"/rules/{rule_id}/check", data={"csrf": logged.csrf, "mode": "dry"}
+    )
+    assert page.status_code == 200
+    assert "评估日 2026-10-30" in page.text
+    assert "数据 2026-10-30" in page.text
+
+
+def test_a_missing_mode_is_a_trial_not_a_write(logged, monkeypatch):
+    """按回车与拼错都不该写告警：只有明写 mode=real 才算真跑。"""
+    rule_id = _add(logged)
+    seen: dict = {}
+    _fake_check(monkeypatch, _report(logged, dry_run=True), seen)
+    assert (
+        logged.client.post(f"/rules/{rule_id}/check", data={"csrf": logged.csrf}).status_code
+        == 200
+    )
+    assert seen["dry_run"] is True
+
+
+def test_the_result_page_speaks_each_exit(logged, monkeypatch):
+    """压住/判不了/没跑三摞各有各的原句：合成一句「没有触发」是最贵的错法。"""
+    rule_id = _add(logged)
+    report = _report(
+        logged,
+        dry_run=False,
+        suppressed=[
+            Suppressed(
+                rule_id=rule_id, rule_name="止损", market="A", code="600519",
+                stage="hit", reason="冷却：上一条 hit 推出于 10-30 12:00 UTC",
+            )
+        ],
+        skipped=[
+            Skipped(
+                rule_id=rule_id, rule_name="止损", market="A", code="600519",
+                reason="没有 A/600519 过闸的现价：这一趟不判任何价格类条件",
+            )
+        ],
+        blocked=[Blocked(rule_id=rule_id, rule_name="止损", reason="这条规则没有账户")],
+        quiet=2,
+    )
+    _fake_check(monkeypatch, report, {})
+    page = logged.client.post(
+        f"/rules/{rule_id}/check", data={"csrf": logged.csrf, "mode": "real"}
+    )
+    assert "冷却：上一条 hit" in page.text
+    assert "没有 A/600519 过闸的现价" in page.text
+    assert "这条规则没有账户" in page.text
+    assert "没到" in page.text and "2" in page.text
+
+
+def test_the_result_page_says_when_no_channel_can_carry_it(logged, monkeypatch):
+    """告警进了收件箱与消息离开了进程是两件事：没有通道时要说清下一步。"""
+    rule_id = _add(logged)
+    _fake_check(monkeypatch, _report(logged, dry_run=False, raised=[_raised(logged)]), {})
+    page = logged.client.post(
+        f"/rules/{rule_id}/check", data={"csrf": logged.csrf, "mode": "real"}
+    )
+    assert "没有配置任何通道" in page.text
+    assert 'href="/settings"' in page.text
+
+
+def test_the_list_offers_both_a_trial_and_a_real_check(logged):
+    """两个按钮都在那一行上：试算在前，回车落到它（安全的那个）。"""
+    rule_id = _add(logged)
+    text = logged.client.get("/rules").text
+    assert f'action="/rules/{rule_id}/check"' in text
+    assert 'name="mode" value="dry"' in text
+    assert 'name="mode" value="real"' in text
+
+
+def test_the_demo_builds_a_stopped_line_above_the_close_and_marks_it_a_test(
+    logged, monkeypatch
+):
+    """示例要保证一次命中：线在最新收盘上方 1%，规则停用，演练告警带测试标记。"""
+    from datetime import date as _date
+
+    import polars as pl
+
+    logged.context.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"], "code": ["600519"], "date": [_date(2026, 10, 30)],
+                "open": [1.0], "high": [1.5], "low": [0.5], "close": [2.2],
+                "volume": [100.0], "amount": [220.0], "source": ["akshare"],
+            }
+        )
+    )
+    seen: dict = {}
+    _fake_check(monkeypatch, _report(logged, dry_run=False, raised=[_raised(logged)]), seen)
+    page = logged.client.post(
+        "/rules/demo", data={"csrf": logged.csrf, "market": "A", "code": "600519"}
+    )
+    assert page.status_code == 200
+    rules = logged.context.rule_service.list(_alice_id(logged))
+    assert len(rules) == 1
+    rule = rules[0].rule
+    assert rule.kind == "stop.fixed"
+    assert rule.enabled is False
+    assert rule.target_ref == "A/600519"
+    assert rule.params["price"] > 2.2
+    assert rule.params["price"] < 2.3
+    assert seen["rule_id"] == rule.id
+    assert seen["dry_run"] is False
+    assert seen["is_test"] is True
+    assert "示例" in page.text
+    assert f'action="/rules/{rule.id}/remove"' in page.text
+    assert 'href="/alerts/a-1"' in page.text
+
+
+def test_the_demo_without_bars_creates_nothing_and_says_what_to_run(logged, monkeypatch):
+    """没有日线时不留下一条永远判不了的示例：先把话说清楚。"""
+    seen: dict = {}
+    _fake_check(monkeypatch, _report(logged, dry_run=False), seen)
+    page = logged.client.post(
+        "/rules/demo", data={"csrf": logged.csrf, "market": "A", "code": "000001"}
+    )
+    assert page.status_code == 400
+    assert "还没有日线" in page.text
+    assert "sams sync daily --market A --code 000001" in page.text
+    assert seen == {}
+    assert logged.context.rule_service.list(_alice_id(logged)) == ()
+
+
+def test_the_demo_rule_can_be_removed_from_its_result_page(logged, monkeypatch):
+    rule_id = _add(logged, name="示例·可删")
+    response = logged.client.post(
+        f"/rules/{rule_id}/remove", data={"csrf": logged.csrf}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/rules?notice=removed"
+    assert logged.context.rule_service.list(_alice_id(logged)) == ()
+    page = logged.client.get(response.headers["location"])
+    assert "规则已删除。" in page.text
+
+
+def test_check_remove_and_demo_are_behind_csrf(logged):
+    rule_id = _add(logged)
+    assert logged.client.post(f"/rules/{rule_id}/check", data={"mode": "real"}).status_code == 403
+    assert logged.client.post(f"/rules/{rule_id}/remove", data={}).status_code == 403
+    demo = logged.client.post("/rules/demo", data={"market": "A", "code": "600519"})
+    assert demo.status_code == 403
+    assert len(logged.context.rule_service.list(_alice_id(logged))) == 1
+
+
+def test_checking_and_removing_someone_elses_rule_is_404(logged):
+    bob = logged.context.users.create("bob", "another-correct-horse")
+    rule_id = logged.context.rule_service.add(
+        bob.id, kind="stop.fixed", name="bobs", target_type="symbol",
+        target_ref="A/600036", params={"price": 30.0},
+    ).rule.id
+    assert logged.client.post(
+        f"/rules/{rule_id}/check", data={"csrf": logged.csrf, "mode": "real"}
+    ).status_code == 404
+    assert logged.client.post(
+        f"/rules/{rule_id}/remove", data={"csrf": logged.csrf}
+    ).status_code == 404

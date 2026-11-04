@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
-from sams.core.codes import canonical_code, looks_like_index_code
+from sams.core.codes import canonical_code, is_beijing, looks_like_index_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.core.quotes import MARKET_ZONES, Quote, QuoteBatch
 from sams.datasource.base import (
@@ -45,6 +45,8 @@ KLINE_PATHS = {
     "HK": "https://web.ifzq.gtimg.cn/appstock/app/kline/kline",
     "US": "https://web.ifzq.gtimg.cn/appstock/app/kline/kline",
 }
+#: 北交所的日线只有这一条给全历史，见 `kline_path`
+NEW_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get"
 SMARTBOX_URL = "https://smartbox.gtimg.cn/s3/"
 #: 行内六个字段的含义（腾讯给的顺序，收盘价在第 3 个）
 FIELD_ORDER = ("date", "open", "close", "high", "low", "volume")
@@ -433,8 +435,10 @@ class TencentAdapter:
     minute_series_markets = frozenset({"A", "HK"})
     #: 分钟 K 只答 A 股：港美股那边实测永远 `param error`（D165 置灰就念这一份）
     minute_bars_markets = frozenset({"A"})
-    #: 全市场快照只答 A 股：港美股行的 PE/PB 位置没法交叉验证（D188）
-    market_snapshot_markets = frozenset({"A"})
+    #: 全市场快照答 A/HK/US：A 股位置按四只票交叉核对；港股 57/58 的 PE(TTM)/PB
+    #: 与东财 F10 逐只对过（D188）；美股 39/37/43/44/45 与新浪逐项对过，PB 未核对
+    #: 所以不注册那一列（D226）。
+    market_snapshot_markets = frozenset({"A", "HK", "US"})
 
     def __init__(
         self,
@@ -481,7 +485,7 @@ class TencentAdapter:
             "param": kline_param(market, symbol, start, end, _bars_for(start, end))
         }
         try:
-            payload = self._get(KLINE_PATHS[market], params, timeout=self._timeout)
+            payload = self._get(kline_path(market, symbol), params, timeout=self._timeout)
             return parse_tencent_daily(payload, market=market, code=code, symbol=symbol)
         except DatasourceError:
             raise
@@ -507,7 +511,7 @@ class TencentAdapter:
             "param": kline_param(market, symbol, start, end, _bars_for(start, end))
         }
         try:
-            payload = self._get(KLINE_PATHS[market], params, timeout=self._timeout)
+            payload = self._get(kline_path(market, symbol), params, timeout=self._timeout)
             bars = parse_tencent_daily(payload, market=market, code=code, symbol=symbol)
             # normalize_bars 把 code 归一个股形态（sh000001→000001），而指数表的键要源形态（D145）
             return bars.with_columns(pl.lit(code).alias("code"))
@@ -641,6 +645,22 @@ class TencentAdapter:
 def kline_param(market: str, symbol: str, start: date, end: date, count: int) -> str:
     base = f"{symbol},day,{start:%Y-%m-%d},{end:%Y-%m-%d},{count}"
     return f"{base}," if market == "A" else base
+
+
+def kline_path(market: str, symbol: str) -> str:
+    """这个 symbol 的日线该问哪个端点。
+
+    `fqkline/get` 对 `bj` 前缀只回**最后一根**（实测 2026-11-02：`day` 数组一行），
+    同一串参数在 `newfqkline/get` 上给 245 根。坏的地方不在「没答」，在它答得像：
+    入库一行、补数队列被 `mark_done_by_code` 结掉、图上只剩一个点，而没有任何一处
+    说这只票缺了什么（D272 的第二层——号段修对之后才会看见这一条）。
+
+    沪深与港美照旧走原来的端点：新端点对它们给的行更宽（能越过问出去的 `start` 往前
+    多要几百根），收不收那些行是另一个问题，不在这一片里顺手改。
+    """
+    if market == "A" and is_beijing(symbol[2:]):
+        return NEW_KLINE_URL
+    return KLINE_PATHS[market]
 
 
 def _bars_for(start: date, end: date) -> int:

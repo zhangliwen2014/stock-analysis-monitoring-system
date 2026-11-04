@@ -1,7 +1,9 @@
 """`symbol_backfills` 的读写：新票的补数排队簿。
 
-`open_key`（`'{market}|{code}'`，结案置 NULL）是去重键：DuckDB 没有 partial
-unique index，唯一索引里 NULL 互不冲突，于是「开放期只许一条」就靠非空那一份。
+一行是「某只票欠某一种活」：`kind` 有 `bars`（补日线）与 `actions`（确认公司行为覆盖），
+两者是不同的账，同一票可以各挂一条开放行。`open_key`（`'{market}|{code}|{kind}'`，结案置
+NULL）是去重键：DuckDB 没有 partial unique index，唯一索引里 NULL 互不冲突，于是
+「同一票同一活开放期只许一条」就靠非空那一份。
 状态只有三个：pending（可试）、deferred（今日试满 3 次，让位盘后任务）、done。
 """
 
@@ -19,6 +21,11 @@ from sams.storage.db import Database
 PENDING = "pending"
 DEFERRED = "deferred"
 
+#: 队列里的两种活。默认给 `bars`：既有调用方（自选、看板、成交）说的是「这票一根 K 线都没有」，
+#: 加列之前那就是队列唯一的一种活（spec 2026-11-03 §3.3）
+BARS = "bars"
+ACTIONS = "actions"
+
 
 @dataclass(frozen=True)
 class BackfillRow:
@@ -28,20 +35,21 @@ class BackfillRow:
     tries: int
     last_error: str | None
     status: str
+    kind: str = BARS
 
 
 #: `BackfillRow` 的列清单：take_pending 与 open_for 读的是同一个形状，
 #: 两处各写一遍时，加一列只需要改一个地方
-_OPEN_COLUMNS = "id, market, code, tries, last_error, status"
+_OPEN_COLUMNS = "id, market, code, tries, last_error, status, kind"
 
 
 class SymbolBackfillRepo:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def enqueue(self, market: str, code: str) -> bool:
-        """排上返回 True；同一票已在开放队列里返回 False（不重复排队）。"""
-        key = f"{market}|{code}"
+    def enqueue(self, market: str, code: str, kind: str = BARS) -> bool:
+        """排上返回 True；同一票的同一种活已在开放队列里返回 False（不重复排队）。"""
+        key = f"{market}|{code}|{kind}"
         with self.db.transaction():
             # 查后插放在一个事务里：两个并发都看见 None 时，唯一索引是最后的兜底
             existing = self.db.scalar(
@@ -51,9 +59,9 @@ class SymbolBackfillRepo:
                 return False
             self.db.execute(
                 "INSERT INTO symbol_backfills"
-                " (id, market, code, tries, status, open_key, created_at)"
-                " VALUES (?, ?, ?, 0, 'pending', ?, now())",
-                [uuid4().hex, market, code, key],
+                " (id, market, code, tries, status, open_key, created_at, kind)"
+                " VALUES (?, ?, ?, 0, 'pending', ?, now(), ?)",
+                [uuid4().hex, market, code, key, kind],
             )
         return True
 
@@ -73,12 +81,16 @@ class SymbolBackfillRepo:
             [row_id],
         )
 
-    def mark_done_by_code(self, market: str, code: str) -> None:
-        """盘后日线任务替补数队列收尾：只要成功写进行，开放的那条就算结清。"""
+    def mark_done_by_code(self, market: str, code: str, kind: str = BARS) -> None:
+        """盘后日线任务替补数队列收尾：只要成功写进行，开放的那条就算结清。
+
+        按 kind 结：日线写成功了就把同一票的「公司行为待确认」也标成 done，那条覆盖就永远
+        补不上了——而界面上刚说过的「后台已排队」变成假话。
+        """
         self.db.execute(
             "UPDATE symbol_backfills SET status = 'done', open_key = NULL, done_at = now()"
-            " WHERE market = ? AND code = ? AND open_key IS NOT NULL",
-            [market, code],
+            " WHERE market = ? AND code = ? AND kind = ? AND open_key IS NOT NULL",
+            [market, code, kind],
         )
 
     def note_failure(self, row_id: str, error: str, *, max_tries: int = 3) -> str:
@@ -100,10 +112,28 @@ class SymbolBackfillRepo:
             raise ValueError(f"补数记录 {row_id} 不存在")
         return str(status)
 
-    def open_for(self, market: str, code: str) -> BackfillRow | None:
+    def rearm_deferred(self, kind: str) -> int:
+        """把某种活顺延到明天的行重新排上，返回顺延了几条（新的重试预算）。
+
+        `deferred` 那句话的承诺是「今天的预算用光」，所以跨天必须有人把它兑掉：日线有盘后任务
+        结案，而公司行为的今晚 job 只跑 universe（自选/持仓/规则/论点），队列里那条非 universe
+        的行不然会永远躺在 deferred（spec 2026-11-03 §3.4）。
+        """
+        found = self.db.scalar(
+            "SELECT count(*) FROM symbol_backfills WHERE status = ? AND kind = ?",
+            [DEFERRED, kind],
+        )
+        self.db.execute(
+            "UPDATE symbol_backfills SET status = ?, tries = 0, last_error = NULL"
+            " WHERE status = ? AND kind = ?",
+            [PENDING, DEFERRED, kind],
+        )
+        return int(found or 0)
+
+    def open_for(self, market: str, code: str, kind: str = BARS) -> BackfillRow | None:
         rows = self.db.query(
             f"SELECT {_OPEN_COLUMNS} FROM symbol_backfills WHERE open_key = ?",
-            [f"{market}|{code}"],
+            [f"{market}|{code}|{kind}"],
         )
         return None if rows.is_empty() else BackfillRow(**rows.to_dicts()[0])
 

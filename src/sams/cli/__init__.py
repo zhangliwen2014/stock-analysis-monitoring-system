@@ -14,11 +14,14 @@ from sams.bootstrap import build_container
 from sams.cli import (
     alert,
     analysis,
+    attribution,
     calendar,
     channel,
     db,
     health,
     ledger,
+    nav,
+    portfolio,
     rule,
     schedule,
     screen,
@@ -45,9 +48,12 @@ COMMAND_MODULES = (
     thesis,
     ledger,
     channel,
+    nav,
+    portfolio,
     rule,
     schedule,
     alert,
+    attribution,
 )
 
 

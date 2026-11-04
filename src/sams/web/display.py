@@ -9,6 +9,8 @@ from datetime import date, datetime
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
+from sams.core.assumptions import format_value
+from sams.core.notify import SEVERITY_LABELS
 from sams.core.quotes import CLOSED, DELAYED, LIVE, NO_DATA, STALE
 from sams.storage.repos.alerts import ACKNOWLEDGED, DISMISSED, HANDLED, NEW
 
@@ -19,6 +21,37 @@ _STATE_LABEL = {
     STALE: "停更",
     NO_DATA: "无行情",
 }
+
+
+#: 持仓行这一格价格是哪一种（D232）：休市/陈旧时是收盘，别写成现价
+_PRICE_KINDS = {"live": "盘中", "delayed": "延时", "close": "收盘", "stale": "旧价"}
+
+
+def price_kind_label(kind: str) -> str:
+    return _PRICE_KINDS.get(kind, kind)
+
+
+def price_point_label(
+    kind: str, day: date | None, at: datetime | None = None, tz: str | None = None
+) -> str:
+    """统一报价读模型那一格的时点（S0-E）：`14:47 盘中` / `10-30 收盘`。
+
+    盘中要给到分钟：只说「今天」的话，同一天上午和收盘前看到的是两个价。
+    休市/陈旧回落的收盘价必须带日期：没有日期的「收盘」在周六看起来和今天一样新。
+    旧价（库里还没有日线，只有板上那口）把日子和时刻一起给：它可能已经是几天前的。
+    """
+    if kind in ("live", "delayed") and at is not None:
+        return f"{hm(at, tz)} {price_kind_label(kind)}"
+    if day is None:
+        return "—"
+    if kind == "stale" and at is not None:
+        return f"{day:%m-%d} {hm(at, tz)} {price_kind_label(kind)}"
+    return f"{day:%m-%d} {price_kind_label(kind)}"
+
+
+def metric_value(metric: str, value: float | None) -> str:
+    """假设的读数：排法与调度告警共用 `core.assumptions.format_value`，不各写一份。"""
+    return format_value(metric, value)
 
 
 def state_label(state: str) -> str:
@@ -42,6 +75,24 @@ def pct_class(value: float | None) -> str:
     if value is None:
         return ""
     return "up" if value > 0 else ("down" if value < 0 else "")
+
+
+def percent(value: float | None, digits: int = 1) -> str:
+    """小数比率 → 屏幕上的百分数（0.0336 → 3.4%）；None 是一个「—」。"""
+    return "—" if value is None else f"{value * 100:.{digits}f}%"
+
+
+def odds_text(value: float | None) -> str:
+    """赔率保留一位小数；超过 10 写「>10」，不拿一个两位小数暗示精度。"""
+    if value is None:
+        return "—"
+    return ">10" if value > 10 else f"{value:.1f}"
+
+
+def odds_range_text(low: float | None, high: float | None) -> str:
+    if low is None or high is None:
+        return "—"
+    return f"{odds_text(low)} ~ {odds_text(high)}"
 
 
 def ratio_num(value: float | None, digits: int = 2) -> float | None:
@@ -120,6 +171,15 @@ def hms(moment: datetime | None, tz: str | None = None) -> str:
     if tz and moment.tzinfo is not None:
         moment = moment.astimezone(ZoneInfo(tz))
     return moment.strftime("%H:%M:%S")
+
+
+def hm(moment: datetime | None, tz: str | None = None) -> str:
+    """到分钟的时刻：报价那一格「14:47 盘中」不需要秒，秒只会把列撑宽。"""
+    if moment is None:
+        return "—"
+    if tz and moment.tzinfo is not None:
+        moment = moment.astimezone(ZoneInfo(tz))
+    return moment.strftime("%H:%M")
 
 
 def moment_label(value: datetime | None, tz: str | None = None, *, seconds: bool = False) -> str:
@@ -203,10 +263,8 @@ def dismiss_label(value: str | None) -> str:
     return DISMISS_LABELS.get(value, value)
 
 
-#: 三档严重级别的中文名。规则列表、规则表单、告警筛选与徽标说的是同一套话：
-#: 一半屏幕叫「档位」、另一半叫「级别」，读的人要先猜它们是不是一件事
-SEVERITY_LABELS = {"strong": "强", "mid": "中", "weak": "弱"}
-
+#: 三档严重级别的中文名住在 core：摘要正文与规则告警文案说的是同一套话，
+#: 各写一份就会在「强」与「strong」之间漂
 
 def severity_label(value: str | None) -> str:
     if not value:

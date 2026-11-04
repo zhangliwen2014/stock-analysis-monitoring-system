@@ -1,11 +1,12 @@
 {% extends "base.html" %}
 {% block title %}{{ title }}{% endblock %}
 {% block content %}
+<p><a href="{{ back_url }}">{{ back_label }}</a></p>
 <section class="card">
   <h1>{{ thesis.market }}/{{ thesis.code }} <span class="badge">{{ thesis.status }}</span></h1>
   <p class="muted">
     打分模板 {{ thesis.style }} · id {{ thesis.id }} ·
-    <a href="/symbol/{{ thesis.market }}/{{ thesis.code }}">这只票的现场</a>
+    <a href="/symbol/{{ thesis.market }}/{{ thesis.code }}?back={{ page_url|urlencode }}">这只票的现场</a>
   </p>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
   {% if steps %}
@@ -58,6 +59,57 @@
     </tr>
     {% endif %}
   </table>
+</section>
+
+<section class="card">
+  <h2>证伪台账 <span class="muted">哪条假设被证伪、哪条还成立</span></h2>
+  {% if assumptions %}
+  <table>
+    <tr><th>假设</th><th>复核日</th><th>上次判定</th><th class="num">读数</th><th></th></tr>
+    {% for item in assumptions %}
+    <tr>
+      <td>{{ item.metric_label }} {{ item.op_label }} {{ item.threshold }}
+        {% if item.note %}<span class="muted">{{ item.note }}</span>{% endif %}</td>
+      <td>{{ item.due_on or "—" }}</td>
+      <td>{{ item.status_label }}
+        {% if item.evaluated_on %}<span class="muted">{{ item.evaluated_on }}</span>{% endif %}</td>
+      <td class="num">{{ item.value }}</td>
+      <td>
+        <form method="post" action="/theses/{{ thesis.id }}/assumptions/{{ item.id }}/delete" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <form method="post" action="/theses/{{ thesis.id }}/assumptions/evaluate" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">按今天判一次</button>
+    <span class="muted">读截至今天的已披露财报与最近一天估值；数据不够的那条标「数据不足」，不当作证伪。</span>
+  </form>
+  {% else %}
+  <p class="muted">还没有假设。先写一条能被证伪的：指标、方向、阈值，最好带复核日。</p>
+  {% endif %}
+
+  <form method="post" action="/theses/{{ thesis.id }}/assumptions" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>指标
+      <select name="metric">
+        {% for key, label in metrics.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>方向
+      <select name="op">
+        {% for key, label in ops.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>阈值 <input name="threshold" size="8" placeholder="0.15 或 12"></label>
+    <label>复核日 <input type="date" name="due_on"></label>
+    <input name="note" placeholder="为什么这条重要（可空）">
+    <button type="submit">加一条</button>
+  </form>
+  <p class="muted">比率类按小数填（ROE 15% 写 0.15）；PE/PB/PR 是倍数，直接填数。</p>
 </section>
 
 <section class="card">

@@ -25,8 +25,9 @@ from sams.core.screener_recipes import recipes_for
 from sams.services.screener import preset_strategy_id
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
-from sams.web.display import moment_label
+from sams.web.display import moment_label, money
 from sams.web.forms import form_data, many, one
+from sams.web.quotes import QuoteView, price_unit, quote_reader
 
 router = APIRouter()
 
@@ -51,6 +52,9 @@ def screen_page(request: Request):
         page=_page_number(query.get("page")),
         confirm_all=query.get("confirm") == "all",
         notice=_notice(query),
+        selected=set(query.getlist("sel")),
+        include_negatives=query.get("include_negatives") == "1",
+        include_st=query.get("include_st") == "1",
     )
 
 
@@ -83,6 +87,9 @@ def _render(
     confirm_all: bool = False,
     error: str = "",
     notice: str = "",
+    selected: set[str] | None = None,
+    include_negatives: bool = False,
+    include_st: bool = False,
 ):
     web = request.app.state.web
     ctx = web.contexts.current()
@@ -97,14 +104,21 @@ def _render(
         try:
             conditions = _conditions(rows)
             if conditions:
-                result = ctx.screener.run(market, conditions)
+                result = ctx.screener.run(
+                    market,
+                    conditions,
+                    positive_only=not include_negatives,
+                    include_st=include_st,
+                )
         except ValidationError as exc:
             error = str(exc)
     # 范围行与结果出自同一次采：有结果时就用引擎读到的那一份，别再回库猜一遍
     day = result.day if result is not None else ctx.snapshot_store.latest_day(market)
     if day is not None:
         if result is not None:
-            taken_at, pool = result.taken_at, result.universe_size
+            taken_at = result.taken_at
+            # 票池说的是快照 ∩ 代码表；ST/退市虽未参与比较，仍属于这个市场
+            pool = result.universe_size + result.st_excluded
         else:
             frame = ctx.snapshot_store.load_day(market, day)
             taken_at = None if frame.is_empty() else frame["taken_at"].max()
@@ -150,7 +164,18 @@ def _render(
             "capped": max(0, len(hits) - already - quota),
             "max": MAX_ITEMS_PER_USER,
         }
-    view = [_hit_row(hit, conditions, held) for hit in shown]
+    # 报价走统一读模型（S0-E）：盘中是过闸的报价，休市回落库内最后一根不复权收盘。
+    # 这一页原先把快照那天的 `price` 当现价——周六看到的价与看板不是同一个数
+    now = web.core.clock.now_utc()
+    quotes = (
+        quote_reader(ctx, web.core, now).views(market, [hit.code for hit in shown])
+        if shown
+        else {}
+    )
+    view = [
+        _hit_row(ctx, hit, conditions, held, quotes.get(hit.code), market=market, day=day)
+        for hit in shown
+    ]
     counts_view = (
         [
             {
@@ -159,21 +184,34 @@ def _render(
                 "passed": item.passed,
                 "failed": item.failed,
                 "missing": item.missing,
+                "nonpositive": item.nonpositive,
             }
             for item in result.fields
         ]
         if result is not None
         else []
     )
+    options = {"include_negatives": include_negatives, "include_st": include_st}
     pager = {
-        "prev": _url(market, rows, preset=preset, page=page - 1) if page > 1 else "",
-        "next": _url(market, rows, preset=preset, page=page + 1) if page < pages else "",
+        "prev": _url(market, rows, preset=preset, page=page - 1, **options)
+        if page > 1
+        else "",
+        "next": _url(market, rows, preset=preset, page=page + 1, **options)
+        if page < pages
+        else "",
     }
+    # 详情页的「返回」要落回**这一屏**（条件与页号），不是落回一张空表的 /screen
+    back_url = _url(market, rows, preset=preset, page=page, **options)
     presets_view = []
+    channels = [
+        {"id": channel.id, "name": channel.name}
+        for channel in ctx.channels_store.list_for(user.id)
+    ]
+    channel_names = {channel["id"]: channel["name"] for channel in channels}
     for item in ctx.screener_presets.list(user.id):
         runs = ctx.scan_store.recent(
             market=item.market,
-            strategy_id=preset_strategy_id(item.name, item.conditions),
+            strategy_id=preset_strategy_id(item.id, item.conditions),
             limit=1,
         )
         presets_view.append(
@@ -188,6 +226,19 @@ def _render(
                 "last_run": moment_label(runs[0]["created_at"], ctx.settings.server.display_tz)
                 if runs
                 else "",
+                "enabled": item.enabled,
+                "channel_ids": item.channel_ids,
+                "channels_label": "、".join(
+                    channel_names.get(channel_id, channel_id)
+                    for channel_id in item.channel_ids
+                )
+                or "只进告警中心",
+                "monitored_at": moment_label(
+                    item.last_run_at, ctx.settings.server.display_tz
+                )
+                if item.last_run_at is not None
+                else "还没运行",
+                "members": ctx.screener_hits.count(user.id, item.id),
             }
         )
     recipes_view = [
@@ -205,10 +256,12 @@ def _render(
         }
         for item in recipes_for(market)
     ]
-    add_url = _url(market, [*rows, _draft()])
-    remove_urls = [_url(market, rows[:i] + rows[i + 1 :]) for i in range(len(rows))]
+    add_url = _url(market, [*rows, _draft()], **options)
+    remove_urls = [
+        _url(market, rows[:i] + rows[i + 1 :], **options) for i in range(len(rows))
+    ]
     if not rows:
-        add_url = _url(market, [_draft()])
+        add_url = _url(market, [_draft()], **options)
     return web.render(
         request,
         "screen.html",
@@ -226,8 +279,12 @@ def _render(
         labels=[specs[item.field] for item in conditions] if result is not None else [],
         counts_view=counts_view,
         view=view,
+        selected=selected or set(),
         total=total,
+        back_url=back_url,
         sort_hint=result.order_note if result is not None else "",
+        basis_note=result.basis_note if result is not None else "",
+        financial_coverage=result.financial_coverage if result is not None else None,
         pages=pages,
         pager=pager,
         missing=result.missing if result is not None else (),
@@ -240,7 +297,10 @@ def _render(
         page=page,
         plan=plan,
         confirm_all=confirm_all,
+        include_negatives=include_negatives,
+        include_st=include_st,
         presets=presets_view,
+        channels=channels,
         recipes=recipes_view,
     )
 
@@ -301,10 +361,19 @@ def _condition(row: dict) -> Condition:
 
 
 def _number(text: str, name: str) -> float:
+    """错误里用屏幕上的中文标签（R-09）：`pe_ttm` 是词表里的名字，不是给人看的。"""
+    label = next((item.label for item in FIELDS if item.name == name), name)
     try:
         return float(text)
     except ValueError:
-        raise ValidationError(f"{name} 的值要一个数，收到 {text!r}") from None
+        raise ValidationError(f"{label} 的值要一个数，收到 {text!r}") from None
+
+
+def _switches(data: dict[str, list[str]]) -> dict[str, bool]:
+    return {
+        "include_negatives": one(data, "include_negatives") == "1",
+        "include_st": one(data, "include_st") == "1",
+    }
 
 
 def _url(
@@ -316,6 +385,9 @@ def _url(
     confirm: bool = False,
     notice: str = "",
     extra: dict | None = None,
+    selected: list[str] | None = None,
+    include_negatives: bool = False,
+    include_st: bool = False,
 ) -> str:
     pairs: list[tuple[str, str]] = [("market", market)]
     if preset is not None:
@@ -327,10 +399,16 @@ def _url(
         pairs.append(("page", str(page)))
     if confirm:
         pairs.append(("confirm", "all"))
+    if include_negatives:
+        pairs.append(("include_negatives", "1"))
+    if include_st:
+        pairs.append(("include_st", "1"))
     if notice:
         pairs.append(("notice", notice))
     for key, value in (extra or {}).items():
         pairs.append((key, str(value)))
+    for code in selected or ():
+        pairs.append(("sel", code))
     return f"/screen?{urlencode(pairs)}"
 
 
@@ -350,11 +428,15 @@ def _notice(query) -> str:
     if kind == "edited":
         return "方案的名字与说明已更新"
     if kind == "updated":
-        return "方案的条件已覆盖为当前这一组"
+        return "方案的条件已覆盖为当前这一组；下次自动运行只记基线，不推送"
     if kind == "deleted":
         return "方案已删除（已加进自选的票不受影响）"
     if kind == "ran":
         return "方案已按今天的快照重跑"
+    if kind == "monitor_on":
+        return "自动监控已开启：第一次运行只记基线，不推送"
+    if kind == "monitor_off":
+        return "自动监控已关闭"
     if kind == "added":
         added = _count(query.get("added"))
         already = _count(query.get("already"))
@@ -378,6 +460,7 @@ def recollect(
     ctx = request.app.state.web.contexts.current()
     market = one(data, "market").strip().upper()
     rows = _posted_rows(data)
+    switches = _switches(data)
     try:
         ctx.scheduler.request_run(job="spot", market=market)
     except ValidationError as exc:
@@ -388,11 +471,33 @@ def recollect(
             preset=None,
             rows=rows,
             error=str(exc),
+            **switches,
         )
-    return RedirectResponse(_url(market, rows, notice="queued"), status_code=303)
+    return RedirectResponse(
+        _url(market, rows, notice="queued", **switches), status_code=303
+    )
 
 
-def _hit_row(hit, conditions: tuple[Condition, ...], held: set[str]) -> dict:
+def _hit_row(
+    ctx,
+    hit,
+    conditions: tuple[Condition, ...],
+    held: set[str],
+    quote: QuoteView | None,
+    *,
+    market: str,
+    day,
+) -> dict:
+    """结果表里的一行。价那一格与看板同源；库里还没有这只票的日线时退回快照那天的价，
+    并把「10-28 快照」写出来——快照价不是现价，假装成现价就是另一个数。"""
+    unit = quote.unit if quote is not None else price_unit(ctx, market, hit.code)
+    if quote is not None and quote.price is not None:
+        price = money(quote.price, unit)
+        price_point = quote.label
+    else:
+        raw = hit.values.get("price")
+        price = money(raw, unit) if raw is not None else "—"
+        price_point = f"{day:%m-%d} 快照" if raw is not None and day is not None else ""
     return {
         "code": hit.code,
         "name": hit.name or "—",
@@ -400,7 +505,8 @@ def _hit_row(hit, conditions: tuple[Condition, ...], held: set[str]) -> dict:
             "—" if hit.values.get(item.field) is None else f"{hit.values[item.field]:g}"
             for item in conditions
         ],
-        "price": "—" if hit.values.get("price") is None else f"{hit.values['price']:g}",
+        "price": price,
+        "price_point": price_point,
         "held": hit.code in held,
     }
 
@@ -421,13 +527,31 @@ def add_to_watchlist(
     market = one(data, "market").strip().upper()
     rows = _posted_rows(data)
     action = one(data, "action")
+    page = _page_number(one(data, "page"))
+    switches = _switches(data)
     if action == "all":
         if one(data, "confirm") != "yes":
-            return RedirectResponse(_url(market, rows, confirm=True), status_code=303)
+            return RedirectResponse(
+                _url(market, rows, page=page, confirm=True, **switches),
+                status_code=303,
+            )
         try:
-            result = ctx.screener.run(market, _conditions(rows))
+            result = ctx.screener.run(
+                market,
+                _conditions(rows),
+                positive_only=not switches["include_negatives"],
+                include_st=switches["include_st"],
+            )
         except ValidationError as exc:
-            return _render(request, user, market=market, preset=None, rows=rows, error=str(exc))
+            return _render(
+                request,
+                user,
+                market=market,
+                preset=None,
+                rows=rows,
+                error=str(exc),
+                **switches,
+            )
         codes = [hit.code for hit in result.hits]
     elif action == "checked":
         codes = [code.strip() for code in many(data, "codes") if code.strip()]
@@ -451,8 +575,11 @@ def add_to_watchlist(
         _url(
             market,
             rows,
+            page=page,
             notice="added",
             extra={"added": added, "already": already, "capped": capped},
+            selected=codes if action == "checked" else None,
+            **switches,
         ),
         status_code=303,
     )
@@ -475,6 +602,7 @@ def save_preset(
     ctx = request.app.state.web.contexts.current()
     market = one(data, "market").strip().upper()
     rows = _posted_rows(data)
+    switches = _switches(data)
     try:
         ctx.screener_presets.create(
             user.id,
@@ -484,8 +612,18 @@ def save_preset(
             description=one(data, "description"),
         )
     except ValidationError as exc:
-        return _render(request, user, market=market, preset=None, rows=rows, error=str(exc))
-    return RedirectResponse(_url(market, rows, notice="saved"), status_code=303)
+        return _render(
+            request,
+            user,
+            market=market,
+            preset=None,
+            rows=rows,
+            error=str(exc),
+            **switches,
+        )
+    return RedirectResponse(
+        _url(market, rows, notice="saved", **switches), status_code=303
+    )
 
 
 @router.post("/screen/presets/{preset_id}/run")
@@ -504,11 +642,39 @@ def run_preset(request: Request, preset_id: str, _csrf: None = Depends(csrf_prot
         ctx.scan_store.record(
             on=result.day,
             market=preset.market,
-            strategy_id=preset_strategy_id(preset.name, preset.conditions),
+            strategy_id=preset_strategy_id(preset.id, preset.conditions),
             universe_size=result.universe_size,
             hits=[{"code": hit.code, "name": hit.name, **hit.values} for hit in result.hits],
         )
     return RedirectResponse(_url(preset.market, [], preset=preset, notice="ran"), status_code=303)
+
+
+@router.post("/screen/presets/{preset_id}/monitor")
+def toggle_monitor(
+    request: Request,
+    preset_id: str,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _FORM_BODY,
+):
+    """开关自动监控并写下新命中会走的渠道（S4-B / D254–D256）。
+
+    关→开会把 `last_run_at` 归空：第一次运行只记基线，不把整篮票当「新命中」推出去。
+    渠道为空不是「没开」——告警仍进告警中心，只是不往外发。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    preset = _preset(ctx, user.id, preset_id)
+    enabled = "enabled" in data
+    ctx.screener_presets.set_monitor(
+        user.id,
+        preset.id,
+        enabled=enabled,
+        channel_ids=many(data, "channel_ids"),
+    )
+    return RedirectResponse(
+        _url(preset.market, [], preset=preset, notice="monitor_on" if enabled else "monitor_off"),
+        status_code=303,
+    )
 
 
 @router.post("/screen/presets/{preset_id}/edit")
@@ -547,6 +713,7 @@ def overwrite_preset(
     preset = _preset(ctx, user.id, preset_id)
     market = one(data, "market").strip().upper()
     rows = _posted_rows(data)
+    switches = _switches(data)
     if market != preset.market:
         return _render(
             request,
@@ -555,12 +722,24 @@ def overwrite_preset(
             preset=preset,
             rows=rows,
             error=f"方案的市场不能改（现在是 {preset.market}）：要换市场请另存一条",
+            **switches,
         )
     try:
         ctx.screener_presets.update_conditions(user.id, preset.id, list(_conditions(rows)))
     except ValidationError as exc:
-        return _render(request, user, market=market, preset=preset, rows=rows, error=str(exc))
-    return RedirectResponse(_url(market, rows, preset=preset, notice="updated"), status_code=303)
+        return _render(
+            request,
+            user,
+            market=market,
+            preset=preset,
+            rows=rows,
+            error=str(exc),
+            **switches,
+        )
+    return RedirectResponse(
+        _url(market, rows, preset=preset, notice="updated", **switches),
+        status_code=303,
+    )
 
 
 @router.post("/screen/presets/{preset_id}/delete")

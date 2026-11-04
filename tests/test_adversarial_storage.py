@@ -708,6 +708,77 @@ def test_two_handles_on_the_same_path_in_one_process_share_the_database(tmp_path
     b.close()
 
 
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+
+
+def _spawn(body: str) -> None:
+    subprocess.run([sys.executable, "-c", body], check=True, timeout=180)
+
+
+def test_should_still_delete_rows_that_came_back_from_the_wal(tmp_path):
+    """重放 WAL 的那一程必须紧接着 checkpoint，否则它自己把索引写坏。
+
+    DuckDB 的实测（上游 duckdb#26106，本仓库在 2.0.0 上复现）：一个进程没 checkpoint
+    就死了（被 kill、崩在夜里、验收时 Ctrl-C），下一个进程 open 时重放 WAL，行回到了表里，
+    但那一程的**第一次自动 checkpoint**（`wal_autocheckpoint` 越过阈值那一下）会把这些行的
+    索引项丢掉，而且丢的是**落盘的那份**：再下一程删到它们时抛
+    `Failed to delete all rows from index`，那是 FATAL——整个库实例作废，进程里后面的每一条
+    SQL 都失败，只能重启。2026-11-03 生产上崩的就是每晚的净值 job（`nav_holding_daily`
+    整段先删后写，删的正是上一程 CLI 回填留下的那 8 行）。
+    紧跟着重放做一次显式 `CHECKPOINT` 就不坏，所以这条路收在 `Database.open` 里（D282）。
+
+    四个进程，因为坏掉的索引只有下一程才看得见：①schema 落盘 → ②写一行到 WAL 后硬退
+    → ③走 `Database.open` 重放并撑过自动 checkpoint → ④删那一行。
+    """
+    path = tmp_path / "wal_replay.duckdb"
+    first = Database.open(path)
+    try:
+        apply_migrations(first)
+        first.execute("CHECKPOINT")
+    finally:
+        first.close()
+    assert not Path(str(path) + ".wal").exists()
+
+    # ②只进 WAL 的一行：`source` 没被索引，最后一程从扫描路把这些行喂给索引去删
+    _spawn(
+        "import os, duckdb\n"
+        f"con = duckdb.connect({str(path)!r})\n"
+        'con.execute("INSERT INTO bars_daily (market, code, date, close, source)'
+        " VALUES ('A', 'walrow', DATE '2026-01-05', 1.0, 'walprobe')\")\n"
+        "os._exit(0)\n"
+    )
+    wal = Path(str(path) + ".wal")
+    assert wal.exists() and wal.stat().st_size > 0, "上一程没留下 WAL，这条测试就没在测那件事"
+
+    # ③重放这一程走的就是被测的 `Database.open`，然后撑过它自己的自动 checkpoint
+    _spawn(
+        "import os, sys\n"
+        f"sys.path.insert(0, {_SRC!r})\n"
+        "from sams.storage.db import Database\n"
+        f"db = Database.open({str(path)!r})\n"
+        "db.conn.execute(\"SET wal_autocheckpoint='1KB'\")\n"
+        'db.execute("CREATE TABLE bulk_probe AS SELECT * FROM range(20000) r(x)")\n'
+        "os._exit(0)\n"
+    )
+
+    reopened = Database.open(path)
+    try:
+        # 行一直在（扫描读得到），坏的是索引：能删才说明这条路真的被带正了
+        assert reopened.scalar("SELECT count(*) FROM bars_daily WHERE source='walprobe'") == 1
+        try:
+            reopened.execute("DELETE FROM bars_daily WHERE source = 'walprobe'")
+        except StorageError as exc:
+            pytest.fail(f"重放回来的行删不动（索引项被那一程的自动 checkpoint 丢了）：{exc}")
+        assert reopened.scalar("SELECT count(*) FROM bars_daily WHERE source='walprobe'") == 0
+    finally:
+        reopened.close()
+
+
+# 这一条没有「更便宜的写法」：试过只问文件（重放那一程之后 WAL 还在不在），但纯 DDL 的 WAL
+# 本来就会被 DuckDB 在恢复时并进主文件，掐掉 `open` 里的 checkpoint 它也照样消失——那条断言
+# 是空的。坏掉的索引只有**下一程删那些行**才看得见，所以这里必须是四个进程。
+
+
 # ==================== 5. 其它仓库 ====================
 
 

@@ -30,6 +30,7 @@ from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import StorageError, ValidationError
 from sams.core.fundamentals import (
     FINANCIAL_COLUMNS,
+    FISCAL_YEAR_ANNUAL_MARKETS,
     FLOW_COLUMNS,
     RATIO_BOUNDS,
     ROE_BASIS,
@@ -37,6 +38,7 @@ from sams.core.fundamentals import (
     TEXT_COLUMNS,
     VALUATION_COLUMNS,
     out_of_caliber,
+    ratio_bound,
 )
 from sams.storage.db import Database
 from sams.storage.repos._keys import normalize_keys
@@ -48,22 +50,25 @@ logger = logging.getLogger("sams.storage.fundamentals")
 _GROWTH_LEVELS = {"revenue_yoy": "revenue", "profit_yoy": "net_profit"}
 
 
-def _basis_clause(basis: str) -> str:
-    """ROE 口径 → SQL 谓词（D62）。认报告期的日历日，不认名字或字段。
+def _basis_clause(basis: str, *, market: str | None = None) -> str:
+    """ROE 口径 → SQL 谓词（D62 + D228）。认报告期的日历日，不认名字或字段。
 
     这一句只写在这里，不散进调用方：口径的日历日判据是 D62 的全部内容，
     改一次就要改所有读侧，而漏改一处的症状是「扫出的票数与算出 PR 的票数对不上」。
     打印用的同一句判据是 `core.fundamentals.is_year_end()`（两处一起改）。
+
+    美股是例外（D228）：财年可以 9 月末结账，按 12-31 认年报会把每一行都排除掉。
+    这些市场的年报认源给的报告类型，`FISCAL_YEAR_ANNUAL_MARKETS` 是唯一名单。
     """
     if basis not in ROE_BASIS:
         raise ValidationError(
             f"ROE 口径只认 {' 或 '.join(ROE_BASIS)}（年报 / 最新一期），收到 {basis!r}"
         )
-    return (
-        "AND month(report_date) = 12 AND day(report_date) = 31"
-        if basis == ROE_BASIS_ANNUAL
-        else ""
-    )
+    if basis != ROE_BASIS_ANNUAL:
+        return ""
+    if market in FISCAL_YEAR_ANNUAL_MARKETS:
+        return "AND report_type = '年报'"
+    return "AND month(report_date) = 12 AND day(report_date) = 31"
 
 
 def _last_year(day: date) -> date:
@@ -154,12 +159,24 @@ def _prepare(
     )
     # 小数口径越界（多半是百分数没换算，D58 + D66）：置空那一列，留 warn 给人看。
     # 判据逐行走 core 那一个 `out_of_caliber`，不在这里重写 `>=`：仓库拦下而命令行放过的
-    # 数，最后会以「同一个数在两侧口径不同」的形状出现在 PR 里
+    # 数，最后会以「同一个数在两侧口径不同」的形状出现在 PR 里。
+    # 市场按行带进来（D228）：美股的 ROE 上界与 A 股不同，而同一批行可能来自多个市场。
+    markets = (
+        [
+            canonical_market(item) if item is not None else None
+            for item in out["market"].to_list()
+        ]
+        if "market" in out.columns
+        else [None] * out.height
+    )
     for column in RATIO_BOUNDS:
         if column not in out.columns:
             continue
         flagged = pl.Series(
-            [out_of_caliber(column, value) for value in out[column].to_list()],
+            [
+                out_of_caliber(column, value, market=market)
+                for value, market in zip(out[column].to_list(), markets, strict=True)
+            ],
             dtype=pl.Boolean,
         )
         if column in _GROWTH_LEVELS:
@@ -175,12 +192,20 @@ def _prepare(
             flagged = flagged & ~rescued
         suspect = int(flagged.sum())
         if suspect:
+            ceilings = sorted(
+                {
+                    bound
+                    for market in markets
+                    if (bound := ratio_bound(column, market=market)) is not None
+                }
+            )
+            ceiling_text = "/".join(f"{bound:g}" for bound in ceilings) or "—"
             logger.warning(
-                "%s 有 %d 行的 %s 越出小数口径的可信范围（|x| >= %g，疑似百分数未 ÷100）已置空",
+                "%s 有 %d 行的 %s 越出小数口径的可信范围（|x| >= %s，疑似百分数未 ÷100）已置空",
                 table,
                 suspect,
                 column,
-                RATIO_BOUNDS[column],
+                ceiling_text,
             )
             mark = f"__{column}_out_of_caliber"
             out = (
@@ -278,7 +303,13 @@ class FinancialRepo:
         return prepared.height
 
     def load_as_of(
-        self, market: str, codes: list[str], as_of: date, *, basis: str = ROE_BASIS_ANNUAL
+        self,
+        market: str,
+        codes: list[str],
+        as_of: date,
+        *,
+        basis: str = ROE_BASIS_ANNUAL,
+        include_undated: bool = False,
     ) -> tuple[pl.DataFrame, int]:
         """每只票取「`as_of` 那天已经披露的、该口径下最新的一期」，另带回被 NULL 披露日挡掉的行数。
 
@@ -289,33 +320,56 @@ class FinancialRepo:
         `basis`（D62）决定「最新一期」允许落在哪些报告期上：默认只认年报，因为源的
         ROE 是该期累计值，而 PR 的分子 PE(TTM) 是十二个月。`dropped` 按同一口径计——
         把季报的 NULL 披露日也算进「年报口径下被挡掉的行数」，那句话就成了一句谎话。
+
+        `include_undated`（D215）只给「源根本不提供披露日」的市场开口（港股指标源）：
+        那些行按 `report_date <= as_of` 采信，但同一只票已有带披露日的行时，带日期的那期
+        优先——一次源故障留下的 NULL 不该把一期更晚、却没有公开时间的数顶上来。
+        这个开关不是把 PIT 关掉：报告期仍不能晚于截至日。此时 `dropped` 只数报告期晚于
+        截至日的 NULL 行；让位给已披露期的 NULL 行不算——它们不是被披露日挡住的，
+        是被「已披露优先」挡住的。
         """
         market = canonical_market(market)
         if as_of is None:
             raise ValidationError("load_as_of 必须给截至日：PIT 读取没有『默认今天』这条路")
-        clause = _basis_clause(basis)
+        clause = _basis_clause(basis, market=market)
         if not codes:
             return _empty(FINANCIAL_COLUMNS, self.DATE_COLUMNS), 0
         wanted = [canonical_code(market, c) for c in codes]
+        if include_undated:
+            eligible = (
+                "((published_date IS NOT NULL AND published_date <= ?)"
+                " OR (published_date IS NULL AND report_date <= ?))"
+            )
+            order = "(published_date IS NOT NULL) DESC, report_date DESC"
+            params: list = [market, wanted, as_of, as_of]
+        else:
+            eligible = "published_date IS NOT NULL AND published_date <= ?"
+            order = "report_date DESC"
+            params = [market, wanted, as_of]
         frame = self.db.query(
             f"""
             SELECT * EXCLUDE (rnk) FROM (
                 SELECT *,
-                       rank() OVER (PARTITION BY code ORDER BY report_date DESC) AS rnk
+                       rank() OVER (PARTITION BY code ORDER BY {order}) AS rnk
                 FROM financials
                 WHERE market = ? AND code = ANY(?)
-                  AND published_date IS NOT NULL AND published_date <= ?
+                  AND {eligible}
                   {clause}
             ) WHERE rnk = 1
             ORDER BY code
             """,
-            [market, wanted, as_of],
+            params,
         )
+        unadopted = "published_date IS NULL"
+        if include_undated:
+            # 开口之后，只有「报告期还没到」的 NULL 披露日行仍算被挡掉
+            unadopted += " AND report_date > ?"
+        dropped_params: list = [market, wanted] if not include_undated else [market, wanted, as_of]
         dropped = int(
             self.db.scalar(
                 f"SELECT count(*) FROM financials"
-                f" WHERE market = ? AND code = ANY(?) AND published_date IS NULL {clause}",
-                [market, wanted],
+                f" WHERE market = ? AND code = ANY(?) AND {unadopted} {clause}",
+                dropped_params,
             )
             or 0
         )

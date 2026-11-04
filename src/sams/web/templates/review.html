@@ -31,7 +31,7 @@
   {% for row in overdue %}
   <tr>
     <td>{{ row.at }}</td>
-    <td><a href="/alerts/{{ row.id }}">{{ row.symbol }}</a></td>
+    <td><a href="/alerts/{{ row.id }}?back={{ page_url|urlencode }}">{{ row.symbol }}</a></td>
     <td>{{ row.rule_name }}</td>
     <td>{{ row.status }}{% if row.deferred %} <span class="badge">你让它稍后提醒</span>{% endif %}</td>
     <td>
@@ -39,7 +39,7 @@
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <button type="submit">已读</button>
       </form>
-      <a href="/alerts/{{ row.id }}">处置 / 忽略 / 稍后</a>
+      <a href="/alerts/{{ row.id }}?back={{ page_url|urlencode }}">处置 / 忽略 / 稍后</a>
     </td>
   </tr>
   {% endfor %}
@@ -74,7 +74,7 @@
 <h2>本窗口已处置</h2>
 {% for row in handled %}
 <div class="row">
-  <a href="/alerts/{{ row.id }}">{{ row.at }}</a>
+  <a href="/alerts/{{ row.id }}?back={{ page_url|urlencode }}">{{ row.at }}</a>
   {{ row.rule_name }} —
   {% if row.url %}<a href="{{ row.url }}">{{ row.label }}</a>{% else %}{{ row.label }}{% endif %}
 </div>

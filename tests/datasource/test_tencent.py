@@ -206,7 +206,58 @@ def test_a_share_request_targets_fqkline_with_empty_adjust():
     adapter, get, _ = adapter_with(A_PAYLOAD)
     adapter.daily_bars("A", "600519", START, END)
     url, param = get.calls[0]
-    assert url.endswith("fqkline/get") and param.endswith(",")
+    assert url.split("/app/")[-1] == "fqkline/get" and param.endswith(",")
+
+
+def test_beijing_codes_are_asked_on_the_endpoint_that_has_history():
+    """`fqkline/get` 对 `bj920020` 只回**最后一根**，`newfqkline/get` 回 245 根（实测 2026-11-02）。
+
+    这不是「静默回空」那种一眼看得见的坏：它回一条字段齐全、日期正常的单根序列，
+    `bars_daily` 有了一行、补数队列被 `mark_done_by_code` 结掉，而图上只有一个点。
+    北交所的号段判据只写在一处（`core/codes.is_beijing`），这里只是它的第二个读者。
+    """
+    payload = {
+        "code": 0,
+        "data": {
+            "bj920020": {
+                # 新端点一行十一格：前六格是标准列集，后面多出涨跌幅与成交额
+                "day": [
+                    [
+                        "2026-10-29",
+                        "14.09",
+                        "13.87",
+                        "14.31",
+                        "13.82",
+                        "2623.00",
+                        {},
+                        "0.47",
+                        "367.50",
+                        "0.00",
+                        "0.00",
+                    ],
+                    [
+                        "2026-10-30",
+                        "13.68",
+                        "13.90",
+                        "14.16",
+                        "13.68",
+                        "2237.00",
+                        {},
+                        "0.40",
+                        "312.61",
+                        "0.00",
+                        "0.00",
+                    ],
+                ]
+            }
+        },
+    }
+    adapter, get, _ = adapter_with(payload)
+    frame = adapter.daily_bars("A", "920020", START, END)
+    url, param = get.calls[0]
+    assert url.split("/app/")[-1] == "newfqkline/get"
+    assert param.startswith("bj920020,day,")
+    assert frame["close"].to_list() == [13.87, 13.90]
 
 
 def test_hk_and_us_request_targets_kline_and_carries_resolved_suffix():

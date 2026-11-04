@@ -42,6 +42,7 @@ def as_data(container, settings) -> RuleData:
         theses=container.theses_store,
         watchlists=container.watchlists,
         settings=settings,
+        assumptions=container.assumptions_store,
     )
 
 
@@ -454,6 +455,25 @@ def test_a_hand_typed_target_has_no_reading_day(db, settings):
     got = read_thesis(db, settings)
     assert got.target_price == 30.0
     assert got.target_on is None
+
+
+def test_the_drift_rule_reads_the_assumptions_of_that_thesis(db, settings):
+    """D232 P0-3：`stop.thesis_drift` 的判据是这条论名下的假设，不是全库的假设。"""
+    container = support_valuation.make_container(db, settings)
+    thesis_id = seed_thesis(db)
+    container.assumptions_store.create(
+        thesis_id=thesis_id,
+        metric="roe",
+        op=">=",
+        threshold=0.25,
+        due_on=None,
+        note=None,
+        now=NOW,
+    )
+    data = as_data(container, settings)
+    (item,) = data.assumptions_for(Target("u1", "A", CODE, None, thesis_id))
+    assert (item.metric, item.threshold) == ("roe", 0.25)
+    assert data.assumptions_for(Target("u1", "A", CODE, None, None)) == ()
 
 
 def test_a_synthesized_target_is_anchored_to_the_day_it_was_read(data):

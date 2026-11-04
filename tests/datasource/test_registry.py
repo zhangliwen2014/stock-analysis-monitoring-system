@@ -284,6 +284,113 @@ def test_consecutive_failures_publish_exactly_one_system_alarm():
     assert "连续 3 次失败" in seen[0].message
 
 
+def cooling_pair(clock: FrozenClock) -> tuple[FakeAdapter, AdapterRegistry]:
+    """一对已经冷却下去的主/备源：主源整夜 429，备源每次都答。
+
+    四条评论都在这一对上跑，所以「把它撞满 10 次」这段前置只做一次：
+    那 10 轮本身就是整夜的缩时模型（一轮 = `attempts_per_source` 次带退避的调用）。
+    """
+    dead = FakeAdapter("akshare", ["A"], RateLimited("akshare", "429"))
+    good = FakeAdapter("eastmoney", ["A"], frame("eastmoney"))
+    reg = registry(dead, good, clock=clock)
+    for _ in range(10):
+        assert reg.fetch_daily("A", "600519", D1, D2).source == "eastmoney"
+    return dead, reg
+
+
+def test_a_source_that_fails_ten_times_in_a_row_is_set_aside_for_a_while():
+    """连败到阈值就把它放一边：夜里 500 只各撞它一次，等于把预算烧在已定性的坏源上。
+
+    撞满 10 次已经是 30 个请求（一次判定 = `attempts_per_source` 次带退避的调用）。
+    """
+    clock = FrozenClock(datetime(2024, 1, 3, tzinfo=UTC))
+    dead, reg = cooling_pair(clock)
+    assert dead.calls == 30
+
+    for _ in range(5):
+        assert reg.fetch_daily("A", "600519", D1, D2).source == "eastmoney"
+    assert dead.calls == 30, "冷却窗口内一次都不该再调"
+
+
+def test_the_cooled_source_is_probed_again_when_the_window_passes():
+    """冷却到期不是「恢复」：它只是允许再真调一次，成功才算回来。"""
+    clock = FrozenClock(datetime(2024, 1, 3, tzinfo=UTC))
+    dead, reg = cooling_pair(clock)
+
+    clock.advance(minutes=30)
+    reg.fetch_daily("A", "600519", D1, D2)
+    assert dead.calls == 33, "到窗后的第一次调用就是探针"
+
+    reg.fetch_daily("A", "600519", D1, D2)
+    assert dead.calls == 33, "探针仍然失败：立刻重新冷却，不再连撞剩下的 499 只"
+
+
+def test_a_skipped_while_cooling_source_is_not_a_new_failure():
+    """跳过不是一次新的失败：否则「连续失败 480 次」这句话再也说不出它真试过几次。"""
+    clock = FrozenClock(datetime(2024, 1, 3, tzinfo=UTC))
+    dead, reg = cooling_pair(clock)
+
+    for _ in range(5):
+        reg.fetch_daily("A", "600519", D1, D2)
+    record = next(h for h in reg.health() if h.name == "akshare")
+    assert record.consecutive_failures == 10
+
+
+def test_the_only_capable_source_is_called_even_while_cooling():
+    """冷却是止损，不是自造不可用：链上只剩它一个时，宁可慢，不能没有。
+
+    `akshare_hk` 正是这种形状——HK 的公司行为只有它答，冷却它等于整晚「什么都答不上来」，
+    而那个空会被下游读成「这只票没分过红」。
+    """
+    clock = FrozenClock(datetime(2024, 1, 3, tzinfo=UTC))
+    alone = FakeAdapter("akshare", ["A"], RateLimited("akshare", "429"))
+    reg = registry(alone, clock=clock)
+
+    for _ in range(12):
+        with pytest.raises(DatasourceError):
+            reg.fetch_daily("A", "600519", D1, D2)
+    assert alone.calls == 36, "孤源不冷却：它的下一次调用就是探针"
+
+
+def test_a_cooled_source_does_not_sign_a_no_records_confirmation():
+    """没答过话的源不能替整条链签「查无记录」——少调一次不许让 D36 那句话变松。"""
+    clock = FrozenClock(datetime(2024, 1, 3, tzinfo=UTC))
+    dead = ActionsAdapter("akshare", error=RateLimited("akshare", "429"))
+    quiet = ActionsAdapter("eastmoney", outcome=empty_actions())
+    reg = registry(dead, quiet, clock=clock)
+
+    for _ in range(10):
+        with pytest.raises(DatasourceError):
+            reg.fetch_actions("A", "601088", D1, D2)
+    assert dead.calls == 30
+
+    with pytest.raises(DatasourceError, match="冷却"):
+        reg.fetch_actions("A", "601088", D1, D2)
+    assert quiet.calls == 11 and dead.calls == 30
+
+
+def test_a_cooled_source_is_not_counted_as_one_we_actually_tried():
+    """链走到尽头那句话要分清两堆（D65）：「真调用过又失败」≠「这次没去敲」。
+
+    把冷却里的源写进前一堆，serve.log 里就成了「akshare 试过、还是 429」，
+    而下一个人会据此再撞 10 次——这句话的全部用途就是告诉人下一步做什么。
+    """
+    clock = FrozenClock(datetime(2024, 1, 3, tzinfo=UTC))
+    dead = ActionsAdapter("akshare", error=RateLimited("akshare", "429"))
+    quiet = ActionsAdapter("eastmoney", outcome=empty_actions())
+    reg = registry(dead, quiet, clock=clock)
+
+    for _ in range(10):
+        with pytest.raises(DatasourceError):
+            reg.fetch_actions("A", "601088", D1, D2)
+
+    with pytest.raises(DatasourceError) as caught:
+        reg.fetch_actions("A", "601088", D1, D2)
+    message = str(caught.value)
+    assert message.split("真调用过又失败的")[1].split("；")[0].strip() == "（无）", message
+    assert "冷却" in message, "没去敲也要点名，否则看不出这条链其实只试了一个源"
+
+
 def test_success_stamp_comes_from_the_injected_clock():
     clock = FrozenClock(datetime(2024, 5, 6, tzinfo=UTC))
     reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")), clock=clock)

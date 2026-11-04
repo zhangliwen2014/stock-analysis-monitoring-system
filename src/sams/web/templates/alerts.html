@@ -4,6 +4,8 @@
 <h1>告警</h1>
 {# 这一句只可能来自应用自己发的 303（白名单见 pages/alerts.py 的 _INBOX_NOTICES） #}
 {% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}
+{# 批量已读的回显只由两个整数拼出来（pages/alerts.py 的 _count），原文不上屏 #}
+{% if ack_notice %}<p class="flash-ok">{{ ack_notice }}</p>{% endif %}
 
 <form method="get" action="/alerts" class="panel grid">
   <label>状态
@@ -39,27 +41,45 @@
   <button type="submit">筛选</button>
 </form>
 
+{% if groups %}
+<form method="post" action="/alerts/ack">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  {# 回当前筛选与页码：标几条已读不该把这一屏洗回全量第一页 #}
+  <input type="hidden" name="next" value="{{ ack_next }}">
+{% endif %}
 {% for (market, code), rows in groups.items() %}
 <section class="card">
-  <h2>{{ market }}/{{ code }}{% if rows[0].symbol_name %}
+  <h2>{{ market }}/{{ code }}{% if (market, code) in muted_keys %}<span class="badge">已静音</span>{% endif %}{% if rows[0].symbol_name %}
     <span class="muted">{{ rows[0].symbol_name }}</span>{% endif %}</h2>
   {# 分组是页内各算一次的：真分页时这一组可能被拆开，这句话只在那一屏出现 #}
   {% if group_note %}<p class="muted">{{ group_note }}</p>{% endif %}
   <table>
-    <tr><th>时刻</th><th>档位</th><th>规则</th><th>现值 / 阈值</th><th>状态</th><th>投递</th><th></th></tr>
+    <tr><th><input type="checkbox" data-ack-all aria-label="全选本页未读"></th><th>时刻</th><th>档位</th><th>规则</th><th>现值 / 阈值</th><th>状态</th><th>投递</th><th></th></tr>
     {% for row in rows %}
     <tr>
+      {# 只有还挂着的行有框：已读/终态行没有可标的东西 #}
+      <td>{% if row.can_ack %}<input type="checkbox" name="ids" value="{{ row.id }}" aria-label="选择这条告警">{% endif %}</td>
       {# 时刻在 Python 里已折到 display_tz：模板拿到的是字符串，不是 datetime #}
       <td class="muted">{{ row.at }}</td>
       <td><span class="badge">{{ severity_label(row.severity) }}</span></td>
       <td>{{ row.rule_name or "—" }}
         {# 测试告警（D131）在列表里也要认得出来：不然它和真告警长得一样 #}
         {% if row.is_test %}<span class="badge">测试</span>{% endif %}
+        {% if row.kind == "news" %}<span class="badge">资讯</span>{% endif %}
+        {% if row.kind == "screen" %}<span class="badge">选股</span>{% endif %}
         {% if row.deferred %}<span class="badge">稍后至 {{ row.deferred }}</span>{% endif %}</td>
+      {% if row.url %}
+      {# 资讯命中：标题就是原文链接（D246），点开是新窗口，表单一页不丢 #}
+      <td class="num"><a href="{{ row.url }}" target="_blank" rel="noopener">{{ row.title or row.value_text }}</a></td>
+      {% elif row.symbol_url %}
+      {# 选股新命中（S4-B）：点开就是这只票的个股页，不丢回 /screen 重选一遍 #}
+      <td class="num"><a href="{{ row.symbol_url }}">{{ row.value_text }} / {{ row.threshold_text }}</a></td>
+      {% else %}
       <td class="num">{{ row.value_text }} / {{ row.threshold_text }}</td>
+      {% endif %}
       <td>{{ alert_status(row.status) }}</td>
       <td class="muted">{{ row.delivery or "—" }}</td>
-      <td><a href="/alerts/{{ row.id }}">详情</a></td>
+      <td><a href="/alerts/{{ row.id }}?back={{ page_url|urlencode }}">详情</a></td>
     </tr>
     {% endfor %}
   </table>
@@ -68,6 +88,10 @@
 {# 这句话在 Python 里按页码选：越界的那一页说「没有命中的告警」是假话（见 PAGE_EMPTY_NOTE） #}
 <p class="muted">{{ empty_note }}</p>
 {% endfor %}
+{% if groups %}
+  <p><button type="submit">把勾选的标为已读</button></p>
+</form>
+{% endif %}
 
 <p class="muted">
   第 {{ page }} 页

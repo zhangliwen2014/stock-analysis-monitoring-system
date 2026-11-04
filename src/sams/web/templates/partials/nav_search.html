@@ -1,0 +1,18 @@
+{# 全局搜索（S4-C）：一行就是一条链接，去处只有个股页 #}
+{% if rows %}
+<div class="muted nav-hits-head">市场 / 代码 / 名称 · 最近收盘</div>
+<ul class="nav-hits">
+  {% for row in rows %}
+  <li>
+    <a href="/symbol/{{ row.market }}/{{ row.code }}{% if back_url %}?back={{ back_url|urlencode }}{% endif %}">
+      <span class="nav-hit-market">{{ row.market }}</span>
+      <span class="nav-hit-code">{{ row.code }}</span>
+      <span class="nav-hit-name">{{ row.name or "—" }}</span>
+      <span class="nav-hit-price">{{ money(row.price, row.unit) }}</span>
+    </a>
+  </li>
+  {% endfor %}
+</ul>
+{% elif none_found %}
+<p class="muted nav-hits-head">查无「{{ query }}」</p>
+{% endif %}

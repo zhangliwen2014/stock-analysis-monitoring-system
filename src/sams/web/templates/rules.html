@@ -5,6 +5,27 @@
   <h1>规则 <a class="muted" href="/rules/new">新建</a></h1>
   {% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  {# 怎么用与一键示例（D231）：规则建完没有反馈是这一页原先最大的缺口 #}
+  <p class="muted">规则 = 一个对象 + 一个条件。每一行的「试算」不写任何东西，「判一次」命中后会真的写一条告警（在告警收件箱里看）。</p>
+  <form method="post" action="/rules/demo" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>市场
+      <select name="market">
+        {% for market in demo_markets %}
+        <option value="{{ market }}"{% if market == demo_market %} selected{% endif %}>{{ market }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>代码 <input name="code" value="{{ demo_code }}" size="8"
+           placeholder="代码 / 首字母 / 名称"
+           hx-get="/api/symbol-search/pick?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
+           hx-target="#demo-candidates"
+           hx-include="select[name=market]" hx-swap="innerHTML"></label>
+    <button type="submit">建一条示例并真跑一次</button>
+    {# 容器在 form 里：app.js 那条共用监听按「最近的 form」找要写哪几格 #}
+    <div id="demo-candidates"></div>
+  </form>
+  <p class="muted">示例会在最新收盘上方 1% 放一条止损线（所以必然命中），建好后停用、不会在后台反复响。演练告警带「测试」标记，不进健康积压，也不会挡同标的的真实规则。</p>
   {% if groups %}
   {% for heading, rows in groups %}
   <h2>{{ heading }}（{{ rows | length }}）</h2>
@@ -28,6 +49,12 @@
       <td>{{ row.last_at }}{% if row.last_count %}（{{ row.last_count }} 次）{% endif %}</td>
       <td>{{ "是" if row.rule.enabled else "否" }}</td>
       <td>
+        {# 试算在前：回车落到第一个按钮，安全的那一个（D231） #}
+        <form method="post" action="/rules/{{ row.rule.id }}/check" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit" name="mode" value="dry">试算</button>
+          <button type="submit" name="mode" value="real">判一次</button>
+        </form>
         <form method="post" action="/rules/{{ row.rule.id }}/toggle" class="inline-form">
           <input type="hidden" name="csrf" value="{{ csrf }}">
           <button type="submit">{{ "停用" if row.rule.enabled else "启用" }}</button>

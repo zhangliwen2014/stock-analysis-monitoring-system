@@ -16,8 +16,13 @@
   {% endfor %}
   {% else %}
   <h1>{{ "改参数" if rule_id else "新建" }}：{{ template.label }}（{{ template.kind }}）</h1>
+  <p class="muted"><a href="/rules">← 返回规则列表</a></p>
   {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
   {% if bound %}<p class="muted">挂在 {{ bound }}（要换挂载对象请回列表另建一条）</p>{% endif %}
+  {# 试算的结果与表单同一屏（R-22）：改一个数再试一次，不必先保存再回列表点「判一次」 #}
+  {% if outcome %}
+  {% include "partials/rule_outcome.html" %}
+  {% endif %}
   <form method="post" action="{{ "/rules/" + rule_id + "/edit" if rule_id else "/rules/new" }}" class="panel">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>名称 <input name="name" value="{{ values.get("name", "") }}"></label>
@@ -31,9 +36,15 @@
       </select>
     </label>
     <label>对象引用
+      {# 只敲六位数字认不出是哪只票：候选给出名称，点一下写成本表单要的「市场/代码」 #}
       <input name="target_ref" value="{{ values.get("target_ref", "") }}"
-             placeholder="单只标的写 市场/代码（A/600519）；集合类写 *；论点写论点的 id">
+             placeholder="单只标的写 市场/代码（A/600519）；集合类写 *；论点写论点的 id"
+             hx-get="/api/symbol-search/pick?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
+             hx-target="#rule-ref-candidates" hx-swap="innerHTML">
     </label>
+    <div id="rule-ref-candidates"></div>
+    {# 现价那一格（R-22）：填线的人得知道自己填的数离现价多远 #}
+    {% if panel.text %}<p class="muted">{{ panel.text }}</p>{% endif %}
     {% if template.needs_position %}
     <label>账户
       {# 下拉而不是输入框：这一类读的就是这个人名下那个账户的成本与浮盈，
@@ -77,12 +88,15 @@
         {% endfor %}
       </select>
       {% endif %}
-      {% if spec.unit %}<span class="muted">{{ spec.unit }}</span>{% endif %}
+      {% if spec.percent %}<span class="muted">%（按百分数填，例如 8 就是 8%）</span>
+      {% elif spec.unit %}<span class="muted">{{ spec.unit }}</span>{% endif %}
       {# 编辑页上参数框空着起步，库里那份只当提示出现在这一格旁边：预填等于替人把 #}
       {# 每个框都「填了一遍」，每一次保存都会被当成重填了那些数、`params_on` 盖成今天 #}
       {# （为什么要紧写在 `pages/rules.py` 的合并处——除权换算按它决定那条线搬不搬）。 #}
       {# 新建那一屏没有 `hints`：留空是按模板默认值。 #}
       {% if hints.get(spec.name) %}<span class="muted">当前：{{ hints[spec.name] }}（留空是不改这一项）</span>{% endif %}
+      {# 绝对价那一格换算成「线在现价哪一侧」；百分比那一格不换算，理由写在 `_line_notes` #}
+      {% if panel.lines.get(spec.name) %}<span class="muted">{{ panel.lines[spec.name] }}</span>{% endif %}
     </label>
     {% endfor %}
     <label>级别
@@ -121,6 +135,8 @@
       {% endfor %}
     </fieldset>
     {% endif %}
+    {# 试算排在保存前面：回车落在第一个提交按钮上，落的是「不写任何东西的那一次」 #}
+    <button type="submit" formaction="{{ "/rules/" + rule_id + "/edit/preview" if rule_id else "/rules/preview" }}">试算（不保存）</button>
     <button type="submit">保存</button>
   </form>
   {% endif %}

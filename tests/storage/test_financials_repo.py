@@ -146,6 +146,40 @@ def test_annual_means_the_report_date_is_a_year_end(fin):
     assert adopted["report_date"].to_list() == [date(2024, 12, 31)]
 
 
+def test_us_annual_is_recognised_by_its_report_type_not_the_calendar(fin):
+    """美股财年不一定落在 12-31：苹果 2025 年报的报告期是 2025-09-27（D228）。
+
+    按日历日认年报会在美股上把每一行年报都排除掉，筛选结果永久「无数」。
+    美股的财年标记是源给的 `DATE_TYPE=年报`，落库在 `report_type` 这一格。
+    """
+    fin.upsert(
+        pl.DataFrame(
+            [
+                row(
+                    market="US",
+                    code="AAPL",
+                    report_type="年报",
+                    report_date=date(2025, 9, 27),
+                    published_date=None,
+                    roe=1.714224497448,
+                ),
+                row(
+                    market="US",
+                    code="AAPL",
+                    report_type="单季报",
+                    report_date=date(2026, 6, 27),
+                    published_date=None,
+                    roe=0.369,
+                ),
+            ],
+            schema_overrides={"published_date": pl.Date},
+        )
+    )
+    adopted, _ = fin.load_as_of("US", ["AAPL"], date(2026, 10, 30), include_undated=True)
+    assert adopted["report_date"].to_list() == [date(2025, 9, 27)]
+    assert adopted["roe"].to_list() == [1.714224497448]
+
+
 def test_publication_state_distinguishes_no_date_from_a_later_date(fin):
     """「没有可用期」有两种，下一步命令不同：一句排除要说得出是哪种（D61 + D64）。"""
     fin.upsert(
@@ -369,6 +403,57 @@ def test_periods_keys_like_every_other_read(fin):
     """`hk`/`700` 进来要按 D50 的形态落键，否则这一问在港美股上永远是空表。"""
     fin.upsert(pl.DataFrame([row(market="HK", code="00700", report_date=Q4)]))
     assert fin.periods("hk", "700").height == 1
+
+
+def test_undated_rows_are_adopted_only_when_the_caller_asks(fin):
+    """港股源不给披露日（D215）：默认读法仍看不见，只有明确开口的调用方拿得到。
+
+    开口的那一条不是把 PIT 关掉：报告期仍要 <= 截至日，越不过「还没发生的期」。
+    """
+    fin.upsert(
+        pl.DataFrame(
+            [
+                row(
+                    market="HK",
+                    code="00700",
+                    report_date=Q4,
+                    published_date=None,
+                    profit_yoy=0.15,
+                )
+            ],
+            schema_overrides={"published_date": pl.Date},
+        )
+    )
+    assert fin.load_as_of("HK", ["00700"], date(2026, 10, 1))[0].is_empty()
+    adopted, dropped = fin.load_as_of(
+        "HK", ["00700"], date(2026, 10, 1), include_undated=True
+    )
+    assert adopted["profit_yoy"].to_list() == [0.15]
+    assert dropped == 0, "被明确采信的行不能同时记成「被 NULL 披露日挡掉」"
+
+    future, _ = fin.load_as_of(
+        "HK", ["00700"], date(2023, 12, 30), include_undated=True
+    )
+    assert future.is_empty(), "报告期晚于截至日的行仍然不可见"
+
+
+def test_an_undated_row_does_not_beat_a_dated_one_for_the_same_code(fin):
+    """开口只补缺口：同一只票有已披露的一期时，已披露的那期仍是答案。
+
+    否则一次源故障留下的 NULL 披露日就能把一期更晚、但没有公开时间的数顶上来。
+    """
+    fin.upsert(
+        pl.DataFrame(
+            [
+                row(report_date=Q4, published_date=PUBLISHED_Q4, roe=0.10),
+                row(report_date=Q1, published_date=None, roe=0.90),
+            ]
+        )
+    )
+    adopted, _ = fin.load_as_of("A", ["601088"], Q1, include_undated=True)
+    assert adopted["roe"].to_list() == [0.10]
+    dated, _ = fin.load_as_of("A", ["601088"], Q1)
+    assert dated["roe"].to_list() == [0.10]
 
 
 # ---------- 0028：Wind 式展示列（D217） ----------

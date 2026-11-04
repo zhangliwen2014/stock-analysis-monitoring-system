@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from datetime import date
 from uuid import uuid4
 
 import polars as pl
@@ -150,6 +152,14 @@ class CompanyProfileRepo:
     def count(self) -> int:
         return int(self.db.scalar(f"SELECT count(*) FROM {self.TABLE}") or 0)
 
+    def list_market(self, market: str) -> pl.DataFrame:
+        """一个市场的概况（行业回填用）：不读 `summary`，这里只要行业与抓取日。"""
+        return self.db.query(
+            f"SELECT market, code, name, industry, fetched_at FROM {self.TABLE}"
+            " WHERE market = ? ORDER BY code",
+            [canonical_market(market)],
+        )
+
 
 class AnnouncementRepo:
     """公告元数据，按 (market, code, art_code) 幂等；正文与 PDF 留外链（D216）。"""
@@ -207,6 +217,35 @@ class AnnouncementRepo:
             f"SELECT * FROM {self.TABLE} WHERE market = ? AND code = ?"
             f" ORDER BY published_on DESC, art_code DESC LIMIT {int(limit)}",
             [canonical_market(market), canonical_code(market, code)],
+        )
+
+    def recent(
+        self,
+        market: str,
+        codes: Sequence[str],
+        *,
+        since: date | None = None,
+        through: date | None = None,
+        limit: int = 50,
+    ) -> pl.DataFrame:
+        """一批标的的公告，按披露日倒序；`through` 含当天（公告只有日期，没有时刻）。"""
+        canonical = [canonical_code(market, code) for code in codes]
+        if not canonical:
+            return self.db.query(f"SELECT * FROM {self.TABLE} WHERE FALSE")
+        placeholders = ", ".join("?" for _ in canonical)
+        clauses = ["market = ?", f"code IN ({placeholders})"]
+        params: list[object] = [canonical_market(market), *canonical]
+        if since is not None:
+            clauses.append("published_on >= ?")
+            params.append(since)
+        if through is not None:
+            clauses.append("published_on <= ?")
+            params.append(through)
+        params.append(int(limit))
+        return self.db.query(
+            f"SELECT * FROM {self.TABLE} WHERE {' AND '.join(clauses)}"
+            f" ORDER BY published_on DESC, art_code DESC LIMIT ?",
+            params,
         )
 
     def count(self, market: str | None = None) -> int:

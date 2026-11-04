@@ -153,21 +153,44 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
     report = reports[0]
 
     # 五个能力都在的源才登记得出 A 的那五条数据 job：`WorldAdapter` 少一个方法，
-    # 这一晚会安静地退化成「只验了日线」（D38 的按方法路由 + D106 的按能力登记）
+    # 这一晚会安静地退化成「只验了日线」（D38 的按方法路由 + D106 的按能力登记）。
+    # 分红与净值不依赖市场源（单元是账户），所以紧跟数据链登记、三个市场都有；
+    # news@ 紧贴净值之后登记，港美没源也登记，跑起来是「未接入，跳过」
     assert [job.title for job in container.scheduler.jobs] == [
         "bars@A",
         "actions@A",
         "financials@A",
         "valuation@A",
         "flow@A",
+        "dividends@A",
+        "nav@A",
+        "news@A",
+        "industry@A",
+        "screener@A",
         "recheck@A",
+        "assumptions@A",
         "rules@A",
+        "digest@A",
         "bars@HK",
+        "dividends@HK",
+        "nav@HK",
+        "news@HK",
+        "industry@HK",
+        "screener@HK",
         "recheck@HK",
+        "assumptions@HK",
         "rules@HK",
+        "digest@HK",
         "bars@US",
+        "dividends@US",
+        "nav@US",
+        "news@US",
+        "industry@US",
+        "screener@US",
         "recheck@US",
+        "assumptions@US",
         "rules@US",
+        "digest@US",
         "fx@全局",
         "calendar@A",
         "calendar@HK",
@@ -206,10 +229,15 @@ def test_one_trading_day_converges_to_one_alert_and_a_fresh_heartbeat(db, settin
     )
 
     # 同一晚再一拍（把钟推过「失联」阈值再多一分钟，让「这一拍留没留痕迹」可分辨）：
-    # 成功的周期不重跑，不写新账，也不重复打扰
+    # 成功的周期不重跑，不写新账，也不重复打扰。第二次仍走常驻循环的入口——
+    # 手工 tick 不认领心跳，收工的那一行会如实显示「已停」
     run_count = container.scheduler.runs.count()
     container.clock.advance(seconds=HEARTBEAT_STALE_S + 60)
-    again = container.scheduler.tick()
+    again_reports = []
+    assert container.scheduler.run_forever(
+        max_ticks=1, on_tick=again_reports.append
+    ) == 1
+    again = again_reports[0]
     assert len(again.results) == len(container.scheduler.jobs)
     assert [result.status for result in again.results] == [SKIPPED] * len(again.results)
     assert container.scheduler.runs.count() == run_count

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import date
 
@@ -14,34 +15,36 @@ import polars as pl
 
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import DatasourceError
-from sams.datasource.base import classify_error
+from sams.datasource.base import a_share_symbol, classify_error
 from sams.datasource.f10 import (
     empty_profile,
     parse_announcements,
     parse_profile,
+)
+from sams.datasource.news import (
+    in_window,
+    parse_jsonp,
+    parse_stock_news,
 )
 from sams.datasource.sources import source
 
 A_PROFILE_URL = "https://emweb.securities.eastmoney.com/PC_HSF10/CompanySurvey/PageAjax"
 HK_PROFILE_URL = "https://emweb.securities.eastmoney.com/PC_HKF10/CompanyProfile/PageAjax"
 ANNOUNCEMENTS_URL = "https://np-anotice-stock.eastmoney.com/api/security/ann"
-
-#: 北交所号段（与 `core.codes.daily_price_limit` 同一份判据）：这些前缀的 F10 代码
-#: 不是 SH/SZ 出身，拼错交易所会让接口回「股票代码不合法」，而屏幕上只会说没有概况
-_BJ_PREFIXES = ("43", "83", "87", "88", "92")
-_SH_FIRST = "569"
-
+NEWS_SEARCH_URL = "https://search-api-web.eastmoney.com/search/jsonp"
+#: 搜索接口一页给多少条：与公告同量级，够覆盖盘后一晚的新增
+NEWS_PAGE_SIZE = 50
 
 def f10_code(market: str, code: str) -> str:
-    """F10 接口认的代码形态：A 股带交易所前缀（`SH600519`），港股是五位数字。"""
+    """F10 接口认的代码形态：A 股带交易所前缀（`SH600519`），港股是五位数字。
+
+    交易所标签从 `a_share_symbol` 那三格推（北交所是 `BJ`）：拼错了接口回「股票代码不合法」，
+    而屏幕上只会说没有概况。
+    """
     market = canonical_market(market)
     canonical = canonical_code(market, code)
     if market == "A":
-        if not canonical.isdigit() or len(canonical) != 6:
-            raise ValueError(f"A 股代码应为 6 位数字，收到 {code!r}")
-        if canonical.startswith(_BJ_PREFIXES):
-            return f"BJ{canonical}"
-        return f"{'SH' if canonical[0] in _SH_FIRST else 'SZ'}{canonical}"
+        return a_share_symbol(canonical)[:2].upper() + canonical
     if market == "HK":
         return canonical
     raise ValueError(f"{market} 没有 F10 概况")
@@ -55,12 +58,23 @@ def _http_get(url: str, params: dict[str, str]) -> dict:
     return http_get(url, params)
 
 
+def _http_get_text(url: str, params: dict[str, str]) -> str:
+    from sams.datasource.eastmoney import http_get_text
+
+    return http_get_text(url, params)
+
+
 class EastmoneyF10Adapter:
     name = "eastmoney_f10"
     markets = frozenset({"A", "HK"})
 
-    def __init__(self, get: Callable[[str, dict[str, str]], dict] | None = None) -> None:
+    def __init__(
+        self,
+        get: Callable[[str, dict[str, str]], dict] | None = None,
+        get_news: Callable[[str, dict[str, str]], str] | None = None,
+    ) -> None:
         self._get = get or _http_get
+        self._get_news = get_news or _http_get_text
 
     def company_profile(
         self, market: str, code: str, start: date, end: date
@@ -94,6 +108,42 @@ class EastmoneyF10Adapter:
         try:
             payload = self._get(ANNOUNCEMENTS_URL, params)
             return parse_announcements(payload, market=market, code=code, source=self.name)
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
+    def stock_news(
+        self, market: str, code: str, start: date, end: date
+    ) -> pl.DataFrame:
+        """个股新闻（D247：v0 只接 A 股）。窗口只裁源返回的那一页。"""
+        if market != "A":
+            raise DatasourceError(self.name, f"{market} 新闻源未接入（v0 只接 A 股）")
+        canonical_request = canonical_code(market, code)
+        param = {
+            "uid": "",
+            "keyword": canonical_request,
+            "type": ["cmsArticleWebOld"],
+            "client": "web",
+            "clientType": "web",
+            "clientVersion": "curr",
+            "param": {
+                "cmsArticleWebOld": {
+                    "searchScope": "default",
+                    "sort": "default",
+                    "pageIndex": 1,
+                    "pageSize": NEWS_PAGE_SIZE,
+                    "preTag": "<em>",
+                    "postTag": "</em>",
+                }
+            },
+        }
+        params = {"cb": "jQuery_sams", "param": json.dumps(param, ensure_ascii=False)}
+        try:
+            text = self._get_news(NEWS_SEARCH_URL, params)
+            payload = parse_jsonp(text)
+            frame = parse_stock_news(payload, market=market, code=code, source=self.name)
+            return in_window(frame, market, start, end)
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001

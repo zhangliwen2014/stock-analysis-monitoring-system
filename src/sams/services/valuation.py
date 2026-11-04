@@ -30,6 +30,7 @@ import polars as pl
 
 from sams.analysis.valuation.compose import Plan, trade_plan
 from sams.analysis.valuation.percentile import (
+    DEFAULT_WINDOW_YEARS,
     DisclosedPeriod,
     Percentile,
     ValuationDay,
@@ -123,6 +124,27 @@ class ValuationRead:
 
     def percentile(self, metric: str) -> Percentile | None:
         found = [row for row in self.percentiles if row.metric == metric]
+        return found[0] if found else None
+
+
+@dataclass(frozen=True)
+class ValuationPercentiles:
+    """分位条那一块的读数：PR / PE / PB 三条，加一句覆盖面的话。
+
+    三条都在：某一支算不出时它带着 `missing_kind`，而不是从列表里消失——屏幕上
+    「少了一栏」与「这一栏说明了为什么没有」是两件事（D241）。
+    """
+
+    market: str
+    code: str
+    as_of: date
+    window_years: int
+    rows: tuple[Percentile, ...]
+    #: 库里的序列够不到五年前时的那句话；覆盖满窗口时为空
+    coverage_note: str = ""
+
+    def reading(self, metric: str) -> Percentile | None:
+        found = [row for row in self.rows if row.metric == metric]
         return found[0] if found else None
 
 
@@ -259,8 +281,60 @@ class ValuationService:
             notes=tuple(notes),
         )
 
+    def percentiles(
+        self,
+        market: str,
+        code: str,
+        *,
+        as_of: date | None = None,
+        window_years: int = DEFAULT_WINDOW_YEARS,
+        basis: str = ROE_BASIS_ANNUAL,
+    ) -> ValuationPercentiles:
+        """个股页分位条那一块的读法：只吃估值行与财务行，不碰日线和资金流。
+
+        与 `read` 分开是因为它问的是另一件事：「这个数在它自己历史上排第几」。
+        三条曲线固定按 pr / pe_ttm / pb 出门，拒绝的那条也在——见 `ValuationPercentiles`。
+        """
+        market = canonical_market(market)
+        code = canonical_code(market, code)
+        until = as_of if as_of is not None else self.clock.today()
+        rows = _valuation_days(self.valuation.series(market, code))
+        periods = _disclosed_periods(self.financials.periods(market, code))
+        readings = (
+            pr_percentile(rows, periods, until, basis=basis, window_years=window_years),
+            metric_percentile(rows, "pe_ttm", until, window_years=window_years),
+            metric_percentile(rows, "pb", until, window_years=window_years),
+        )
+        return ValuationPercentiles(
+            market=market,
+            code=code,
+            as_of=until,
+            window_years=window_years,
+            rows=readings,
+            coverage_note=_coverage_note(rows, until, window_years),
+        )
+
 
 # --- 取哪几个数 ---------------------------------------------------------------------------
+
+def _coverage_note(rows: Sequence[ValuationDay], until: date, window_years: int) -> str:
+    """库里最早一行晚于窗口起点时，说清这条分位不是完整的 N 年。
+
+    「只有两年数据」与「五年分位」不能混着说（D238）：同一个 20 分位，两年里的第 20 档
+    和五年里的第 20 档不是一件事。覆盖满窗口、或者一行都没有（那由各条曲线自己拒绝）
+    时不出这句话。
+    """
+    if not rows:
+        return ""
+    oldest = min(row.day for row in rows)
+    window_from = until - timedelta(days=365 * window_years)
+    if oldest <= window_from:
+        return ""
+    return (
+        f"本地估值序列从 {oldest} 起，{window_years} 年窗口 "
+        f"（{window_from}~{until}）只覆盖了 {(until - oldest).days} 天："
+        "这条分位不是完整的五年，读的时候按实际跨度换算"
+    )
 
 
 def _bar_start(until: date, template: Style) -> date:

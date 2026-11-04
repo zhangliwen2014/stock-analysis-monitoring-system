@@ -20,6 +20,7 @@ U26 补上第四件：**这条论到底买过没有**。状态走到 `opened` �
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -31,6 +32,7 @@ from sams.core.errors import NotAdjustable, ValidationError
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
 from sams.core.version import VersionGate
 from sams.services.actors import resolve_actor
+from sams.services.decision import PLAN_VERSION
 from sams.services.valuation import STYLE_NAMES, ValuationRead, ValuationService
 from sams.storage.repos.ledger import SimOrderRepo
 from sams.storage.repos.theses import (
@@ -64,6 +66,24 @@ LEVEL_ROWS = (
 #: 不能用仓库那一张 `LEVEL_COLUMNS`——里面还挂着 M5 才回填的 `win_rate`，
 #: 那条有数而价位全空，会被读成「价位填过了」。
 LEVEL_ROW_COLUMNS = tuple(dict.fromkeys(col for _, _, cols in LEVEL_ROWS for col in cols))
+
+
+def method_from_read(read: ValuationRead) -> dict[str, str]:
+    """这条价位是按哪套方法落的：写进 `plan_method`，换口径时旧行还认得出自己。"""
+    return {
+        "entry": str(read.style.param("entry_rule")),
+        "stop": str(read.style.param("stop_kind")),
+        "target": "near",
+        "basis": read.fundamental.pr.basis,
+        "as_of": read.as_of.isoformat(),
+    }
+
+
+def _plan_meta(read: ValuationRead) -> dict[str, str]:
+    return {
+        "plan_version": PLAN_VERSION,
+        "plan_method": json.dumps(method_from_read(read), ensure_ascii=False, sort_keys=True),
+    }
 
 
 def levels_from_plan(plan: Plan) -> dict:
@@ -236,6 +256,7 @@ class ThesisService:
             roe_basis=roe_basis,
         )
         levels = {} if read is None else levels_from_plan(read.plan)
+        meta = {} if read is None or not levels else _plan_meta(read)
         thesis = self.theses.create(
             user_id=user.id,
             market=market,
@@ -247,6 +268,7 @@ class ThesisService:
             note=note,
             # 那几列价位属于哪一天的读数——不是「哪一秒写进库」（0013）
             levels_on=None if read is None else read.as_of,
+            **meta,
             **levels,
         )
         self._bump()
@@ -298,6 +320,7 @@ class ThesisService:
         )
         recomputed = {} if read is None or not from_plan else levels_from_plan(read.plan)
         merged = {**levels, **recomputed}
+        meta = {} if read is None or not recomputed else _plan_meta(read)
         thesis = self.theses.set_levels(
             user.id,
             thesis_id,
@@ -305,6 +328,7 @@ class ThesisService:
             now=self.clock.now_utc(),
             # 只有从这条结论里取出来的那几个数有读数日；手填的那些没有（0013）
             levels_on=None if read is None or not recomputed else read.as_of,
+            **meta,
             **merged,
         )
         self._bump()

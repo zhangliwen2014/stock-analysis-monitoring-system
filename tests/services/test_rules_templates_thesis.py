@@ -9,11 +9,12 @@
 from __future__ import annotations
 
 import inspect
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
 from sams.analysis.valuation.scoring import item_label
+from sams.core.assumptions import MET, REFUTED, UNKNOWN
 from sams.core.rules import HIT, PRE, RULE_KINDS
 from sams.services.rules.snapshot import Snapshot
 from sams.services.rules.templates import (
@@ -27,6 +28,7 @@ from sams.services.rules.templates import (
     thesis_odds_below,
     tp_tiered,
 )
+from sams.storage.repos.assumptions import Assumption
 from sams.storage.repos.theses import HIT_STOP, INVALIDATED, TRACKING, Thesis
 
 
@@ -66,7 +68,7 @@ def thesis(**over) -> Thesis:
 _MISSING = object()
 
 
-def ask(params: dict, snapshot_over: dict, the=_MISSING) -> Ask:
+def ask(params: dict, snapshot_over: dict, the=_MISSING, *, assumptions=()) -> Ask:
     """`the` 不传 ⇒ 造一条活着的论；显式传 `None` ⇒ 「这一趟没读到论」。
 
     这两件事必须分开：`the=None` 走 `the or thesis()` 会悄悄换成默认那条论，
@@ -76,6 +78,7 @@ def ask(params: dict, snapshot_over: dict, the=_MISSING) -> Ask:
         snapshot=snap(**snapshot_over),
         params=params,
         thesis=thesis() if the is _MISSING else the,
+        assumptions=assumptions,
     )
 
 
@@ -159,6 +162,59 @@ def test_a_single_tier_drop_is_enough() -> None:
     got = stop_thesis_drift(ask(DRIFT, {"score": 40.0}))
     assert got.hit is not None
     assert "掉到 40" in got.hit.why
+
+
+def assumption(**over) -> Assumption:
+    base = {
+        "id": "as-1",
+        "thesis_id": "th-1",
+        "metric": "roe",
+        "op": ">=",
+        "threshold": 0.25,
+        "due_on": date(2026, 10, 30),
+        "note": None,
+        "status": REFUTED,
+        "evaluated_on": date(2026, 10, 30),
+        "evaluated_value": 0.20,
+        "created_at": datetime(2026, 10, 1),
+        "updated_at": datetime(2026, 10, 30),
+    }
+    base.update(over)
+    return Assumption(**base)
+
+
+def test_a_refuted_assumption_is_drift_on_its_own() -> None:
+    """D232 P0-3：理由失效的信号来自假设台账，而不是合成分掉了几档。"""
+    got = stop_thesis_drift(ask(DRIFT, {"score": 62.0, "odds": 2.6}, assumptions=(assumption(),)))
+    assert got.hit is not None
+    assert "ROE" in got.hit.why or "净资产收益率" in got.hit.why
+    assert "20.00%" in got.hit.why and "25.00%" in got.hit.why
+    assert got.hit.value == pytest.approx(0.20)
+
+
+def test_assumptions_replace_the_composite_score_comparison() -> None:
+    """有假设台账时不再比合成分：分掉一档而假设都还成立 ⇒ 不算理由失效。"""
+    got = stop_thesis_drift(
+        ask(
+            DRIFT,
+            {"score": 35.0, "odds": 2.6},
+            assumptions=(assumption(status=MET, op=">=", threshold=0.15),),
+        )
+    )
+    assert got.hit is None
+    assert got.why_not == ""
+
+
+def test_an_unevaluated_assumption_is_not_evidence_either_way() -> None:
+    got = stop_thesis_drift(
+        ask(
+            DRIFT,
+            {"score": 35.0, "odds": 2.6},
+            assumptions=(assumption(status=UNKNOWN, evaluated_value=None),),
+        )
+    )
+    assert got.hit is None
+    assert got.why_not == ""
 
 
 def test_a_thesis_without_a_baseline_is_a_gap_not_a_pass() -> None:

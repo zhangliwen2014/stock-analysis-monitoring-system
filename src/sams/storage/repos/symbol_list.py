@@ -2,6 +2,7 @@
 
 五档排序（精确代码 > 首字母精确 > 全拼精确 > 前缀 > 片段）在一条 SQL 里定序：
 拆成五段查询再 Python 合并，症状是每一档各自对、全局序错乱，而 LIMIT 10 截错边。
+中文别名是第六档，追加在五档之后（S4-C）：它只补叫法，不抢主档命中的位次。
 搜索永不 LIKE：`contains(lower(x), ?)` 是房规（见 `repos/annotations.py`）。
 """
 
@@ -85,14 +86,18 @@ class SymbolListRepo:
         """`q` 是归一好的检索词（大写片段）：py 列按小写比，code 按大写比。
 
         CTE `p` 只为了让 `?` 各出现一次——十来个重复 `?` 的实参表错位都错得安静。
+
+        别名（S4-C）是第 6 档：主档代码/拼音/名称的五档全部走完才轮到它。别名的活是
+        「补一个叫法」，不是「比代码更准」；同一只票两路都命中时 `row_number` 留档位
+        更小的那一行，既去了重，也不会把别名抬到名称命中之前。
         """
         # 空检索词在 contains/starts_with 下全表命中，空 py 列的无名票会落进第 2 档。
         # 调用方 normalize_query 已保证非空，这里是仓库层自守，不靠调用方的自觉。
         if not q.strip():
             return []
         rows = self.db.query(
-            "WITH p AS (SELECT ? AS q_up, ? AS q_low)"
-            " SELECT market, code, name, py_initials, py_full FROM ("
+            "WITH p AS (SELECT ? AS q_up, ? AS q_low),"
+            " base AS ("
             "   SELECT s.market, s.code, s.name, s.py_initials, s.py_full,"
             "     CASE"
             "       WHEN s.code = p.q_up THEN 1"
@@ -109,7 +114,20 @@ class SymbolListRepo:
             "     OR starts_with(s.py_full, p.q_low)"
             "     OR contains(s.code, p.q_up)"
             "     OR contains(lower(s.name), p.q_low) OR contains(s.py_full, p.q_low))"
-            ") ORDER BY tier, market, code LIMIT ?",
+            " ),"
+            " alias AS ("
+            "   SELECT s.market, s.code, s.name, s.py_initials, s.py_full, 6 AS tier"
+            "   FROM symbol_master s"
+            "   JOIN symbol_aliases a ON a.market = s.market AND a.code = s.code"
+            "   CROSS JOIN p"
+            "   WHERE s.is_active AND contains(lower(a.alias), p.q_low)"
+            " )"
+            " SELECT market, code, name, py_initials, py_full FROM ("
+            "   SELECT u.*,"
+            "     row_number() OVER (PARTITION BY u.market, u.code ORDER BY u.tier) AS rn"
+            "   FROM (SELECT * FROM base UNION ALL SELECT * FROM alias) u"
+            " ) WHERE rn = 1"
+            " ORDER BY tier, market, code LIMIT ?",
             [q.upper(), q.lower(), limit],
         )
         return rows.to_dicts()

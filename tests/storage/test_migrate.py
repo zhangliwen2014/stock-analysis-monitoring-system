@@ -53,6 +53,7 @@ EXPECTED_TABLES = {
     "snapshot_daily",
     "screener_presets",
     "chart_prefs",
+    "company_business",
 }
 
 
@@ -281,3 +282,43 @@ def test_0014_remembers_which_day_the_order_s_rate_is(db) -> None:
     没有 `fx_rate_ref` 时两段拆分只能整段报成价格盈亏，换汇的影响会被读成股价涨了。
     """
     assert "fx_rate_ref" in columns_of(db, "sim_orders")
+
+
+def test_0046_gives_the_open_backfill_rows_their_kind(tmp_path):
+    """带库升级：队列里那条开放的日线行，升级后既要知道自己是 `bars`，也要保住去重键。
+
+    只在新库上跑绿的迁移不算数：`open_key` 归一漏掉时，旧行留着 `A|600519`、新行插成
+    `A|600519|bars`，同一只票就能挂出两条重复的日线活。
+    """
+    old_dir = tmp_path / "old"
+    old_dir.mkdir()
+    paths = [p for p in discover() if p.name != "0046_backfill_kind.sql"]
+    for path in paths:
+        (old_dir / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    file = tmp_path / "prod.duckdb"
+    legacy = Database.open(file)
+    try:
+        assert len(apply_migrations(legacy, old_dir)) == len(paths)
+        legacy.execute(
+            "INSERT INTO symbol_backfills (id, market, code, tries, status, open_key, created_at)"
+            " VALUES ('old1', 'A', '600519', 0, 'pending', 'A|600519', now())"
+        )
+        legacy.close()
+        upgraded = Database.open(file)
+        try:
+            assert apply_migrations(upgraded) == ["0046_backfill_kind.sql"]
+            row = upgraded.query(
+                "SELECT kind, open_key, status FROM symbol_backfills WHERE id = 'old1'"
+            ).to_dicts()
+            assert row == [{"kind": "bars", "open_key": "A|600519|bars", "status": "pending"}]
+            # 结案的行（open_key 为 NULL）不参与归一：唯一索引里 NULL 互不冲突
+            done = upgraded.scalar(
+                "SELECT count(*) FROM symbol_backfills WHERE open_key IS NULL"
+            )
+            assert done == 0
+        finally:
+            upgraded.close()
+    finally:
+        if file.exists():
+            file.unlink()

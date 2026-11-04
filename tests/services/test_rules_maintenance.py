@@ -323,3 +323,32 @@ def test_a_hand_built_rule_carves_today_into_the_anchor(container, uid) -> None:
     """
     frozen = replace(container, clock=support.FrozenClock(datetime(2026, 4, 9, 1, 0, tzinfo=UTC)))
     assert add(frozen, uid).rule.params_on == date(2026, 4, 9)
+
+
+def test_a_draft_is_checked_like_an_added_rule_and_writes_nothing(container, uid) -> None:
+    """保存前试算造的那一条走 `add` 的全部前置检查，然后什么都不写。
+
+    「检查一样」是这一枚的要害：草稿若自己另写一套判据，分叉的样子是屏幕上说
+    「这条线会响」而保存时服务层回一句「不认」。`list_for` 为空钉住另一半——
+    那颗按钮的名字是「试算（不保存）」。
+    """
+    service = make_service(container)
+    draft = service.draft(
+        uid, kind="stop.fixed", name="草稿", target_type="symbol",
+        target_ref=f"A/{CODE}", params={"price": 10.0},
+    )
+    assert draft.name == "草稿"
+    assert draft.params == {"price": 10.0}
+    assert draft.params_on == container.clock.today()
+    assert container.rules_store.list_for(uid) == []
+    with pytest.raises(ValidationError, match="没有用户"):
+        service.draft(
+            "nobody", kind="stop.fixed", name="草稿", target_type="symbol",
+            target_ref=f"A/{CODE}", params={"price": 10.0},
+        )
+    with pytest.raises(ValidationError, match="名下没有账户"):
+        service.draft(
+            uid, kind="stop.pct", name="草稿", target_type="position", target_ref="*",
+            account_id="acct-not-mine", params={"pct": 0.08},
+        )
+    assert container.rules_store.list_for(uid) == []

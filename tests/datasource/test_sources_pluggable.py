@@ -21,6 +21,8 @@ ADAPTER_MODULES = {
     "eastmoney",
     "eastmoney_f10",
     "eastmoney_hk_f10",
+    "eastmoney_us_f10",
+    "nasdaq_trader",
     "sina",
     "sina_quote",
     "tencent",
@@ -72,6 +74,7 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
     """
     entries = catalog().by_kind()
     assert entries["akshare_hk"].capabilities == ("corp_actions", "symbol_list")
+    assert entries["nasdaq_trader"].capabilities == ("symbol_list",)
     assert entries["akshare_ths"].capabilities == ("corp_actions",)
     assert entries["tencent"].capabilities == (
         "daily_bars",

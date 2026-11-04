@@ -32,6 +32,12 @@ from sams.core.fundamentals import (
     ROE_BASIS_ANNUAL,
     is_year_end,
 )
+from sams.core.missing import (
+    NOT_APPLICABLE,
+    NOT_COVERED,
+    NOT_DISCLOSED,
+    UNCOMPUTABLE,
+)
 
 #: 分位要的最小可比天数。约等于一个交易日年（A 股 244 天、美股 252 天）：少于这个数时
 #: 分位说的是抽样噪声而不是估值位置——一个 30 天样本的「10 分位」只是「这三十天里最低的那天」。
@@ -93,6 +99,12 @@ class Percentile:
     evidence: str = ""
     #: 今天那一行实际是哪一天：`as_of` 常常比库里最新的估值行晚
     current_day: date | None = None
+    #: 历史 20/50/80 分位对应的值（分位条上的三档刻度）；拒绝时都是 None
+    q20: float | None = None
+    q50: float | None = None
+    q80: float | None = None
+    #: 拒绝时属于哪一档（D241）：成功时为空
+    missing_kind: str = ""
 
     @property
     def ok(self) -> bool:
@@ -143,6 +155,23 @@ def _rank(values: Sequence[float], current: float) -> float:
     return 100.0 * at_or_below / len(values)
 
 
+def _quantile(values: Sequence[float], q: float) -> float | None:
+    """历史值的 q 分位（线性插值）。空序列返回 None，不拿 0 代替。"""
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[int(position)]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _quantiles(values: Sequence[float]) -> tuple[float | None, float | None, float | None]:
+    return _quantile(values, 0.20), _quantile(values, 0.50), _quantile(values, 0.80)
+
+
 def _pr_on(
     day: ValuationDay, periods: Sequence[DisclosedPeriod], *, basis: str
 ) -> tuple[float | None, str]:
@@ -184,15 +213,19 @@ def _too_thin(samples: int) -> str:
     )
 
 
-def _refuse(base: Percentile, why: str) -> Percentile:
-    """拒绝出门的那条：`why` 说清为什么不出数，「丢掉了多少行」跟着 base 自己的计数器走。"""
+def _refuse(base: Percentile, why: str, kind: str) -> Percentile:
+    """拒绝出门的那条：`why` 说清为什么不出数，`kind` 说这属于哪一档缺失（D241）。
+
+    「不适用 / 未披露 / 无法计算 / 未覆盖」的下一步不同：前两种是接受，后两种是补数据。
+    混成一个「—」会让读者对着一个本该补数的空条发呆。
+    """
     dropped = _tally(
         no_pe=base.skipped_no_pe,
         no_roe=base.skipped_no_roe,
         caliber=base.skipped_caliber,
         unpublished=base.unpublished_periods,
     )
-    return replace(base, reason=f"{why}{dropped}")
+    return replace(base, reason=f"{why}{dropped}", missing_kind=kind)
 
 
 def pr_percentile(
@@ -222,6 +255,7 @@ def pr_percentile(
             replace(empty, unpublished_periods=unpublished),
             f"窗口 {window_from}~{as_of} 内没有任何按日估值行："
             "先同步这只票的估值（`sams sync valuation`）",
+            NOT_COVERED,
         )
 
     today = in_window[-1]
@@ -263,14 +297,19 @@ def pr_percentile(
     )
 
     if current is None:
+        # PE 那支不成立是「不适用」（D59），缺已披露的年报才是「未披露」：两句话的
+        # 下一步不同——后者去补 disclosure，前者接受「这个口径对这只票没有意义」
+        kind = NOT_DISCLOSED if today_why == "no_roe" else NOT_APPLICABLE
         return _refuse(
             base,
             f"现在这一天（{today.day}）在 PE 那一支上算不出 PR："
             "没有可比的历史位置可说（跨支不可比，D59）",
+            kind,
         )
     if len(values) < MIN_SAMPLES:
-        return _refuse(base, _too_thin(len(values)))
-    return replace(base, value=_rank(values, current))
+        return _refuse(base, _too_thin(len(values)), UNCOMPUTABLE)
+    q20, q50, q80 = _quantiles(values)
+    return replace(base, value=_rank(values, current), q20=q20, q50=q50, q80=q80)
 
 
 def metric_percentile(
@@ -299,7 +338,23 @@ def metric_percentile(
     dropped = len(pairs) - len(usable)
     # 丢掉的那几行只写进 evidence：`skipped_*` 那三个计数器是 PR 那条链的三堆原因，
     # 拿 `skipped_no_pe` 装「pb 缺失」会让同一个字段名在两种 metric 下说两种话
-    if not usable:
+    present = [value for _, value in pairs if value is not None]
+    if not pairs:
+        return Percentile(
+            None,
+            None,
+            0,
+            metric,
+            window_from,
+            as_of,
+            reason=(
+                f"窗口 {window_from}~{as_of} 内没有任何按日估值行："
+                "先同步这只票的估值（`sams sync valuation`）"
+            ),
+            missing_kind=NOT_COVERED,
+        )
+    if not present:
+        # 整列没有数 ⇒ 未覆盖：下一步是同步；有数但全不为正 ⇒ 无法计算：那个倍数是负的
         return Percentile(
             None,
             None,
@@ -312,6 +367,21 @@ def metric_percentile(
                 f"（{len(pairs)} 行里 {dropped} 行缺失或不为正）："
                 "先同步估值数据（`sams sync valuation`）"
             ),
+            missing_kind=NOT_COVERED,
+        )
+    if not usable:
+        return Percentile(
+            None,
+            None,
+            0,
+            metric,
+            window_from,
+            as_of,
+            reason=(
+                f"窗口 {window_from}~{as_of} 内有 {len(present)} 个 {metric}，"
+                "但没有一个为正：负倍数不是「便宜」，是没有意义，不能排位置"
+            ),
+            missing_kind=UNCOMPUTABLE,
         )
     current_day, current = usable[-1]
     values = [value for _, value in usable[:-1]]
@@ -333,5 +403,6 @@ def metric_percentile(
         evidence=evidence,
     )
     if len(values) < MIN_SAMPLES:
-        return replace(base, reason=_too_thin(len(values)))
-    return replace(base, value=_rank(values, current))
+        return replace(base, reason=_too_thin(len(values)), missing_kind=UNCOMPUTABLE)
+    q20, q50, q80 = _quantiles(values)
+    return replace(base, value=_rank(values, current), q20=q20, q50=q50, q80=q80)

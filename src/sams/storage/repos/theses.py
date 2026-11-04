@@ -64,7 +64,7 @@ PRICES = ("entry_low", "entry_high", "stop_price", "target_price")
 _COLUMNS = (
     "id, user_id, market, code, style, status, entry_low, entry_high, stop_price, "
     "target_price, reward_risk, win_rate, win_rate_samples, levels_on, created_at, updated_at, "
-    "archived_at, baseline_score, baseline_items, baseline_on"
+    "archived_at, baseline_score, baseline_items, baseline_on, plan_version, plan_method"
 )
 
 
@@ -101,6 +101,9 @@ class Thesis:
     baseline_score: float | None = None
     baseline_items: tuple[tuple[str, float], ...] = ()
     baseline_on: date | None = None
+    #: 价位是按哪套方法落的（0033）：手填的行两列都空，没有式子可 backing
+    plan_version: str | None = None
+    plan_method: str | None = None
     archived_at: datetime | None = None
 
 
@@ -256,6 +259,8 @@ class ThesisRepo:
         status: str = OBSERVING,
         note: str | None = None,
         levels_on: date | None = None,
+        plan_version: str | None = None,
+        plan_method: str | None = None,
         **levels: float | int | None,
     ) -> Thesis:
         """开局只有 `observing` 与 `proposed` 两种：从链条中段开局等于跳过「观点怎么来的」。"""
@@ -288,6 +293,8 @@ class ThesisRepo:
             style=style,
             status=name,
             levels_on=levels_on,
+            plan_version=plan_version,
+            plan_method=plan_method,
             created_at=now,
             updated_at=now,
             **cleaned,
@@ -297,8 +304,8 @@ class ThesisRepo:
             INSERT INTO theses
                 (id, user_id, market, code, style, status, entry_low, entry_high,
                  stop_price, target_price, reward_risk, win_rate, win_rate_samples,
-                 levels_on, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 levels_on, created_at, updated_at, plan_version, plan_method)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 thesis.id,
@@ -317,6 +324,8 @@ class ThesisRepo:
                 levels_on,
                 now,
                 now,
+                plan_version,
+                plan_method,
             ],
         )
         self._event(thesis.id, None, name, actor_id, note, now)
@@ -385,6 +394,8 @@ class ThesisRepo:
         actor_id: str,
         now: datetime,
         levels_on: date | None = None,
+        plan_version: str | None = None,
+        plan_method: str | None = None,
         **levels: float | int | None,
     ) -> Thesis:
         """改那几列价位而不改状态，因此**不写事件**：`thesis_events.to_status` 非空，
@@ -405,24 +416,29 @@ class ThesisRepo:
         self._reject_unknown(levels)
         merged = {**{c: getattr(current, c) for c in LEVEL_COLUMNS}, **levels}
         cleaned = _check_levels(merged)
-        self.db.execute(
+        sql = (
             "UPDATE theses SET entry_low = ?, entry_high = ?, stop_price = ?, "
             "target_price = ?, reward_risk = ?, win_rate = ?, win_rate_samples = ?, "
-            "levels_on = ?, updated_at = ? WHERE user_id = ? AND id = ?",
-            [
-                cleaned["entry_low"],
-                cleaned["entry_high"],
-                cleaned["stop_price"],
-                cleaned["target_price"],
-                cleaned["reward_risk"],
-                cleaned["win_rate"],
-                cleaned["win_rate_samples"],
-                levels_on,
-                now,
-                current.user_id,
-                current.id,
-            ],
+            "levels_on = ?, updated_at = ?"
         )
+        params: list = [
+            cleaned["entry_low"],
+            cleaned["entry_high"],
+            cleaned["stop_price"],
+            cleaned["target_price"],
+            cleaned["reward_risk"],
+            cleaned["win_rate"],
+            cleaned["win_rate_samples"],
+            levels_on,
+            now,
+        ]
+        # 手填价位不碰这两列：它没有方法可写，但也不该把上一次读数的方法抹掉
+        if plan_version is not None:
+            sql += ", plan_version = ?, plan_method = ?"
+            params.extend([plan_version, plan_method])
+        sql += " WHERE user_id = ? AND id = ?"
+        params.extend([current.user_id, current.id])
+        self.db.execute(sql, params)
         found = self.get(user_id, thesis_id)
         assert found is not None  # 同一个库里刚 UPDATE 过
         return found
@@ -601,6 +617,8 @@ def _to_theses(rows) -> list[Thesis]:
                 )
             ),
             baseline_on=r["baseline_on"],
+            plan_version=r["plan_version"],
+            plan_method=r["plan_method"],
         )
         for r in rows.to_dicts()
     ]

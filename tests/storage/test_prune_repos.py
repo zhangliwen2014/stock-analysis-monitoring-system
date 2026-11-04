@@ -101,6 +101,27 @@ def test_heartbeats_beyond_the_keep_count_are_the_oldest(db):
     assert [row["id"] for row in left] == ids[-2:]
 
 
+def test_a_stopped_heartbeat_is_marked_instead_of_left_fresh(db):
+    """正常退出的那一行要留下「已停」：只靠 5 分钟过期挡重启，会让一次计划内的
+    重启在头五分钟里静悄悄没有调度线程（实机重启撞到过）。历史行照样留着可查。"""
+    clock = FrozenClock(NOW)
+    repo = HeartbeatRepo(db, clock=clock)
+    beat_id = repo.start(note="tick=60s")
+
+    repo.stop(beat_id)
+
+    latest = repo.latest()
+    assert latest is not None
+    assert latest.id == beat_id
+    assert latest.stopped_at == NOW
+
+
+def test_stopping_an_unknown_heartbeat_is_silent(db):
+    repo = HeartbeatRepo(db, clock=FrozenClock(NOW))
+    repo.stop("nope")
+    assert repo.latest() is None
+
+
 def test_heartbeats_keep_rejects_zero(db):
     with pytest.raises(ValidationError, match="keep"):
         HeartbeatRepo(db).count_beyond(0)

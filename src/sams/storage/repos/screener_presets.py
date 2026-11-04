@@ -32,6 +32,12 @@ class Preset:
     created_at: datetime
     updated_at: datetime
     description: str = ""
+    #: 每个交易日收盘后是否自动跑（S4-B / D254）
+    enabled: bool = False
+    #: 新命中推送到哪几个通道；空 = 只进告警中心
+    channel_ids: tuple[str, ...] = ()
+    #: 监控最后一次真的看过市场；NULL 同时是「下一趟只记基线」的闸
+    last_run_at: datetime | None = None
 
 
 class ScreenerPresetRepo:
@@ -80,6 +86,16 @@ class ScreenerPresetRepo:
         )
         return [_to_preset(row) for row in rows.to_dicts()]
 
+    def list_enabled(self, *, market: str | None = None) -> list[Preset]:
+        """调度读的那一半：所有打开监控的方案，按市场与名字排。"""
+        sql = f"SELECT * FROM {self.TABLE} WHERE enabled"
+        params: list[object] = []
+        if market is not None:
+            sql += " AND market = ?"
+            params.append(canonical_market(market))
+        rows = self.db.query(sql + " ORDER BY market, user_id, name", params)
+        return [_to_preset(row) for row in rows.to_dicts()]
+
     def get(self, user_id: str, preset_id: str) -> Preset | None:
         rows = self.db.query(
             f"SELECT * FROM {self.TABLE} WHERE user_id = ? AND id = ?",
@@ -118,12 +134,46 @@ class ScreenerPresetRepo:
         if preset is None:
             return False
         checked = _checked(preset.market, conditions)
+        # 改了条件就是另一句话（D257）：下一趟只记基线，不拿旧名单去比新条件
         self.db.execute(
-            f"UPDATE {self.TABLE} SET conditions_json = ?, updated_at = ?"
+            f"UPDATE {self.TABLE} SET conditions_json = ?, updated_at = ?, last_run_at = NULL"
             " WHERE user_id = ? AND id = ?",
             [_to_json(checked), self.clock.now_utc(), user_id, preset_id],
         )
         return True
+
+    def set_monitor(
+        self,
+        user_id: str,
+        preset_id: str,
+        *,
+        enabled: bool,
+        channel_ids: list[str] | tuple[str, ...] = (),
+    ) -> bool:
+        """打开/关闭自动监控，并写下新命中要走的通道。
+
+        「关 → 开」清空 `last_run_at`：重新打开之后的第一趟又是一次基线，不把关闭
+        期间的进出当成今晚发生的事。一直开着只改通道时，基线不受影响。
+        """
+        user_id = _user(user_id)
+        preset = self.get(user_id, preset_id)
+        if preset is None:
+            return False
+        cleaned = _channels(channel_ids)
+        sql = f"UPDATE {self.TABLE} SET enabled = ?, channel_ids = ?"
+        params: list[object] = [bool(enabled), json.dumps(cleaned, ensure_ascii=False)]
+        if enabled and not preset.enabled:
+            sql += ", last_run_at = NULL"
+        sql += " WHERE user_id = ? AND id = ?"
+        params += [user_id, preset_id]
+        self.db.execute(sql, params)
+        return True
+
+    def mark_run(self, user_id: str, preset_id: str, at: datetime) -> None:
+        self.db.execute(
+            f"UPDATE {self.TABLE} SET last_run_at = ? WHERE user_id = ? AND id = ?",
+            [at, _user(user_id), preset_id],
+        )
 
     def delete(self, user_id: str, preset_id: str) -> bool:
         user_id = _user(user_id)
@@ -164,6 +214,15 @@ def _description(description: str | None) -> str:
     return cleaned
 
 
+def _channels(channel_ids: list[str] | tuple[str, ...]) -> list[str]:
+    cleaned: list[str] = []
+    for value in channel_ids:
+        item = str(value).strip()
+        if item and item not in cleaned:
+            cleaned.append(item)
+    return cleaned
+
+
 def _checked(market: str, conditions: list[Condition]) -> tuple[Condition, ...]:
     if not conditions:
         raise ValidationError("一条条件都没有：空条件等于「全市场都通过」，那不是一个能重跑的方案")
@@ -193,4 +252,7 @@ def _to_preset(row: dict) -> Preset:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         description=row["description"] or "",
+        enabled=bool(row.get("enabled")),
+        channel_ids=tuple(json.loads(row.get("channel_ids") or "[]")),
+        last_run_at=row.get("last_run_at"),
     )

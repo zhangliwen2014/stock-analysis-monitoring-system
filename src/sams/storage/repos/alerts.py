@@ -10,7 +10,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import Conflict, StorageError, ValidationError
@@ -49,7 +49,8 @@ _ERROR_MAX_CHARS = 400
 _ALERT_COLUMNS = (
     "id, user_id, rule_id, account_id, market, code, stage, triggered_at,"
     " status, payload_json, severity, handled_at, handle_note, dismiss_reason, is_test,"
-    " acknowledged_at, action_kind, action_ref, dismiss_code, thesis_id, deferred_until"
+    " acknowledged_at, action_kind, action_ref, dismiss_code, thesis_id, deferred_until,"
+    " trigger_bar_ts, dedupe_key"
 )
 
 #: `/review` 的原始行列集：统计与清单要的那十几列。`payload_json` 整列不带回来，
@@ -133,6 +134,9 @@ class Alert:
     intraday: bool = False
     quote_ts: datetime | None = None
     quote_source: str | None = None
+    #: 证据两列（S1-B）：判自哪根 bar、按哪个去重键。老行没有，都是 None
+    trigger_bar_ts: date | None = None
+    dedupe_key: str | None = None
 
 
 class AlertRepo:
@@ -167,6 +171,9 @@ class AlertRepo:
         intraday: bool = False,
         quote_ts: datetime | None = None,
         quote_source: str | None = None,
+        trigger_bar_ts: date | None = None,
+        dedupe_key: str | None = None,
+        facts: Mapping[str, object] | None = None,
     ) -> Alert:
         if severity not in SEVERITIES:
             raise ValidationError(
@@ -190,12 +197,16 @@ class AlertRepo:
             "quote_ts": None if quote_ts is None else _moment(quote_ts).isoformat(),
             "quote_source": quote_source,
         }
+        # 顶层事实（S3-C）：资讯告警按 `payload.kind=news` 与价格规则告警分开。
+        # 放在核心键之后合并，调用方给的是事实而不是覆盖内部字段的补丁。
+        payload.update(dict(facts or {}))
         alert_id = new_id()
         self.db.execute(
             "INSERT INTO alerts"
             " (id, user_id, rule_id, account_id, market, code, stage, triggered_at,"
-            " status, payload_json, severity, is_test, thesis_id)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)",
+            " status, payload_json, severity, is_test, thesis_id,"
+            " trigger_bar_ts, dedupe_key)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)",
             [
                 alert_id,
                 user_id,
@@ -209,6 +220,8 @@ class AlertRepo:
                 severity,
                 bool(is_test),
                 thesis_id,
+                trigger_bar_ts,
+                dedupe_key,
             ],
         )
         created = self.get(alert_id)
@@ -552,6 +565,44 @@ class AlertRepo:
             )
         return moved
 
+    def acknowledge_many(
+        self, user_id: str, alert_ids: Sequence[str]
+    ) -> tuple[int, int]:
+        """批量已读：只动本人的 `new` 行，其余跳过并报数。
+
+        收件箱勾选里夹着一条刚被别人处置的，不该让整批失败；条件更新与单条
+        `acknowledge` 同一个口径，状态列与历史行在同一个事务里落。重复提交同一个
+        id 不算「跳过」——那是一次提交里的重复项，不是一条真被跳过的告警。
+        """
+        ids = [str(item) for item in alert_ids]
+        if not ids:
+            return 0, 0
+        seen: set[str] = set()
+        acked = skipped = 0
+        moment = self.clock.now_utc()
+        with self.db.transaction():
+            for alert_id in ids:
+                if alert_id in seen:
+                    continue
+                seen.add(alert_id)
+                changed = self.db.scalar(
+                    "UPDATE alerts SET status = ?, acknowledged_at = ?"
+                    " WHERE id = ? AND user_id = ? AND status = ? RETURNING id",
+                    [ACKNOWLEDGED, moment, alert_id, user_id, NEW],
+                )
+                if changed is None:
+                    skipped += 1
+                    continue
+                self.events.add(
+                    alert_id,
+                    user_id=user_id,
+                    action="ack",
+                    from_status=NEW,
+                    to_status=ACKNOWLEDGED,
+                )
+                acked += 1
+        return acked, skipped
+
     def act(
         self,
         alert_id: str,
@@ -800,5 +851,9 @@ class AlertRepo:
             quote_ts=_parse_ts(payload.get("quote_ts")),
             quote_source=(
                 str(payload["quote_source"]) if payload.get("quote_source") else None
+            ),
+            trigger_bar_ts=row["trigger_bar_ts"],
+            dedupe_key=(
+                str(row["dedupe_key"]) if row["dedupe_key"] is not None else None
             ),
         )

@@ -106,9 +106,12 @@ def test_health_and_the_other_commands_exit_3_while_a_writer_holds_the_database(
         holder.wait(timeout=10)
 
 
-def test_a_stale_beat_file_says_the_holder_may_be_stuck(tmp_path, capsys) -> None:
-    """库仍然被锁着，但那一拍已经很旧：占着它的人可能卡住了，锁不会自己释放。
-    健康的那个进程与卡死的那个进程在「库打不开」这一件事上完全同形，心跳文件是唯一的分界。
+def test_a_stale_beat_from_a_live_pid_says_a_long_job_not_a_dead_loop(tmp_path, capsys) -> None:
+    """那一拍过期了，但写它的进程还在：这说的是「某一趟比阈值长」，不是「调度器停了」。
+
+    本机实测（2026-11-02）：A 股基本面清扫一趟跑几分钟，`_beat()` 只在轮首与每个 job
+    之前打，所以单趟超阈值的那一段一定读成过期——健康页于是常年 `degraded`。
+    把「可能死了」印在这种时候，看的人学到的第一件事就是别再看这页。
     """
     db = tmp_path / "sams.duckdb"
     write_beat(
@@ -120,8 +123,34 @@ def test_a_stale_beat_file_says_the_holder_may_be_stuck(tmp_path, capsys) -> Non
 
     code = show_locked(DatabaseLocked(str(db), detail="Conflicting lock"))
 
+    text = capsys.readouterr().out
     assert code == EXIT_LOCKED
-    assert "可能已经卡住" in capsys.readouterr().out
+    assert "还在" in text and "一趟" in text
+    assert "可能已经卡住" not in text
+
+
+def test_a_stale_beat_from_a_dead_pid_says_the_holder_is_gone(tmp_path, capsys) -> None:
+    """写那一拍的进程已经不在了，而锁还没释放：这才是需要人去看的现场。
+
+    单写者模型下这条判据是硬的——只有真没人持锁才可能有第二份写连接，所以拍上的 pid
+    死了就等于没有别人在写这一份库（D276）。这里用一个刚退出的真子进程，不留猜测。
+    """
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    db = tmp_path / "sams.duckdb"
+    write_beat(
+        beat_path(db),
+        pid=dead.pid,
+        beat_at=datetime.now(UTC) - timedelta(seconds=HEARTBEAT_STALE_S + 60),
+    )
+    capsys.readouterr()
+
+    code = show_locked(DatabaseLocked(str(db), detail="Conflicting lock"))
+
+    text = capsys.readouterr().out
+    assert code == EXIT_LOCKED
+    assert "已经不在了" in text
+    assert "还在写" not in text
 
 
 def test_without_a_beat_file_the_screen_does_not_pretend_to_know(tmp_path, capsys) -> None:

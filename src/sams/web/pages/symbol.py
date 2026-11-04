@@ -13,24 +13,43 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 import polars as pl
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
+from sams.core.business import BUSINESS_FIELD_KEYS
 from sams.core.codes import canonical_code, canonical_market, looks_like_index_code
 from sams.core.errors import NotAdjustable, ValidationError
-from sams.core.quotes import NO_DATA, quote_state
 from sams.services.analysis import parse_period
+from sams.services.decision import CardQuote
 from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
+from sams.services.news import NEWS_MARKETS
 from sams.storage.repos.symbol_backfills import DEFERRED
 from sams.web.auth import csrf_protect, require_user
+from sams.web.back import local_back
 from sams.web.chart_prefs import CHART_PERIODS, ordered_periods, parse_windows, windows_text
-from sams.web.display import hms, moment_label, pct_class, ratio_num, state_label
-from sams.web.pages.dashboard import _market_open
+from sams.web.display import moment_label, pct_class, ratio_num, state_label
+from sams.web.feed import feed_rows
+from sams.web.forms import form_data, one
+from sams.web.quotes import quote_reader
 
 router = APIRouter()
+
+
+def _focus_day(raw: str | None) -> str:
+    """告警回跳的那一天。形状不对就当没给，不 400——它只是视图参数。
+
+    与筛选日期（`pages/alerts.py` 的 `_day_bound`）不同：那边填错会把一屏筛成空，
+    必须说清楚；这边填错最多是图上少一条竖线，拦人只会让「回到现场」先撞一次墙。
+    """
+    value = (raw or "").strip()
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
 
 
 def _require_symbol(request: Request, user, market: str, code: str):
@@ -45,6 +64,9 @@ def _require_symbol(request: Request, user, market: str, code: str):
     主档没有但代码表在册（is_active）= 「全市场认识这只票、本地档案还没追上」：兜底建行走
     `SymbolInterest.ensure`（顺带排补数），不再 404（D146）。退市码不兜底：给它建行排队
     是每一拍白试一次的死占用。兜不住才 404，措辞不变——不给探测者区分「没有」与「不是你的」。
+
+    登记兴趣对**已有主档**的票也要跑一次（D283）：只在缺主档时登记，那些「档案在、
+    公司行为从没查过」的票就永远排不上队，而屏幕上那句「已登记后台补采」也就成了假话。
     """
     web = request.app.state.web
     ctx = web.contexts.current()
@@ -57,12 +79,12 @@ def _require_symbol(request: Request, user, market: str, code: str):
     if market not in ctx.settings.markets:
         # 这条 404 与兜底无关：市场不在本机配置清单里本就不可达，兜底只是会晚一步崩 KeyError
         raise HTTPException(status_code=404)
-    row = ctx.symbols.get(market, code)
-    if row is None:
+    if ctx.symbols.get(market, code) is None:
         listed = ctx.symbol_list_store.get(market, code)
-        if listed is not None and listed["is_active"]:
-            ctx.symbol_interest.ensure(market, code, actor=user.username)
-            row = ctx.symbols.get(market, code)
+        if listed is None or not listed["is_active"]:
+            raise HTTPException(status_code=404)
+    ctx.symbol_interest.ensure(market, code, actor=user.username)
+    row = ctx.symbols.get(market, code)
     if row is None:
         raise HTTPException(status_code=404)
     return ctx, market, code, row
@@ -90,15 +112,24 @@ def symbol_page(request: Request, market: str, code: str):
     now = core.clock.now_utc()
     tz = ctx.settings.server.display_tz
 
-    quote = core.board.get(market, code)
-    state = NO_DATA
-    if quote is not None:
-        state = quote_state(
-            quote,
-            now=now,
-            market_open=_market_open(ctx, market, now),
-            stale_s=ctx.settings.quote_stale_s,
-        )
+    # 与看板、选股、持仓、规则同一套读模型（S0-E）：盘中是过闸的报价，休市回落
+    # 库内最后一根不复权日线，并把「10-30 收盘 / 14:47 盘中」与来处一起交给模板
+    quote = quote_reader(ctx, core, now).view(market, code)
+    # 决策卡只吃报价那一格的六个字段：服务层不认识 web 的 QuoteView，也不该认识
+    decision = ctx.decision.card(
+        user.id,
+        market,
+        code,
+        CardQuote(
+            price=quote.price,
+            day=quote.day,
+            source=quote.source,
+            kind=quote.kind,
+            state=quote.state,
+            label=quote.label,
+            detail=quote.detail,
+        ),
+    )
 
     # 只问「有哪些规则挂在这只票上」，所以读仓库而不是 rule_service.list：后者会为
     # 每一条规则展开标的（读估值与日线），一页的第一眼不该付这个代价，锁库时那趟还是
@@ -153,17 +184,23 @@ def symbol_page(request: Request, market: str, code: str):
         market=market,
         code=code,
         symbol=symbol,
-        price=quote.price if quote else None,
-        quote_pct=quote.pct_chg if quote else None,
-        pct_class=pct_class(quote.pct_chg if quote else None),
-        state=state_label(state),
-        quote_at=hms(quote.ts if quote else None, tz),
+        price=quote.price,
+        quote_pct=quote.pct,
+        pct_class=pct_class(quote.pct),
+        state=state_label(quote.state),
+        quote_at=quote.label,
+        quote_unit=quote.unit,
+        quote_detail=quote.detail,
+        decision=decision,
         rules=rules,
         theses=theses,
         alerts=alerts,
         no_bars=no_bars,
         backfill_note=backfill_note,
         backfill_deferred=backfill_deferred,
+        # 告警详情来的回跳（S1-B）：图上要标出判出那条告警的那根 bar
+        focus=_focus_day(request.query_params.get("focus")),
+        back_url=local_back(request.query_params.get("back")),
     )
 
 
@@ -480,7 +517,8 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
     拆出来的 loader 都指向同一份资料，库里的键也只有一种形态（D50）。
 
     三种「没有」在这里分开说（设计 §F）：链上没有源（US）→ 明说缺源；有源但本地
-    没数据 → 给采集命令；有数据 → 照常渲染。财务与估值的空态同第二档，只是命令换成
+    没数据 → 分红送转那一格改说「已排进后台补采队列」（D283，打开本页的那一刻排的），
+    其余几格暂时还给采集命令；有数据 → 照常渲染。财务与估值的空态同第二档，只是命令换成
     它们各自的那一条。
     """
     user = require_user(request)
@@ -488,6 +526,13 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
     ctx, market, code, symbol = _require_symbol(request, user, market, code)
     _financial_view(view)
     read = ctx.f10.read(market, code)
+    zone = ctx.settings.markets[market].zone()
+    now = ctx.clock.now_utc()
+    news_feed = feed_rows(
+        ctx.news.feed(user.id, market, [code], limit=5),
+        zone=zone,
+        today=now.astimezone(zone).date(),
+    )
     return web.render(
         request,
         "partials/f10.html",
@@ -497,14 +542,17 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
         currency=symbol.get("currency") or "",
         read=read,
         kind_labels=_ACTION_KIND_LABELS,
+        news_feed=news_feed,
+        news_covered=market in NEWS_MARKETS,
+        all_news_url=f"/news?market={market}&code={code}",
         fin_view=view,
         financial_periods=FINANCIAL_PERIODS,
         financial_views=FINANCIAL_VIEWS,
         profile_command=f"sams sync profile --market {market} --code {code}",
         announcement_command=f"sams sync announcements --market {market} --code {code}",
+        news_command=f"sams sync news --market {market} --code {code}",
         financials_command=f"sams sync financials --market {market} --code {code}",
         valuation_command=f"sams sync valuation --market {market} --code {code}",
-        actions_command=f"sams sync actions --market {market} --code {code}",
     )
 
 
@@ -606,7 +654,7 @@ def f10_chart_api(request: Request, market: str, code: str, period_type: str = "
 @router.get("/api/partials/chart")
 def chart_partial(
     request: Request, market: str, code: str, period: str = "day", view: str = "kline",
-    main: str = "ma", sub: str = "vol", ma: str = "",
+    main: str = "ma", sub: str = "vol", ma: str = "", focus: str = "",
 ):
     """个股页那一块图：视图切换 + 周期条 + 指标开关 + 挂着 `data-chart-url` 的那个 div。
 
@@ -641,6 +689,13 @@ def chart_partial(
     if market not in ctx.settings.markets:
         raise HTTPException(status_code=404)
     available = ctx.minute.availability(market)
+    caption = _chart_caption(view, period)
+    if view == "kline" and period not in MINUTE_SCALES:
+        # 图上的最后一根是哪一天：不复权的报价那一格写着「10-30 收盘」，
+        # 图却可能因为采集没追上停在更早，不标出来读的人会以为它画到昨天（S0-E）
+        latest = ctx.bars.latest_date(market, code)
+        if latest is not None:
+            caption += f" · 数据截至 {latest:%Y-%m-%d}"
     return web.render(
         request,
         "partials/chart.html",
@@ -666,7 +721,10 @@ def chart_partial(
         series_why=available.series.why_not,
         bars_ok=available.bars.ok,
         bars_why=available.bars.why_not,
-        caption=_chart_caption(view, period),
+        # 告警详情来的那一天：图局部把 `data-focus` 交给 `app.js` 画竖线、收窗口；
+        # 换周期/换指标的 htmx 链接也带着它，切一次不该把「哪根 bar」丢掉
+        focus=_focus_day(focus),
+        caption=caption,
         chart_url=(
             f"/api/symbol/{market}/{code}/minute"
             if view == "time"
@@ -675,6 +733,79 @@ def chart_partial(
                 f"?period={period}&main={main}&sub={sub}&ma={ma}"
             )
         ),
+    )
+
+
+@router.get("/api/partials/business")
+def business_partial(request: Request, market: str, code: str, back: str = ""):
+    """核心业务六字段（S2 / D240）：草稿与已确认在屏幕上必须是两种样子。"""
+    user = require_user(request)
+    web = request.app.state.web
+    ctx, market, code, _row = _require_symbol(request, user, market, code)
+    read = ctx.business.read(market, code)
+    return web.render(
+        request,
+        "partials/business.html",
+        market=market,
+        code=code,
+        read=read,
+        back=local_back(back),
+    )
+
+
+@router.post("/symbol/{market}/{code}/business")
+async def business_save(
+    request: Request,
+    market: str,
+    code: str,
+    _csrf: None = Depends(csrf_protect),
+):
+    """六项一次提交：留空清除，非空保存并确认；303 回到这一张卡（PRG）。"""
+    user = require_user(request)
+    ctx, market, code, _row = _require_symbol(request, user, market, code)
+    data = await form_data(request)
+    values = {key: one(data, key) for key in BUSINESS_FIELD_KEYS}
+    ctx.business.save(market, code, values, user_id=user.username)
+    target = f"/symbol/{market}/{code}"
+    back = local_back(one(data, "back"))
+    if back:
+        target = f"{target}?{urlencode({'back': back})}"
+    return RedirectResponse(f"{target}#business", status_code=303)
+
+
+@router.get("/api/partials/peers")
+def peers_partial(request: Request, market: str, code: str):
+    """同业对比（S2 / D237–D239）：中位只算同业，排除计数必须说出口。"""
+    user = require_user(request)
+    web = request.app.state.web
+    ctx, market, code, symbol = _require_symbol(request, user, market, code)
+    report = ctx.peers.compare(market, code)
+    return web.render(
+        request,
+        "partials/peers.html",
+        market=market,
+        code=code,
+        # 局部的「这一屏」是 /api/partials/peers?…：把它交给 `back` 会把人带回一段裸片段
+        origin_url=f"/symbol/{market}/{code}",
+        currency=symbol.get("currency") or "",
+        report=report,
+    )
+
+
+@router.get("/api/partials/valuation")
+def valuation_partial(request: Request, market: str, code: str):
+    """估值位置（S2 / D241）：PR / PE / PB 各自的历史分位，拒绝时说明是哪一档。"""
+    user = require_user(request)
+    web = request.app.state.web
+    ctx, market, code, _row = _require_symbol(request, user, market, code)
+    read = ctx.valuation.percentiles(market, code)
+    return web.render(
+        request,
+        "partials/valuation.html",
+        market=market,
+        code=code,
+        read=read,
+        metric_labels={"pr": "市赚率 PR", "pe_ttm": "PE(TTM)", "pb": "PB"},
     )
 
 
@@ -687,5 +818,8 @@ def symbol_sync(request: Request, market: str, code: str, _csrf: None = Depends(
     """
     user = require_user(request)
     ctx, market, code, _row = _require_symbol(request, user, market, code)
-    ctx.symbol_interest.ensure(market, code, actor=user.username)
-    return RedirectResponse(f"/symbol/{market}/{code}", status_code=303)
+    target = f"/symbol/{market}/{code}"
+    back = local_back(request.query_params.get("back"))
+    if back:
+        target = f"{target}?{urlencode({'back': back})}"
+    return RedirectResponse(target, status_code=303)

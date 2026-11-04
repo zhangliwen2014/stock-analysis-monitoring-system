@@ -7,9 +7,17 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 
-from sams.services.scheduler.beatfile import BeatFile, beat_path, read_beat, write_beat
+from sams.services.scheduler.beatfile import (
+    BeatFile,
+    beat_path,
+    pid_is_gone,
+    read_beat,
+    write_beat,
+)
 
 MOMENT = datetime(2024, 10, 25, 23, 0, tzinfo=UTC)
 
@@ -61,3 +69,26 @@ def test_naive_timestamp_reads_as_unknown(tmp_path) -> None:
     )
     assert read_beat(path) is None
     assert os.path.exists(path)
+
+
+def test_a_reaped_child_reads_as_gone(tmp_path) -> None:
+    """「那个进程不在了」是一个可以问出来的事实，不需要猜心跳的年龄。
+
+    单写者模型给了这条判据分量：能开写连接的人只有一个，所以拍上那个 pid 死了
+    就等于没有别人在写这一份库（D276）。这里用一个刚退出的真子进程，不留 pid 猜测。
+    """
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    assert pid_is_gone(dead.pid) is True
+
+
+def test_this_process_reads_as_alive() -> None:
+    assert pid_is_gone(os.getpid()) is False
+
+
+def test_an_unusable_pid_reads_as_unknown() -> None:
+    """判不了要说「不知道」，不是「死了」也不是「活着」。
+
+    超出系统的 pid 连信号都发不出去：那一刻既没证明它在，也没证明它不在。
+    """
+    assert pid_is_gone(2**31) is None

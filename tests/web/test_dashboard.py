@@ -249,13 +249,16 @@ def _quote_cells(page, code: str) -> list[str]:
 
 def test_watchlist_row_without_master_symbol_links_anyway(logged):
     """链接统一（D146/N4）：主档没这行也挂 /symbol 链接——那一屏由代码表兜底建行，
-    兜不住才 404，不再是「点下去必死」的死路。名称列仍交代码：空白看起来像页面坏了。"""
+    兜不住才 404，不再是「点下去必死」的死路。名称列仍交代码：空白看起来像页面坏了。
+
+    断的是「这一行到底有没有链接」；锚点后面可能跟着 `?back=`（回到刚才那一屏，
+    spec 2026-11-03-back-link），那不是这一条要管的事。"""
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "US", "AAPL")
     _seed_quote(logged, market="US", code="AAPL", price=250.0)
     page = logged.client.get("/")
     assert page.status_code == 200
-    assert '<a href="/symbol/US/AAPL">' in _quote_row(page, "AAPL")
+    assert '<a href="/symbol/US/AAPL' in _quote_row(page, "AAPL")
     cells = _quote_cells(page, "AAPL")
     assert cells[2] == "AAPL", "名称列不许留空：空白看起来像页面坏了"
 
@@ -266,11 +269,14 @@ def test_watchlist_management_table_links_code(logged):
     logged.context.watchlists.add(user.id, "US", "AAPL")
     page = logged.client.get("/watchlist")
     row = _quote_row(page, "AAPL", table_marker="/watchlist/remove")
-    assert '<a href="/symbol/US/AAPL">' in row
+    assert '<a href="/symbol/US/AAPL' in row
 
 
 def test_quotes_partial_links_every_row(logged):
-    """10 秒一刷的那块与首屏同一个折法：链接统一之后每一行都挂anchor（D146）。"""
+    """10 秒一刷的那块与首屏同一个折法：链接统一之后每一行都挂anchor（D146）。
+
+    这里是**不带 `back` 地**直接请求那段片段：没有谁报上来路，那一行的 href 就该停在
+    裸路径上（闭合引号紧跟着路径）——写成片段自己的 URL，是一条会把人带回裸表的「返回」。"""
     user = logged.context.users.get_by_username("alice")
     logged.context.watchlists.add(user.id, "US", "AAPL")
     _seed_quote(logged, market="US", code="AAPL", price=250.0)

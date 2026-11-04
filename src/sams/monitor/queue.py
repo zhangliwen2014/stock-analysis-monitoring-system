@@ -38,6 +38,39 @@ class AlertJob:
 
 
 @dataclass(frozen=True)
+class DigestJob:
+    """「把库里这一条摘要发完」的工作单（S1-C）。只有 id：正文从库里重建。"""
+
+    digest_id: str
+
+    def run(self, notify) -> None:
+        notify.deliver_digest(self.digest_id)
+
+
+class QueuedDigestSender:
+    """`DigestService.send` 的队列版：入队即返回；满了把 `no_channel` 写回摘要行。
+
+    摘要没有告警那种「收件箱里重发」的入口（v0 不做自动重发），所以队列满时
+    必须留下原因，而不是让那一行看起来像「已推送但没人收到」。
+    """
+
+    def __init__(self, notify, queue: AlertQueue) -> None:
+        self.notify = notify
+        self.queue = queue
+
+    def __call__(self, digest_id: str) -> None:
+        if self.queue.offer(DigestJob(digest_id)):
+            return
+        self.notify.abandon_digest(
+            digest_id,
+            reason=(
+                f"通知队列已满（上限 {self.queue.maxsize}）：摘要没有发送；"
+                "网页上仍可读到这一条"
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class CallbackJob:
     """系统告警的搬运单（`SystemAlarmRelay`）：真正的处理在通知线程里跑。"""
 
@@ -99,8 +132,8 @@ class QueuedAlertSender:
         account_id=None,
         is_test=False,
     ) -> str:
-        # `is_test` 只是把端口那一格接住：引擎只会按 False 走，而这里少收一个参数
-        # 就等于端口那张参数表骗人（`core/notify.py` 的 `AlertSender` 说了要逐字对齐）
+        # `is_test` 只有网页的示例演练会传（D231）；这里少收一个参数就等于端口那张
+        # 参数表骗人（`core/notify.py` 的 `AlertSender` 说了要逐字对齐）
         alert = self.notify.record(
             message,
             user_id=user_id,
@@ -164,9 +197,18 @@ class NotifyWorker:
 
         `CallbackJob` 直接返回：系统告警从来不是收件箱里的一行，没有可弃的东西。
         """
-        if not isinstance(job, AlertJob):
-            return
         try:
+            if isinstance(job, DigestJob):
+                self.notify.fail_digest(
+                    job.digest_id,
+                    error=(
+                        f"通知线程处理这条摘要时出了预期外的错："
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+                return
+            if not isinstance(job, AlertJob):
+                return
             self.notify.abandon(
                 job.alert_id,
                 reason=(
@@ -175,7 +217,7 @@ class NotifyWorker:
                 ),
             )
         except Exception:  # noqa: BLE001 — 弃单本身坏了也不能停在同一个坑里
-            logger.exception("给告警 %s 落弃单失败", job.alert_id)
+            logger.exception("通知工作单 %r 的弃单失败", job)
 
 
 class SystemAlarmRelay:

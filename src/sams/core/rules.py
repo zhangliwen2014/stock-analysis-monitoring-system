@@ -52,6 +52,9 @@ class Param:
     maximum: float | None = None
     choices: tuple[str, ...] = ()
     unit: str = ""
+    #: 用户按百分数填、库里存小数（0.08）：只有页面这一层换算，CLI 与仓库仍是小数。
+    #: 标在参数上而不是按名字猜：下一个「比例」参数不该再靠 `name == "pct"` 认出来。
+    percent: bool = False
 
     def describe(self) -> str:
         tail = f"，默认 {self.default}" if not self.required else "，必填"
@@ -108,9 +111,9 @@ class Template:
 
 
 def _number(name: str, label: str, *, default=None, required=False, minimum=None,
-            maximum=None, unit: str = "") -> Param:
+            maximum=None, unit: str = "", percent: bool = False) -> Param:
     return Param(name=name, label=label, shape="number", default=default, required=required,
-                 minimum=minimum, maximum=maximum, unit=unit)
+                 minimum=minimum, maximum=maximum, unit=unit, percent=percent)
 
 
 def _choice(name: str, label: str, choices: tuple[str, ...], default: str) -> Param:
@@ -128,14 +131,16 @@ TEMPLATES: dict[str, Template] = {
     ),
     "stop.pct": Template(
         "stop.pct", "成本下浮 x%",
-        (_number("pct", "回撤比例", required=True, minimum=0.0, maximum=0.9),),
+        (_number("pct", "回撤比例", required=True, minimum=0.0, maximum=0.9,
+                 percent=True),),
         severity="strong", stages=True, needs_position=True,
         judged=frozenset({"avg_cost"}),
         targets=("position", "thesis"), intraday=True,
     ),
     "stop.trailing": Template(
         "stop.trailing", "持仓期最高价回撤 x%",
-        (_number("pct", "回撤比例", required=True, minimum=0.0, maximum=0.9),),
+        (_number("pct", "回撤比例", required=True, minimum=0.0, maximum=0.9,
+                 percent=True),),
         severity="strong", stages=True, needs_position=True, targets=("position", "thesis"),
         intraday=True,
     ),

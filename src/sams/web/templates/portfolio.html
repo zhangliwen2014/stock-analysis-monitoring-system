@@ -5,6 +5,63 @@
 {% if notice %}<p class="flash-ok">{{ notice }}</p>{% endif %}
 {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
 
+{% if exposure.holdings %}
+{# 组合体检（D232）：跨账户合起来才看得出「在赌什么」；权重分母是 NAV，含现金 #}
+<section class="card">
+  <h2>组合体检 <span class="muted">按最新可用价格折算到 {{ report_currency }}</span></h2>
+  <table>
+    <tr>
+      <th class="num">总资产</th><th class="num">现金</th><th class="num">前五大</th>
+      <th class="num">有效只数</th>
+    </tr>
+    <tr>
+      <td class="num">{{ money(exposure.total, report_currency) }}</td>
+      <td class="num">{{ ratio_pct(exposure.cash_weight) }}</td>
+      <td class="num">{{ ratio_pct(exposure.top5_weight) }}</td>
+      <td class="num">{{ "%.1f"|format(exposure.effective_n) }}</td>
+    </tr>
+  </table>
+  <h3>市场</h3>
+  <table>
+    <tr><th>市场</th><th class="num">市值</th><th class="num">权重</th></tr>
+    {% for row in exposure.by_market %}
+    <tr><td>{{ row.label }}</td><td class="num">{{ money(row.value, report_currency) }}</td>
+      <td class="num">{{ ratio_pct(row.weight) }}</td></tr>
+    {% endfor %}
+  </table>
+  <h3>币种</h3>
+  <table>
+    <tr><th>币种</th><th class="num">市值</th><th class="num">权重</th></tr>
+    {% for row in exposure.by_currency %}
+    <tr><td>{{ row.label }}</td><td class="num">{{ money(row.value, report_currency) }}</td>
+      <td class="num">{{ ratio_pct(row.weight) }}</td></tr>
+    {% endfor %}
+  </table>
+  <h3>行业</h3>
+  <table>
+    <tr><th>行业</th><th class="num">市值</th><th class="num">权重</th></tr>
+    {% for row in exposure.by_industry %}
+    <tr><td>{{ row.label }}</td><td class="num">{{ money(row.value, report_currency) }}</td>
+      <td class="num">{{ ratio_pct(row.weight) }}</td></tr>
+    {% endfor %}
+  </table>
+  <h3>持仓权重</h3>
+  <table>
+    <tr><th>标的</th><th class="num">市值</th><th class="num">权重</th></tr>
+    {% for row in exposure.holdings %}
+    <tr><td>{{ row.name }} <span class="muted">{{ row.market }}/{{ row.code }}</span></td>
+      <td class="num">{{ money(row.value, report_currency) }}</td>
+      <td class="num">{{ ratio_pct(row.weight) }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if exposure.unclassified_weight > 0 %}
+  <p class="muted">{{ ratio_pct(exposure.unclassified_weight) }} 的持仓没有行业数据（未分类）：行业只对 A 股可信，
+    港股/美股多数没有概况；这不代表它们属于同一个行业。</p>
+  {% endif %}
+  {% for note in exposure.notes %}<p class="muted">{{ note }}</p>{% endfor %}
+</section>
+{% endif %}
+
 {% for account in accounts %}
 <section class="card">
   <h2>{{ account.name }}
@@ -31,6 +88,67 @@
       <td class="num">{{ money(account.realized, account.currency) }}</td>
     </tr>
   </table>
+  {# 净值卡异步取：逐日重放是一段读库的重活，与这页的其余读数分开加载（S4-D） #}
+  <div hx-get="/api/partials/portfolio/nav?account={{ account.id }}" hx-trigger="load" hx-swap="innerHTML">
+    <p class="muted">净值读取中…</p>
+  </div>
+  {# 归因卡同样异步取：它读的是净值重放留下的每日快照，与净值卡同一批数据、同一次加载代价（S5） #}
+  <div hx-get="/api/partials/portfolio/attribution?account={{ account.id }}" hx-trigger="load" hx-swap="innerHTML">
+    <p class="muted">归因读取中…</p>
+  </div>
+  {# 限额（S4-E）：红 = 自定义线被踩；灰 = 没有自定义线时的参考值；「无法判定」不显示 0% #}
+  {% set limits = account.limits %}
+  <h3>限额</h3>
+  <table>
+    <tr>
+      <th>对象</th><th class="num">当前</th><th class="num">红线</th><th>判定</th><th></th>
+    </tr>
+    {% for row in limits.rows %}
+    <tr>
+      <td>{{ row.label }}</td>
+      <td class="num">{{ ratio_pct(row.actual) }}</td>
+      <td class="num">{{ ratio_pct(row.threshold) }}</td>
+      <td>
+        {% if row.status == "breach" %}<span class="limit-breach">超限</span>
+        {% elif row.status == "unknown" %}<span class="muted">无法判定</span>
+        {% elif row.status == "reference" %}<span class="muted">参考</span>
+        {% else %}正常{% endif %}
+        {% if row.note %}<span class="muted">{{ row.note }}</span>{% endif %}
+      </td>
+      <td>
+        {% if row.custom %}
+        <form method="post" action="/portfolio/limits/{{ row.limit_id }}/delete" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">删除</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">还没有可判的线（账户为空）。</td></tr>
+    {% endfor %}
+  </table>
+  <p class="muted">只判你自己设的红线；灰色的「参考」是默认参考值（单票 20%、行业 40%、回撤 20%），
+    不算违规。权重分母是这个账户的总资产（含现金）；缺价、缺汇率、缺行业或净值有缺口时
+    显示「无法判定」，不显示 0%。回撤取当前净值离区间高点的距离，不是区间最深的那一坑。</p>
+  <form method="post" action="/portfolio/limits" class="panel inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>种类
+      <select name="kind">{% for kind in limit_kinds %}<option value="{{ kind }}">{{ limit_labels[kind] }}</option>{% endfor %}</select>
+    </label>
+    <label>对象 <input type="text" name="scope" size="10" placeholder="代码 / 市场 / 行业；回撤留空"
+           hx-get="/api/symbol-search/pick?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
+           hx-target="#limit-candidates" hx-swap="innerHTML"></label>
+    <label>红线（%） <input type="text" name="threshold" size="4" placeholder="20"></label>
+    <label>作用范围
+      <select name="account_id">
+        <option value="{{ account.id }}">{{ account.name }}</option>
+        <option value="">全部账户</option>
+      </select>
+    </label>
+    <button type="submit">加一条</button>
+    <div id="limit-candidates"></div>
+  </form>
   {% if account.duplicates %}
   <ul class="muted">{% for note in account.duplicates %}<li>{{ note }}</li>{% endfor %}</ul>
   {% endif %}
@@ -47,11 +165,12 @@
     {% for row in account.positions %}
     <tr>
       <td>{{ row.market }}</td>
-      <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.code }}</a></td>
+      <td><a href="/symbol/{{ row.market }}/{{ row.code }}?back={{ page_url|urlencode }}">{{ row.code }}</a>
+        <a class="muted" href="/symbol/{{ row.market }}/{{ row.code }}?back={{ page_url|urlencode }}#decision">决策</a></td>
       <td class="num">{{ row.qty }}</td>
       <td class="num">{{ money(row.avg_cost, row.currency) }}</td>
       <td class="num">{{ money(row.last_price, row.currency) }}
-        {% if row.price_day %}<span class="muted quote-day">{{ row.price_day }}</span>{% endif %}</td>
+        {% if row.price_label %}<span class="muted quote-label">{{ row.price_label }}</span>{% endif %}</td>
       <td class="num">{{ money(row.price_pnl, row.currency) }}</td>
       {# 不可换算那一行不给 0.00：它没进上面那个总资产，显示成零会让读数的人以为两只币种的数混在了一列 #}
       <td class="num">{{ money(row.pnl_report, account.currency) if row.convertible else "不计入" }}
@@ -75,7 +194,7 @@
     {% for row in account.fills %}
     <tr>
       <td class="muted">{{ row.at }}</td>
-      <td><a href="/symbol/{{ row.market }}/{{ row.code }}">{{ row.market }}/{{ row.code }}</a></td>
+      <td><a href="/symbol/{{ row.market }}/{{ row.code }}?back={{ page_url|urlencode }}">{{ row.market }}/{{ row.code }}</a></td>
       <td>{{ row.name or "—" }}</td>
       <td>{{ row.side }}</td>
       <td class="num">{{ row.qty }}</td>
@@ -98,6 +217,9 @@
   <p class="muted">只显示最近 {{ account.fills | length }} 笔（共 {{ account.fill_total }} 笔）。</p>
   {% endif %}
   <p class="muted">撤销把现金逐分退回、持仓按其余成交重算；然后按正确的市场与代码重记一笔。</p>
+  {# 分红的口径页面上要说全：按除权日（源没有派息日）、税前毛额；v0 不改股数（S4-D §6.2） #}
+  <p class="muted">分红在除权日按「除权日前持股 × 每股派息」自动入账，税前毛额、未扣红利税；
+    拆股/送转不会自动改持仓股数，净值只是照实提示。</p>
 </section>
 {% else %}
 <section class="card">
@@ -219,9 +341,9 @@
     {# 代码格带名称候选：只看六位数字认不出票，选错市场就会记成另一种币（D206） #}
     <label>代码 <input name="code" value="{{ fill.code }}"
         placeholder="代码 / 首字母 / 名称，如 601088、zgsh"
-        hx-get="/api/symbol-search" hx-trigger="keyup changed delay:300ms"
+        hx-get="/api/symbol-search/fills?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
         hx-target="#fill-candidates" hx-include="#portfolio-fill select[name=market]"
-        hx-vals='{"scope": "fills"}' hx-swap="innerHTML"></label>
+        hx-swap="innerHTML"></label>
     <label>数量 <input name="qty" type="number" step="any" value="{{ fill.qty }}"></label>
     <label>价格 <input name="price" type="number" step="any" value="{{ fill.price }}"></label>
     <label>费用 <input name="fee" type="number" step="any" value="{{ fill.fee }}"></label>

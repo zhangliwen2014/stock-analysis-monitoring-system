@@ -30,7 +30,8 @@
 
 <section class="card">
   <h2>自选 <a class="muted" href="/watchlist">管理</a></h2>
-  <div id="quote-board" hx-get="/api/partials/quotes" hx-trigger="every 10s" hx-swap="innerHTML">
+  {# `back=`：这一段每 10 秒换进去一次，裸片段自己的 URL 不是来路，发起页得报上名 #}
+  <div id="quote-board" hx-get="/api/partials/quotes?back={{ page_url|urlencode }}" hx-trigger="every 10s" hx-swap="innerHTML">
     {% include "partials/quotes.html" %}
   </div>
 </section>

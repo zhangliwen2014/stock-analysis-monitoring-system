@@ -16,6 +16,7 @@ from sams.core.codes import canonical_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.datasource.base import (
     LOTS_TO_SHARES,
+    a_share_symbol,
     classify_error,
     code_in_market,
     normalize_bars,
@@ -38,12 +39,16 @@ COLUMN_MAP = {
 
 
 def secid(market: str, code: str) -> str:
-    """东财的市场前缀编号：沪 1、深 0、港 116、美 105/106/107。"""
+    """东财的市场前缀编号：沪 1、深与北 0、港 116、美 105/106/107。
+
+    交易所从 `a_share_symbol` 的前缀推，不再在这里重写一遍号段：`9` 开头同时是沪市 B 股
+    （900）与北交所新股段（920），按首位分会把北交所问成沪市，而东财对问错的交易所回
+    `data: null`——那是「这段没有 K 线」，不是一条错误。
+    """
     symbol = code_in_market(market, code)
     if market == "A":
-        if not symbol.isdigit() or len(symbol) != 6:
-            raise ValueError(f"A 股代码应为 6 位数字，收到 {code!r}")
-        return f"{'1' if symbol[0] in '5669' else '0'}.{symbol}"
+        exchange = a_share_symbol(symbol)[:2]
+        return f"{'1' if exchange == 'sh' else '0'}.{symbol}"
     if market == "HK":
         return f"116.{symbol.removesuffix('.HK')}"
     if market == "US":
@@ -103,6 +108,17 @@ def http_get(url: str, params: dict[str, str]) -> dict:
         raise RateLimited("eastmoney", "HTTP 429 被限流")
     response.raise_for_status()
     return json.loads(response.text)
+
+
+def http_get_text(url: str, params: dict[str, str]) -> str:
+    """原样取文本：新闻搜索接口包着 JSONP 外壳，先解成 JSON 就会在这一步失败。"""
+    import requests
+
+    response = requests.get(url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    if response.status_code == 429:
+        raise RateLimited("eastmoney", "HTTP 429 被限流")
+    response.raise_for_status()
+    return response.text
 
 
 class EastmoneyAdapter:

@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}规则求值{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>规则求值</h1>
+  {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+  {% if demo %}
+  <p class="flash-ok">已建一条示例规则并真跑一次；它已停用，后台不会反复响它。</p>
+  <p class="muted">止损线 {{ demo.line }} 设在最新收盘 {{ demo.price }} 上方 1%：这条线已经破了，所以这一趟必然命中。演练告警带「测试」标记，不进健康积压，也不会挡同标的的真实规则。</p>
+  {% endif %}
+  <p>
+    <strong>{{ rule.name }}</strong>（{{ rule.kind }}）<br>
+    <span class="muted">{{ condition }}｜{{ target }}</span>
+  </p>
+  {% if not rule.enabled %}
+  <p class="muted">这条规则当前停用，这一趟是点名求值。</p>
+  {% endif %}
+  {% include "partials/rule_outcome.html" %}
+
+  <p class="muted">
+    <a href="/rules">← 返回规则列表</a>｜<a href="/rules/{{ rule.id }}/edit">改这条规则</a>
+  </p>
+  {% if demo %}
+  <form method="post" action="/rules/{{ rule.id }}/remove" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">删除这条示例规则</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

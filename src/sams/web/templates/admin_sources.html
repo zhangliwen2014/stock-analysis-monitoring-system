@@ -46,10 +46,14 @@
     <select name="market">
       {% for market in markets %}<option value="{{ market }}">{{ market }}</option>{% endfor %}
     </select>
-    <input type="text" name="code" placeholder="代码" required>
+    <input type="text" name="code" placeholder="代码 / 首字母 / 名称" required
+           hx-get="/api/symbol-search/pick?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
+           hx-target="#probe-candidates"
+           hx-include="select[name=market]" hx-swap="innerHTML">
     <input type="date" name="start">
     <input type="date" name="end">
     <button type="submit">试跑</button>
+    <div id="probe-candidates"></div>
   </form>
 </section>
 

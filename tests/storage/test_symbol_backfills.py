@@ -50,3 +50,53 @@ def test_mark_done_by_code(db):
     repo.mark_done_by_code("A", "600519")
     assert repo.open_for("A", "600519") is None
     assert repo.enqueue("A", "600519") is True
+
+
+def test_two_kinds_for_the_same_symbol_are_two_rows(db):
+    """一条待补日线不该把「公司行为覆盖也没确认」一起吞掉（spec 2026-11-03 §3.3）。
+
+    去重键不带 kind 时，先排上的那条会占住这只票：后一种活永远进不了队列，
+    而先完成的那件又会把两件一起标成 done。
+    """
+    repo = SymbolBackfillRepo(db)
+    assert repo.enqueue("A", "600519", kind="bars") is True
+    assert repo.enqueue("A", "600519", kind="actions") is True
+    assert repo.enqueue("A", "600519", kind="actions") is False, "同 kind 重复排要吸收掉"
+    assert {row.kind for row in repo.take_pending()} == {"bars", "actions"}
+
+
+def test_kind_defaults_to_bars(db):
+    """不传 kind 的旧调用方（自选、看板、成交）语义一字不改。"""
+    repo = SymbolBackfillRepo(db)
+    assert repo.enqueue("A", "600519") is True
+    assert repo.open_for("A", "600519").kind == "bars"
+
+
+def test_the_bars_wrap_up_does_not_close_the_actions_row(db):
+    """盘后日线任务结的是日线的账：把同一票的「公司行为待确认」顺手标成 done，
+    那条覆盖就永远补不上了，而界面上那句「后台已排队」变成假话。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind="bars")
+    repo.enqueue("A", "600519", kind="actions")
+    repo.mark_done_by_code("A", "600519")
+    assert [row.kind for row in repo.take_pending()] == ["actions"]
+
+
+def test_rearm_deferred_gives_the_next_day_a_new_budget(db):
+    """deferred 的原文承诺是「今天预算用光，明天再来」：跨天顺延要真的把它排回去。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind="actions")
+    row = repo.take_pending()[0]
+    for _ in range(3):
+        repo.note_failure(row.id, "源挂了")
+    assert repo.open_for("A", "600519", kind="actions").status == "deferred"
+    assert repo.rearm_deferred("actions") == 1
+    rearmed = repo.open_for("A", "600519", kind="actions")
+    assert (rearmed.status, rearmed.tries) == ("pending", 0)
+    # 另一种 kind 的 deferred 不归这次顺延管：日线队列自有盘后任务收尾
+    repo.enqueue("A", "000001", kind="bars")
+    # 按 kind 取那一行：刚顺延回来的 actions 行创建得更早，`take_pending()[0]` 是它
+    bars_row = next(row for row in repo.take_pending() if row.kind == "bars")
+    for _ in range(3):
+        repo.note_failure(bars_row.id, "源挂了")
+    assert repo.rearm_deferred("actions") == 0

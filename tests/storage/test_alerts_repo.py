@@ -73,6 +73,20 @@ def test_create_returns_the_row_with_a_generated_id(repo, seeded_user):
     assert alert.payload["extra"]["pr"] == 0.31
 
 
+def test_facts_land_at_the_top_of_the_payload(repo, seeded_user):
+    """资讯告警按 `payload.kind=news` 与价格规则分开（D246）：埋在 `extra` 里
+    会让「按 kind 查资讯」变成挖子树，而列表要的正是这一格。"""
+    alert = repo.create(
+        seeded_user,
+        **{**CREATE_KW, "rule_id": None},
+        facts={"kind": "news", "url": "https://example.test/N1"},
+    )
+    assert alert.rule_id is None
+    assert alert.payload["kind"] == "news"
+    assert alert.payload["url"] == "https://example.test/N1"
+    assert alert.payload["extra"]["pr"] == 0.31
+
+
 def test_severity_is_validated(repo, seeded_user):
     with pytest.raises(ValidationError, match="severity"):
         repo.create(seeded_user, **{**CREATE_KW, "severity": "urgent"})
@@ -899,3 +913,58 @@ def test_a_racing_close_makes_defer_a_conflict_without_an_event(tmp_path, monkey
         repo.defer(alert.id, user_id=user, until=clock.moment + timedelta(hours=1))
     assert repo.events.list_for(alert.id) == []
     other.close()
+
+
+def test_create_carries_the_trigger_bar_and_the_dedupe_key(repo, seeded_user):
+    """S1-B 的证据两列：告警判自哪根 bar、按哪个键去重（都不参与状态判定）。"""
+    from datetime import date
+
+    alert = repo.create(
+        seeded_user,
+        trigger_bar_ts=date(2026, 10, 30),
+        dedupe_key="r1|A|601088|acc1",
+        **CREATE_KW,
+    )
+    assert alert.trigger_bar_ts == date(2026, 10, 30)
+    assert alert.dedupe_key == "r1|A|601088|acc1"
+
+
+def test_create_without_evidence_leaves_both_columns_empty(repo, seeded_user):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    assert alert.trigger_bar_ts is None
+    assert alert.dedupe_key is None
+
+
+def test_acknowledge_many_acks_only_the_new_own_rows(
+    repo, seeded_user, other_user, clock
+):
+    """收件箱勾选里夹着已读/别人的行时，整批不该失败：跳过的数量要报出来。"""
+    first = repo.create(seeded_user, **CREATE_KW)
+    already = repo.create(seeded_user, **CREATE_KW)
+    repo.acknowledge(already.id, user_id=seeded_user)
+    foreign = repo.create(other_user, **CREATE_KW)
+
+    acked, skipped = repo.acknowledge_many(
+        seeded_user, [first.id, already.id, foreign.id, "missing"]
+    )
+
+    assert (acked, skipped) == (1, 3)
+    assert repo.get(first.id).status == ACKNOWLEDGED
+    assert repo.get(already.id).status == ACKNOWLEDGED
+    assert repo.get(foreign.id).status == NEW
+    assert [e.action for e in repo.events.list_for(first.id)] == ["ack"]
+    assert repo.events.list_for(foreign.id) == []
+
+
+def test_acknowledge_many_is_idempotent(repo, seeded_user):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    assert repo.acknowledge_many(seeded_user, [alert.id]) == (1, 0)
+    assert repo.acknowledge_many(seeded_user, [alert.id]) == (0, 1)
+    assert len(repo.events.list_for(alert.id)) == 1
+
+
+def test_acknowledge_many_skips_a_terminal_row(repo, seeded_user):
+    alert = repo.create(seeded_user, **CREATE_KW)
+    repo.dismiss(alert.id, user_id=seeded_user, code="expected")
+    assert repo.acknowledge_many(seeded_user, [alert.id]) == (0, 1)
+    assert repo.get(alert.id).status == DISMISSED

@@ -80,20 +80,17 @@ def require_echoed_code(frame: pl.DataFrame, *, code: str) -> None:
         raise FieldDrift("akshare", f"响应回写的代码是 {sorted(echoed)}，请求的是 {code}")
 
 
-#: 北交所号段。`base.a_share_symbol` 只分沪/深（新浪与腾讯要的那个形态），而东财的资金流
-#: 接口要第三种标签：把 43/83/87/920 开头的票当深市问一次，接口回空——空看起来像
-#: 「这只票没有资金流记录」，而真相是问错了交易所。
-_BJ_PREFIXES = ("43", "83", "87", "920")
-#: `secucode` 的后缀由交易所标签推出来：两处共用一份判据，别各写一遍号段规则
+#: `secucode` 的后缀由交易所标签推出来：交易所本身只由 `base.a_share_symbol` 判一次
 _SUFFIX = {"sh": "SH", "sz": "SZ", "bj": "BJ"}
 
 
 def fund_flow_market(code: str) -> str:
-    """东财资金流接口的市场标签：沪 sh、深 sz、北 bj。"""
-    symbol = code_in_market("A", code)
-    if symbol.startswith(_BJ_PREFIXES):
-        return "bj"
-    return a_share_symbol(symbol)[:2]
+    """东财资金流接口的市场标签：沪 sh、深 sz、北 bj。
+
+    把北交所的票当深市问一次，接口回空——空看起来像「这只票没有资金流记录」，
+    而真相是问错了交易所。
+    """
+    return a_share_symbol(code_in_market("A", code))[:2]
 
 
 def secucode(market: str, code: str) -> str:

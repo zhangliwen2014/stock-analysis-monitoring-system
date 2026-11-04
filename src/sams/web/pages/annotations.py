@@ -39,8 +39,13 @@ from sams.services.markdown import render_markdown
 from sams.storage.repos.annotations import ORDER, TARGET_TYPES
 from sams.web.auth import audit, csrf_protect, require_user
 from sams.web.display import moment_label
+from sams.web.forms import form_data, one
 
 router = APIRouter()
+
+#: 正文与标签是自由文本：走 `form_data` 折回裸 UTF-8。附件仍是 multipart 字段，
+#: 那条路 starlette 按 UTF-8 解，不受影响。
+_FORM_BODY = Depends(form_data)
 
 #: 面板一屏 20 条：它是「看几条 + 写一条」的地方，不是归档柜；更多去 /annotations（计划 5）
 PANEL_LIMIT = 20
@@ -385,15 +390,16 @@ def annotation_create(
     _csrf: None = Depends(csrf_protect),
     target_type: str = Form(""),
     target_ref: str = Form(""),
-    body_md: str = Form(""),
-    tags: str = Form(""),
     visibility: str = Form("private"),
+    data: dict[str, list[str]] = _FORM_BODY,
     # `str` 那一支接的就是 httpx/浏览器不发真文件时落进来的普通字段分片
     files: list[UploadFile | str] = _files_field,
 ):
     web = request.app.state.web
     user = require_user(request)
     ctx = web.contexts.current()
+    body_md = one(data, "body_md")
+    tags = one(data, "tags")
     target_type = target_type.strip()
     target_ref = target_ref.strip()
     if target_type not in TARGET_TYPES or not target_ref:
@@ -485,12 +491,12 @@ def annotation_create(
 def annotation_preview(
     request: Request,
     _csrf: None = Depends(csrf_protect),
-    body_md: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
 ):
     require_user(request)
     # 预览与上屏同一条渲染管线（`render_markdown`）：两套渲染器迟早分叉，
     # 分叉的代价是「预览里好看、发出去是另一个样子」
-    return Response(render_markdown(body_md), media_type="text/html; charset=utf-8")
+    return Response(render_markdown(one(data, "body_md")), media_type="text/html; charset=utf-8")
 
 
 def _load_for_write(request: Request, annotation_id: str):
@@ -516,14 +522,15 @@ def annotation_edit(
     request: Request,
     annotation_id: str,
     _csrf: None = Depends(csrf_protect),
-    body_md: str = Form(""),
-    tags: str = Form(""),
+    data: dict[str, list[str]] = _FORM_BODY,
     updated_at: str = Form(""),
     visibility: str = Form(""),
     remove_attachments: list[str] = _remove_attachments_field,
     files: list[UploadFile | str] = _files_field,
 ):
     web, ctx, user, made = _load_for_write(request, annotation_id)
+    body_md = one(data, "body_md")
+    tags = one(data, "tags")
     clean = _clean_files(files)
     removed_ids = [item.strip() for item in remove_attachments if item.strip()]
     draft = {"body_md": body_md, "tags": tags}

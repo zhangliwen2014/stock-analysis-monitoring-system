@@ -325,20 +325,37 @@ def channels_page(request: Request):
     return request.app.state.web.render(request, "admin_channels.html", rows=rows)
 
 
+def _scheduler_note(scheduler: dict) -> str:
+    """调度那一句：「心跳过期」有两种解释，这一屏必须说得出是哪一种。
+
+    库里挂着一趟还新鲜的执行时，那一拍没翻只说明这一趟比阈值长（单个 job 之内不补拍）；
+    把那种样子印成「陈旧」，管理员每刷一次都看到一次事故，看多了就不看了。
+    """
+    if scheduler.get("error"):
+        # 读不出调度器要说读不出：报一个空心跳会被读成「没任务所以不跳」，
+        # 而真正的情况是那条线程已经死了
+        return f"读不到：{scheduler['error']}"
+    beat = scheduler.get("beat_age_s")
+    note = f"心跳 {'—' if beat is None else beat}s 前"
+    running = scheduler.get("running") or []
+    if running:
+        job = running[0]
+        note += f" · 正在跑「{job['job']}」（{job.get('market') or '全局'}，已 {job['age_s']}s）"
+    if scheduler.get("stale"):
+        note += (
+            "：这一趟之内不补拍，进程还在"
+            if scheduler.get("busy")
+            else "（陈旧）：没有任务在跑，常驻调度器可能已经停了"
+        )
+    return note
+
+
 def _health_ctx(web, ctx) -> dict:
     """健康页要的那些只读快照：HTTP 线程不碰库（`healthz()` 用它自己的探针连接）。"""
     health = web.runtime.healthz()
     tz = ctx.settings.server.display_tz
     scheduler = health.get("scheduler") or {}
-    beat = scheduler.get("beat_age_s")
-    if scheduler.get("error"):
-        # 读不出调度器要说读不出：报一个空心跳会被读成「没任务所以不跳」，
-        # 而真正的情况是那条线程已经死了
-        scheduler_note = f"读不到：{scheduler['error']}"
-    else:
-        scheduler_note = f"心跳 {'—' if beat is None else beat}s 前"
-        if scheduler.get("stale"):
-            scheduler_note += "（陈旧）"
+    scheduler_note = _scheduler_note(scheduler)
     db = health.get("db") or {}
     intraday = []
     for market, reading in (health.get("intraday") or {}).items():

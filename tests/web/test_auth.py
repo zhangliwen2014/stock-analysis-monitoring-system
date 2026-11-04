@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import Request
 from fastapi.testclient import TestClient
+from support import FrozenClock
 
 from sams.web.auth import RateCard, sign
 
@@ -68,6 +69,26 @@ def test_anonymous_pages_redirect_to_login(web_app):
     response = web_app.client.get("/", follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"].startswith("/login")
+
+
+def test_a_fresh_session_follows_the_injected_clock_not_the_wall_clock(make_app):
+    """心跳时刻与「现在」必须读同一个钟：冻结在 2020 年的替身登录后照样能进首页。
+
+    混用墙钟会让任何回放/冻结时钟的会话在真实时间走过闲置窗口后凭空失效。
+    """
+    web = make_app(clock=FrozenClock(datetime(2020, 1, 2, 2, 0, tzinfo=UTC)))
+    web.contexts.current().users.create(
+        "alice", "correct-horse-battery", is_admin=True
+    )
+    with TestClient(web.app) as client:
+        login = client.post(
+            "/login",
+            data={"username": "alice", "password": "correct-horse-battery"},
+            follow_redirects=False,
+        )
+        assert login.status_code == 303
+        home = client.get("/", follow_redirects=False)
+    assert home.status_code == 200
 
 
 def test_idle_timeout_revokes_the_session(logged):

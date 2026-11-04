@@ -64,25 +64,30 @@
     {% endfor %}
   </table>
   {% else %}
-  <p class="muted">本地还没有这只票的分红送转记录。采一次：<code>{{ actions_command }}</code></p>
+  <p class="muted">本地还没有这只票的分红送转记录——打开本页时它已排进后台补采队列，补完这张表自动出现。</p>
   {% endif %}
 </section>
 
-<section class="card" id="f10-announcements">
-  <h2>公告</h2>
-  {% if read.announcements %}
+<section class="card" id="f10-news">
+  <h2>资讯 <a class="muted" href="{{ all_news_url }}">全部 →</a></h2>
+  {% if news_feed %}
   <ul>
-    {% for row in read.announcements %}
+    {% for row in news_feed %}
     <li>
-      {{ row.published_on }}
-      <a href="{{ row.url }}" target="_blank" rel="noreferrer">{{ row.title }}</a>
-      {% if row.category %}<span class="muted">{{ row.category }}</span>{% endif %}
+      <span class="muted">{{ row.when }}</span>
+      <span class="badge">{{ row.kind_label }}</span>
+      <a href="{{ row.url }}" target="_blank" rel="noopener">{{ row.title }}</a>
+      <span class="muted">{{ row.source }}</span>
+      {% if row.matched %}<span class="badge">命中：{{ row.matched|join("、") }}</span>{% endif %}
     </li>
     {% endfor %}
   </ul>
-  {% elif not read.has_announcement_source %}
-  <p class="muted">{{ market_name }}的这条链上还没有公告的源。</p>
+  {% elif not read.has_announcement_source and not news_covered %}
+  <p class="muted">{{ market_name }}的新闻源未接入；这条链上也没有公告的源。</p>
+  {% elif not news_covered %}
+  <p class="muted">{{ market_name }}新闻源未接入（v0 只接 A 股）；这里只有公告。</p>
   {% else %}
-  <p class="muted">本地还没有这只票的公告。采一次：<code>{{ announcement_command }}</code></p>
+  <p class="muted">本地还没有这只票的公告或新闻。采一次：
+    <code>{{ announcement_command }}</code> 与 <code>{{ news_command }}</code></p>
   {% endif %}
 </section>

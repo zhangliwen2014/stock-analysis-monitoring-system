@@ -71,6 +71,14 @@ class SnapshotRepo:
         )
         return value if isinstance(value, date) else None
 
+    def latest_until(self, market: str, as_of: date) -> date | None:
+        """截至日之前最近的一整日横截面。回看某一天时，今天的快照不能穿越回去。"""
+        value = self.db.scalar(
+            f"SELECT max(day) FROM {self.TABLE} WHERE market = ? AND day <= ?",
+            [canonical_market(market), as_of],
+        )
+        return value if isinstance(value, date) else None
+
     def load_day(self, market: str, day: date) -> pl.DataFrame:
         return self.db.query(
             f"SELECT * FROM {self.TABLE} WHERE market = ? AND day = ? ORDER BY code",

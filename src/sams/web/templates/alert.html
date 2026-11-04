@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ title }}{% endblock %}
 {% block content %}
+<p><a href="{{ back_url }}">{{ back_label }}</a></p>
 <section class="card">
   <h1>{{ alert.market }}/{{ alert.code }}
     {% if alert.symbol_name %}<span class="muted">{{ alert.symbol_name }}</span>{% endif %}
@@ -12,6 +13,7 @@
     {# 时刻在 Python 里折到 display_tz 并排成字符串：模板拿到的一律不是 datetime #}
     <span class="muted">{{ triggered_at }}</span>
     {% if alert.is_test %}<span class="badge">测试</span>{% endif %}
+    {% if kind == "screen" %}<span class="badge">选股</span>{% endif %}
     {% if intraday %}<span class="badge">盘中</span>{% endif %}
     {# 稍后不改状态（D138）：「稍后至」是它唯一的痕迹，得说清这一格只作展示，
        否则人会等一个「到点自动做什么」的动作 #}
@@ -23,6 +25,18 @@
     <tr><td>账户</td><td>{{ alert.account_name or "—" }}</td></tr>
     {# 现值/阈值/建议动作在 payload 里，不是列（措辞改版不动表），取的工作在端点里做完了 #}
     <tr><td>现值 / 阈值</td><td class="num">{{ value_text }} / {{ threshold_text }}</td></tr>
+    {% if news_url %}
+    {# 资讯命中（D246）：原文是新窗口，标题本身就是链接；来源与发布时刻一起印 #}
+    <tr><td>资讯原文</td><td>
+      <a href="{{ news_url }}" target="_blank" rel="noopener">{{ news_title or value_text }}</a>
+      <span class="muted">{{ news_source }}{% if news_published %} · {{ news_published }}{% endif %}</span>
+    </td></tr>
+    {% endif %}
+    {# 证据链（S1-B）：这条告警由哪根 bar 判出来。没有记录就写「—」，不拿今天猜 #}
+    <tr><td>触发 K 线</td><td>
+      {% if trigger_bar_ts %}<a href="{{ trigger_url }}">{{ trigger_bar_ts }}（查看当天走势）</a>
+      {% else %}<span class="muted">—</span>{% endif %}
+    </td></tr>
     <tr><td>建议动作</td><td>{{ action_note or "—" }}</td></tr>
     <tr><td>阶段</td><td>{{ alert.stage or "—" }}</td></tr>
     <tr><td>正文</td><td>{{ body or "—" }}</td></tr>
@@ -129,6 +143,41 @@
       <p class="muted">这条原因会进入本周忽略率。忽略率只统计「驳回」，稍后不算。</p>
     </form>
   </details>
+</section>
+{% endif %}
+
+{# 单票静音按类别分开（D249）：价格规则、资讯、摘要各管一路，`全部` 才全静。
+   不放在「闭环」里——闭环只对未处理/已读的告警出现，而静音讲的是这只票，
+   终态的告警一样该能把它静掉 #}
+{% if mutable %}
+<section class="card">
+  <h2>单票静音</h2>
+  <p class="muted">静音的是 {{ alert.market }}/{{ alert.code }} 这只票的某一类提醒，不只是这一条告警；
+    「全部」等于这只票的全部规则与资讯；解除后不补发静音期间的历史。</p>
+  {% if mutes %}
+  <ul class="mutes">
+    {% for m in mutes %}
+    <li>
+      <span class="badge">{{ m.label }}</span>
+      已静音{% if m.at %}：{{ m.at }}{% endif %}{% if m.note %} —— {{ m.note }}{% endif %}
+      <form method="post" action="/alerts/{{ alert.id }}/unmute" class="inline-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="kind" value="{{ m.kind }}">
+        <button type="submit">{{ m.button }}</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <form method="post" action="/alerts/{{ alert.id }}/mute" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>类别 <select name="kind">
+      {% for value, label in mute_kinds %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+    </select></label>
+    <label>备注（可空） <input name="note" size="24" placeholder="比如：财报前别吵"></label>
+    <button type="submit">静音这类提醒</button>
+  </form>
+  {% endif %}
 </section>
 {% endif %}
 

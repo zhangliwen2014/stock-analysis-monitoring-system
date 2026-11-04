@@ -13,6 +13,7 @@
   var live = []; // 一页可以同时有 K 线与财务图：按元素各记一张，换档只换掉自己那张
   var PRICE = "#2563eb"; // 分时线：与涨跌无关，它要说的是「走到哪」，红绿会把它读成涨或跌
   var AVG = "#e8a33d"; // 均价线：交易所口径的均价，与分时线交叉处就是「强于均价/弱于均价」
+  var FOCUS = "#7c3aed"; // 告警回跳的那根 bar：既不是涨也不是跌，用一条中性的竖线标它
 
   function sweep() {
     // 换卡后旧元素已经离开文档：实例要 dispose，不只是从 resize 名单里摘掉
@@ -183,6 +184,28 @@
     subNames.forEach(function (family, i) {
       series = series.concat(paneSeries(payload.sub[family], i + 1, payload));
     });
+    // 告警详情带过来的那一天：找到就画竖线并把窗口收到它前后各 30 根；
+    // 找不到不能假装标上了——默认窗口只有 180 天，那句话得由图注说
+    var focus = (el.dataset.focus || "").trim();
+    var focusAt = focus ? dates.indexOf(focus) : -1;
+    if (focusAt >= 0 && series.length) {
+      series[0].markLine = {
+        symbol: "none", silent: true, animation: false,
+        data: [{ xAxis: dates[focusAt] }],
+        lineStyle: { type: "dashed", color: FOCUS },
+        label: { formatter: "告警 " + dates[focusAt], position: "insideEndTop" },
+      };
+    }
+    var insideZoom = { type: "inside", xAxisIndex: indices };
+    var sliderZoom = { type: "slider", xAxisIndex: indices, height: 18, bottom: 2 };
+    if (focusAt >= 0) {
+      var from = Math.max(0, focusAt - 30);
+      var to = Math.min(dates.length - 1, focusAt + 30);
+      insideZoom.startValue = from;
+      insideZoom.endValue = to;
+      sliderZoom.startValue = from;
+      sliderZoom.endValue = to;
+    }
     mount(el, {
       // legend 不给 data：ECharts 自己按 series 的名字铺，加一种指标不必回来改这里
       legend: { type: "scroll", top: 0 },
@@ -191,13 +214,14 @@
       grid: grids,
       xAxis: xAxes,
       yAxis: yAxes,
-      dataZoom: [
-        { type: "inside", xAxisIndex: indices },
-        { type: "slider", xAxisIndex: indices, height: 18, bottom: 2 },
-      ],
+      dataZoom: [insideZoom, sliderZoom],
       series: series,
     });
-    if (note) note.textContent = note.textContent + caption(payload);
+    var captionBits = caption(payload);
+    if (focus && focusAt < 0) {
+      captionBits += (captionBits ? "；" : "：") + "告警那天 " + focus + " 不在当前窗口里";
+    }
+    if (note) note.textContent = note.textContent + captionBits;
   }
 
   function timeChart(el, payload) {
@@ -379,6 +403,42 @@
     });
   }
 
+  function navChart(el, payload) {
+    // 组合净值：算不出来的那天是 null，`connectNulls:false` 让它断在那儿——
+    // 用前值接起来会画出一条「平滑」的假线，而那一天本来就该看见缺口
+    var days = payload.days || [];
+    if (!days.length) return;
+    mount(el, {
+      animation: false,
+      tooltip: {
+        trigger: "axis",
+        formatter: function (items) {
+          if (!items || !items.length) return "";
+          var point = items[0];
+          if (point.value === null || point.value === undefined) {
+            return point.axisValue + "<br>缺口：缺价或缺汇率，这天不计";
+          }
+          return point.axisValue + "<br>净值：" +
+            Number(point.value).toLocaleString("zh-CN", { maximumFractionDigits: 2 }) +
+            (payload.currency ? " " + payload.currency : "");
+        },
+      },
+      grid: { left: 76, right: 24, top: 18, bottom: 28 },
+      xAxis: { type: "category", data: days, axisTick: { show: false },
+        axisLabel: { showMaxLabel: true } },
+      yAxis: { type: "value", scale: true,
+        axisLabel: { formatter: function (value) {
+          return Math.abs(value) >= 1e4 ? (value / 1e4).toFixed(1) + "万" : value.toFixed(0);
+        } } },
+      series: [{
+        name: "净值", type: "line", data: payload.nav, connectNulls: false,
+        showSymbol: false, lineStyle: { width: 2, color: PRICE },
+        itemStyle: { color: PRICE },
+        areaStyle: { opacity: 0.08, color: PRICE },
+      }],
+    });
+  }
+
   function samsChart(el) {
     if (typeof echarts === "undefined" || el.dataset.samsChart === "on") return;
     var url = el.dataset.chartUrl;
@@ -401,6 +461,7 @@
         // 那比空白更难查
         if (el.dataset.chartKind === "time") timeChart(el, payload);
         else if (el.dataset.chartKind === "finance") financeChart(el, payload);
+        else if (el.dataset.chartKind === "nav") navChart(el, payload);
         else klineChart(el, payload);
       })
       .catch(function () {
@@ -413,6 +474,56 @@
     sweep();
     (root || document).querySelectorAll("[data-chart-url]").forEach(samsChart);
   }
+
+  // 收件箱的「全选本页未读」：只勾这一页真有框的行（终态行不渲染 checkbox），
+  // 用一个委托处理器——htmx 换过分页/筛选后不必重新绑一遍
+  document.addEventListener("change", function (event) {
+    var master = event.target;
+    if (!master || !master.matches || !master.matches("[data-ack-all]") || !master.form) return;
+    master.form.querySelectorAll('input[name="ids"]').forEach(function (box) {
+      box.checked = master.checked;
+    });
+  });
+
+  // 导航搜索：Esc 收起结果（S4-C）。不清输入框——收了又清空等于替用户重来一遍；
+  // 空输入另有 htmx 的 search 事件收走结果
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "Escape") return;
+    var results = document.getElementById("nav-search-results");
+    if (!results) return;
+    results.innerHTML = "";
+    var box = document.querySelector(".nav-search input");
+    if (box && box === document.activeElement) box.blur();
+  });
+
+  // 候选行的「填入」：一张共用监听，服务规则/建论/限额/关键词/探源那几张表单。
+  // 只写**这个表单里真存在的那几格**——各页字段名不一样（code / scope / target_ref），
+  // 按页各开一个 scope 就得把同一份候选表抄七遍。收起面板靠约定：交换目标那个 div
+  // 的 id 以 `-candidates` 结尾（模板守卫测试钉着这条约定）。
+  document.addEventListener("click", function (event) {
+    var button = event.target.closest ? event.target.closest("[data-pick-code]") : null;
+    if (!button) return;
+    var form = button.closest("form");
+    if (!form) return;
+    var pick = button.dataset;
+    // 市场格不管是下拉还是隐藏域都跟着这一行走：选了另一市场的票却把市场留在原处，
+    // 落库的是一条永远匹配不上的关键词（资讯那一张表单就是这样）
+    var market = form.querySelector("[name=market]");
+    if (market) market.value = pick.pickMarket;
+    // 代码类字段只挑非隐藏的：`<input type="hidden" name="code">` 带着的是这一屏
+    // 已经在用的过滤条件，替用户改掉它等于悄悄换了查询
+    var bare = form.querySelector('input[name=code]:not([type="hidden"])');
+    if (bare) bare.value = pick.pickCode;
+    var limit = form.querySelector('input[name=scope]:not([type="hidden"])');
+    if (limit) limit.value = pick.pickCode;
+    var ref = form.querySelector('input[name=target_ref]:not([type="hidden"])');
+    if (ref) ref.value = pick.pickRef;
+    // 资讯那格搜的是标题：标题里出现的是名字，代码填进去什么都搜不到
+    var keyword = form.querySelector('input[name=q]:not([type="hidden"])');
+    if (keyword) keyword.value = pick.pickName;
+    var box = button.closest("[id$=-candidates]");
+    if (box) box.innerHTML = "";
+  });
 
   document.addEventListener("DOMContentLoaded", function () { boot(document); });
   // htmx:afterSwap 会冒泡到 document，挂在 document 上就不依赖脚本排在 head 还是 body 末尾。

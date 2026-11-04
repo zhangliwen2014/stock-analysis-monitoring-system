@@ -23,6 +23,7 @@ from starlette.templating import Jinja2Templates
 
 from sams.bootstrap import AppCore
 from sams.core.errors import DatabaseLocked, SamsError
+from sams.core.missing import missing_label
 from sams.services.runtime import Runtime
 from sams.web.auth import (
     ACTIVE_COOKIE,
@@ -34,6 +35,7 @@ from sams.web.auth import (
     _stamp_active,
 )
 from sams.web.auth import router as auth_router
+from sams.web.back import page_url
 from sams.web.context import ThreadContexts
 from sams.web.display import (
     action_label,
@@ -46,7 +48,10 @@ from sams.web.display import (
     moment_label,
     money,
     money_compact,
+    odds_range_text,
     pct,
+    percent,
+    price_kind_label,
     ratio_pct,
     severity_label,
     state_label,
@@ -58,7 +63,10 @@ from sams.web.pages import (
     admin_annotations,
     alerts,
     annotations,
+    calendar,
     dashboard,
+    digest,
+    news,
     portfolio,
     review,
     rules,
@@ -81,6 +89,9 @@ def _templates() -> Jinja2Templates:
         currency_label=currency_label,
         website_url=website_url,
         pct=pct,
+        percent=percent,
+        odds_range_text=odds_range_text,
+        price_kind_label=price_kind_label,
         ratio_pct=ratio_pct,
         hms=hms,
         state_label=state_label,
@@ -92,6 +103,7 @@ def _templates() -> Jinja2Templates:
         delivery_label=delivery_label,
         target_type_label=target_type_label,
         filter_label=filter_label,
+        missing_label=missing_label,
     )
     return templates
 
@@ -129,6 +141,8 @@ class WebState:
 
         ctx.setdefault("csrf", csrf_value(request))
         ctx.setdefault("user", getattr(request.state, "sams_user", None))
+        # 这一屏的 URL 进每个模板：列表出链把它编进 `back=`，退回来才是同一张筛过的表
+        ctx.setdefault("page_url", page_url(request))
         return self.templates.TemplateResponse(
             request=request, name=name, context=ctx, status_code=status_code
         )
@@ -186,7 +200,10 @@ def create_app(
     app.include_router(admin.router)
     app.include_router(admin_annotations.router)
     app.include_router(alerts.router)
+    app.include_router(calendar.router)
     app.include_router(dashboard.router)
+    app.include_router(digest.router)
+    app.include_router(news.router)
     app.include_router(portfolio.router)
     app.include_router(review.router)
     app.include_router(rules.router)

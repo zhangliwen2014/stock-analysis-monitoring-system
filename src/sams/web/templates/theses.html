@@ -10,8 +10,8 @@
     <tr><th>标的</th><th>状态</th><th>风格</th><th>更新</th></tr>
     {% for row in rows %}
     <tr>
-      <td><a href="/theses/{{ row.id }}">{{ row.market }}/{{ row.code }}</a></td>
-      <td><a href="/theses/{{ row.id }}">{{ row.status }}</a></td>
+      <td><a href="/theses/{{ row.id }}?back={{ page_url|urlencode }}">{{ row.market }}/{{ row.code }}</a></td>
+      <td><a href="/theses/{{ row.id }}?back={{ page_url|urlencode }}">{{ row.status }}</a></td>
       <td>{{ row.style }}</td>
       {# 这一列在 Python 里已经折到 display_tz 并排好：模板拿到的是字符串，不是 datetime #}
       <td class="muted">{{ row.updated_at }}</td>
@@ -35,7 +35,11 @@
         {% endfor %}
       </select>
     </label>
-    <label>代码 <input name="code"></label>
+    <label>代码 <input name="code"
+           placeholder="代码 / 首字母 / 名称，如 601088、zgsh"
+           hx-get="/api/symbol-search/pick?back={{ page_url|urlencode }}" hx-trigger="keyup changed delay:300ms"
+           hx-target="#thesis-candidates"
+           hx-include="select[name=market]" hx-swap="innerHTML"></label>
     <label>打分模板
       {# 值来自 STYLE_NAMES（`ThesisService.add` 收的就是这批名字）：填一个不存在的名字，
          拒回来的那句话会列出能用的，但下拉里本来就该只有能用的 #}
@@ -45,6 +49,7 @@
     </label>
     <label>一句话 <input name="note" placeholder="为什么看好它（写进时间线第一条）"></label>
     <button type="submit">建论</button>
+    <div id="thesis-candidates"></div>
   </form>
 </section>
 {% endblock %}

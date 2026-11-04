@@ -18,13 +18,27 @@
       <a href="/watchlist">自选</a>
       <a href="/screen">选股</a>
       <a href="/portfolio">持仓</a>
+      <a href="/calendar">复检</a>
       <a href="/theses">论点</a>
       <a href="/rules">规则</a>
       <a href="/alerts">告警<span id="open-count" class="badge" hx-get="/api/partials/open-count" hx-trigger="load, every 60s"></span></a>
+      <a href="/digest">摘要</a>
+      <a href="/news">资讯</a>
       <a href="/review">复盘</a>
       <a href="/annotations">批注</a>
       <a href="/settings">设置</a>
       {% if user.is_admin %}<a href="/admin">管理</a>{% endif %}
+    </div>
+    <div class="nav-search" role="search">
+      {# 顶栏这格不带 `back`：它长在每一屏上（含报错页和管理页），带上就等于把「当前请求的
+         完整 URL」原样印进 HTML——那串里可能有页面根本没认识的参数。
+         顶栏搜索是「跳到任何一只票」，不是「从我刚看的那张表点出去」，本来就没有来路可回。 #}
+      <input type="search" name="code" placeholder="代码 / 拼音 / 中文名" aria-label="搜索股票"
+             autocomplete="off"
+             hx-get="/api/symbol-search/nav"
+             hx-trigger="keyup changed delay:250ms, search"
+             hx-target="#nav-search-results" hx-swap="innerHTML">
+      <div id="nav-search-results" class="nav-search-results"></div>
     </div>
     <form method="post" action="/logout" class="inline-form">
       <input type="hidden" name="csrf" value="{{ csrf }}">

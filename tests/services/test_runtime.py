@@ -15,16 +15,17 @@ from sams.services import runtime as runtime_module
 from sams.services.prune import PruneReport, PruneStep
 from sams.services.quotes import MarketBoard
 from sams.services.runtime import Runtime
-from sams.services.scheduler.report import ScheduleData
+from sams.services.scheduler.report import RunningJob, ScheduleData
 
 NOW = datetime(2026, 10, 23, 2, 0, tzinfo=UTC)
 
 
 class FakeScheduler:
-    def __init__(self, *, beat_age_s=5) -> None:
+    def __init__(self, *, beat_age_s=5, running=()) -> None:
         self.started = threading.Event()
         self.stopped = threading.Event()
         self.beat_age_s = beat_age_s
+        self.running = running
 
     def run_forever(self, *, stop, **_kwargs):
         self.started.set()
@@ -34,7 +35,11 @@ class FakeScheduler:
 
     def schedule_data(self):
         return ScheduleData(
-            heartbeat=None, beat_age_s=self.beat_age_s, admins=0, jobs=()
+            heartbeat=None,
+            beat_age_s=self.beat_age_s,
+            admins=0,
+            jobs=(),
+            running=self.running,
         )
 
 
@@ -180,6 +185,30 @@ def test_a_stale_scheduler_or_unreadable_schedule_degrades_the_status(settings):
     assert "台账读不到" in broken["scheduler"]["error"]
 
 
+def test_a_long_job_running_now_does_not_degrade_the_status(settings):
+    """心跳过期 + 库里挂着一趟还新鲜的执行：进程在干活，`/healthz` 不该报 degraded。
+
+    这一屏是给探针（与管理员健康页）读的，误报一夜就等于把「degraded」这个词用废。
+    跑的那一趟要跟着一起交出去：只有「没坏」而说不出「在做什么」，读的人仍然要猜。
+    """
+    payload = make_runtime(
+        settings,
+        scheduler=FakeScheduler(
+            beat_age_s=400,
+            running=(
+                RunningJob(
+                    name="financials", market="A", period_key="2024-10-25", age_s=300
+                ),
+            ),
+        ),
+    ).healthz()
+
+    assert payload["status"] == "ok"
+    assert payload["scheduler"]["stale"] is True
+    assert payload["scheduler"]["busy"] is True
+    assert payload["scheduler"]["running"] == [{"job": "financials", "market": "A", "age_s": 300}]
+
+
 def test_healthz_reads_the_schedule_through_the_injected_probe(settings):
     """`/healthz` 在 HTTP 线程上跑（D113），调度器的库连接属于调度线程。
 
@@ -195,7 +224,12 @@ def test_healthz_reads_the_schedule_through_the_injected_probe(settings):
     )
     payload = runtime.healthz()
     assert payload["status"] == "ok"
-    assert payload["scheduler"] == {"beat_age_s": 5, "stale": False}
+    assert payload["scheduler"] == {
+        "beat_age_s": 5,
+        "stale": False,
+        "busy": False,
+        "running": [],
+    }
 
 
 def test_an_unreadable_database_is_reported_not_raised(settings):

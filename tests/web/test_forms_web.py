@@ -45,3 +45,72 @@ def test_genuine_latin1_bytes_are_not_mangled(logged):
     assert resp.status_code == 303
     alice = logged.context.users.get_by_username("alice")
     assert alice.display_name == "café"
+
+
+def _post_raw(logged, path: str, **fields: str):
+    """把裸 UTF-8 字节写进 urlencoded 体：`curl -d 'note=腾讯'` 的形状。
+
+    键与 csrf 是 ASCII，值按字段自己的编码走——这正是 starlette 会按 latin-1
+    读错、而 `form_data` 要折回来的那种请求。
+    """
+    parts = [b"csrf=" + logged.csrf.encode("ascii")]
+    parts += [key.encode("ascii") + b"=" + value.encode("utf-8") for key, value in fields.items()]
+    return logged.client.post(
+        path,
+        content=b"&".join(parts),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        follow_redirects=False,
+    )
+
+
+def test_watchlist_note_from_raw_utf8_body_survives(logged):
+    resp = _post_raw(logged, "/watchlist/add", market="A", code="600519", note="高端白酒")
+    assert resp.status_code == 303, resp.text
+    alice = logged.context.users.get_by_username("alice")
+    rows = {item.code: item for item in logged.context.watchlists.list(alice.id)}
+    assert rows["600519"].note == "高端白酒"
+
+
+def test_thesis_note_from_raw_utf8_body_survives(logged):
+    resp = _post_raw(
+        logged, "/theses/create", market="A", code="600036", style="value", note="低估值银行"
+    )
+    assert resp.status_code == 303, resp.text
+    thesis = next(item for item in logged.context.theses.list("alice") if item.code == "600036")
+    alice = logged.context.users.get_by_username("alice")
+    events = logged.context.theses.theses.events(alice.id, thesis.id)
+    assert events[0].note == "低估值银行"
+
+
+def test_annotation_body_from_raw_utf8_body_survives(logged):
+    resp = _post_raw(
+        logged,
+        "/annotations",
+        target_type="symbol",
+        target_ref="A:600519",
+        body_md="渠道**库存见底**",
+        tags="逻辑,放量",
+    )
+    assert resp.status_code == 200, resp.text
+    alice = logged.context.users.get_by_username("alice")
+    rows = logged.context.annotations.list_target(alice.id, "symbol", "A:600519")
+    assert rows[0].body_md == "渠道**库存见底**"
+    assert rows[0].tags == ["逻辑", "放量"]
+
+
+def test_rule_name_from_raw_utf8_body_survives(logged):
+    resp = _post_raw(
+        logged,
+        "/rules/new",
+        kind="stop.fixed",
+        name="茅台止损",
+        target_type="symbol",
+        target_ref="A/600519",
+        severity="strong",
+        cooldown_min="30",
+        param_price="1400",
+    )
+    assert resp.status_code == 303, resp.text
+    alice = logged.context.users.get_by_username("alice")
+    names = {rule.name for rule in logged.context.rules_store.list_for(alice.id)}
+    assert "茅台止损" in names

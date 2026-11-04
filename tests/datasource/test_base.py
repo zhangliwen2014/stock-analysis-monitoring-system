@@ -16,6 +16,7 @@ from sams.core.errors import (
 from sams.datasource.base import (
     BAR_COLUMNS,
     LOTS_TO_SHARES,
+    a_share_symbol,
     classify_error,
     code_in_market,
     normalize_bars,
@@ -198,3 +199,18 @@ def test_scale_leaves_amount_untouched():
     """成交额两个源都给元，只有量需要换算——搞反一次就是万亿级的错。"""
     scaled = normalize_scaled(raw(), volume_scale=LOTS_TO_SHARES)
     assert scaled["amount"].to_list() == [120.0, 440.0, 960.0]
+
+
+def test_beijing_codes_ask_the_beijing_exchange():
+    """北交所代码要带着 `bj` 去问：发成 `sh920xxx` 时新浪与腾讯都回空行，
+    症状是「这只票从来没交易过」而不是一条报错（实测 24 只零根 K 线）。
+
+    `900xxx` 是沪市 B 股，号段判据不能把它们一起搬到北交所。
+    """
+    assert a_share_symbol("920020") == "bj920020"
+    assert a_share_symbol("430047") == "bj430047"
+    assert a_share_symbol("830799") == "bj830799"
+    assert a_share_symbol("870504") == "bj870504"
+    assert a_share_symbol("900901") == "sh900901"
+    assert a_share_symbol("600519") == "sh600519"
+    assert a_share_symbol("000001") == "sz000001"

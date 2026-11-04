@@ -25,6 +25,7 @@ from sams.services.corp_actions import CorpActionSyncService
 from sams.services.f10 import F10SyncService
 from sams.services.fundamentals import FundamentalSyncService
 from sams.services.market_snapshot import SnapshotSync
+from sams.services.news import NewsService
 from sams.services.scheduler.jobs import (
     build_jobs,
     run_actions,
@@ -33,6 +34,7 @@ from sams.services.scheduler.jobs import (
     run_financials,
     run_flow,
     run_indices,
+    run_news,
     run_profile,
     run_spot,
     run_symbol_master,
@@ -48,6 +50,13 @@ from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
 from sams.storage.repos.f10 import AnnouncementRepo, CompanyProfileRepo
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.index_daily import IndexDailyRepo
+from sams.storage.repos.news import NewsRepo
+from sams.storage.repos.symbol_backfills import (
+    ACTIONS,
+    DEFERRED,
+    PENDING,
+    SymbolBackfillRepo,
+)
 from sams.storage.repos.symbols import SymbolRepo
 
 AS_OF = date(2024, 10, 25)
@@ -164,6 +173,21 @@ class F10CapableAdapter(RecordingBarsAdapter):
             }
         )
 
+    def stock_news(self, market, code, start, end):
+        self.f10_calls.append(("stock_news", market, code, start, end))
+        return pl.DataFrame(
+            {
+                "market": [market],
+                "code": [code],
+                "source": [self.name],
+                "item_id": [f"{code}-N1"],
+                "published_at": [datetime(2024, 10, 25, 8, 0, tzinfo=UTC)],
+                "title": [f"{code} 的新闻"],
+                "summary": [None],
+                "url": [f"https://example.test/news/{code}"],
+            }
+        )
+
 
 def deps(
     db,
@@ -231,6 +255,11 @@ def deps(
             registry,
             CompanyProfileRepo(db),
             AnnouncementRepo(db),
+            clock=FrozenClock(datetime(2024, 10, 25, tzinfo=UTC)),
+        ),
+        news=NewsService(
+            registry,
+            NewsRepo(db),
             clock=FrozenClock(datetime(2024, 10, 25, tzinfo=UTC)),
         ),
         fx=None,  # type: ignore[arg-type]
@@ -310,6 +339,39 @@ def test_one_bad_code_does_not_drop_the_rest(db, settings):
 def test_empty_universe_is_a_successful_noop(db, settings):
     outcome = run_bars(deps(db, settings), ctx())
     assert outcome.errors == () and outcome.rows_affected == 0
+
+
+def test_bars_note_names_the_codes_with_no_bars_at_all(db, settings):
+    """「504/504 只日线」里那 24 只一根 K 线都没有：这一句必须把它们说出来。
+
+    链上一个字都没回不是失败（D43：停牌、新股、区间过短都可能是 0 行），所以它不进
+    `errors`；但它也不是「这只票有日线」。合进分子里的后果是页面上没有 K 线的票
+    在健康页被读成成功——那 24 只北交所代码就是这么藏了两周的（D272）。
+    哪几只不在这里列：空答复不标记补数完成，第二天仍留在 `symbol_backfills` 队列里。
+    """
+    adapter = RecordingBarsAdapter(frame=sample_bars())  # 只有 600519 有行
+    outcome = run_bars(deps(db, settings, bars=adapter), ctx("600519", "920020"))
+    assert outcome.note == "2/2 只日线，1 只一根 K 线都没有"
+    assert outcome.errors == ()
+
+    answered = run_bars(deps(db, settings, bars=adapter), ctx("600519"))
+    assert answered.note == "1/1 只日线"
+
+
+def test_today_suspension_does_not_look_like_a_missing_history(db, settings):
+    """停牌今天没成交，与「这只票从来没入库」是两个问题，只有后者值得单独说一句。
+
+    按「今晚写了几行」判会把每天几十只停牌票都念成窟窿，而几十句噪音的下场是没人再读
+    这一句；库里已有日线的那几只因此必须留在分子里不说。
+    """
+    BarRepo(db).upsert(
+        sample_bars(code="601088", start=date(2024, 10, 24)).filter(
+            pl.col("date") == date(2024, 10, 24)
+        )
+    )
+    adapter = RecordingBarsAdapter(frame=sample_bars(code="600519"))
+    outcome = run_bars(deps(db, settings, bars=adapter), ctx("600519", "601088"))
+    assert outcome.note == "2/2 只日线"
 
 
 def test_a_programming_error_is_not_collected_as_a_failed_code(db, settings, monkeypatch):
@@ -418,6 +480,24 @@ def test_actions_job_skips_a_fully_covered_code(db, settings):
     assert db.row_count("corp_actions") == 0
 
 
+def test_actions_job_rearms_yesterday_deferred_rows(db, settings):
+    """三次没补上的行今晚重新排上队：否则 consumer 那句「等今晚」就是空的（D283）。
+
+    今晚的 `actions` job 只跑 universe（自选/持仓/规则/论点）里的票，队列里那条
+    非 universe 的 `actions` 行没人替它结案——不顺延就永远躺在 deferred。
+    """
+    backfills = SymbolBackfillRepo(db)
+    backfills.enqueue("A", "601299", ACTIONS)
+    row = backfills.open_for("A", "601299", kind=ACTIONS)
+    for _ in range(3):
+        backfills.note_failure(row.id, "源链全断")
+    assert backfills.open_for("A", "601299", kind=ACTIONS).status == DEFERRED
+    outcome = run_actions(replace(deps(db, settings), backfills=backfills), ctx())
+    rearmed = backfills.open_for("A", "601299", kind=ACTIONS)
+    assert (rearmed.status, rearmed.tries) == (PENDING, 0)
+    assert "1 条" in outcome.note
+
+
 def test_actions_job_bumps_the_gate_because_factors_moved(db, settings):
     """公司行为改的是复权口径：只 bump 自己的表不够，盘中缓存的那份日线读数同样作废。
 
@@ -510,6 +590,44 @@ def test_announcements_job_asks_for_the_last_thirty_days(db, settings):
     assert adapter.f10_calls == [
         ("announcements", "A", "600519", AS_OF - timedelta(days=30), AS_OF)
     ]
+
+
+def test_news_job_writes_new_rows_and_a_rerun_is_zero(db, settings):
+    adapter = F10CapableAdapter()
+    subject = deps(db, settings, f10=adapter)
+    outcome = run_news(subject, ctx("600519"))
+    assert outcome.ok and outcome.rows_affected == 1
+    assert "1/1 只新闻" in outcome.note
+    assert adapter.f10_calls == [
+        ("stock_news", "A", "600519", AS_OF - timedelta(days=30), AS_OF)
+    ]
+    again = run_news(subject, ctx("600519"))
+    assert again.ok and again.rows_affected == 0
+    assert NewsRepo(db).count() == 1
+
+
+def test_news_job_skips_hk_and_us_instead_of_recording_a_failure(db, settings):
+    """港美没有新闻源（D247）：这一趟要看得见，但它是「跳过」不是「失败」。"""
+    subject = deps(db, settings, f10=F10CapableAdapter(), with_us=True)
+    for market, code in (("HK", "00700"), ("US", "AAPL")):
+        outcome = run_news(
+            subject,
+            JobContext(
+                period_key="2024-10-25",
+                as_of=AS_OF,
+                market=market,
+                universe=Universe(by_market={market: (code,)}, fx_pairs=()),
+            ),
+        )
+        assert outcome.ok and outcome.rows_affected == 0
+        assert f"{market} 新闻源未接入" in outcome.note
+
+
+def test_news_job_is_registered_for_every_market(db, settings):
+    registered = {(job.name, job.market) for job in build_jobs(deps(db, settings))}
+    assert ("news", "A") in registered
+    assert ("news", "HK") in registered
+    assert ("news", "US") in registered
 
 
 def test_indices_job_is_incremental(db, settings):

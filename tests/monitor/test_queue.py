@@ -15,8 +15,10 @@ from sams.monitor.queue import (
     AlertJob,
     AlertQueue,
     CallbackJob,
+    DigestJob,
     NotifyWorker,
     QueuedAlertSender,
+    QueuedDigestSender,
     SystemAlarmRelay,
 )
 
@@ -28,7 +30,10 @@ class FakeNotify:
         # `dispatch` 少转一个参数，用例要看得见，不能只看见「返回了个 id」
         self.calls: list[tuple[AlertMessage, str, tuple[str, ...], str | None, str | None]] = []
         self.abandoned: list[tuple[str, str]] = []
+        self.abandoned_digests: list[tuple[str, str]] = []
+        self.failed_digests: list[tuple[str, str]] = []
         self.delivered: list[str] = []
+        self.delivered_digests: list[str] = []
         self.next_id = 1
 
     def record(
@@ -46,6 +51,15 @@ class FakeNotify:
 
     def deliver_existing(self, alert_id, *, context_provider=None):
         self.delivered.append(alert_id)
+
+    def deliver_digest(self, digest_id):
+        self.delivered_digests.append(digest_id)
+
+    def abandon_digest(self, digest_id, *, reason):
+        self.abandoned_digests.append((digest_id, reason))
+
+    def fail_digest(self, digest_id, *, error):
+        self.failed_digests.append((digest_id, error))
 
 
 def msg():
@@ -258,3 +272,42 @@ def test_system_alarms_land_in_the_queue_as_callback_jobs():
     assert q.qsize() == 1  # 订阅回调只入队：EventBus 的订阅方跑在发布线程里
     job = q.get()
     assert isinstance(job, CallbackJob)
+
+
+def test_a_digest_job_delivers_by_id():
+    notify = FakeNotify()
+    q = AlertQueue()
+    q.offer(DigestJob("d1"))
+    stop = threading.Event()
+    stop.set()
+    NotifyWorker(notify, q, drain_s=2.0).run(stop=stop)
+    assert notify.delivered_digests == ["d1"]
+
+
+def test_a_full_queue_marks_the_digest_no_channel():
+    notify = FakeNotify()
+    q = AlertQueue(maxsize=1)
+    q.offer(AlertJob("occupied"))
+    QueuedDigestSender(notify, q)("d1")
+    assert notify.abandoned_digests and notify.abandoned_digests[0][0] == "d1"
+    assert "队列已满" in notify.abandoned_digests[0][1]
+
+
+def test_an_unexpected_failure_in_a_digest_job_is_recorded_as_failed():
+    notify = FakeNotify()
+
+    def flaky(digest_id):
+        if digest_id == "d1":
+            raise RuntimeError("摘要发不出去")
+        notify.delivered_digests.append(digest_id)
+
+    notify.deliver_digest = flaky
+    q = AlertQueue()
+    q.offer(DigestJob("d1"))
+    q.offer(DigestJob("d2"))
+    stop = threading.Event()
+    stop.set()
+    NotifyWorker(notify, q, drain_s=2.0).run(stop=stop)
+    assert [item[0] for item in notify.failed_digests] == ["d1"]
+    assert "摘要发不出去" in notify.failed_digests[0][1]
+    assert notify.delivered_digests == ["d2"]  # 后面那张单照发：逐单隔离

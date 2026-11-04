@@ -9,7 +9,7 @@ import pytest
 from support import FrozenClock
 
 from sams.core.errors import StorageError, ValidationError
-from sams.services.portfolio import PortfolioService
+from sams.services.portfolio import LivePrice, PortfolioService
 from sams.storage.db import Database
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.fx import FxRepo
@@ -354,3 +354,60 @@ def test_price_pnl_plus_fx_always_equals_the_reported_change(db, portfolio, pric
     assert summary.price_pnl_report + summary.fx_pnl == pytest.approx(
         sum(r.total_report for r in rows)
     )
+
+
+# ---- 盘中现价（D232）：新鲜报价覆盖收盘，且行上留下「这是哪一种价」 ----
+
+
+class StubPrices:
+    """`PriceView` 的替身：页面那一侧已经按 `quote_state` 过完闸，这里只答价。"""
+
+    def __init__(self, prices=None) -> None:
+        self.prices = dict(prices or {})
+
+    def get(self, market: str, code: str):
+        return self.prices.get((market, code))
+
+
+def test_a_fresh_quote_overrides_the_close_and_is_marked_live(db, portfolio) -> None:
+    """盘中跌了 7% 而持仓页还拿昨收算盈亏，是按隔夜价做风控——D232 的起点。"""
+    account_id = _funded_position(portfolio, price=40.0)
+    BarRepo(db).upsert(_bars("A", "601088", [(DAY, 42.0)]))
+    prices = StubPrices({("A", "601088"): LivePrice(39.0, TODAY)})
+    row = portfolio.positions(USER, account_id, prices=prices)[0]
+    assert row.last_price == pytest.approx(39.0)
+    assert row.last_price_date == TODAY
+    assert row.price_kind == "live"
+    assert row.price_pnl == pytest.approx(-100.0)
+
+
+def test_a_delayed_quote_is_used_but_marked_delayed(db, portfolio) -> None:
+    """延时报价可以用，但屏幕上不能写成实时（`Quote.delayed` 的语义一路带到行上）。"""
+    account_id = _funded_position(portfolio, price=40.0)
+    BarRepo(db).upsert(_bars("A", "601088", [(DAY, 42.0)]))
+    prices = StubPrices({("A", "601088"): LivePrice(41.0, TODAY, delayed=True)})
+    row = portfolio.positions(USER, account_id, prices=prices)[0]
+    assert row.last_price == pytest.approx(41.0)
+    assert row.price_kind == "delayed"
+
+
+def test_without_a_quote_the_row_still_uses_the_close(db, portfolio) -> None:
+    """休市、陈旧或没轮到：回落收盘，并把「这是收盘」说在行上。"""
+    account_id = _funded_position(portfolio, price=40.0)
+    BarRepo(db).upsert(_bars("A", "601088", [(DAY, 42.0)]))
+    row = portfolio.positions(USER, account_id, prices=StubPrices())[0]
+    assert row.last_price == pytest.approx(42.0)
+    assert row.last_price_date == DAY
+    assert row.price_kind == "close"
+
+
+def test_the_summary_adds_up_on_the_live_price(db, portfolio) -> None:
+    """汇总与逐行必须是同一套价：否则合计与明细差出一个「盘中变动」。"""
+    account_id = _funded_position(portfolio, price=40.0)
+    BarRepo(db).upsert(_bars("A", "601088", [(DAY, 42.0)]))
+    prices = StubPrices({("A", "601088"): LivePrice(39.0, TODAY)})
+    summary = portfolio.summary(USER, account_id, prices=prices)
+    # 现金 1,000,000 − 买入 4,000 + 盘中市值 3,900：合计与明细是同一套价
+    assert summary.total_report == pytest.approx(999_900.0)
+    assert summary.position_value_by_currency == {"CNY": pytest.approx(3_900.0)}
+    assert summary.as_of == TODAY

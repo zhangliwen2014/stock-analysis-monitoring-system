@@ -284,11 +284,11 @@ class Runtime:
     def healthz(self) -> dict[str, Any]:
         now = self.clock.now_utc()
         db_ok, db_error = self._db_probe()
-        scheduler, schedule_stale = self._scheduler_reading()
+        scheduler, scheduler_down = self._scheduler_reading()
         intraday = self._intraday_reading(now)
         degraded = (
             not db_ok
-            or schedule_stale
+            or scheduler_down
             or any(not market["ok"] for market in intraday.values())
         )
         return {
@@ -314,12 +314,37 @@ class Runtime:
         return True, None
 
     def _scheduler_reading(self) -> tuple[dict[str, Any], bool]:
-        """调度器的读数；读不出来就是「可能死了」，不是让整份 healthz 变成 500。"""
+        """调度器的读数；读不出来就是「可能死了」，不是让整份 healthz 变成 500。
+
+        返回的第二格是「这一条该不该把状态拖进 degraded」：`may_be_stopped`，不是
+        `stale`——单个 job 跑过阈值的那一段本来就不补拍，那一趟正在跑的执行就是
+        「进程还活着」的证据（见 `report.py`）。
+        """
         try:
             schedule = self.schedule_reading()
         except Exception as exc:
-            return {"beat_age_s": None, "stale": True, "error": str(exc)}, True
-        return {"beat_age_s": schedule.beat_age_s, "stale": schedule.stale}, schedule.stale
+            return (
+                {
+                    "beat_age_s": None,
+                    "stale": True,
+                    "busy": False,
+                    "running": [],
+                    "error": str(exc),
+                },
+                True,
+            )
+        return (
+            {
+                "beat_age_s": schedule.beat_age_s,
+                "stale": schedule.stale,
+                "busy": schedule.busy,
+                "running": [
+                    {"job": job.name, "market": job.market, "age_s": job.age_s}
+                    for job in schedule.running
+                ],
+            },
+            schedule.may_be_stopped,
+        )
 
     def _intraday_reading(self, now: datetime) -> dict[str, dict[str, Any]]:
         snapshots = self.board.snapshot() if self.board is not None else {}

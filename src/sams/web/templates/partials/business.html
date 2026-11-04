@@ -1,0 +1,50 @@
+{# 核心业务六字段（S2 / D240）：草稿与已确认必须是两种样子。
+   来源日期与确认时刻分开写；缺的那一格给「哪一档 + 下一步」，不统一糊成「未披露」。 #}
+
+<section class="card" id="business">
+  <h2>核心业务</h2>
+  <table class="business-table">
+    <tr><th>项目</th><th>内容</th><th>来源 / 状态</th></tr>
+    {% for field in read.fields %}
+    <tr>
+      <td>
+        <strong>{{ field.spec.label }}</strong><br>
+        <span class="muted">{{ field.spec.hint }}</span>
+      </td>
+      <td class="pre-wrap">
+        {%- if field.value -%}
+        {{ field.value }}
+        {%- else -%}
+        <span class="muted">— {{ missing_label(field.missing_kind) }}</span>
+        {%- endif -%}
+      </td>
+      <td class="muted">
+        {%- if field.value -%}
+          {{ field.source_label }} · {{ field.as_of or "—" }}
+          {%- if field.draft %} · 待确认
+          {%- elif field.confirmed_at %} · 已确认（{{ field.confirmed_by or "?" }} {{ field.confirmed_at.strftime("%Y-%m-%d") }}）
+          {%- else %} · 已确认{% endif %}
+        {%- else -%}
+          {{ field.missing_reason }}
+        {%- endif -%}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <details>
+    <summary>编辑六项</summary>
+    <form method="post" action="/symbol/{{ market }}/{{ code }}/business{% if back %}?back={{ back|urlencode }}{% endif %}">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      {% for field in read.fields %}
+      <label>
+        {{ field.spec.label }}
+        <span class="muted">{{ field.spec.hint }}</span>
+      </label>
+      <textarea name="{{ field.spec.key }}" maxlength="{{ field.spec.max_chars }}" rows="3">{{ field.value or "" }}</textarea>
+      {% endfor %}
+      <p class="muted">留空 = 清除这一项；保存即确认。</p>
+      <button type="submit">保存并确认</button>
+    </form>
+  </details>
+</section>

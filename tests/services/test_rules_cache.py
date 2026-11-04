@@ -83,8 +83,11 @@ def test_two_intraday_rounds_share_one_daily_read(db, settings):
     assert len(first.raised) == 1
     board.current[("A", "601088")] = q(9.1)
     second = engine.check(USER, intraday=True, quotes=board)
-    assert len(second.raised) == 1
-    assert "9.10" in second.raised[0].value_text  # 判的是新价，不是缓存里的旧价
+    # S1-B 之后同一个阶段的第二趟不再推：这一枚与「跃迁才发」不冲突，它验的是
+    # 缓存——第二轮仍然判过（reason 是「状态未变」，不是「没读数」），却没再读日线
+    assert second.raised == ()
+    assert second.judged == 1
+    assert "状态未变" in second.suppressed[0].reason
     assert len(engine.data.as_of_seen) == 1  # 第二轮没再读日线
 
 

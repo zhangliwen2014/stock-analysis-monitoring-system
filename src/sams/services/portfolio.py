@@ -2,16 +2,20 @@
 
 写不在这个类里（`LedgerService`）：读用例不该有机会改账。
 
-现价取自 `BarRepo`（库里只有不复权那一套，`adjust = 'raw'` 写死在查询里），而不是走
+现价默认取自 `BarRepo`（库里只有不复权那一套，`adjust = 'raw'` 写死在查询里），而不是走
 M2 那条后复权链：`avg_cost` 是成交那天的真价格，拿 hfq 绝对值去减它，算出来的是一段
 从来没存在过的价差（D73）。换算锚在**行情的那一天**而不是「今天」，这样这个类不需要
 墙钟，也避开了用 UTC 日期推交易日在美股上恒错一天（`core/clock.py` 开头那句警告）。
+
+盘中可以传 `prices`（D232）：新鲜报价顶掉收盘价，行上 `price_kind` 留下这是哪一种价。
+闸不在这一层——`STALE`/`NO_DATA`/休市回落到收盘，是装配方按 `quote_state` 判过的。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
+from typing import Protocol
 
 from sams.core import funds
 from sams.core.clock import SYSTEM_CLOCK, Clock
@@ -29,6 +33,25 @@ from sams.storage.repos.users import User, UserRepo
 
 
 @dataclass(frozen=True)
+class LivePrice:
+    """一条已经过闸的盘中价（D232）：`day` 是报价所属交易日的本地日期。"""
+
+    price: float
+    day: date
+    #: 源明确标了延时：数照用，屏幕上不能写「现价」
+    delayed: bool = False
+    #: 报价的时刻（UTC）：页面上「14:47 盘中」的那一半是它（S0-E）
+    at: datetime | None = None
+
+
+class PriceView(Protocol):
+    """持仓页向报价板开口的那一个问题；`QuoteBoard` 不直接长成这样（还要判五态），
+    由装配方折一层再交进来。"""
+
+    def get(self, market: str, code: str) -> LivePrice | None: ...
+
+
+@dataclass(frozen=True)
 class PositionRow:
     market: str
     code: str
@@ -40,6 +63,8 @@ class PositionRow:
     avg_cost: float
     last_price: float | None
     last_price_date: date | None
+    #: 盘中价的时刻（UTC）：休市回落的收盘价没有它（S0-E）
+    last_price_at: datetime | None = None
     #: None = 这一行给不出任何报告币种里的数（缺现价或缺汇率），原因在 `unavailable_note`
     pnl: funds.PositionPnl | None = None
     #: False = 不进汇总。它不是「数为 0」，而是「这一笔此刻无法换算」
@@ -48,6 +73,9 @@ class PositionRow:
     unavailable_note: str | None = None
     #: 基准汇率看着像占位值（跨币种却记成 1.0）时的一句话：数照算，来处得说清（D212）
     rate_note: str | None = None
+    #: `live` / `delayed` / `close`：这一行的 `last_price` 是哪一种价（D232）。
+    #: 默认 `close`，CLI 与调度不传报价时行为不变
+    price_kind: str = "close"
 
     @property
     def price_pnl(self) -> float | None:
@@ -140,10 +168,14 @@ class PortfolioService:
         self.users = users
         self.clock = clock
 
-    def positions(self, username: str, account_id: str) -> list[PositionRow]:
-        return self._positions(resolve_actor(self.users, username), account_id)
+    def positions(
+        self, username: str, account_id: str, *, prices: PriceView | None = None
+    ) -> list[PositionRow]:
+        return self._positions(resolve_actor(self.users, username), account_id, prices=prices)
 
-    def _positions(self, user: User, account_id: str) -> list[PositionRow]:
+    def _positions(
+        self, user: User, account_id: str, *, prices: PriceView | None = None
+    ) -> list[PositionRow]:
         """当前持仓逐行给出（已清仓的不出现）；报告币种取的是**账户**那一列。
 
         读也带归属：与 `repos/theses.py` 同形，不提供「查全量再由调用方过滤」的接口
@@ -154,7 +186,7 @@ class PortfolioService:
         for pos in self.orders.positions(account_id):
             if pos.qty <= 0:
                 continue
-            rows.append(self._one(account_id, pos, account.report_currency))
+            rows.append(self._one(account_id, pos, account.report_currency, prices=prices))
         return rows
 
     def _account(self, user: User, account_id: str) -> Account:
@@ -167,7 +199,14 @@ class PortfolioService:
             raise StorageError(f"账户 {account_id} 不存在或不属于用户 {user.username}")
         return account
 
-    def _one(self, account_id: str, pos: Position, report: str) -> PositionRow:
+    def _one(
+        self,
+        account_id: str,
+        pos: Position,
+        report: str,
+        *,
+        prices: PriceView | None = None,
+    ) -> PositionRow:
         base = PositionRow(
             market=pos.market,
             code=pos.code,
@@ -178,7 +217,9 @@ class PortfolioService:
             last_price=None,
             last_price_date=None,
         )
-        price, price_day = self._last_price(pos.market, pos.code)
+        price, price_day, price_kind, price_at = self._last_price(
+            pos.market, pos.code, prices
+        )
         if price is None:
             return replace(
                 base,
@@ -192,12 +233,16 @@ class PortfolioService:
                 base,
                 last_price=price,
                 last_price_date=price_day,
+                last_price_at=price_at,
+                price_kind=price_kind,
                 unavailable_note=note,
             )
         row = replace(
             base,
             last_price=price,
             last_price_date=price_day,
+            last_price_at=price_at,
+            price_kind=price_kind,
             pnl=funds.position_pnl(
                 qty=pos.qty,
                 avg_cost=pos.avg_cost,
@@ -222,16 +267,35 @@ class PortfolioService:
             )
         return row
 
-    def _last_price(self, market: str, code: str) -> tuple[float | None, date | None]:
-        """未复权收盘（D73）：`BarRepo` 的读取一律带 `adjust = 'raw'`，后复权序列不参与。"""
+    def _last_price(
+        self, market: str, code: str, prices: PriceView | None
+    ) -> tuple[float | None, date | None, str, datetime | None]:
+        """未复权收盘（D73）；给了新鲜报价就用它，并说清这一行是哪种价（D232）。
+
+        返回的第四个值是报价时刻：休市回落的收盘价没有它，屏幕上那一格只写日期。
+        """
+        if prices is not None:
+            live = prices.get(market, code)
+            if live is not None:
+                return (
+                    live.price,
+                    live.day,
+                    "delayed" if live.delayed else "live",
+                    live.at,
+                )
         latest = self.bars.latest_date(market, code)
         if latest is None:
-            return None, None
+            return None, None, "close", None
         frame = self.bars.load(market, [code], start=latest, end=latest)
         if frame.is_empty():
-            return None, None
+            return None, None, "close", None
         value = frame["close"][-1]
-        return (None if value is None else float(value)), latest
+        return (
+            (None if value is None else float(value)),
+            latest,
+            "close",
+            None,
+        )
 
     def _rates(
         self, account_id: str, pos: Position, price_day: date, report: str
@@ -275,7 +339,9 @@ class PortfolioService:
             entries.append((order.qty, order.fx_rate_ref, False))
         return funds.weighted_rate(entries)
 
-    def summary(self, username: str, account_id: str) -> AccountSummary:
+    def summary(
+        self, username: str, account_id: str, *, prices: PriceView | None = None
+    ) -> AccountSummary:
         """账户汇总：先按币种给出本币小计，再逐笔换算（§5.4 规则 2/3）。
 
         把所有币种的数额直接相加报成一个数，是比「算错」更隐蔽的错：它看着完全正常。
@@ -283,7 +349,7 @@ class PortfolioService:
         """
         user = resolve_actor(self.users, username)
         account = self._account(user, account_id)
-        rows = self._positions(user, account_id)
+        rows = self._positions(user, account_id, prices=prices)
         as_of = self._as_of(rows)
         notes: list[str] = []
         value_by_ccy: dict[str, float] = {}

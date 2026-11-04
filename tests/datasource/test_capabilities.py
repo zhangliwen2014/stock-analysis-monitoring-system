@@ -29,6 +29,7 @@ def test_the_kind_name_is_the_adapter_method_name():
         "funding_flow",
         "company_profile",
         "announcements",
+        "stock_news",
         "listed_date",
         "fx_rate",
         "quote",
@@ -112,11 +113,14 @@ def test_market_snapshot_is_registered_under_its_method_name():
     assert "market_snapshot" in CAPABILITIES
 
 
-def test_tencent_answers_market_snapshot_only_for_a():
+def test_tencent_answers_market_snapshot_for_all_three_markets():
     from sams.datasource.minute import answers
     from sams.datasource.tencent import TencentAdapter
 
     adapter = TencentAdapter(quote_fetch=lambda *a, **k: "")
     assert "market_snapshot" in provided_by(TencentAdapter)
     assert answers(adapter, "market_snapshot", "A") is True
-    assert answers(adapter, "market_snapshot", "HK") is False
+    # 港股九只票的 57/58 与东财 F10 的 PE/PB 对过之后才注册
+    assert answers(adapter, "market_snapshot", "HK") is True
+    # 美股 39/37/43/44/45 与新浪逐项对过；PB 没核对，只关那一列（D226）
+    assert answers(adapter, "market_snapshot", "US") is True

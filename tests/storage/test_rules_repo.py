@@ -479,3 +479,25 @@ def test_a_rename_next_to_a_re_typed_price_still_moves_the_day(repo):
     clocked = RuleRepo(repo.db, clock=support.FrozenClock(datetime(2026, 4, 9, 1, 0, tzinfo=UTC)))
     again = clocked.update(made.id, changed_by=user, name="改个名字", params={"price": 10.0})
     assert again.params_on == date(2026, 4, 9)
+
+
+def test_a_draft_is_refused_by_the_same_rules_as_a_created_one_and_writes_nothing(repo):
+    """保存前试算要的正是「创建时那套判据」：两处各写一遍会分叉成「试算说会响，保存说不行」。
+
+    草稿不落库是这一枚的另一半：`build` 一旦顺手 INSERT，网页那颗「试算（不保存）」就成了
+    一条没人要的规则的产地，而屏幕上那句「一条都没写」会变成分叉口上的谎话。
+    """
+    user = seed_user(repo.db)
+    draft = repo.build(
+        user, kind="stop.fixed", name="草稿", target_type="symbol",
+        target_ref="A/600519", params={"price": 1400.0},
+    )
+    assert draft.params == {"price": 1400.0}
+    assert draft.id == "draft"
+    assert repo.list_for(user) == []
+    with pytest.raises(ValidationError, match="不认这些参数"):
+        repo.build(
+            user, kind="stop.fixed", name="草稿", target_type="symbol",
+            target_ref="A/600519", params={"price": 1400.0, "line": 1300.0},
+        )
+    assert repo.list_for(user) == []

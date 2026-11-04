@@ -76,6 +76,26 @@ def test_profile_keeps_unknown_fields_null_instead_of_zero(db):
     assert row["hk_connect"] is None
 
 
+def test_profile_list_market_carries_the_industry_and_fetch_time(db):
+    """行业回填读的是「这个市场有哪些概况」：行业与抓取日必须在同一行里。"""
+    repo = CompanyProfileRepo(db)
+    repo.upsert(
+        pl.concat(
+            [
+                profile(),
+                profile(market="HK", code="700", name="腾讯控股", industry="资讯科技-软件"),
+            ]
+        )
+    )
+    rows = repo.list_market("A")
+    assert rows.height == 1
+    row = rows.row(0, named=True)
+    assert row["code"] == "600519"
+    assert row["industry"] == "食品饮料-饮料-白酒"
+    assert row["fetched_at"] is not None
+    assert repo.list_market("US").is_empty()
+
+
 def test_announcement_rewrite_does_not_add_a_row(db):
     repo = AnnouncementRepo(db)
     repo.upsert(announcement(title="旧标题"))

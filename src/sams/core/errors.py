@@ -104,6 +104,15 @@ class NotAdjustable(SamsError):
     """
 
 
+class CoverageMissing(NotAdjustable):
+    """「没确认过公司行为」这一种拒绝，单独一个类型（D283）。
+
+    分开不是为了类型体操：`NotAdjustable` 还装着「缺收盘价」「以股代息没法定价」这些拒绝，
+    给它们统一挂一句 `sams sync actions` 是错的建议。而覆盖这一种的下一步在网页上是
+    「打开个股页，后台排队补采」，在命令行上是那条命令——同一个事实，两个出口两套话。
+    """
+
+
 class SchedulerBusy(SamsError):
     """同一份库上已经有一个心跳还热的调度器（D100）。
 

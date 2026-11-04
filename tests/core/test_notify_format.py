@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -15,10 +15,13 @@ import pytest
 from sams.core.errors import ValidationError
 from sams.core.notify import (
     DEFAULT_ROUTE,
+    DIGEST_KINDS,
+    KINDS,
     LIMITS,
     OUTCOMES,
     SEVERITIES,
     AlertMessage,
+    DigestMessage,
     format_headline,
     route_for,
     trim,
@@ -124,3 +127,24 @@ def test_no_channel_route_is_not_a_failure():
     """`route_for` 只回答「默认该走哪几个」；一个都没有由 router 写成 no_channel，
     这里不返回空 tuple 之外的暗号——空 tuple 与「没配通道」在健康页是两句话。"""
     assert set(DEFAULT_ROUTE["mid"]) == {"wecom", "dingtalk"}
+
+
+# ---------- 摘要（S1-C）----------
+
+def test_a_digest_carries_its_own_headline():
+    """摘要不是告警：`[A][未知账户] … | ?/?` 那条标题行读不出一件事，
+    摘要自己写好的标题就是通道要的那一行。"""
+    message = DigestMessage(
+        market="A",
+        as_of=date(2026, 10, 30),
+        title="A · 2026-10-30 收盘摘要",
+        body="【持仓】\n· 无变化",
+        triggered_at=datetime(2026, 10, 30, 7, 30, tzinfo=UTC),
+    )
+    assert format_headline(message) == "A · 2026-10-30 收盘摘要"
+
+
+def test_digest_kinds_are_only_the_text_channels():
+    """桌面 200 字节、语音 140 字节装不下摘要；六个通道里只这四个接。"""
+    assert DIGEST_KINDS == ("wecom", "dingtalk", "pushplus", "email")
+    assert set(DIGEST_KINDS) <= set(KINDS)

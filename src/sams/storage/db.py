@@ -27,24 +27,57 @@ def _is_lock_error(exc: duckdb.Error) -> bool:
     return any(marker in text for marker in _LOCK_MARKERS)
 
 
+#: 本进程里每个库文件当前活着的连接数。
+#:
+#: 同一个进程里 DuckDB 共享实例：实例创建时的那**第一条**连接负责重放 WAL，之后的连接
+#: 看到的已经是重放好的库。所以「重放之后立刻 checkpoint」只在计数从 0 变 1 的那一次
+#: 需要做（D282）。全部关干净再开，是另一个实例，要重做一次。
+_live: dict[str, int] = {}
+
+
+def _pending_wal(target: str) -> bool:
+    """磁盘上有没有等着被重放的 WAL：那是那个索引 bug 的唯一入口。"""
+    try:
+        return Path(target + ".wal").stat().st_size > 0
+    except OSError:
+        return False
+
+
 class Database:
     def __init__(self, conn: duckdb.DuckDBPyConnection, path: str = MEMORY) -> None:
         self.conn = conn
         #: 记住来源，健康报告与日志要显示「这个库是哪个文件」
         self.path = path
         self._tx_depth = 0
+        #: 只有创建实例那一条连接要在关闭时把计数减回去（`open` 里设）
+        self._counts = False
 
     @classmethod
     def open(cls, path: str | Path) -> Database:
         target = str(path)
         if target != MEMORY:
             Path(target).parent.mkdir(parents=True, exist_ok=True)
+        # 上一程没 checkpoint 就死了（被 kill、崩在夜里、验收时 Ctrl-C）→ 留下 WAL
+        creates_instance = target != MEMORY and _live.get(target, 0) == 0
+        replay_needs_persisting = creates_instance and _pending_wal(target)
         try:
-            return cls(duckdb.connect(target), target)
+            conn = duckdb.connect(target)
         except duckdb.Error as exc:
             if _is_lock_error(exc):
                 raise DatabaseLocked(target, detail=str(exc)) from exc
             raise StorageError(f"无法打开数据库 {target}: {exc}") from exc
+        database = cls(conn, target)
+        if creates_instance:
+            _live[target] = _live.get(target, 0) + 1
+            database._counts = True
+        if replay_needs_persisting:
+            # 重放回来的行只有被这一次 checkpoint 带过，才算真的带着索引（D282）
+            try:
+                database.execute("CHECKPOINT")
+            except StorageError as exc:
+                database.close()
+                raise StorageError(f"重放 WAL 之后 checkpoint 失败 {target}: {exc}") from exc
+        return database
 
     @property
     def in_transaction(self) -> bool:
@@ -142,4 +175,13 @@ class Database:
         return int(self.scalar(f"SELECT count(*) FROM {table}") or 0)
 
     def close(self) -> None:
+        # 计数要跟着减：DuckDB 在同进程里按路径共享实例，最后一条连接关掉后实例就没了，
+        # 下一次 open 是新实例、要重新重放 WAL（D282 的那一次 checkpoint 因此也要重做）。
+        if self._counts:
+            self._counts = False
+            left = _live.get(self.path, 1) - 1
+            if left > 0:
+                _live[self.path] = left
+            else:
+                _live.pop(self.path, None)
         self.conn.close()

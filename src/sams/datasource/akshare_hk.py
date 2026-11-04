@@ -170,9 +170,12 @@ def akshare_hk_payout(symbol: str) -> pl.DataFrame:
     import akshare as ak
 
     frame = ak.stock_hk_dividend_payout_em(symbol=symbol)
-    if frame is None or len(frame) == 0:
-        # 一次都没派息是一家真实存在的公司的正常状态（在韩/内房股里常见），不是故障
+    if frame is None:
         return pl.DataFrame()
+    # 一次都没派息是一家真实存在的公司的正常状态（在韩/内房股里常见，实测 03690 回
+    # 0 行 7 列），不是故障。但「0 行」这句话靠的是那 7 列：压成无列的空帧，
+    # `required_columns` 就把它读成改版，于是这只正常票每晚失败一次，公司行为覆盖
+    # 永远确认不下来，而复权闸接着把库里已有的 K 线一起挡掉。
     return pl.from_pandas(frame)
 
 
