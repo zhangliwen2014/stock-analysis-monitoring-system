@@ -184,6 +184,20 @@ class BarRepo:
             return None
         return value.date() if isinstance(value, datetime) else value
 
+    def latest_date_for_market(self, market: str) -> date | None:
+        """这个市场库里最新的 K 线日——「有人看的那只票跟没跟上」的对照（D309）。
+
+        用库里的最大值而不是日历上「最近一个已收盘的交易日」：对照本来就在那里，而日历那个判据
+        在整市场都没跑的那天会给每个被打开过的票都排一条，那种市场级缺口该由日线 job 自己盖。
+        """
+        value = self.db.scalar(
+            "SELECT max(date) FROM bars_daily WHERE adjust = ? AND market = ?",
+            [ADJUST, canonical_market(market)],
+        )
+        if value is None:
+            return None
+        return value.date() if isinstance(value, datetime) else value
+
     def load(
         self,
         market: str,

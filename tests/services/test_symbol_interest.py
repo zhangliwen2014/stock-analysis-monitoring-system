@@ -2,6 +2,7 @@
 
 from datetime import UTC, date, datetime, timedelta
 
+import polars as pl
 import pytest
 from support import FrozenClock
 
@@ -148,3 +149,67 @@ def test_stale_confirmation_queues_once_a_day(db, parts, coverage, bars_frame):
     second = interest.ensure("A", "600519", actor="bob")
     assert (first.actions_queued, second.actions_queued) == (True, False)
     assert backfills.open_for("A", "600519", kind="actions") is not None
+
+
+def _one_bar(market: str, code: str, day: date) -> pl.DataFrame:
+    """一根 K 线：`ensure()` 问的是「这只票最新那根比市场最新那根老几天」，一根就够回答。"""
+    return pl.DataFrame(
+        {
+            "market": [market],
+            "code": [code],
+            "date": [day],
+            "open": [1.0],
+            "high": [1.5],
+            "low": [0.5],
+            "close": [1.2],
+            "volume": [100.0],
+            "amount": [120.0],
+            "source": ["akshare"],
+        }
+    )
+
+
+def test_stale_bars_queue_a_refetch(db, parts):
+    """看过的票冻在 10-29，同市场别的票已经到 11-04 ⇒ 排一条日线补采（#380 F1）。
+
+    这一条是那六只港股的完整形状：第一次打开补了 493 行，此后每次打开 `count` 都不是 0，
+    旧判据再也不问第二句，于是页面停在六个工作日之前而没有任何东西去补它。
+    """
+    repo = BarRepo(db)
+    repo.upsert(_one_bar("A", "600519", date(2026, 10, 29)))
+    repo.upsert(_one_bar("A", "000002", date(2026, 11, 4)))
+    _, backfills, interest = parts
+    report = interest.ensure("A", "600519", actor="alice")
+    assert report.queued is True
+    assert backfills.open_for("A", "600519") is not None
+
+
+def test_market_latest_symbol_queues_nothing(db, parts):
+    """跟上市场最大值的那只不排：否则每次渲染页面都排一条，队列被念成积压。"""
+    repo = BarRepo(db)
+    repo.upsert(_one_bar("A", "600519", date(2026, 11, 4)))
+    repo.upsert(_one_bar("A", "000002", date(2026, 10, 29)))
+    _, backfills, interest = parts
+    report = interest.ensure("A", "600519", actor="alice")
+    assert report.queued is False
+    assert backfills.open_for("A", "600519") is None
+
+
+def test_other_market_does_not_make_it_look_stale(db, parts):
+    """对照只在市场内：A 股冻在 10-29 不因为港股已经到 11-04 而排队。"""
+    repo = BarRepo(db)
+    repo.upsert(_one_bar("A", "600519", date(2026, 10, 29)))
+    repo.upsert(_one_bar("HK", "00700", date(2026, 11, 4)))
+    _, backfills, interest = parts
+    assert interest.ensure("A", "600519", actor="alice").queued is False
+
+
+def test_stale_refetch_queues_once(db, parts):
+    """落后那条只排一次：`open_key` 的去重在这条判据上同样成立。"""
+    repo = BarRepo(db)
+    repo.upsert(_one_bar("A", "600519", date(2026, 10, 29)))
+    repo.upsert(_one_bar("A", "000002", date(2026, 11, 4)))
+    _, backfills, interest = parts
+    first = interest.ensure("A", "600519", actor="alice")
+    second = interest.ensure("A", "600519", actor="bob")
+    assert (first.queued, second.queued) == (True, False)

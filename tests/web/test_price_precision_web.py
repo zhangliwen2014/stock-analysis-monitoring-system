@@ -135,9 +135,10 @@ def test_timeshare_prev_close_label_uses_the_same_precision_rule(tmp_path):
     body = source[start : source.index("\n  }", start) + len("\n  }")]
     assert '"昨收 " + priceText(baseline)' in source, "那段算法有了却没被昨收那一格用上"
     script = tmp_path / "price_text.js"
+    check = "console.log([4.855, 4.58, 0.0045].map(priceText).join(' '));"
     script.write_text(
         "var echarts = {format: {addCommas: function (value) { return value; }}};\n"
-        f"{body}\nconsole.log(priceText(4.855) + ' ' + priceText(4.58) + ' ' + priceText(0.0045));\n"
+        f"{body}\n{check}\n"
     )
     done = subprocess.run(
         ["node", str(script)], capture_output=True, text=True, check=False

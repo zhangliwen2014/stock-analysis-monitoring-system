@@ -75,7 +75,13 @@ class SymbolInterest:
             )
             created = True
         queued = False
-        if self.bars.count(market, code) == 0:
+        latest = self.bars.latest_date(market, code)
+        market_latest = self.bars.latest_date_for_market(market)
+        # 库里有过 K 线不等于跟上了：那六只港股第一次打开补了 493 行，此后每次打开
+        # `count` 都不是 0，旧判据再也不问第二句，页面就停在六个工作日之前（D309）。
+        # 对照取市场自己的最大值而不是「最近一个已收盘的交易日」：市场整片没跑那天
+        # 由日线 job 盖，不该给每个被打开过的票都排一条 730 天的活
+        if latest is None or (market_latest is not None and latest < market_latest):
             queued = self.backfills.enqueue(market, code)
         # 没覆盖确认就排一条：判据与今晚的 `actions` job 同一条，两边不会一个松一个紧
         actions_queued = False
