@@ -341,6 +341,61 @@ def _index(world, closes: dict[date, float], *, code: str = "sh000001") -> None:
     )
 
 
+def _index_hk(world, closes: dict[date, float], *, code: str = "hkHSI") -> None:
+    world.index.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"] * len(closes),
+                "index_code": [code] * len(closes),
+                "date": list(closes),
+                "close": list(closes.values()),
+                "source": ["test"] * len(closes),
+            }
+        )
+    )
+
+
+def _buy_hk(world, code: str, qty: float, price: float, day: date = DAY_1) -> None:
+    """港股建仓：这个账户报告币种是 CNY，所以按 D209 从 CNY 口袋按汇率结算。"""
+    world.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"],
+                "code": [code],
+                "name": ["腾讯"],
+                "currency": ["HKD"],
+                "sector": ["互联网"],
+            }
+        )
+    )
+    world.ledger.buy(
+        world.account.id,
+        USER,
+        "HK",
+        code,
+        qty=qty,
+        price=price,
+        fx_rate=0.9,
+        ts=_at(day),
+    )
+    for one in (DAY_1, DAY_2, DAY_3):
+        world.fx.put(one, "HKD", "CNY", 0.9)
+
+
+def _bars_hk(world, code: str, closes: dict[date, float]) -> None:
+    world.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["HK"] * len(closes),
+                "code": [code] * len(closes),
+                "date": list(closes),
+                "close": list(closes.values()),
+                "source": ["test"] * len(closes),
+            }
+        )
+    )
+
+
 def test_the_benchmark_excess_uses_the_first_and_last_close_in_the_window(world) -> None:
     """指数涨了 5%、组合没动：超额 −5%，基准与起止日一起说清。"""
     _buy(world, "601088", 4_000, 10.0)
@@ -368,16 +423,88 @@ def test_no_index_close_in_the_window_gives_no_excess_instead_of_a_zero(world) -
     assert report.benchmark.note != ""
 
 
-def test_a_missing_index_day_is_counted_out_loud(world) -> None:
-    """区间里指数少一天：照样给超额，但说明按现有的两根收盘算，缺了几天。"""
+def test_a_cash_only_run_has_no_benchmark_to_compare_against(world) -> None:
+    """整段都是现金：没有持仓就没有「这一段压在哪几个市场」，超额不评。"""
+    report = _report(world)
+
+    assert report.benchmark is not None
+    assert report.benchmark.value is None
+    assert report.excess is None
+    assert "没有持仓" in report.benchmark.note
+
+
+def test_a_benchmark_that_misses_a_day_in_the_window_gives_no_excess(world) -> None:
+    """基准缺中间那一天：不给超额，也不「按现有的两根连乘」（D292）。
+
+    一句 note 洗不掉两个市场的 β 之差，同样洗不掉一段没走完的行情——
+    缺几天的收盘算出来的仍然是个「超额」，而它已经不代表这段时间。
+    """
     _buy(world, "601088", 4_000, 10.0)
     _bars(world, "601088", {DAY_1: 10.0, DAY_2: 10.0, DAY_3: 10.0})
     _index(world, {DAY_1: 3_000.0, DAY_3: 3_150.0})
 
     report = _report(world)
 
-    assert report.benchmark.value == pytest.approx(0.05)
-    assert "1" in report.benchmark.note
+    assert report.benchmark.value is None
+    assert report.excess is None
+    assert str(DAY_2) in report.benchmark.note
+    assert "只出绝对收益" in report.benchmark.note
+    # 组合这段的数照出：不给基准不等于不给收益
+    assert report.window_return is not None
+
+
+def test_a_benchmark_that_starts_or_ends_off_the_run_gives_no_excess(world) -> None:
+    """基准的首根收盘比窗口起点晚一天：那一段行情的涨跌没被算进来，不给超额。"""
+    _buy(world, "601088", 4_000, 10.0)
+    _bars(world, "601088", {DAY_1: 10.0, DAY_2: 10.0, DAY_3: 10.0})
+    _index(world, {DAY_2: 3_100.0, DAY_3: 3_150.0})
+
+    report = _report(world)
+
+    assert report.benchmark.value is None
+    assert report.excess is None
+    assert str(DAY_1) in report.benchmark.note
+
+
+def test_an_all_hong_kong_run_is_measured_against_hong_kong(world) -> None:
+    """R3-05：账户开在 A，这一段却全是港股——基准跟着持仓走（D291）。
+
+    拿上证指数去比一个 HKD 仓位，那个「超额」是两个市场的 β 之差，不是判断的钱。
+    """
+    _buy_hk(world, "00700", 200, 300.0)
+    _bars_hk(world, "00700", {DAY_1: 300.0, DAY_2: 300.0, DAY_3: 300.0})
+    _index(world, {DAY_1: 3_000.0, DAY_2: 3_100.0, DAY_3: 3_150.0})
+    _index_hk(world, {DAY_1: 20_000.0, DAY_2: 20_400.0, DAY_3: 20_600.0})
+
+    report = _report(world)
+
+    assert report.benchmark.market == "HK"
+    assert report.benchmark.label == "恒生指数"
+    # 恒指这段涨了 3%，组合没动：超额是 −3%，而不是拿 A 股那 5% 算出来的 −5%
+    assert report.benchmark.value == pytest.approx(0.03)
+    assert report.excess == pytest.approx(-0.03)
+    assert "上证指数" not in report.benchmark.label
+
+
+def test_a_run_spanning_two_markets_gets_no_benchmark_at_all(world) -> None:
+    """A 与 HK 都有仓位：任何单一指数都不配当这段的基准，只出绝对收益（D291）。
+
+    合成基准（A 70% + HK 30%）这轮不做：宁可不给那个数，也不给一个说不出算法的数。
+    """
+    _buy(world, "601088", 4_000, 10.0)
+    _bars(world, "601088", {DAY_1: 10.0, DAY_2: 10.0, DAY_3: 10.0})
+    _buy_hk(world, "00700", 200, 300.0)
+    _bars_hk(world, "00700", {DAY_1: 300.0, DAY_2: 300.0, DAY_3: 300.0})
+    _index(world, {DAY_1: 3_000.0, DAY_2: 3_100.0, DAY_3: 3_150.0})
+    _index_hk(world, {DAY_1: 20_000.0, DAY_2: 20_400.0, DAY_3: 20_600.0})
+
+    report = _report(world)
+
+    assert report.benchmark.value is None
+    assert report.excess is None
+    assert report.window_return is not None
+    assert "只出绝对收益" in report.benchmark.note
+    assert "A" in report.benchmark.note and "HK" in report.benchmark.note
 
 
 def test_another_users_account_is_not_readable_through_attribution(world) -> None:

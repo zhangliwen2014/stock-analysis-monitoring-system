@@ -824,7 +824,6 @@ def _context_on(
         symbols,
         index_daily_store,
         cfg,
-        calendar=calendar,
     )
     peers = PeerService(
         profiles_store, symbols, valuation_store, financials_store, snapshot_store, clock=clock

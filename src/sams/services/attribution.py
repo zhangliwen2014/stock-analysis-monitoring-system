@@ -7,6 +7,8 @@
 * **缺口不跨**：窗口只取连续完整日，实际用了哪几天写在报告上，不拿首尾两点连线冒充；
 * **分红归给派它的票**：到账现金按 `sim_cash_moves.ref`（`market:code:除权日`）记在那只票
   名下，不留在残差里——「这只票这段时间给了我多少钱」要包括它发现的金（D267）；
+* **基准跟着这一段持仓的市场走**：账户开在 A 不等于它的钱压在 A。这一段跨两个市场、
+  或基准缺其中任何一个净值日的收盘，就整段不给超额，只出绝对收益（D291/D292）；
 * **算不出就说算不出**：不足两个完整日时整张表是空的并给原因——空的归因表比一张 0 更诚实。
 
 `window_return` 用逐日链乘（与 S4-D 的 TWR 同一条），各票贡献是「日收益直接相加」，
@@ -24,9 +26,8 @@ from itertools import pairwise
 from sams.core.config import Settings
 from sams.core.errors import StorageError
 from sams.services.actors import resolve_actor
-from sams.services.decision import trading_days_between
 from sams.services.industry import IndustryService
-from sams.services.nav import NAV_WINDOW_DAYS, CalendarView, WeekdayCalendar
+from sams.services.nav import NAV_WINDOW_DAYS
 from sams.storage.repos.holding_nav import HoldingNavPoint, HoldingNavRepo
 from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.ledger import SimAccountRepo
@@ -117,7 +118,6 @@ class AttributionService:
         symbols: SymbolRepo,
         index: IndexDailyRepo,
         settings: Settings,
-        calendar: CalendarView | None = None,
     ) -> None:
         self.users = users
         self.accounts = accounts
@@ -127,7 +127,6 @@ class AttributionService:
         self.symbols = symbols
         self.index = index
         self.settings = settings
-        self.calendar = calendar or WeekdayCalendar()
 
     def evaluate(self, username: str, account_id: str, start: date, end: date):
         user = resolve_actor(self.users, username)
@@ -211,7 +210,7 @@ class AttributionService:
         entries.sort(key=lambda row: abs(row.contribution), reverse=True)
         window_return = _chain(run)
         total = sum(row.contribution for row in entries)
-        benchmark = self._benchmark(account.home_market, run)
+        benchmark = self._benchmark(_run_markets(entries), run)
         return AttributionReport(
             account_id=account.id,
             currency=account.report_currency,
@@ -229,11 +228,25 @@ class AttributionService:
             dropped_days=len(points) - len(run),
         )
 
-    def _benchmark(self, market: str, run: list) -> Benchmark:
-        """账户所属市场的第一个配置指数：区间内首尾两根收盘之比。
+    def _benchmark(self, markets: tuple[str, ...], run: list) -> Benchmark:
+        """这一段压着哪个市场的钱，就对标那个市场的第一个配置指数。
 
         取不到就是取不到——`value=None` 一路带到卡片上是「—」，不是 0.0%。
         """
+        if not markets:
+            return Benchmark(market="", index_code="", label="", note="这一段没有持仓，超额不评")
+        if len(markets) > 1:
+            # 合成基准（A 70% + HK 30%）不做：宁可不给这个数，也不给一个说不出算法的数
+            return Benchmark(
+                market="",
+                index_code="",
+                label="",
+                note=(
+                    f"这一段持仓跨 {'、'.join(markets)} 共 {len(markets)} 个市场，"
+                    "没有哪个单一指数配当这段的基准，只出绝对收益"
+                ),
+            )
+        market = markets[0]
         codes = self.settings.indices.for_market(market)
         if not codes:
             return Benchmark(
@@ -254,35 +267,45 @@ class AttributionService:
                     "（该市场无可用数据源，或指数日线未同步），超额不给"
                 ),
             )
-        first_day, first_close = closes[0]
-        last_day, last_close = closes[-1]
-        if len(closes) < 2 or first_close <= 0:
+        first_day, last_day = run[0].day, run[-1].day
+        # 同窗口（D292）：这一段每一个净值日都要有收盘，缺一天整段就不给。
+        # 「缺几天按现有的连乘」给出来的数仍然叫「超额」，而它已经不代表这段时间
+        by_day = dict(closes)
+        missing = [point.day for point in run if point.day not in by_day]
+        if missing:
+            listed = "、".join(str(day) for day in missing[:3])
+            tail = f" 等 {len(missing)} 天" if len(missing) > 3 else ""
+            return dataclass_replace(
+                empty,
+                note=f"{label} 缺 {listed}{tail} 的收盘，这一段不完整，只出绝对收益",
+            )
+        first_close = by_day[first_day]
+        if first_close <= 0:
             return dataclass_replace(
                 empty,
                 start=first_day,
                 end=last_day,
-                note=f"区间内 {label} 只有一根可用收盘，超额不给",
+                note=f"{label} 在 {first_day} 的收盘不是正数，超额不给",
             )
-        missing = max(
-            0,
-            trading_days_between(self.calendar, market, first_day, last_day) - (len(closes) - 1),
-        )
-        notes = []
-        if missing:
-            notes.append(f"基准缺 {missing} 天，按现有的 {len(closes)} 根收盘连乘")
-        if (first_day, last_day) != (run[0].day, run[-1].day):
-            notes.append(f"基准实际用 {first_day} 与 {last_day} 的收盘")
         return dataclass_replace(
             empty,
             start=first_day,
             end=last_day,
-            value=last_close / first_close - 1.0,
-            note="；".join(notes),
+            value=by_day[last_day] / first_close - 1.0,
         )
 
     def _name(self, market: str, code: str) -> str:
         found = self.symbols.get(market, code)
         return str((found or {}).get("name") or code)
+
+
+def _run_markets(entries: list[HoldingContribution]) -> tuple[str, ...]:
+    """这一段压着哪几个市场的钱（D291）。
+
+    基准要的是「这几天的钱在哪个市场」，而 `sim_accounts.home_market` 说的是开户主场：
+    一个 A 股账户把仓位全换成港股时，后者会把上证指数的涨跌安到 HKD 仓位头上。
+    """
+    return tuple(sorted({row.market for row in entries}))
 
 
 def _run_ending_at_last_complete(points) -> list:
