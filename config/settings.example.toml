@@ -16,6 +16,7 @@ rate_limit_per_s = 5         # 单源请求上限（spec §6.1）
 polling_interval_s = 10      # 盘中轮询间隔
 cooldown_min = 30            # 同一规则命中后的冷却
 scheduler_tick_s = 60        # 调度器检查到期任务的间隔（秒）；不是盘中轮询
+scheduler_job_max_min = 60   # 一趟按只循环的盘后 job 最多跑多久（分钟）；到点收工，剩下的自动接着补
 
 # sources 是降级顺序：前一个失败才用后一个。
 # 这里的值只在**库里 data_sources 表为空**时生效（没跑过 0007 迁移的老库）。

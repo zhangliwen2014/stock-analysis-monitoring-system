@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Protocol
 
 from sams.core.config import Settings
@@ -60,6 +61,13 @@ class JobContext:
     #: 市场 job 一定非空；全局 job（汇率）是 None
     market: str | None
     universe: Universe
+    #: 本轮的起跑时刻（`runner` 从 clock 取到的那个 `now`）。它同时是**洗牌种子**：
+    #: 截断之后按直线顺序重跑，尾部那两百只永远轮不到（#380 F3）。
+    #: `None` 只出现在没走 runner 的调用方（测试、CLI 手跑），那时保持清单原顺序。
+    started_at: datetime | None = None
+    #: 本轮的墙钟截止点，与 `deps.monotonic` 同一把尺（`runner` 算成
+    #: `monotonic() + spec.max_wall_s`）。`None` = 不设预算。
+    deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,10 @@ class JobOutcome:
     rows_affected: int = 0
     note: str = ""
     errors: tuple[str, ...] = ()
+    #: 到墙钟预算收工、还剩单位没跑（#380 F3）。它是 `ok` 的一种：截断不是失败，
+    #: 混进 `errors` 会让天天被截断的链把真故障淹掉（`runner` 的连续失败计数读的就是它）。
+    #: 用布尔字段而不是让读取侧解析 note 文案，健康页与告警两头才都不用靠字符串读数。
+    truncated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -79,6 +91,9 @@ class JobSpec:
     period: str
     market: str | None
     run: Callable[[JobContext], JobOutcome]
+    #: 这一趟最多允许跑多少秒（`None` = 不设预算）。挂在 job 上而不是挂在一个 tick 上：
+    #: tick 是顺序的，共用一份预算会让排在后面的那条分到 0 秒（#380 F3）。
+    max_wall_s: float | None = None
 
     @property
     def title(self) -> str:
@@ -138,3 +153,7 @@ class JobDeps:
     #: 补数队列（D283）：`actions` job 开跑前把昨天没补上的行顺延回 pending，给一份新预算。
     #: 带默认值：没装这一层的部署照旧能构造 `JobDeps`，只是队列会一天一躺平
     backfills: SymbolBackfillRepo | None = None
+    #: 墙钟：job 与 `runner` 算 deadline 用的是同一把尺（#380 F3）。
+    #: 注入它而不是在 `_collect` 里直接 `time.monotonic()`，为的是「跑到第几只收工」
+    #: 能在测试里被写死，不必真等 30 分钟
+    monotonic: Callable[[], float] = time.monotonic

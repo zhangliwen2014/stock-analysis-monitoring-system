@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 
 from support import FrozenClock
@@ -29,13 +30,13 @@ UNIVERSE = Universe(by_market={}, fx_pairs=())
 DUE = Due(period_key="2024-10-25", as_of=date(2024, 10, 25))
 
 
-def harness(db, run, *, market="A"):
+def harness(db, run, *, market="A", monotonic=lambda: 1000.0):
     clock = FrozenClock(MOMENT)
     runs = TaskRunRepo(db, clock=clock)
     bus = EventBus()
     alarms: list[SystemAlarm] = []
     bus.subscribe(SystemAlarm, alarms.append)
-    runner = JobRunner(runs=runs, bus=bus, clock=clock)
+    runner = JobRunner(runs=runs, bus=bus, clock=clock, monotonic=monotonic)
     spec = JobSpec(name="bars", period="daily", market=market, run=run)
     return runner, runs, clock, alarms, spec
 
@@ -342,3 +343,35 @@ def test_the_running_row_written_by_this_round_is_not_its_own_block(db):
     runner, runs, _, _, spec = harness(db, job)
     assert runner.execute(spec, DUE, UNIVERSE).status == OK
     assert runs.latest_for_period("bars", "A", DUE.period_key).status == OK
+
+
+def test_the_context_carries_the_starting_instant_and_the_deadline(db):
+    """预算写在登记处，换成截止点是 runner 的活：job 本体不必各自去问钟（#380 F3）。
+
+    `started_at` 同时是按只循环的洗牌种子——截断之后直线顺序会让尾部永远轮不到。
+    """
+    seen = []
+
+    def job(ctx):
+        seen.append(ctx)
+        return JobOutcome()
+
+    runner, _, _, _, spec = harness(db, job)
+    runner.execute(replace(spec, max_wall_s=900.0), DUE, UNIVERSE)
+
+    assert seen[0].started_at == MOMENT
+    assert seen[0].deadline == 1000.0 + 900.0
+
+
+def test_a_job_without_a_budget_gets_no_deadline(db):
+    """没有预算的那几条（汇率、日历、按账户的那两趟）照旧跑到底，不受这条新闸影响。"""
+    seen = []
+
+    def job(ctx):
+        seen.append(ctx)
+        return JobOutcome()
+
+    runner, _, _, _, spec = harness(db, job)
+    runner.execute(spec, DUE, UNIVERSE)
+
+    assert seen[0].deadline is None

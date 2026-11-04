@@ -25,7 +25,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -85,6 +86,9 @@ class JobRunner:
     runs: TaskRunRepo
     bus: EventBus
     clock: Clock = SYSTEM_CLOCK
+    #: 墙钟：把 `spec.max_wall_s` 换成 `ctx.deadline` 用的就是它，与 `_collect` 读的那一把
+    #: 同源（`JobDeps.monotonic` 默认同一个函数），所以两边不必约定任何起点（#380 F3）
+    monotonic: Callable[[], float] = time.monotonic
 
     def execute(self, spec: JobSpec, due: Due, universe: Universe) -> RunResult:
         now = self.clock.now_utc()
@@ -109,6 +113,9 @@ class JobRunner:
             as_of=due.as_of,
             market=spec.market,
             universe=universe,
+            # 起跑时刻往下传：它既是按只循环的洗牌种子，也是那条 job 自己的截止点的起点
+            started_at=now,
+            deadline=None if spec.max_wall_s is None else self.monotonic() + spec.max_wall_s,
         )
         try:
             outcome = spec.run(context)

@@ -172,6 +172,13 @@ class Settings:
     #: `polling_interval_s` 预留给 M4/U7 的 10 秒快照，那条链目前还没有消费者；
     #: 盘后任务按分钟级检查就够了，把一个盘中参数借给它，会让改盘中频率顺手改掉盘后
     scheduler_tick_s: int = 60
+    #: 一趟按只循环的市场 job 最多允许跑多久（分钟，#380 F3 / D311）。
+    #: 挂在 job 上而不是挂在一个 tick 上：一个 tick 里所有 job 共用一份预算的话，
+    #: 排在后面的那条会分到 0 秒——那正是这条要修的饿死。
+    #: 默认取 60 而不是 30：实机八天的读数是财务一趟 29~41 分钟、日线成功过的那几趟最长
+    #: 73 分钟、概况 12 分钟，30 会把正常的一晚截掉；这条闸要拦的是「一条链挂住四天」
+    #: （库里 `flow` 有过 102 小时的一行），不是正常速度
+    scheduler_job_max_min: int = 60
     #: 报价超过这么久没更新 ⇒ `stale`，价格类规则不评估（spec D134）
     quote_stale_s: int = 60
     server: ServerCfg = field(default_factory=ServerCfg)
@@ -275,6 +282,7 @@ class Settings:
             cooldown_min=int(general.get("cooldown_min", 30)),
             markets=markets,
             scheduler_tick_s=int(general.get("scheduler_tick_s", 60)),
+            scheduler_job_max_min=int(general.get("scheduler_job_max_min", 60)),
             quote_stale_s=int(general.get("quote_stale_s", 60)),
             server=server,
             annotations=annotations,
@@ -292,6 +300,8 @@ class Settings:
             raise ValidationError("cooldown_min 不能为负")
         if self.scheduler_tick_s <= 0:
             raise ValidationError("scheduler_tick_s 必须为正数")
+        if self.scheduler_job_max_min <= 0:
+            raise ValidationError("scheduler_job_max_min 必须为正数")
         if self.quote_stale_s <= 0:
             raise ValidationError("quote_stale_s 必须为正数")
         self.server.validate()

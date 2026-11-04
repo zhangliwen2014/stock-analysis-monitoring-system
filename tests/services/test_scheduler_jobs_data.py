@@ -53,6 +53,7 @@ from sams.storage.repos.index_daily import IndexDailyRepo
 from sams.storage.repos.news import NewsRepo
 from sams.storage.repos.symbol_backfills import (
     ACTIONS,
+    BARS,
     DEFERRED,
     PENDING,
     SymbolBackfillRepo,
@@ -270,13 +271,36 @@ def deps(
     )
 
 
-def ctx(*codes: str) -> JobContext:
+def ctx(
+    *codes: str,
+    deadline: float | None = None,
+    started_at: datetime | None = None,
+) -> JobContext:
     return JobContext(
         period_key="2024-10-25",
         as_of=AS_OF,
         market="A",
         universe=Universe(by_market={"A": codes}, fx_pairs=()),
+        deadline=deadline,
+        started_at=started_at,
     )
+
+
+class SteppingMonotonic:
+    """每问一次就走一步的单调钟：那一步就是「一只票花掉多少秒」。
+
+    真等 30 分钟不是测试能等的东西，而「跑到第几只时收工」必须能被写死。它只被
+    `_collect` 那一处按两只票之间的检查点问，所以一步 = 一只票。
+    """
+
+    def __init__(self, step_s: float) -> None:
+        self.step_s = step_s
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        value = self._now
+        self._now += self.step_s
+        return value
 
 
 def test_the_nightly_bars_window_reopens_the_settle_margin(db, settings):
@@ -838,3 +862,135 @@ class SnapshotCapable(RecordingBarsAdapter):
 
     def market_snapshot(self, market, codes):
         raise NotImplementedError
+
+
+# --------------------------------------------------------------------------- #
+# F3：一趟 job 的墙钟预算（#380）
+
+
+def test_bars_job_stops_at_its_budget_and_queues_the_tail(db, settings):
+    """到点收工，剩下的那几只排进补数队列而不是被忘掉（#380 F3）。
+
+    20 分钟预算、每只票走 10 分钟：第 3 只问出去之前就已经到点，所以链上只该有两次请求。
+    截断**不是失败**——`errors` 空、`ok` 为真，所以健康页的连续失败周期计数不涨：
+    天天被截断的链会把真故障淹掉。
+    """
+    adapter = RecordingBarsAdapter(frame=sample_bars(code="600519"))
+    backfills = SymbolBackfillRepo(db)
+    d = replace(
+        deps(db, replace(settings, scheduler_job_max_min=20), bars=adapter),
+        backfills=backfills,
+        monotonic=SteppingMonotonic(600.0),
+    )
+    outcome = run_bars(d, ctx("600519", "601088", "601857", deadline=1200.0))
+
+    assert [call[1] for call in adapter.calls] == ["600519", "601088"]
+    assert outcome.truncated is True
+    assert outcome.ok and outcome.errors == ()
+    assert "到 20 分钟收工" in outcome.note
+    assert "已排队" in outcome.note
+    assert backfills.open_for("A", "601857", BARS) is not None
+
+
+def test_actions_job_hands_its_unrun_tail_to_the_queue(db, settings):
+    """公司行为截断时排的是 `actions` 那一半：kind 由 job 自己说，不是队列去猜。
+
+    队列表只有 `bars`/`actions` 两个 kind（`symbol_backfills.py`），消费者也只服务这两样：
+    这两条 job 有地方交接，其余那几样没有（D311）。
+    """
+    adapter = RecordingBarsAdapter()
+    backfills = SymbolBackfillRepo(db)
+    d = replace(
+        deps(db, replace(settings, scheduler_job_max_min=20), bars=adapter),
+        backfills=backfills,
+        monotonic=SteppingMonotonic(600.0),
+    )
+    outcome = run_actions(d, ctx("600519", "601088", "601857", deadline=1200.0))
+
+    assert outcome.truncated is True
+    assert backfills.open_for("A", "601857", ACTIONS) is not None
+    assert db.row_count("symbol_backfills") == 1  # 只有没跑的那一只
+
+
+def test_a_fundamentals_job_truncates_without_a_queue(db, settings):
+    """财务这一类不新建 kind：到点收工，剩下的说明留待下一轮。
+
+    给每一种都写一条消费者分派换来的是「今晚没跑到的那只明天也不一定会跑到」，
+    而这几样的数据本来就是天/周量级的慢（D311）。
+    """
+    finance = StubFundamentalsAdapter(["A"], financials=financial_rows())
+    d = replace(
+        deps(db, replace(settings, scheduler_job_max_min=20), finance=finance),
+        monotonic=SteppingMonotonic(600.0),
+    )
+    outcome = run_financials(
+        d, ctx("601088", "600519", "601398", "601857", deadline=1200.0)
+    )
+
+    assert outcome.truncated is True
+    assert outcome.ok
+    assert "留待下一轮" in outcome.note
+    assert db.row_count("symbol_backfills") == 0
+
+
+def test_a_truncated_round_asks_a_different_batch_next_time(db, settings):
+    """直线顺序 + 截断 = 尾部那两百只永远轮不到：起跑顺序按本轮起跑时刻洗牌（#380 F3）。
+
+    这一枚钉的是这条性质，不是某一种具体顺序：下一轮问到的那几只里必须有上一轮没问过的。
+    """
+    codes = ("600519", "601088", "601398", "601857", "601988", "600036", "601166", "600000")
+
+    def asked_at(hour: int, minute: int) -> list[str]:
+        adapter = F10CapableAdapter()
+        d = replace(
+            deps(db, replace(settings, scheduler_job_max_min=20), f10=adapter),
+            monotonic=SteppingMonotonic(600.0),
+        )
+        run_profile(
+            d,
+            ctx(
+                *codes,
+                deadline=1200.0,
+                started_at=datetime(2024, 10, 25, hour, minute, tzinfo=UTC),
+            ),
+        )
+        return [call[2] for call in adapter.f10_calls]
+
+    first = asked_at(20, 0)
+    second = asked_at(20, 31)
+
+    assert len(first) == 2 and len(second) == 2
+    assert set(second) - set(first)
+
+
+def test_the_same_starting_instant_repeats_the_same_order(db, settings):
+    """种子洗牌而不是随机洗牌：同一轮重跑同一顺序，测试与复盘都看得见它。"""
+    codes = ("600519", "601088", "601398", "601857", "601988", "600036")
+
+    def asked() -> list[str]:
+        adapter = F10CapableAdapter()
+        d = replace(
+            deps(db, replace(settings, scheduler_job_max_min=20), f10=adapter),
+            monotonic=SteppingMonotonic(600.0),
+        )
+        run_profile(
+            d,
+            ctx(
+                *codes,
+                deadline=1200.0,
+                started_at=datetime(2024, 10, 25, 20, 0, tzinfo=UTC),
+            ),
+        )
+        return [call[2] for call in adapter.f10_calls]
+
+    assert asked() == asked()
+
+
+def test_per_symbol_jobs_are_registered_with_the_configured_budget(db, settings):
+    """预算来自配置而不是写死在代码里：登记处统一填，job 本体不必各写一份。"""
+    strict = replace(settings, scheduler_job_max_min=45)
+    specs = {
+        spec.name: spec for spec in build_jobs(deps(db, strict, f10=F10CapableAdapter()))
+    }
+    for name in ("bars", "actions", "financials", "valuation", "flow", "profile"):
+        assert specs[name].max_wall_s == 45 * 60, name

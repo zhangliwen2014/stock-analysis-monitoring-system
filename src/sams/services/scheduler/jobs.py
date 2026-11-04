@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import random
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
@@ -76,16 +77,47 @@ def _settle_window(latest: date | None, as_of: date) -> date | None:
 
 def _units(ctx: JobContext) -> list[tuple[str, str]]:
     assert ctx.market is not None  # 数据 job 只在市场 job 上登记
-    return [(ctx.market, code) for code in ctx.universe.codes(ctx.market)]
+    codes = list(ctx.universe.codes(ctx.market))
+    # 按本轮起跑时刻定序，不是随机：直线顺序 + 截断的后果是尾部那两百只永远轮不到，
+    # 而洗牌让每轮盖住随机的一批（#380 F3）。种子确定 ⇒ 同一轮重跑同一顺序，可复现。
+    # 「旋转起跑点」买不到这件事：它每分钟只挪一位，尾部仍要十几轮才浮上来。
+    # 它不改幂等性（`upsert`），也不碰按每只票自己的 `latest_date` 定窗口那一段。
+    if ctx.started_at is not None:
+        random.Random(int(ctx.started_at.timestamp())).shuffle(codes)
+    return [(ctx.market, code) for code in codes]
 
 
 def _collect(
-    units: list[tuple[str, str]], action: Callable[[str, str], int], label: str
+    deps: JobDeps,
+    units: list[tuple[str, str]],
+    action: Callable[[str, str], int],
+    label: str,
+    *,
+    deadline: float | None = None,
+    defer_kind: str | None = None,
 ) -> JobOutcome:
+    """按只跑完这批单位，闸落在**两只票之间**，一条规则八种 job 共用。
+
+    不在一只票内部打断：单只票已经有边界（适配器 `timeout=15`、退避三次），最坏 overshoot
+    约一分钟，而中间打断会把半截 HTTP 响应留在栈上。
+
+    到点之后剩下的不许被忘掉，收尾分两种，取决于补数队列表里有没有这一种活：
+    `defer_kind` 非空（日线、公司行为——`symbol_backfills` 只有这两个 kind，消费者也只服务
+    这两样）时交给队列，每拍 3 条慢慢消化；其余那几样不新建 kind——那要给每一种都写一条
+    消费者分派，而换回来的只是「今晚没跑到的那只今晚也不会跑到」（D311）。它们靠 `_units`
+    的每轮换序保证覆盖，note 说的是留待下一轮。
+
+    **截断不是失败**：`errors` 保持空，所以 `task_runs` 那行是 ok，不进连续失败计数——
+    天天被截断的链会把真故障淹掉。
+    """
     rows = 0
     done = 0
     errors: list[str] = []
-    for market, code in units:
+    stopped = len(units)
+    for index, (market, code) in enumerate(units):
+        if deadline is not None and deps.monotonic() >= deadline:
+            stopped = index
+            break
         try:
             rows += action(market, code)
         except SamsError as exc:
@@ -97,7 +129,22 @@ def _collect(
     note = f"{done}/{len(units)} 只{label}"
     if errors:
         note += f"，{len(errors)} 只失败"
-    return JobOutcome(rows_affected=rows, note=note, errors=tuple(errors))
+    truncated = stopped < len(units)
+    if truncated:
+        left = units[stopped:]
+        note += f"，到 {deps.settings.scheduler_job_max_min} 分钟收工"
+        if defer_kind is not None and deps.backfills is not None:
+            for market, code in left:
+                deps.backfills.enqueue(market, code, defer_kind)
+            note += f"，其余 {len(left)} 只已排队"
+        else:
+            note += f"，其余 {len(left)} 只留待下一轮"
+    return JobOutcome(
+        rows_affected=rows,
+        note=note,
+        errors=tuple(errors),
+        truncated=truncated,
+    )
 
 
 def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -123,7 +170,9 @@ def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             barless += 1
         return summary.written
 
-    outcome = _collect(_units(ctx), one, "日线")
+    outcome = _collect(
+        deps, _units(ctx), one, "日线", deadline=ctx.deadline, defer_kind=BARS
+    )
     if barless:
         outcome = replace(outcome, note=f"{outcome.note}，{barless} 只一根 K 线都没有")
     if outcome.rows_affected > 0:
@@ -144,7 +193,9 @@ def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             return 0
         return deps.corp_actions.sync_actions(market, code, HISTORY_START, ctx.as_of).written
 
-    outcome = _collect(_units(ctx), one, "公司行为")
+    outcome = _collect(
+        deps, _units(ctx), one, "公司行为", deadline=ctx.deadline, defer_kind=ACTIONS
+    )
     if rearmed:
         outcome = replace(outcome, note=f"{outcome.note}，{rearmed} 条顺延的补采重新排队")
     if outcome.rows_affected > 0:
@@ -169,7 +220,9 @@ def run_financials(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     def one(market: str, code: str) -> int:
         return deps.fundamentals.sync_financials(market, code, HISTORY_START, ctx.as_of).written
 
-    return _bump_fundamentals(deps, _collect(_units(ctx), one, "财务"))
+    return _bump_fundamentals(
+        deps, _collect(deps, _units(ctx), one, "财务", deadline=ctx.deadline)
+    )
 
 
 def run_valuation(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -179,7 +232,9 @@ def run_valuation(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             return 0
         return deps.fundamentals.sync_valuation(market, code, start, ctx.as_of).written
 
-    return _bump_fundamentals(deps, _collect(_units(ctx), one, "按日估值"))
+    return _bump_fundamentals(
+        deps, _collect(deps, _units(ctx), one, "按日估值", deadline=ctx.deadline)
+    )
 
 
 def run_flow(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -189,7 +244,9 @@ def run_flow(deps: JobDeps, ctx: JobContext) -> JobOutcome:
             return 0
         return deps.fundamentals.sync_flow(market, code, start, ctx.as_of).written
 
-    return _bump_fundamentals(deps, _collect(_units(ctx), one, "资金流"))
+    return _bump_fundamentals(
+        deps, _collect(deps, _units(ctx), one, "资金流", deadline=ctx.deadline)
+    )
 
 
 #: 公告的盘后窗口：只要最近 30 天。源一次最多给 100 条，今晚没抓到的旧公告
@@ -199,7 +256,10 @@ ANNOUNCEMENTS_WINDOW_DAYS = 30
 
 def run_profile(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     """公司概况一票一行：窗口对它没有意义，重复执行是覆盖（D214）。"""
-    return _collect(_units(ctx), lambda m, c: deps.f10.sync_profile(m, c).written, "公司概况")
+    return _collect(
+        deps, _units(ctx), lambda m, c: deps.f10.sync_profile(m, c).written, "公司概况",
+        deadline=ctx.deadline,
+    )
 
 
 def run_announcements(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -209,7 +269,7 @@ def run_announcements(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     def one(market: str, code: str) -> int:
         return deps.f10.sync_announcements(market, code, start, ctx.as_of).written
 
-    return _collect(_units(ctx), one, "公告")
+    return _collect(deps, _units(ctx), one, "公告", deadline=ctx.deadline)
 
 
 def run_news(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -228,7 +288,7 @@ def run_news(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     def one(market: str, code: str) -> int:
         return deps.news.sync(market, code, start, ctx.as_of).written
 
-    return _collect(_units(ctx), one, "新闻")
+    return _collect(deps, _units(ctx), one, "新闻", deadline=ctx.deadline)
 
 
 def run_industry(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -399,7 +459,7 @@ def run_indices(deps: JobDeps, ctx: JobContext) -> JobOutcome:
         return summary.written
 
     units = [(ctx.market, ic) for ic in deps.settings.indices.for_market(ctx.market)]
-    outcome = _collect(units, one, "指数日线")
+    outcome = _collect(deps, units, one, "指数日线", deadline=ctx.deadline)
     if empty_series:
         outcome = replace(outcome, note=f"{outcome.note}，{empty_series} 只一根 K 线都没有")
     return outcome
@@ -760,13 +820,18 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
     已经有基线的论不受这个顺序影响。
     """
     jobs: list[JobSpec] = []
+    # 按只循环的那几条共用一份墙钟预算（#380 F3）：一条源变慢的 job 不许把同一个 tick
+    # 里排在后面的那几条饿死。挂在 job 上而不是 tick 上，理由写在 `JobSpec.max_wall_s`
+    budget_s = deps.settings.scheduler_job_max_min * 60.0
     for market in sorted(deps.settings.markets):
         # 代码表排市场组最前：当晚新上市的票先进表，后面的搜索与补数才找得到它
         if deps.symbol_master is not None and _has(deps, market, "symbol_list"):
             jobs.append(JobSpec("symbol_master", WEEKLY, market, partial(run_symbol_master, deps)))
         for method, name, run in _DATA_JOBS:
             if _has(deps, market, method):
-                jobs.append(JobSpec(name, DAILY, market, partial(run, deps)))
+                jobs.append(
+                    JobSpec(name, DAILY, market, partial(run, deps), max_wall_s=budget_s)
+                )
         # 分红与净值都排在数据链之后：`actions` 先落库，分红才看得见今晚的除权日；
         # 净值重放读的是同一晚的收盘价，并且要包含刚入账的那笔派息（S4-D）
         if deps.dividends is not None and deps.sim_accounts is not None:
@@ -778,7 +843,9 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         # 新闻排在数据链之后、行业回填之前：公告与新闻同一晚落库，行业回填与它们无关；
         # 无源的港美也登记，job 里写「未接入」而不是从注册表里消失（D247）
         if deps.news is not None:
-            jobs.append(JobSpec("news", DAILY, market, partial(run_news, deps)))
+            jobs.append(
+                JobSpec("news", DAILY, market, partial(run_news, deps), max_wall_s=budget_s)
+            )
         # 行业回填读的是上面那批概况：排在数据链之后，才回填得到今晚的行业
         if deps.industry is not None:
             jobs.append(JobSpec("industry", DAILY, market, partial(run_industry, deps)))
@@ -796,7 +863,11 @@ def build_jobs(deps: JobDeps) -> tuple[JobSpec, ...]:
         if deps.screener_monitor is not None:
             jobs.append(JobSpec("screener", DAILY, market, partial(run_screener, deps)))
         if deps.sync.indices is not None and _has(deps, market, "index_daily"):
-            jobs.append(JobSpec("indices", DAILY, market, partial(run_indices, deps)))
+            jobs.append(
+                JobSpec(
+                    "indices", DAILY, market, partial(run_indices, deps), max_wall_s=budget_s
+                )
+            )
         jobs.append(JobSpec("recheck", WEEKLY, market, partial(run_recheck, deps)))
         if deps.assumptions is not None and deps.alerts is not None:
             jobs.append(

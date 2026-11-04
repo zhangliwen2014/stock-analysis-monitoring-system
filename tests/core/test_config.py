@@ -108,6 +108,22 @@ def test_scheduler_tick_is_read_and_validated(tmp_path):
         Settings.load(write(tmp_path, BASE.replace("[general]", "[general]\nscheduler_tick_s = 0")))
 
 
+def test_job_wall_clock_budget_defaults_to_one_hour(tmp_path):
+    assert Settings.load(write(tmp_path)).scheduler_job_max_min == 60
+
+
+def test_job_wall_clock_budget_is_read_and_validated(tmp_path):
+    read = write(
+        tmp_path, BASE.replace("[general]", "[general]\nscheduler_job_max_min = 5")
+    )
+    assert Settings.load(read).scheduler_job_max_min == 5
+
+    with pytest.raises(ValidationError, match="scheduler_job_max_min"):
+        Settings.load(
+            write(tmp_path, BASE.replace("[general]", "[general]\nscheduler_job_max_min = 0"))
+        )
+
+
 def test_server_defaults_are_loopback_only(tmp_path):
     settings = Settings.load(write(tmp_path))
     assert (settings.server.host, settings.server.port) == ("127.0.0.1", 8765)
