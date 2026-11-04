@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 import pytest
@@ -407,6 +407,24 @@ def test_live_tencent_range_is_not_truncated():
     today = date.today()
     frame = TencentAdapter().daily_bars("A", "600519", today.replace(year=today.year - 1), today)
     assert frame.height > 200, f"只回来 {frame.height} 根，接口有隐性上限"
+
+
+@pytest.mark.live
+def test_live_tencent_index_daily_covers_all_three_markets():
+    """真接口：三个市场的**指数**都要拿到根数不为 0 的最近日线（D304）。
+
+    这一枚早就该有：`index_daily` 的市场闸当年写成「腾讯没有美股指数」，
+    而那句话从没被真接口问过——2026-11-05 实测 `us.INX` 正常答序列，
+    大盘条的美股那一段因此空了整整一个版本。断言里带上 `code` 列，
+    是因为入库键必须是配置形态（`usINX`），点号那一形只是问腾讯时用的。
+    """
+    today = date.today()
+    adapter = TencentAdapter()
+    for market, code in (("A", "sh000001"), ("HK", "hkHSI"), ("US", "usINX")):
+        frame = adapter.index_daily(market, code, today - timedelta(days=14), today)
+        assert frame.height >= 1, f"{market} {code} 拿到空序列"
+        assert frame["code"].unique().to_list() == [code]
+        assert frame["close"][0] > 0
 
 
 # --- 分时（D165）：`minute/query`，累计量折成股，美股在联网前就拒 ----------------------
