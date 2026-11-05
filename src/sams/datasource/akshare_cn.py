@@ -47,6 +47,20 @@ from sams.datasource.symbol_list import normalize_symbol_list
 
 logger = logging.getLogger("sams.datasource")
 
+
+def _classify(source: str, exc: Exception) -> DatasourceError:
+    """估值/基本面/资金流三族的边界：库在 `None` 上崩的那一句读成「答空」（D327）。
+
+    东财对 `000996`/`999999` 回 `result: null`，akshare 在 `data_json["result"]["data"]`
+    上崩成 `TypeError: 'NoneType' object is not subscriptable`——那是「这张表里没有它」，
+    不是它挂了。按失败计会把单源链推进冷却（D279），冷掉之后那条链一个源都不剩（#365）。
+    只认这一种形状：别的 `TypeError`（我们自己写挂的）照原样抛出。
+    """
+    if isinstance(exc, TypeError) and "NoneType" in str(exc):
+        return EmptyResponse(source, f"库在 None 上崩了：{exc}")
+    return classify_error(source, exc)
+
+
 COLUMN_MAP = {
     "date": "日期",
     "open": "开盘",
@@ -489,7 +503,7 @@ class AkshareAdapter:
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise classify_error(self.name, exc) from exc
+            raise _classify(self.name, exc) from exc
         return _in_window(out, "report_date", start, end)
 
     def valuation(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
@@ -516,7 +530,7 @@ class AkshareAdapter:
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise classify_error(self.name, exc) from exc
+            raise _classify(self.name, exc) from exc
         return _in_window(out, "date", start, end)
 
     def funding_flow(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
@@ -539,7 +553,7 @@ class AkshareAdapter:
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise classify_error(self.name, exc) from exc
+            raise _classify(self.name, exc) from exc
         return _in_window(out, "date", start, end)
 
     def listed_date(self, market: str, code: str) -> date | None:
