@@ -784,6 +784,31 @@ def test_symbol_master_kept_old_shows_in_note(db, settings):
     assert "保留旧表" in outcome.note
 
 
+def test_symbol_master_floor_shows_in_note(db, settings):
+    """读到半张表就停手不关停（D315）：note 得明说「比旧表少一半，保留旧表在册」。
+
+    沿用「代码表 1 行、关停 0」的文案，健康页读到的是一次正常同步的收尾——
+    而它实际含义是「这一轮名单不可信」，后者才是需要人看一眼的那件事。
+    """
+
+    class FlooredMaster:
+        def sync(self, market):
+            return SymbolMasterSummary(
+                market=market,
+                source="akshare",
+                rows=1,
+                deactivated=0,
+                degraded=False,
+                kept_floor=True,
+            )
+
+    outcome = run_symbol_master(
+        replace(deps(db, settings), symbol_master=FlooredMaster()), ctx()
+    )
+    assert outcome.ok is True
+    assert "少一半" in outcome.note
+
+
 def test_build_jobs_registers_indices_only_with_repo_and_capability(db, settings):
     assert ("indices", "A") not in titles(deps(db, settings))
     # 有能力但 SyncService 没拿到指数仓库：登记了就是在 job 里撞那句 assert

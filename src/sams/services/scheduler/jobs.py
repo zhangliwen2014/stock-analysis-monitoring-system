@@ -363,14 +363,15 @@ def run_symbol_master(deps: JobDeps, ctx: JobContext) -> JobOutcome:
         summary = deps.symbol_master.sync(ctx.market)
     except SamsError as exc:
         return JobOutcome(note=f"{ctx.market} 代码表失败", errors=(f"{ctx.market}: {exc}",))
-    return JobOutcome(
-        rows_affected=summary.rows,
-        note=(
-            f"{ctx.market} 代码表空答复，保留旧表"
-            if summary.kept_old
-            else f"{ctx.market} 代码表 {summary.rows} 行、关停 {summary.deactivated}"
-        ),
-    )
+    if summary.kept_old:
+        note = f"{ctx.market} 代码表空答复，保留旧表"
+    elif summary.kept_floor:
+        # 读到半张表就停手（D315）：「N 行、关停 0」是一次正常同步的收尾，
+        # 而它的真实含义是「这一轮名单不可信」——后者才需要人看一眼
+        note = f"{ctx.market} 代码表比旧表少一半，保留旧表在册"
+    else:
+        note = f"{ctx.market} 代码表 {summary.rows} 行、关停 {summary.deactivated}"
+    return JobOutcome(rows_affected=summary.rows, note=note)
 
 
 def run_spot(deps: JobDeps, ctx: JobContext) -> JobOutcome:

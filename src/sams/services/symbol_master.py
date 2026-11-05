@@ -37,6 +37,8 @@ class SymbolMasterSummary:
     degraded: bool
     #: 全链空答复，旧表原样保留（D147）
     kept_old: bool = False
+    #: 新名单比旧表在册数少一半，什么都不关停（D315）
+    kept_floor: bool = False
 
 
 class SymbolMasterSyncService:
@@ -55,6 +57,9 @@ class SymbolMasterSyncService:
         if result.empty_everywhere or result.frame.is_empty():
             logger.warning("%s 代码表所有源都答空，保留现有表", market)
             return SymbolMasterSummary(market, None, 0, 0, result.degraded, kept_old=True)
+        # 在册数要在写入之前取：upsert 把新名单里的行全置成 is_active，写完再数就把
+        # 「旧表在册多少只」与「这次写了多少只」混成同一个数
+        before = self.symbol_list.count(market)
         rows = []
         for item in result.frame.to_dicts():
             name = (item["name"] or "").strip()
@@ -70,6 +75,19 @@ class SymbolMasterSyncService:
                 }
             )
         self.symbol_list.upsert_batch(market, rows)
+        # 地板（D315）：D314 把「在册」变成了采集的前置条件，一次读小的名单不再只是搜索少
+        # 几只——没进名单的票当晚起从每一条按只循环的链里掉出去，整片停更。真实退市是每周
+        # 几十只的量级（实机三张快照一共关停 6 行），少一半这个地板拦不到它，拦的是源改版。
+        if len(rows) * 2 < before:
+            logger.warning(
+                "%s 代码表只读到 %s 行，旧表在册 %s：比一半还少，不关停任何行",
+                market,
+                len(rows),
+                before,
+            )
+            return SymbolMasterSummary(
+                market, result.source, len(rows), 0, result.degraded, kept_floor=True
+            )
         deactivated = self.symbol_list.deactivate_missing(market, [row["code"] for row in rows])
         logger.info(
             "%s 代码表 %s 行（源 %s），关停 %s", market, len(rows), result.source, deactivated
