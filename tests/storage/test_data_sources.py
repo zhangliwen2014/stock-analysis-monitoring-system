@@ -96,6 +96,16 @@ def test_seeded_kinds_match_names(repo):
         assert source.kind == source.name, "种子用实现名当源名：多实例才需要另取名字"
 
 
+def test_the_same_domain_financials_rows_say_so_in_their_note(repo):
+    """D322：同源不算第二个故障域，备注要在目录里一眼看得出来。
+
+    `eastmoney_global` 与两家 F10 用的是同一个上游；看备注的人只翻到其中一行时，
+    也得知道这一点——否则「US 基本面有 2 家」会被读成「一家倒了还有另一家」。
+    """
+    for name in ("eastmoney_global", "eastmoney_hk_f10", "eastmoney_us_f10"):
+        assert "同源" in (repo.get(name).note or ""), name
+
+
 def test_migrations_are_idempotent_for_the_seed(repo):
     apply_migrations(repo.db)
     assert len(repo.list()) == 15

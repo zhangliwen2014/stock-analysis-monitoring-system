@@ -13,8 +13,8 @@
 * **HK 指数日线的 secid 不统一**：恒指与国企指数在 100，恒生科技在 124；指数字段第三格
   叫 `latest`，它就是收盘价。
 * **快照是全表分页**：`clist` 忽略 `pz=5000`，一页硬上限 100；港股 4745 行（48 页）、
-  美股 13899 行（139 页），实测 60s / 167s。所以它挂在快照链的最后（D325），而
-  `note` 里写的是实测秒数，不是「较慢」。
+  美股 13899 行（139 页），实测 HK 36–60s、US 99–167s（两次；网络与东财限流会变）。
+  所以它挂在快照链的最后（D325），而 `note` 里写的是实测秒数，不是「较慢」。
 * **同一份基本面接口**：HK 用 F10 主要指标全史，US 与 `eastmoney_us_f10` 同一个
   数据中心的报表——按 D322 第 2 档，`note` 里必须写明「同源」。
 
@@ -395,7 +395,7 @@ source(
     note=(
         "东方财富港美股（分钟K、HK指数日线、HK上市日期、HK/US基本面与快照；"
         "基本面与 eastmoney_hk_f10 / eastmoney_us_f10 同源；"
-        "快照整表分页，实测 HK 约 35–60s / US 约 167s）"
+        "快照整表分页，实测 HK 约 35–60s / US 约 100–170s）"
     ),
 )(EastmoneyGlobalAdapter)
 
@@ -597,7 +597,7 @@ def parse_em_spot(
 def fetch_snapshot(
     market: str, *, get: Callable[[str, dict[str, str]], dict] | None = None
 ) -> list[dict]:
-    """真实网络调用：一个市场的整表。页间停 0.5s，实测 HK 约 60s、US 约 167s。"""
+    """真实网络调用：一个市场的整表。页间停 0.5s，实测 HK 约 35–60s、US 约 100–170s。"""
     market = canonical_market(market)
     fetch = get or _http_get
     try:
