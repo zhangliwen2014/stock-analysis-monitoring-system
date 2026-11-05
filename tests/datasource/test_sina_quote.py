@@ -71,7 +71,7 @@ def test_a_share_fields_and_derived_pct():
     assert quote.source == "sina_quote"
 
 
-def test_hk_fields_use_chinese_name_and_hk_time():
+def hk_cells():
     cells = [""] * 19
     cells[0] = "TENCENT"
     cells[1] = "腾讯控股"
@@ -88,13 +88,37 @@ def test_hk_fields_use_chinese_name_and_hk_time():
     cells[12] = "1000000"
     cells[17] = "2026/10/23"
     cells[18] = "10:00"
+    return cells
+
+
+def test_hk_fields_use_chinese_name_and_hk_time():
     quote = parse_sina_quotes(
-        line("hk00700", cells), market="HK", codes=["00700"], now=NOW,
+        line("hk00700", hk_cells()), market="HK", codes=["00700"], now=NOW,
         zone=ZoneInfo("Asia/Hong_Kong"),
     ).quotes[0]
     assert quote.price == 380.0 and quote.pct_chg == 3.26
     assert quote.ts == datetime(2026, 10, 23, 2, 0, tzinfo=UTC)
     assert quote.volume == 1000000 and quote.amount == 380000000
+
+
+def test_the_hk_row_declares_the_delay_this_feed_is_sold_at():
+    """新浪的港股报价牌上就写着延迟：11-05 实测落后墙钟约 28 分钟，取 1800 秒。
+
+    比腾讯那一路还慢一倍，所以这个数只能跟着报价走、不能按市场记一个常数（D319）
+    """
+    quote = parse_sina_quotes(
+        line("hk00700", hk_cells()), market="HK", codes=["00700"], now=NOW,
+        zone=ZoneInfo("Asia/Hong_Kong"),
+    ).quotes[0]
+    assert quote.delayed is True
+    assert quote.delay_s == 1800
+
+    a = parse_sina_quotes(
+        line("sh600519", a_cells()), market="A", codes=["600519"], now=NOW,
+        zone=ZoneInfo("Asia/Shanghai"),
+    ).quotes[0]
+    assert a.delayed is None
+    assert a.delay_s == 0
 
 
 def us_cells():

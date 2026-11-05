@@ -67,6 +67,11 @@ _QUOTE_TS_FORMATS = {
     "HK": ("%Y/%m/%d %H:%M:%S",),
     "US": ("%Y-%m-%d %H:%M:%S",),
 }
+#: 这一路源**自己声明**的固定延时（秒），按市场记（D319）。
+#: 11-05 实测：同一时刻取回来的港股，field30 落后墙钟 904 秒，交易所挂牌就是 15 分钟；
+#: A 股那几格与墙钟差 0~4 秒，是实时源，所以不列进来。
+#: 美股这一路当天休市、没测过，就不把没测过的数当事实写（跟进 #386）
+QUOTE_DELAY_S: dict[str, int] = {"HK": 900}
 
 
 def tencent_quote_symbol(market: str, code: str) -> str:
@@ -367,6 +372,7 @@ def parse_tencent_quotes(
             amount = field_float(row, 37)
         bid = field_float(row, 9)
         ask = field_float(row, 19)
+        delay_s = QUOTE_DELAY_S.get(market, 0)
         quotes.append(
             Quote(
                 market=market,
@@ -384,6 +390,8 @@ def parse_tencent_quotes(
                 ask1=ask if ask and ask > 0 else None,
                 source="tencent",
                 is_stale=moment is None,
+                delayed=True if delay_s else None,
+                delay_s=delay_s,
             )
         )
     return QuoteBatch(tuple(quotes), tuple(skipped), tuple(errors))

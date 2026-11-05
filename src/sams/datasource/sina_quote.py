@@ -42,6 +42,13 @@ _LINE = re.compile(r'hq_str_([^=]+)="([^"]*)"')
 #: 判错方向是把 B 类股的报价贴到 A 类的键下，所以宁可拒绝。
 _US_EXCHANGE_SUFFIXES = frozenset({".OQ", ".N", ".TO"})
 
+#: 这一路源**自己声明**的固定延时（秒），按市场记（D319）。
+#: 11-05 实测：新浪的港股落后墙钟约 28~30 分钟，比腾讯那一路（15 分钟）还慢一倍——
+#: 同一个市场的两只源延时不同，所以这个数只能跟着报价走，不能按市场记一个常数。
+#: A 股这一路实测与墙钟同步（实时源，不声明）；美股这一路当天休市、没测过，
+#: 不把没测过的数当事实（跟进 #386）
+QUOTE_DELAY_S: dict[str, int] = {"HK": 1800}
+
 
 def sina_quote_symbol(market: str, code: str) -> str:
     if market == "A":
@@ -198,6 +205,8 @@ def _hk_quote(code: str, cells: list[str], *, now: datetime, zone) -> Quote:
         ask1=_tap(cells, 10),
         source="sina_quote",
         is_stale=moment is None,
+        delayed=True,
+        delay_s=QUOTE_DELAY_S["HK"],
     )
 
 

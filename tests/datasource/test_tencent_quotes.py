@@ -100,6 +100,27 @@ def test_hk_quote_uses_hk_timestamp_and_amount_column():
     assert quote.volume == 1000000 and quote.amount == 380000000
 
 
+def test_a_delayed_feed_declares_its_own_delay():
+    """腾讯的港股就是固定晚 15 分钟（11-05 实测 field30 落后墙钟 904 秒）。
+
+    这个数必须跟着报价走：新鲜度闸拿它放宽，否则每一笔港股都被判停更（D319）
+    """
+    hk = parse_tencent_quotes(
+        line("hk00700", fields(code="00700", price="380.00", ts="2026/10/23 10:00:00")),
+        market="HK", codes=["700"], now=NOW, zone=ZoneInfo("Asia/Hong_Kong"),
+    ).quotes[0]
+    assert hk.delayed is True
+    assert hk.delay_s == 900
+    assert hk.is_stale is False
+
+    a = parse_tencent_quotes(
+        line("sh600519", fields(code="600519", price="1540.00", ts="20261023100000")),
+        market="A", codes=["600519"], now=NOW, zone=ZoneInfo("Asia/Shanghai"),
+    ).quotes[0]
+    assert a.delayed is None
+    assert a.delay_s == 0
+
+
 def test_us_quote_accepts_exchange_suffix_in_the_echo():
     text = line("usAAPL", fields(
         code="AAPL.OQ",
