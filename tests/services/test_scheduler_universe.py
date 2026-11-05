@@ -8,6 +8,7 @@ from sams.services.rules.snapshot import Target
 from sams.services.scheduler.universe import UniverseBuilder
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.rules import RuleRepo
+from sams.storage.repos.symbol_list import SymbolListRepo
 from sams.storage.repos.symbols import SymbolRepo
 from sams.storage.repos.theses import ThesisRepo
 from sams.storage.repos.users import UserRepo
@@ -144,6 +145,7 @@ def test_universe_is_the_union_of_watchlist_positions_rules_and_live_theses(db, 
         theses=theses,
         data=StubData(watchlists),
         settings=settings,
+        symbol_list=SymbolListRepo(db),
     ).build()
 
     assert universe.codes("A") == ("000001", "000003", "600519", "601318")
@@ -166,6 +168,7 @@ def test_build_carries_the_configured_indices(db, settings):
         theses=ThesisRepo(db),
         data=StubData(WatchlistRepo(db)),
         settings=settings,
+        symbol_list=SymbolListRepo(db),
     ).build()
     for market in settings.markets:
         assert universe.indices(market) == settings.indices.for_market(market)
@@ -203,6 +206,7 @@ def test_a_folded_watchlist_row_of_the_wrong_shape_never_enters_the_universe(
         theses=ThesisRepo(db),
         data=StubData(watchlists),
         settings=settings,
+        symbol_list=SymbolListRepo(db),
     )
     with caplog.at_level(logging.WARNING, logger="sams.services.scheduler.universe"):
         universe = builder.build()
@@ -214,6 +218,85 @@ def test_a_folded_watchlist_row_of_the_wrong_shape_never_enters_the_universe(
     assert universe.codes("HK") == ("00700",)
     hinted = [record for record in caplog.records if "A 00700" in record.getMessage()]
     assert len(hinted) == 1
+
+
+def test_a_code_the_table_does_not_know_never_enters_the_universe(db, settings, caplog):
+    """六位数字、但不是任何一只在市个股：代码表说没有，采集就不问它（D314）。
+
+    实机的两只：`A/999999` 是上证指数（指数的地方是大盘条，D145），`A/000996` 已退市。
+    形态闸（D210）放它们过去，代价是 `financials/profile/valuation/flow` 四条按只循环
+    **每晚整条标红**——一只永远取不到的票把真故障淹掉了（#382 §1，实机 39/35/38/38 次 failed）。
+    """
+    users = UserRepo(db)
+    alice = users.create("alice", "correct horse battery")
+    watchlists = WatchlistRepo(db)
+    watchlists.add(alice.id, "A", "600519")
+    watchlists.add(alice.id, "A", "999999")
+    watchlists.add(alice.id, "A", "000996")
+    symbol_list = SymbolListRepo(db)
+    # 代码表只认得一只：这就是那 5,577 行在册名单在本用例里的形状
+    symbol_list.upsert_batch(
+        "A",
+        [
+            {
+                "code": "600519",
+                "name": "贵州茅台",
+                "py_initials": "gzym",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            }
+        ],
+    )
+
+    accounts = SimAccountRepo(db)
+    builder = UniverseBuilder(
+        users=users,
+        watchlists=watchlists,
+        accounts=accounts,
+        orders=SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db)),
+        rules=RuleRepo(db),
+        theses=ThesisRepo(db),
+        data=StubData(watchlists),
+        settings=settings,
+        symbol_list=symbol_list,
+    )
+    with caplog.at_level(logging.WARNING, logger="sams.services.scheduler.universe"):
+        universe = builder.build()
+        # 一拍的重建不该把日志念成清单：同一只票只说一次
+        builder.build()
+
+    assert universe.codes("A") == ("600519",)
+    for code in ("999999", "000996"):
+        said = [r for r in caplog.records if f"A {code}" in r.getMessage()]
+        assert len(said) == 1
+
+
+def test_an_empty_code_table_does_not_veto_anything(db, settings):
+    """整表还没同步过时这一闸没有否决权（D314）：否则新装库第一晚什么都采不到。
+
+    `symbol_master` 排在市场组最前（`jobs.py:849`）也修不了这个顺序——同一个 tick 里
+    universe 先建、代码表后同步。这一条是上面那个闸的边界，不是它的例外口径。
+    """
+    users = UserRepo(db)
+    alice = users.create("alice", "correct horse battery")
+    watchlists = WatchlistRepo(db)
+    watchlists.add(alice.id, "A", "999999")
+    symbol_list = SymbolListRepo(db)
+
+    accounts = SimAccountRepo(db)
+    universe = UniverseBuilder(
+        users=users,
+        watchlists=watchlists,
+        accounts=accounts,
+        orders=SimOrderRepo(db, accounts, markets=settings.markets, symbols=SymbolRepo(db)),
+        rules=RuleRepo(db),
+        theses=ThesisRepo(db),
+        data=StubData(watchlists),
+        settings=settings,
+        symbol_list=symbol_list,
+    ).build()
+
+    assert universe.codes("A") == ("999999",)
 
 
 def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, caplog):
@@ -262,6 +345,7 @@ def test_one_rule_that_cannot_expand_does_not_stop_the_others(db, settings, capl
             theses=ThesisRepo(db),
             data=_Expanding(),
             settings=settings,
+            symbol_list=SymbolListRepo(db),
         ).build()
 
     assert universe.codes("A") == ()

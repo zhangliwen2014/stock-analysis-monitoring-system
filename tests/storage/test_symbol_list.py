@@ -171,3 +171,26 @@ def test_active_codes_returns_the_ordered_live_list(repo):
     repo.deactivate_missing("A", ["000001", "600001"])
     assert repo.active_codes("A") == ["000001", "600001"]
     assert repo.active_codes("HK") == ["00700"]
+
+
+def test_admits_asks_the_code_table_and_not_the_shape(repo):
+    """准入判据只有一个出处（D314）：代码表认不认识，与形态对不对是两件事。
+
+    `999999` 是六位数字、过得了形态闸，但它不在任何一张在市名单里——那正是
+    `financials/profile/valuation/flow` 四条链每晚整条标红的那一只（#382 §1）。
+    """
+    assert repo.admits("A", "600519") is True
+    assert repo.admits("A", "999999") is False
+    assert repo.admits("a", "600519") is True  # 市场名归一，不为大小写各开一条路
+    # 关停（退市）之后不再认识：这一只不该再被问，也不该再排补数
+    repo.deactivate_missing("A", ["000001", "600001"])
+    assert repo.admits("A", "600519") is False
+
+
+def test_admits_has_no_veto_before_the_first_sync(repo):
+    """整表还没同步过的市场不许当否决票（D314）：那会让新装库第一晚什么都采不到。
+
+    `symbol_master` 虽然排在市场组最前，也修不了同一个 tick 里 universe 先建、表后同步的顺序。
+    """
+    assert repo.count("US") == 0
+    assert repo.admits("US", "AAPL") is True

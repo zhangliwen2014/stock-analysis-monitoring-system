@@ -3,6 +3,7 @@
 并集而不是「按用户分开跑」：采集是公共资源，同一只票被两个人自选，没有理由拉两次。
 对象来源有四种：自选股、持仓、启用的规则目标、在跟的（opened/tracking）观点。
 停用的规则与观察中的观点不拉数据：它们不会产生任何读写，拉回来的数没人用。
+四种来源出来都要过两道闸：代码形态对不对（D210）与代码表认不认识这只票（D314）。
 
 **用户状态不过滤**：这是数据采集，不是投递。今天停用的用户明天启用，库里该已经有数。
 """
@@ -19,6 +20,7 @@ from sams.core.config import Settings
 from sams.core.errors import ValidationError
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
 from sams.storage.repos.rules import RuleRepo
+from sams.storage.repos.symbol_list import SymbolListRepo
 from sams.storage.repos.theses import OPENED, TRACKING, ThesisRepo
 from sams.storage.repos.users import UserRepo
 from sams.storage.repos.watchlists import WatchlistRepo
@@ -57,6 +59,7 @@ class UniverseBuilder:
         theses: ThesisRepo,
         data: RuleData,
         settings: Settings,
+        symbol_list: SymbolListRepo,
     ) -> None:
         self.users = users
         self.watchlists = watchlists
@@ -66,6 +69,7 @@ class UniverseBuilder:
         self.theses = theses
         self.data = data
         self.settings = settings
+        self.symbol_list = symbol_list
         #: 已经报过形态问题的代码：清单盘中每几秒重建一次，同一条旧行只该说一次
         self._reported: set[tuple[str, str]] = set()
 
@@ -104,19 +108,35 @@ class UniverseBuilder:
                 for thesis in self.theses.list(user.id, status=status):
                     found.add(_key(thesis.market, thesis.code))
 
-        # 形态不对的代码（A 清单里折着的 `00700`）不是「这只票今晚没采到」：它发给
-        # 任何 A 股适配器都只会抛，夜里的 job 因此整晚标成失败并可能在三个周期后告警。
-        # 折起的行照旧留在清单里（D169），但采不了的总得在发请求之前出队（D210）。
+        # 两道闸，各挡一种「这个代码不属于这个市场的个股清单」：
+        # 形态（D210）挡掉 A 清单里折着的 `00700`；代码表（D314）挡掉 `999999` 与 `000996`
+        # 那种六位数字、但不是任何一只在市个股的代码。后者实机的代价不是「这只票今晚没采到」，
+        # 而是 `financials/profile/valuation/flow` 每晚整条标红（#382 §1：39/35/38/38 次 failed），
+        # 一只永远取不到的票把真故障淹掉了。
+        # 折起的行照旧留在清单里（D169），但采不了的总得在发请求之前出队。
+        rosters: dict[str, frozenset[str] | None] = {}
+        kept: set[tuple[str, str]] = set()
         for market, code in sorted(found):
-            if not fits_market(market, code) and (market, code) not in self._reported:
-                self._reported.add((market, code))
-                logger.warning(
-                    "%s %s 不是 %s 的代码形态，已跳过采集（A 股 6 位、港股 5 位，D210）",
+            if not fits_market(market, code):
+                self._say(
                     market,
                     code,
-                    market,
+                    f"不是 {market} 的代码形态，已跳过采集（A 股 6 位、港股 5 位，D210）",
                 )
-        found = {key for key in found if fits_market(*key)}
+                continue
+            if market not in rosters:
+                # 一次 build 每市场只读一遍在册名单（实机三市场 13 ms，一分钟一拍可忽略）
+                rosters[market] = frozenset(self.symbol_list.active_codes(market)) or None
+            roster = rosters[market]
+            if roster is not None and code not in roster:
+                self._say(
+                    market,
+                    code,
+                    "代码表里没有，已跳过采集（退市股/指数/代码表未同步到的新股，D314）",
+                )
+                continue
+            kept.add((market, code))
+        found = kept
 
         markets = set(self.settings.markets) | {market for market, _ in found}
         by_market = {
@@ -132,6 +152,17 @@ class UniverseBuilder:
             fx_pairs=tuple(sorted(pairs)),
             indices_by_market=indices_by_market,
         )
+
+    def _say(self, market: str, code: str, what: str) -> None:
+        """被出队的代码要点名，且同一条只点一次。
+
+        这一份是盘中每几秒重建一次的：不设去重，日志里全是重复的一行；完全不说，
+        「这只票为什么不采」就只剩库里查不到的答案。
+        """
+        if (market, code) in self._reported:
+            return
+        self._reported.add((market, code))
+        logger.warning("%s %s %s", market, code, what)
 
 
 def _key(market: str, code: str) -> tuple[str, str]:

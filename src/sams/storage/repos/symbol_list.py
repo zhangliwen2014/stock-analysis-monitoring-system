@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import polars as pl
 
+from sams.core.codes import canonical_market
 from sams.storage.db import Database
 
 #: 集合写那六列（market 由调用方整批给一个值）：显式 schema 让「整列都是 None」也落定
@@ -139,6 +140,24 @@ class SymbolListRepo:
             [market],
         )
         return frame["code"].to_list()
+
+    def admits(self, market: str, code: str) -> bool:
+        """代码表认不认识这只票——准入与采集共用的那一句（D314）。
+
+        形态对不对是另一件事（`core.codes.fits_market`，D210）：那条挡得住「A 清单里
+        写着 00700」，挡不住「六位数字、但不是任何一只在市个股」。`999999`（上证指数）
+        与 `000996`（退市）就是从那道闸底下过的，代价是四条按只循环的链每晚整条标红
+        （#382 §1）。
+
+        整表未同步的市场返回 True：新装库第一晚代码表是空的，空表当否决票等于
+        「本机什么都别采」，而 `symbol_master` 排在市场组最前也修不了同一个 tick 里
+        universe 先建、表后同步的顺序。
+        """
+        market = canonical_market(market)
+        if self.count(market) == 0:
+            return True
+        row = self.get(market, code)
+        return row is not None and bool(row["is_active"])
 
     def count(self, market: str | None = None) -> int:
         if market is None:

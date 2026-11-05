@@ -840,6 +840,8 @@ def _context_on(
         theses=theses_store,
         data=rule_data,
         settings=cfg,
+        # 采集清单的准入问代码表（D314）：形态对但不是在市个股的代码不进夜间循环
+        symbol_list=symbol_list_store,
     )
     on_poll = (
         None
