@@ -120,6 +120,17 @@ def test_a_delayed_feed_declares_its_own_delay():
     assert a.delayed is None
     assert a.delay_s == 0
 
+    # #386 实测（11-06 盘中两次，北京 02:39 / 02:52）：field30 是纽约时间，
+    # 落后墙钟 4~10 秒。美股这一路也是实时源，没有可声明的固定延时
+    us = parse_tencent_quotes(
+        line("usAAPL", fields(
+            code="AAPL.OQ", price="343.25", ts="2026-10-23 10:00:00", amount="123456789",
+        )),
+        market="US", codes=["AAPL"], now=NOW, zone=ZoneInfo("America/New_York"),
+    ).quotes[0]
+    assert us.delayed is None
+    assert us.delay_s == 0
+
 
 def test_us_quote_accepts_exchange_suffix_in_the_echo():
     text = line("usAAPL", fields(

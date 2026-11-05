@@ -123,7 +123,7 @@ US: yfinance → tencent → sina_quote → nasdaq_trader → eastmoney_us_f10
 |---|---|---|---|---|
 | `baidu_valuation` | 新建 `datasource/baidu_valuation.py` | A、HK | `valuation` | 估值链第 2 位（A 在 akshare 后、HK 在 yfinance 后） |
 | `sina_global` | 新建 `datasource/sina_global.py` | HK、US | `daily_bars`、`index_daily`(US) | HK/US 日线第 3 位；US 指数日线第 2 位 |
-| `eastmoney_global` | 新建 `datasource/eastmoney_global.py` | HK、US | `minute_bars`、`index_daily`(HK)、`listed_date`(HK)、`financials`、`market_snapshot` | 各自那条链的第 2 位（快照因 35–60/167s 排最后） |
+| `eastmoney_global` | 新建 `datasource/eastmoney_global.py` | HK、US | `minute_bars`、`index_daily`(HK)、`listed_date`(HK)、`financials`、`market_snapshot` | 各自那条链的第 2 位（快照因 35–60/100–170s 排最后） |
 | `akshare_cninfo` | 扩能（已存在，只加方法） | A | `company_profile`、`announcements`、`listed_date` | 概况/公告链第 2 位；上市日期链第 2 位 |
 | `sina` | 扩能（已存在，A 股那一路） | A | `financials` | 基本面链第 2 位 |
 
@@ -132,7 +132,7 @@ US: yfinance → tencent → sina_quote → nasdaq_trader → eastmoney_us_f10
 
 ### D325 慢源排最后，并把实测耗时写进 `note`
 
-快照备源一次要 35–60 秒（HK）到 167 秒（US）。降级链只会在家主源失败时才走到它，
+快照备源一次要 35–60 秒（HK）到 100–170 秒（US）。降级链只会在家主源失败时才走到它，
 所以这个代价平时不付；一旦付起来，屏幕与 `task_runs` 里要能看出「这次是那条慢的路」。
 `note` 里写实测数，不写「较慢」这种没法核对的话。
 
@@ -246,3 +246,62 @@ PR 从「算得出」变成「算不出」，而屏幕上只写「未披露」�
 6. `eastmoney_global` 新 kind（分钟 K、HK 指数日线、HK 上市日期、HK/US 基本面、快照）。
 7. D328/#384：一次启动上岗。
 8. 矩阵断言脚本 + 全量回归 + 实机同步。
+
+---
+
+## 7. 实机记录（2026-11-06，线上库副本 + 真实网络）
+
+线上库副本（`tmp/ro3.duckdb`，含用户后加的 `nasdaq_trader`）上跑完 0048–0052：
+
+* **矩阵断言**（`tmp/_chain_matrix.py`）：14 个验收格全部 ≥ 2 个源；US 基本面
+  `eastmoney_global → eastmoney_us_f10`，两家 note 都写「同源」。新库与线上副本结论一致。
+* **`/health`**：`[降级链]` 里港美股按能力标出五个新源的名字；`baidu_valuation`、
+  `eastmoney_global`、`sina_global`、`sina_quote` 显示「尚未被调用过」——新源在目录里，
+  还没被采集轮到。
+* **HK 基本面（服务层）**：`sams sync financials --market HK --code 00700` →
+  `源=eastmoney_global 取回=10 入库=10`，同时把上市日期 2004-06-16 写进主档；
+  链上前三家各自报「不提供基本面」。
+* **HK 快照（备源顶上）**：停用腾讯后 `sync spot --market HK` → `来源 eastmoney_global`，
+  36s，请求 2809 / 落 2799，并点名未答的 10 只（02945 等）。
+* **US 快照（备源顶上）**：同上 → `来源 eastmoney_global`，99s，请求 5915 / 落 5910，
+  未答 5 只（CCXI、GNTA、HODO、INDV、MGPI）。0051 的 167s 因此改成区间
+  「US 约 100–170s」（迁移 0052 同步更新 note）。
+* **A 股估值（服务层）**：`sync valuation --market A --code 600519` →
+  `源=akshare 取回=1 入库=1`；百度是本格备源，akshare 没坏时不会被走到。
+
+**未在线上进程里做的两件事**（都要求重启 serve，当前进程仍握着库）：
+
+1. 0048–0052 还没落到 `data/sams.duckdb`：下一次 `sams serve` 启动时由
+   `migrate_before_start` 补，且这一趟的链快照就含新源（#384 的验收就是这个顺序）。
+2. 线上 `/admin` 与 `/health` 看到新源的时间点同样是那次重启之后。
+
+单测已把这两件事钉住：`test_migrating_before_the_container_puts_the_newest_seed_on_the_chain`
+（旧库 + 一次入口 → 链上有 0051 的源）、`test_one_start_puts_a_newly_seeded_source_on_the_chain`
+（CLI 真实入口）、`test_start_migrates_before_it_builds_the_chain_snapshot`（serve 的调用顺序）。
+
+## 8. #386 收尾：美股报价延时实测与新浪的两处线上缺陷（2026-11-06 02:39 北京）
+
+美股盘中（纽约 11-05 13:39 与 13:52）两次取回两路报价，逐只对照墙钟：
+
+| 源 | 源时间那一格 | 与墙钟差 | 结论 |
+|---|---|---|---|
+| `tencent` | `2026-11-05 13:39:00`（纽约） | 4~10s | 实时源，不声明 |
+| `sina_quote` | `2026-11-06 02:39:05`（北京） | 1.5~2s | 实时源，不声明 |
+
+因此 `QUOTE_DELAY_S` 的 `US` 不落任何数（A 股同理）；`HK` 仍是腾讯 900s、
+新浪 1800s。单测把三条「不声明」钉住：`test_a_delayed_feed_declares_its_own_delay`
+（腾讯 US）、`test_the_us_row_declares_no_delay_because_it_is_not_delayed`（新浪 US）。
+
+实测顺带挖出 `sina_quote` 两处线上缺陷，都修在这一轮：
+
+1. **批量逗号被编码，整批静默 skipped**。`requests` 的 `params` 把
+   `list=gb_aapl,gb_nvda` 编成 `%2C`，新浪按字面量回键，响应是
+   `var hq_str_gb_aapl%2Cgb_nvda="";`。A/HK/US 三个市场一样——这条「备源」
+   在链上挂着，多只票一次批量时从来没真答过（单只的 live 冒烟测不出来）。
+   修法是查询串自己拼（`urlencode(..., safe=",")`），
+   `test_the_batch_comma_reaches_sina_unencoded` 钉住线上形态。修后实机：
+   US 40 只回 39（只 skip 拒绝建键的 `BRK.B`）、HK 10/10、A 10/10；
+   修前同样这三批全是 0。
+2. **美股那一格时刻是北京时间**，原实现按纽约解析，报价落到 13 小时后的未来，
+   新鲜度闸从此永远放行。`_US_FEED_ZONE` 固定按北京读，
+   `test_the_us_row_is_read_as_beijing_time_not_new_york` 钉住。

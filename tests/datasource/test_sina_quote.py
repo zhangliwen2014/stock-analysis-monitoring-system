@@ -121,12 +121,31 @@ def test_the_hk_row_declares_the_delay_this_feed_is_sold_at():
     assert a.delay_s == 0
 
 
+def test_the_us_row_declares_no_delay_because_it_is_not_delayed():
+    """#386 实测（11-06 盘中两次，北京 02:39 / 02:52）：新浪美股那一格落后墙钟 1.5~2 秒，
+    腾讯 5~7 秒——两路都是实时源，没有可声明的固定延时（D319）。
+
+    这里钉的是「没测过就别声明」的另一半：测过了、结果是实时，就不许再挂一个数。
+    """
+    quote = parse_sina_quotes(
+        line("gb_aapl", us_cells()), market="US", codes=["AAPL"], now=NOW,
+        zone=ZoneInfo("America/New_York"),
+    ).quotes[0]
+    assert quote.delayed is None
+    assert quote.delay_s == 0
+
+
 def us_cells():
+    """美股那一行：`2026-11-06 02:39:05` 是**北京时间**，不是纽约时间。
+
+    11-06 实机对表：取回时墙钟北京时间 02:39:06，源给的这一格 02:39:05；
+    纽约当时是 11-05 13:39。按纽约解析会把这根报价挪到未来 13 小时。
+    """
     cells = [""] * 31
     cells[0] = "Apple Inc"
     cells[1] = "230.50"
     cells[2] = "1.25"
-    cells[3] = "2026-10-23 10:00:00"
+    cells[3] = "2026-10-23 22:00:00"
     cells[4] = "2.85"
     cells[5] = "228.00"
     cells[6] = "231.00"
@@ -143,8 +162,23 @@ def test_us_fields_use_price_datetime_and_prev_close_columns():
         zone=ZoneInfo("America/New_York"),
     ).quotes[0]
     assert quote.price == 230.5 and quote.prev_close == 227.65
+    # 北京 22:00 = 纽约 10:00（EDT）——同一时刻，一个写成北京时间、一个写成纽约时间
     assert quote.ts == datetime(2026, 10, 23, 14, 0, tzinfo=UTC)
     assert quote.volume == 50000000 and quote.amount == 11525000000
+
+
+def test_the_us_row_is_read_as_beijing_time_not_new_york():
+    """把北京那一格当纽约读，报价会落到 13 小时后的未来，新鲜度闸就废了。
+
+    同一时刻：北京 2026-10-23 22:00 = 纽约 10:00（EDT）= UTC 14:00；
+    按纽约读会得到次日 02:00 UTC，落在 NOW 之后。
+    """
+    quote = parse_sina_quotes(
+        line("gb_aapl", us_cells()), market="US", codes=["AAPL"], now=NOW,
+        zone=ZoneInfo("America/New_York"),
+    ).quotes[0]
+    assert quote.ts == datetime(2026, 10, 23, 14, 0, tzinfo=UTC)
+    assert quote.ts <= NOW
 
 
 def test_an_empty_line_is_skipped_not_a_zero_quote():
@@ -257,6 +291,32 @@ def test_quote_get_maps_429_to_rate_limited(monkeypatch):
     monkeypatch.setattr("requests.get", lambda *a, **k: Response429())
     with pytest.raises(RateLimited):
         quote_get(QUOTE_URL, {"list": "sh600519"}, timeout=1)
+
+
+def test_the_batch_comma_reaches_sina_unencoded(monkeypatch):
+    """新浪按字面量回键：逗号被编码成 `%2C` 时，整批只回一行空壳。
+
+    11-06 实机抓到的原样：请求 `?list=gb_aapl,gb_nvda`，若走 requests 的 params
+    就变成 `?list=gb_aapl%2Cgb_nvda`，响应是
+    `var hq_str_gb_aapl%2Cgb_nvda="";`——每只票都静默 skipped，备源等于没接上。
+    A/HK/US 三个市场一样；腾讯那边同形的 `q=` 会解 %2C，所以只有这一路要自己拼。
+    """
+    seen = {}
+
+    class Response:
+        status_code = 200
+        content = b'var hq_str_sh600519="";\n'
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, **_kwargs):
+        seen["url"] = url
+        return Response()
+
+    monkeypatch.setattr("requests.get", fake_get)
+    quote_get(QUOTE_URL, {"list": "sh600519,sz000001"}, timeout=1)
+    assert seen["url"] == f"{QUOTE_URL}?list=sh600519,sz000001"
 
 
 @pytest.mark.live

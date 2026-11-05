@@ -8,7 +8,8 @@
     11 买一、21 卖一、30 日期、31 时间；
   * 港股：0 英文名、1 中文名、2 开、3 昨收、4 高、5 低、6 价、8 涨跌幅、
     9 买一、10 卖一、11 额、12 量、17 日期、18 时间；
-  * 美股：0 名、1 价、2 涨跌幅、3 时刻、5 开、6 高、7 低、10 量、26 昨收、30 额。
+  * 美股：0 名、1 价、2 涨跌幅、3 时刻（北京时间，不是纽约）、5 开、6 高、7 低、
+    10 量、26 昨收、30 额。
 
 按「看起来差不多」复用一张表，会把港股的昨收读成现价——这个错误不会抛异常。
 """
@@ -18,6 +19,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from datetime import datetime
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
@@ -28,9 +30,12 @@ from sams.datasource.base import a_share_symbol, classify_error
 from sams.datasource.quote import field_float, parse_moment
 from sams.datasource.sources import source
 
-#: 不能带路径里那个 `=`：requests 会把 params 拼成查询串，`.../list=` 会变成
-#: `.../list=?list=...`，新浪把 `?list=...` 当成代码原样回显——每只票都是空行，
-#: 整批静默 skipped（live 冒烟抓出来的）。`/list?list=...` 实测三个市场都正常回键。
+#: 路径里不能带 `=`，查询串也不能交给 requests 的 params：前者会拼成
+#: `.../list=?list=...`，新浪把 `?list=...` 当成代码原样回显；后者会把批量代码
+#: 之间的逗号编成 `%2C`，而新浪的键是字面量回显——响应变成
+#: `var hq_str_gb_aapl%2Cgb_nvda="";`，每只票都静默 skipped（11-06 实机抓到的原样，
+#: A/HK/US 三个市场一样）。`?list=a,b` 原样送达时三个市场都正常回键；
+#: 腾讯同形的 `q=` 会解 %2C，只有这一路要自己拼查询串。
 QUOTE_URL = "https://hq.sinajs.cn/list"
 _LINE = re.compile(r'hq_str_([^=]+)="([^"]*)"')
 
@@ -42,11 +47,16 @@ _LINE = re.compile(r'hq_str_([^=]+)="([^"]*)"')
 #: 判错方向是把 B 类股的报价贴到 A 类的键下，所以宁可拒绝。
 _US_EXCHANGE_SUFFIXES = frozenset({".OQ", ".N", ".TO"})
 
+#: 美股那一行的时刻是**北京时间**，与港股同区，不是纽约时间。11-06 盘中实测：
+#: 墙钟北京 02:39:06，源给 `2026-11-06 02:39:05`（同一秒），而纽约当时是 13:39。
+#: 按纽约读会把报价挪到 13 小时后的未来——新鲜度闸从此永远放行。
+_US_FEED_ZONE = ZoneInfo("Asia/Shanghai")
+
 #: 这一路源**自己声明**的固定延时（秒），按市场记（D319）。
 #: 11-05 实测：新浪的港股落后墙钟约 28~30 分钟，比腾讯那一路（15 分钟）还慢一倍——
 #: 同一个市场的两只源延时不同，所以这个数只能跟着报价走，不能按市场记一个常数。
-#: A 股这一路实测与墙钟同步（实时源，不声明）；美股这一路当天休市、没测过，
-#: 不把没测过的数当事实（跟进 #386）
+#: A 股与美股实测都是实时源：A 股与墙钟差 0~4 秒；美股 11-06 盘中两次差 1.5~2 秒
+#: （#386），两路都不声明延时。
 QUOTE_DELAY_S: dict[str, int] = {"HK": 1800}
 
 
@@ -71,9 +81,11 @@ def sina_quote_symbol(market: str, code: str) -> str:
 def quote_get(url: str, params: dict[str, str], *, timeout: int = 15) -> str:
     import requests
 
+    # 查询串自己拼：requests 的 params 会把批量代码之间的逗号编成 %2C，
+    # 而新浪按字面量回键（见 QUOTE_URL 上方）
+    query = urlencode(params, safe=",")
     response = requests.get(
-        url,
-        params=params,
+        f"{url}?{query}",
         timeout=timeout,
         headers={
             "User-Agent": "Mozilla/5.0",
@@ -214,7 +226,8 @@ def _us_quote(code: str, cells: list[str], *, now: datetime, zone) -> Quote:
     if len(cells) < 31:
         raise _BadRow(f"美股字段不足（{len(cells)} 个）")
     price = _price(cells, 1)
-    moment = parse_moment(cells[3], ("%Y-%m-%d %H:%M:%S",), zone)
+    # 这一格是北京时间，不能用调用方传进来的纽约时区（见 _US_FEED_ZONE）
+    moment = parse_moment(cells[3], ("%Y-%m-%d %H:%M:%S",), _US_FEED_ZONE)
     return Quote(
         market="US",
         code=code,
