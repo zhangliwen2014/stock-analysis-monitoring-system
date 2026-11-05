@@ -54,6 +54,10 @@ class Quote:
     status: str = ""
     #: 源明确标了延迟才为 True；`None` 是「没标」，不等于「保证实时」
     delayed: bool | None = None
+    #: 这一路源**自己声明**的固定延时（秒）：`delayed=True` 时才有意义，0 表示实时源。
+    #: 它跟着报价走而不是跟着市场走——同一只港股在腾讯晚 15 分钟、在新浪晚 30 分钟
+    #: （11-05 实测），而这个数决定新鲜度闸放宽多少（D319）
+    delay_s: int = 0
     source: str = ""
     #: 源没给时刻（或给了读不懂的格式），于是 `ts` 是取回时刻
     is_stale: bool = False
@@ -131,6 +135,18 @@ def as_utc(value: datetime, zone: ZoneInfo) -> datetime:
     return value.astimezone(UTC)
 
 
+def stale_allowance(quote: Quote | None, stale_s: int) -> int:
+    """这一笔报价在被判「停更」之前允许等多久：本地阈值 + 源自己声明的延时（D319）。
+
+    两个数各管一件事：`stale_s` 是「本地多久没有新 tick 算故障」，`delay_s` 是「这一路源
+    本来就晚这么多」。合成一个可配置的数就把它们分不开了——那 900 秒不该由用户调，
+    它是端点的授权边界。
+    """
+    if quote is None:
+        return stale_s
+    return stale_s + max(0, quote.delay_s)
+
+
 def quote_state(
     quote: Quote | None,
     *,
@@ -151,7 +167,7 @@ def quote_state(
     if quote is None:
         return NO_DATA
     age = max(0.0, (now - quote.ts).total_seconds())
-    if quote.is_stale or age > stale_s:
+    if quote.is_stale or age > stale_allowance(quote, stale_s):
         return STALE
     if quote.delayed is True:
         return DELAYED

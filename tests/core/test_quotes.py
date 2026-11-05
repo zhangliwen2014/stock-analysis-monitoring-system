@@ -69,6 +69,33 @@ def test_the_five_states_are_ordered_by_what_the_user_must_do_first():
     assert quote_state(late_delayed, now=now, market_open=True, stale_s=60) == STALE
 
 
+def test_a_delayed_feed_is_not_measured_by_the_local_threshold():
+    """实测 11-05：腾讯港股每一笔都晚 904 秒（`field30` 与墙上时钟），A 股晚 0~4 秒。
+
+    60 秒是「本地多久没动算停更」，不该顺带把一路固定晚 15 分钟的源全天判成故障。
+    """
+    aged = quote(market="HK", code="03690", delayed=True, delay_s=900)
+    now = datetime(2026, 10, 23, 2, 15, 4, tzinfo=UTC)
+    assert quote_state(aged, now=now, market_open=True, stale_s=60) == DELAYED
+    broken = quote(
+        market="HK", code="03690", delayed=True, delay_s=900,
+        ts=datetime(2026, 10, 23, 1, 54, tzinfo=UTC),
+    )
+    assert quote_state(broken, now=now, market_open=True, stale_s=60) == STALE
+
+
+def test_the_allowance_comes_from_the_quote_not_from_the_market():
+    """同一只票换到新浪那一路就是晚 30 分钟：延时是这一笔的出处，不是市场的属性。
+
+    而 A 股那一路 `delay_s=0`，60 秒的本地闸一秒都不许放宽（放宽了就是拿旧价判止损）。
+    """
+    sina_hk = quote(market="HK", code="03690", delayed=True, delay_s=1800)
+    at_29_minutes = datetime(2026, 10, 23, 2, 29, tzinfo=UTC)
+    assert quote_state(sina_hk, now=at_29_minutes, market_open=True, stale_s=60) == DELAYED
+    a_share = quote(ts=datetime(2026, 10, 23, 1, 58, tzinfo=UTC))
+    assert quote_state(a_share, now=at_29_minutes, market_open=True, stale_s=60) == STALE
+
+
 def test_a_quote_from_the_future_is_not_reported_as_negative_age():
     future = quote(ts=datetime(2026, 10, 23, 2, 1, tzinfo=UTC))
     now = datetime(2026, 10, 23, 2, 0, tzinfo=UTC)
