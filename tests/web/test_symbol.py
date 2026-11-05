@@ -305,6 +305,23 @@ def test_deferred_without_error_leaves_no_empty_parenthesis(logged):
     assert "（）" not in page.text
 
 
+def test_a_code_the_table_does_not_know_gets_the_fourth_empty_state(logged):
+    """有主档行、代码表不认识、零根 K 线——实机 `A/000996` 的形状：正文说「不再向源问它」，
+    且不摆按钮。F5 之后「立即排一拍」点了队列纹丝不动，摆着就是骗人点（D314）。"""
+    ctx = logged.context
+    _seed_list_row(logged)  # A 市场有一份非空在册名单，里面没有 000996
+    ctx.symbols.upsert(
+        pl.DataFrame(
+            {"market": ["A"], "code": ["000996"], "name": ["退市股"], "currency": ["CNY"]}
+        )
+    )
+    page = logged.client.get("/symbol/A/000996")
+    assert page.status_code == 200
+    assert "代码表里没有这只票" in page.text
+    assert "立即排一拍" not in page.text
+    assert ctx.backfills_store.open_for("A", "000996") is None
+
+
 def test_page_with_bars_has_no_empty_state(logged):
     _seed(logged)
     page = logged.client.get("/symbol/A/600519")

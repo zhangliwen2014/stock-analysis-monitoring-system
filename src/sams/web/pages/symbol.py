@@ -163,9 +163,19 @@ def symbol_page(request: Request, market: str, code: str):
     no_bars = ctx.bars.count(market, code) == 0
     backfill_note = None
     backfill_deferred = False
+    backfill_known = True
     if no_bars:
+        # 第四档排在最前：代码表不认识这只票（实机的 A/000996）时，登记兴趣已经不排任何
+        # 补采了（D314），再说「没有排队：点立即排一拍」就是把用户支使去做一件后台已经
+        # 判定做不成的事——而那个按钮点了也确实纹丝不动
+        backfill_known = ctx.symbol_list_store.admits(market, code)
         backfill_row = ctx.backfills_store.open_for(market, code)
-        if backfill_row is None:
+        if not backfill_known:
+            backfill_note = (
+                "代码表里没有这只票（退市股、指数，或代码表还没跟上的新股）："
+                "不再向源问它，也不占夜间采集。"
+            )
+        elif backfill_row is None:
             backfill_note = "没有排队：点下面「立即排一拍」，否则等今晚盘后任务。"
         elif backfill_row.status == DEFERRED:
             backfill_deferred = True
@@ -198,6 +208,7 @@ def symbol_page(request: Request, market: str, code: str):
         no_bars=no_bars,
         backfill_note=backfill_note,
         backfill_deferred=backfill_deferred,
+        backfill_known=backfill_known,
         # 告警详情来的回跳（S1-B）：图上要标出判出那条告警的那根 bar
         focus=_focus_day(request.query_params.get("focus")),
         back_url=local_back(request.query_params.get("back")),

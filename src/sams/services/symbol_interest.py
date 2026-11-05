@@ -75,25 +75,32 @@ class SymbolInterest:
             )
             created = True
         queued = False
+        # 代码表不认识这只票就不再排任何补采（D314）：主档行照建，否则四个入口的语义变了，
+        # 但明知取不到的活排进去，每一拍都会替它试一次——`A/000996` 那行
+        # deferred / tries=3 就是这么攒出来的，而 #381 刚把队列的喘息口开进按只循环。
+        known = self.symbol_list.admits(market, code)
         latest = self.bars.latest_date(market, code)
         market_latest = self.bars.latest_date_for_market(market)
         # 库里有过 K 线不等于跟上了：那六只港股第一次打开补了 493 行，此后每次打开
         # `count` 都不是 0，旧判据再也不问第二句，页面就停在六个工作日之前（D309）。
         # 对照取市场自己的最大值而不是「最近一个已收盘的交易日」：市场整片没跑那天
         # 由日线 job 盖，不该给每个被打开过的票都排一条 730 天的活
-        if latest is None or (market_latest is not None and latest < market_latest):
+        if known and (latest is None or (market_latest is not None and latest < market_latest)):
             queued = self.backfills.enqueue(market, code)
         # 没覆盖确认就排一条：判据与今晚的 `actions` job 同一条，两边不会一个松一个紧
         actions_queued = False
-        if not self.coverage.full_history_confirmed(market, code, self.clock.today()):
+        if known and not self.coverage.full_history_confirmed(
+            market, code, self.clock.today()
+        ):
             actions_queued = self.backfills.enqueue(market, code, ACTIONS)
         logger.info(
-            "%s %s 登记兴趣 actor=%s 建主档=%s 排队日线=%s 排队公司行为=%s",
+            "%s %s 登记兴趣 actor=%s 建主档=%s 排队日线=%s 排队公司行为=%s 代码表在册=%s",
             market,
             code,
             actor,
             created,
             queued,
             actions_queued,
+            known,
         )
         return EnsureReport(market, code, created, queued, actions_queued)

@@ -39,7 +39,16 @@ def parts(db, settings, clock, coverage):
                 "py_initials": "payh",
                 "py_full": "pinganyinhang",
                 "currency": "CNY",
-            }
+            },
+            # 600519 也得在册：D314 之后「不在名单里」的票根本不排队，
+            # 那几条 stale 用例要测的就是「在册、但落后市场最大值」这一档
+            {
+                "code": "600519",
+                "name": "贵州茅台",
+                "py_initials": "gzmt",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            },
         ],
     )
     backfills = SymbolBackfillRepo(db)
@@ -149,6 +158,30 @@ def test_stale_confirmation_queues_once_a_day(db, parts, coverage, bars_frame):
     second = interest.ensure("A", "600519", actor="bob")
     assert (first.actions_queued, second.actions_queued) == (True, False)
     assert backfills.open_for("A", "600519", kind="actions") is not None
+
+
+def test_a_code_the_table_does_not_know_queues_nothing(db, parts):
+    """代码表不认识 = 向源问它注定失败：主档行照建，两条补采都不排（D314）。
+
+    `A/000996` 那行 `deferred / tries=3` 就是这么来的：点开过一次就排一条每晚白试三次的活，
+    而 #381 刚把补数的喘息口开进按只循环——明知失败的活排得越勤，越吃掉真缺口的份额。
+    """
+    symbols, backfills, interest = parts
+    report = interest.ensure("A", "000996", actor="alice")
+    assert report.created_master is True
+    assert report.queued is False
+    assert report.actions_queued is False
+    assert backfills.open_for("A", "000996") is None
+    assert backfills.open_for("A", "000996", kind="actions") is None
+
+
+def test_an_empty_code_table_still_queues(db, parts):
+    """整表没同步过时补采照排（D314 的「空表没有否决权」）：新装库第一晚加的票不能被判死刑。"""
+    _, backfills, interest = parts
+    report = interest.ensure("US", "AAPL", actor="alice")
+    assert report.created_master is True
+    assert report.queued is True
+    assert backfills.open_for("US", "AAPL") is not None
 
 
 def _one_bar(market: str, code: str, day: date) -> pl.DataFrame:
