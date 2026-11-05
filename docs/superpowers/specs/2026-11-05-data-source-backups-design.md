@@ -65,8 +65,8 @@ US: yfinance → tencent → sina_quote → nasdaq_trader → eastmoney_us_f10
 
 | 接口 | 上游 | 市场 | 能填的能力 | 实测 |
 |---|---|---|---|---|
-| `stock_zh_valuation_baidu` | 百度股市通 | A | 按日估值（按指标一问） | 365 行 / 4.5s |
-| `stock_hk_valuation_baidu` | 百度股市通 | HK | 按日估值 | 365 行 / 2.0s |
+| `stock_zh_valuation_baidu` | 百度股市通 | A | 按日估值（按指标一问） | 365 行 / 4.5s；一只票要问三次（PE(TTM)/PB/总市值）。**只有近一年/近三年逐日**：近五年两天一格、近十年五天一格、全部约十五天一格（600519 实测 913/731/614 行） |
+| `stock_hk_valuation_baidu` | 百度股市通 | HK | 按日估值 | 365 行 / 2.0s；同 A，一票三次 |
 | `stock_financial_analysis_indicator` | 新浪 | A | 基本面（按报告期） | 600519 全史 104 行 / 2.8s（1998–2026Q3）。**不给披露日**，也没有营收/净利金额列；`股息发放率(%)` 是分红÷净利，不是股息率 |
 | `stock_financial_abstract_new_ths` | 同花顺 | A | 基本面（长表 metric/value） | 1200 行 / 0.6s |
 | `stock_profile_cninfo` | 巨潮 | A | 公司概况 + **上市日期** | 1 行 / 0.2–0.9s（600519/000001/920289 三所各答 1 行，列里有 `上市日期`） |

@@ -19,6 +19,7 @@ ADAPTER_MODULES = {
     "akshare_cninfo",
     "akshare_hk",
     "akshare_ths",
+    "baidu_valuation",
     "eastmoney",
     "eastmoney_f10",
     "eastmoney_hk_f10",

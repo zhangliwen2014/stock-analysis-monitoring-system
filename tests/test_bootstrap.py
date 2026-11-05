@@ -96,6 +96,8 @@ def test_registry_chain_comes_from_the_database(migrated):
                 # 0048：巨潮要排在东财之后（它是概况/公告的备源，D324），
                 # 而它在 0047 里与东财同号、按名字排会抢到第 1 位
                 "akshare_cninfo",
+                # 0049：百度估值只报 valuation，挂在链尾；估值链上它紧跟 akshare（D324）
+                "baidu_valuation",
             ),
             # 链是「按市场的路由」，不是「谁能取日线」：akshare_hk 只报公司行为，
             # 采集时被跳过（D38），备源判据走 registry.chain_for(market, method)
@@ -106,6 +108,8 @@ def test_registry_chain_comes_from_the_database(migrated):
                 "eastmoney_f10",
                 "eastmoney_hk_f10",
                 "sina_quote",
+                # 0049：港股的按日估值原来只有 yfinance 一家
+                "baidu_valuation",
             ),
             "US": ("yfinance", "tencent", "sina_quote", "eastmoney_us_f10"),
         }
@@ -138,6 +142,11 @@ def test_registry_chain_comes_from_the_database(migrated):
         # 0048：A 股基本面第二源是新浪（D324）。它在日线链上排第 4，财务能力只由
         # 方法现身，所以这条链是「按优先级过滤后的能力链」，不是日线链的前缀
         assert built.registry.chain_for("A", "financials") == ("akshare", "sina")
+        # 0049：A 股估值的备源是百度（排在 akshare 后）；港股原来只有 yfinance 一家
+        assert built.registry.chain_for("A", "valuation") == ("akshare", "baidu_valuation")
+        assert built.registry.chain_for("HK", "valuation") == ("yfinance", "baidu_valuation")
+        # 美股估值没有第二个域（§4），这一路不进 US 的链
+        assert "baidu_valuation" not in built.registry.chain_for("US", "valuation")
     finally:
         built.close()
 
@@ -160,6 +169,7 @@ def test_disabling_a_source_takes_it_out_of_the_next_container(migrated):
             "eastmoney_f10",
             "sina_quote",
             "akshare_cninfo",
+            "baidu_valuation",
         )
         assert "akshare" not in second.registry.adapters, "停用源连适配器都不该建"
     finally:
