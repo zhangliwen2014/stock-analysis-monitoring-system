@@ -83,6 +83,29 @@ def test_a_wildcard_host_from_the_command_line_still_needs_allow_lan(settings):
         serve._server_for(settings, args(host="0.0.0.0"))
 
 
+def test_start_migrates_before_it_builds_the_chain_snapshot(settings, started, monkeypatch):
+    """#384：链快照在 `build_serve` 里就定了，迁移必须排在它前面。
+
+    顺序反过来的症状不是报错：新迁移种下的源要等第二次启动才上链，屏幕上先亮一轮
+    「这个市场只剩一个源」。
+    """
+    parts, _ = started
+    calls: list[str] = []
+
+    def fake_migrate(cfg):
+        calls.append("migrate")
+
+    def fake_build(cfg):
+        calls.append("build")
+        return parts
+
+    monkeypatch.setattr(serve, "migrate_before_start", fake_migrate)
+    monkeypatch.setattr(serve, "build_serve", fake_build)
+
+    assert serve.start(settings, args()) == 0
+    assert calls == ["migrate", "build"]
+
+
 def test_start_prepares_then_starts_and_passes_single_worker_flags(
     settings, started, capsys
 ):

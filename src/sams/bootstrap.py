@@ -1140,6 +1140,21 @@ def attach_system_alerter(context: ServiceContext) -> SystemAlerter:
     return alerter
 
 
+def migrate_before_start(settings: Settings) -> list[str]:
+    """把库里的迁移补齐，开一条自己的连接用完就关（#384）。
+
+    名字里的 `before_start` 是调用约束：必须在 `build_container` / `build_serve` **之前**。
+    链快照在装配那一刻就从库里定下来了，迁移晚一步不报错——新迁移种下的源要等
+    第二次启动才上链，屏幕上先亮一轮「这个市场只剩一个源」。补源靠迁移种子，
+    这条路必须是「一次启动就上岗」。
+    """
+    database = Database.open(settings.db_path)
+    try:
+        return apply_migrations(database)
+    finally:
+        database.close()
+
+
 def build_container(
     settings: Settings | None = None,
     *,
@@ -1267,7 +1282,11 @@ class ServeParts:
     runtime: Runtime
 
     def prepare(self) -> int:
-        """迁移、再灌板。顺序不能反：`load_board` 读的是 0019 的列。"""
+        """兜底再迁移一次，然后灌板。顺序不能反：`load_board` 读的是 0019 的列。
+
+        `serve.start` 已经在 `build_serve` 之前迁移过（#384：链快照不能早于迁移），
+        这里这一遍是幂等的——直接调 `build_serve` 的地方不经过入口那一步。
+        """
         self.contexts[0].migrate()
         return self.contexts[1].quotes.load_board()
 

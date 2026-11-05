@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import date, timedelta
 
 import polars as pl
@@ -327,8 +328,8 @@ def test_source_add_then_remove(container, capsys):
     assert "tx2" in capsys.readouterr().out
     assert cli_run_on(container, ["source", "list"]) == 0
     assert (
-        "yfinance → tencent → akshare_hk → eastmoney_f10 → eastmoney_hk_f10"
-        " → sina_quote → tx2"
+        "yfinance → tencent → akshare_hk → eastmoney_global → eastmoney_f10"
+        " → eastmoney_hk_f10 → sina_quote → baidu_valuation → sina_global → tx2"
     ) in capsys.readouterr().out
 
     assert cli_run_on(container, ["source", "remove", "tx2"]) == 0
@@ -394,18 +395,43 @@ class _FakeSina:
         ]
 
 
+def test_one_start_puts_a_newly_seeded_source_on_the_chain(config_path, capsys, tmp_path):
+    """#384：迁移排在链快照之前，第一次运行就要看见新迁移种下的源。
+
+    链快照在建容器时定下来。旧库（0051 之前）里没有 eastmoney_global：先建容器再迁移
+    的话这一趟的 `[降级链]` 里就没有它，要等第二次启动——补源成了「重启两遍」。
+    """
+    partial = tmp_path / "migrations-before-0051"
+    partial.mkdir()
+    for path in discover():
+        if path.name < "0051":
+            shutil.copy(path, partial / path.name)
+    db = Database.open(tmp_path / "sams.duckdb")
+    try:
+        apply_migrations(db, partial)
+    finally:
+        db.close()
+
+    assert cli.run(["health"]) == 0
+    assert "eastmoney_global" in capsys.readouterr().out
+
+
 def test_health_shows_chains_and_flags_a_single_source_market(config_path, capsys):
-    """health 要说的是「这个进程会用哪条链」，一个市场的单源状态要从这一屏看出来。"""
+    """health 要说的是「这个进程会用哪条链」，一个市场的单源状态要从这一屏看出来。
+
+    0050 起港股日线有三家（yfinance/腾讯/新浪），所以这里要把另外两家摘掉才剩下单源。
+    """
     # 走真实入口：cli.run 会先补齐迁移，链的权威来源是库里的记录
     assert cli.run(["source", "unroute", "HK", "tencent"]) == 0
     assert cli.run(["source", "unroute", "HK", "akshare_hk"]) == 0
+    assert cli.run(["source", "unroute", "HK", "sina_global"]) == 0
     capsys.readouterr()
 
     assert cli.run(["health"]) == 0
     out = capsys.readouterr().out
     assert "[降级链]（库里的记录）" in out
     assert "akshare → eastmoney → tencent → sina" in out
-    # F10 那几个源只供资料/指标，日线仍然只有 yfinance：那句「没有备源」必须看得见
+    # 其余那些源只供资料/指标/分钟K，日线仍然只有 yfinance：那句「没有备源」必须看得见
     assert "yfinance → " in out and "sina_quote(仅报价)" in out, (
         "每个源都健康 ≠ 有备源：这里必须看得见"
     )
@@ -432,8 +458,10 @@ def test_an_actions_only_source_is_not_counted_as_a_bars_backup(config_path, cap
     而 ⚠ 日线单源永远不出现——D38 分能力记账就是为了这一屏不说假话。
     （SP1 起 akshare_hk 还多一个代码表能力：「仅」后面的那串就是它此刻的本事清单，
     能力长了这一屏要跟着长，这才是分能力记账的本意。）
+    新浪（0050）也是港股日线源，先摘掉它才能让「单源」这件事成立。
     """
     assert cli.run(["source", "unroute", "HK", "tencent"]) == 0
+    assert cli.run(["source", "unroute", "HK", "sina_global"]) == 0
     capsys.readouterr()
 
     assert cli.run(["health"]) == 0

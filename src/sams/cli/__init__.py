@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from sams.bootstrap import build_container
+from sams.bootstrap import build_container, migrate_before_start
 from sams.cli import (
     alert,
     analysis,
@@ -85,6 +85,11 @@ def run(argv: list[str] | None = None) -> int:
         # 分派必须在这里、在容器之前——先造容器会白开一条并把它握在 CLI 手里
         return serve.start(settings, args)
     try:
+        if args.command != "db":
+            # #384：迁移排在链快照前面。建容器那一刻链就从库里定下来了；晚一步的迁移
+            # 幂等，但这一趟的链已经旧了，新源要等下一次启动才上岗。
+            # `db` 命令例外：status 要看的就是「还有哪些没应用」。
+            migrate_before_start(settings)
         container = build_container(settings)
     except DatabaseLocked as exc:
         # 「库被占用」不是配置错误：那个进程可能正在干活（D111）。
@@ -97,10 +102,6 @@ def run(argv: list[str] | None = None) -> int:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 1
     try:
-        if args.command != "db":
-            # 迁移幂等，因此非 db 命令顺手补齐表结构：新装环境直接 `sams user add`
-            # 不该撞 CatalogException；`db migrate/status` 保留手工检视迁移的语义。
-            container.migrate()
         return args.handler(container, args)
     except SamsError as exc:
         print(f"错误: {exc}", file=sys.stderr)

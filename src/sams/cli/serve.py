@@ -15,7 +15,7 @@ from dataclasses import replace
 
 import uvicorn
 
-from sams.bootstrap import build_serve
+from sams.bootstrap import build_serve, migrate_before_start
 from sams.cli.common import EXIT_LOCKED, advertised_url
 from sams.core.config import ServerCfg, Settings
 from sams.core.errors import DatabaseLocked, SamsError, ValidationError
@@ -75,6 +75,9 @@ def start(settings: Settings, args: argparse.Namespace) -> int:
     parts = None
     runtime = None
     try:
+        # #384：链快照在 `build_serve` 里就定了，迁移必须排在它前面——否则新迁移
+        # 种下的源要等第二次重启才上链
+        migrate_before_start(settings)
         parts = build_serve(settings)
         runtime = parts.runtime
         restored = parts.prepare()

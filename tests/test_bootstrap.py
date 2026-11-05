@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -26,6 +27,7 @@ from sams.services.accounts import AccountService
 from sams.services.intraday import MarketPoll
 from sams.services.quotes import QuotePollResult
 from sams.storage.db import Database
+from sams.storage.migrate import MIGRATIONS_DIR, apply_migrations
 from sams.storage.repos.alerts import AlertRepo
 from sams.storage.repos.channels import ChannelRepo
 from sams.storage.repos.ledger import SimAccountRepo, SimOrderRepo
@@ -206,6 +208,42 @@ def test_registry_chain_comes_from_the_database(migrated):
         assert built.registry.chain_for("HK", "valuation") == ("yfinance", "baidu_valuation")
         # 美股估值没有第二个域（§4），这一路不进 US 的链
         assert "baidu_valuation" not in built.registry.chain_for("US", "valuation")
+    finally:
+        built.close()
+
+
+def test_migrating_before_the_container_puts_the_newest_seed_on_the_chain(settings, tmp_path):
+    """#384：只启动一次，新迁移种下的源就要出现在链快照里。
+
+    链快照在建容器时就从库里定下来了。旧库里没有 0051，先建容器再迁移的话这一趟
+    永远看不见 `eastmoney_global`——它要等第二次启动才上链，屏幕上先亮一轮
+    「HK 少了一个源」。所以入口必须先 `migrate_before_start`，再建容器。
+    """
+    partial = tmp_path / "migrations-before-0051"
+    partial.mkdir()
+    for path in MIGRATIONS_DIR.glob("*.sql"):
+        if path.name < "0051":
+            shutil.copy(path, partial / path.name)
+    db = Database.open(settings.db_path)
+    try:
+        apply_migrations(db, partial)
+    finally:
+        db.close()
+
+    stale = build_container(settings)
+    try:
+        assert "eastmoney_global" not in stale.registry.market_sources["HK"]
+    finally:
+        stale.close()
+
+    assert "0051_eastmoney_global.sql" in bootstrap.migrate_before_start(settings)
+
+    built = build_container(settings)
+    try:
+        assert "eastmoney_global" in built.registry.market_sources["HK"]
+        assert "eastmoney_global" in built.registry.market_sources["US"]
+        assert built.source_admin.list(), "目录页读的就是这张表"
+        assert "eastmoney_global" in {row.name for row in built.source_admin.list()}
     finally:
         built.close()
 
