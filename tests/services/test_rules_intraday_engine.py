@@ -57,6 +57,27 @@ def test_a_stale_quote_is_refused_at_the_gate(db, settings):
     assert engine.data.as_of_seen == []
 
 
+def test_the_gate_widens_by_the_delay_the_feed_declares_and_says_so(db, settings):
+    """D321：引擎这一头放宽多少，必须和状态机用同一个数——否则页面说「延迟」、告警说「停更」。
+
+    更要紧的是：港股那一路本来就晚 15 分钟，60 秒的本地阈值能把每一笔都挡在闸外，
+    于是止损整天不判，而屏幕上没有任何一处说这件事。
+    """
+    h = Harness(db, settings)
+    h.add()
+    engine = h.engine()
+    aged = quote(delayed=True, delay_s=900, ts=TS - timedelta(seconds=900))
+    got = engine.check(USER, intraday=True, quotes=board(aged))
+    assert not got.skipped and len(got.raised) == 1
+    assert "延迟" in h.sender.sent[0].body
+
+    broken = quote(delayed=True, delay_s=900, ts=TS - timedelta(seconds=1200))
+    got = engine.check(USER, intraday=True, quotes=board(broken))
+    reason = got.skipped[0].reason
+    assert "源自己声明晚 900 秒" in reason
+    assert "上限 960 秒" in reason
+
+
 def test_a_fresh_quote_overlays_and_flows_to_a_hit(db, settings):
     h = Harness(db, settings)
     h.add()

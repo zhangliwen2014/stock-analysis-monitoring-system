@@ -29,7 +29,7 @@ from sams.core.config import Settings
 from sams.core.errors import NotAdjustable, SamsError, ValidationError
 from sams.core.events import AlertTriggered, EventBus, RuleHit
 from sams.core.notify import AlertMessage, AlertSender
-from sams.core.quotes import Quote, local_day, source_label
+from sams.core.quotes import Quote, local_day, source_label, stale_allowance
 from sams.core.rules import (
     HIT,
     PRE,
@@ -677,13 +677,20 @@ class RuleEngine:
             return None
 
     def _stale_note(self, quote: Quote) -> str:
-        """盘中那一道新鲜度闸（§5.2）：陈旧的报价宁可跳过，也不能拿来判止损。"""
+        """盘中那一道新鲜度闸（§5.2）：陈旧的报价宁可跳过，也不能拿来判止损。
+
+        放宽多少跟着这一笔报价自己声明的延时走，和状态机用同一个数（D321）——
+        港股那一路本来就晚 15 分钟，按本地 60 秒算的话每一笔都挡在闸外，
+        止损整天不判而屏幕上没有任何一处说这件事。
+        """
         if quote.is_stale:
             return "报价源把这一笔标成了不可信（stale）：这一趟不判"
         age = (self.clock.now_utc() - quote.ts).total_seconds()
-        if age > self.settings.quote_stale_s:
+        limit = stale_allowance(quote, self.settings.quote_stale_s)
+        if age > limit:
+            declared = f"，源自己声明晚 {quote.delay_s} 秒" if quote.delay_s else ""
             return (
-                f"报价距今 {int(age)} 秒，超过上限 {self.settings.quote_stale_s} 秒："
+                f"报价距今 {int(age)} 秒，超过上限 {int(limit)} 秒{declared}："
                 "这一趟不判"
             )
         return ""
