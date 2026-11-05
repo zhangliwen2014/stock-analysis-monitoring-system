@@ -251,6 +251,33 @@ def test_the_dividend_card_queues_the_backfill_instead_of_a_command(logged_f10):
     assert logged_f10.context.backfills_store.open_for("A", "600519", kind="actions") is not None
 
 
+def test_the_dividend_card_stops_claiming_a_queue_for_an_unknown_code(logged_f10):
+    """代码表不认识这只票：分红格不许再说「已排进后台补采队列」——D314 之后根本没排。
+
+    上一条用例把那句话当成承诺（「不是安慰话」）；对一只后台已判定不再向源问的票重复
+    同一个承诺，屏幕上就是纯假话：队列里查不到任何一行，而它说「补完这张表自动出现」。
+    """
+    ctx = logged_f10.context
+    ctx.symbol_list_store.upsert_batch(
+        "A",
+        [
+            {
+                "code": "600519",
+                "name": "贵州茅台",
+                "py_initials": "gzmt",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            }
+        ],
+    )
+    _symbol(ctx, "A", "000996", "退市股", "CNY")
+    assert logged_f10.client.get("/symbol/A/000996").status_code == 200
+    text = logged_f10.client.get("/api/partials/f10?market=A&code=000996").text
+    assert "已排进后台补采队列" not in text
+    assert "代码表里没有这只票" in text
+    assert ctx.backfills_store.open_for("A", "000996", kind="actions") is None
+
+
 def test_hk_page_normalises_the_code_for_the_same_material(logged_f10):
     ctx = logged_f10.context
     _symbol(ctx, "HK", "00700", "腾讯控股", "HKD")

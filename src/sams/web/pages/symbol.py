@@ -566,6 +566,9 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
         currency=symbol.get("currency") or "",
         read=read,
         kind_labels=_ACTION_KIND_LABELS,
+        # 分红格那句「已排进后台补采队列」是一句承诺：D314 之后代码表不认识的票根本不排，
+        # 模板得知道这一点才不许把假话说圆
+        admitted=ctx.symbol_list_store.admits(market, code),
         news_feed=news_feed,
         news_covered=market in NEWS_MARKETS,
         all_news_url=f"/news?market={market}&code={code}",
