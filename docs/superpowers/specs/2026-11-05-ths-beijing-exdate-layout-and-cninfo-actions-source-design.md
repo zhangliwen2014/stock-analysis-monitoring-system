@@ -1,6 +1,6 @@
 # 同花顺那张没有 A 股除权日的表：读不出 ≠ 源改版 ≠ 查无（#383）
 
-**状态**：设计待审
+**状态**：已实现（一期 `56106d3`、二期 `c9a79d2`；§7 的单票实机已回填，当晚整趟 `actions/A` 的失败数待今晚读数）
 **日期**：2026-11-05
 **关联**：#360（港股「从没派息」被读成源改版，同一族错误的另一头）、#364/D279（源冷却）、#368/D283（覆盖缺口排队）、#382/D314（同一条准入判据）、D34（每 10 股口径反查）、D36（「没有」要由源说）、D40（全史不按窗口切）、D43（公司行为的 0 行不是成功取数）
 **数据来源**：实机库 `data/sams.duckdb`（11-05 11:34 从运行中的服务复制的只读快照 `tmp/snap_383.duckdb`）、
@@ -166,40 +166,128 @@ else:                                       # 其余（实测：北交所）
 
 ## 6. 测试（先红后绿，逐条一件事）
 
-1. `test_the_beijing_layout_without_the_a_share_ex_date_column_is_not_a_redesign`
+一期（`tests/datasource/test_akshare_ths.py`）：
+
+1. `test_the_beijing_layout_with_nothing_implemented_answers_no_records`
    喂 §2 里 920289 的真实列集 + 只有预案的行 → 期望返回空帧（**不抛** FieldDrift）。
-2. `test_an_implemented_scheme_that_cannot_be_dated_is_read_as_unanswerable`
+2. `test_an_implemented_scheme_without_a_datable_ex_date_is_unanswerable`
    同一列集、把一行进度改成「实施方案」→ 期望 `EmptyResponse`，正文含「实施方案」与 1。
 3. `test_a_response_missing_the_scheme_columns_is_still_a_redesign`
    缺 `分红方案说明` → 仍抛 `FieldDrift`（真改版的报警能力不能因为一期被削掉）。
-4. `test_a_page_with_no_table_at_all_is_unanswerable_not_a_failure`
-   适配器注入的 fetch 抛 `ValueError: No tables found` → 期望 `EmptyResponse`。
-5. `test_an_unanswerable_code_does_not_cool_the_source_down`（registry 级）
-   同花顺对代码甲答「读不出」后，代码乙仍被真调用——钉住 D316 要解决的放大效应本身。
-6. 二期：`test_cninfo_ratios_are_per_ten_shares`（600519 末行 280.2423 → 每股 28.02423）、
-   `test_the_bonus_and_transfer_on_one_row_are_two_facts`、
-   `test_empty_records_from_cninfo_answer_nothing_not_a_crash`（注入 `records: []`）。
+4. `test_a_page_with_no_table_at_all_is_unanswerable_not_a_failure` /
+   `test_a_real_source_failure_is_still_a_real_failure`（D317）
+   注入的 fetch 抛 `ValueError: No tables found` → `EmptyResponse`；抛别的 → 仍按故障归类。
+5. `test_an_unanswerable_code_does_not_cool_the_source_down`（`test_registry.py`，registry 级）
+   同花顺对代码甲答「读不出」后，代码乙仍被真调用（12 轮 12 次、`consecutive_failures` 仍 0），
+   并带一个对照组：同一只链上换成真故障，12 轮只调 10 次——钉住 D316 要解决的放大效应本身。
+
+二期（`tests/datasource/test_akshare_cninfo.py`，25 条；行内数据全部来自 11-05 实网探测）：
+
+- 单位与拆行：`test_cninfo_ratios_are_per_ten_shares`（600519 末行 280.2423 → 每股 28.02423）、
+  `test_a_cash_row_is_converted_from_per_ten_to_per_share`、
+  `test_a_transfer_and_a_dividend_on_one_row_are_two_facts`、
+  `test_bonus_shares_are_a_different_fact_from_transferred_ones`、
+  `test_the_ex_rights_date_is_the_anchor_not_the_registration_date`。
+- 反查失败要响：`test_a_number_that_disagrees_with_the_written_scheme_fails_loudly`、
+  `test_a_scheme_written_per_share_is_a_unit_drift`。
+- 三态：`test_an_empty_response_frame_answers_that_there_was_nothing`、
+  `test_a_table_where_no_row_can_be_dated_answers_nothing`、
+  `test_a_dated_row_with_no_numbers_is_kept_as_unknown`（D39）、
+  `test_a_scheme_that_says_no_distribution_is_a_complete_answer`、
+  `test_a_frame_without_the_ratio_columns_is_a_redesign`。
+- 「查无记录」那句要问得出来：`test_empty_records_from_cninfo_answer_nothing_not_a_crash`、
+  `test_a_crash_that_is_not_a_no_records_answer_still_raises`，以及信封四判
+  `test_the_no_records_verdict_comes_from_the_envelope_not_the_crash` /
+  `test_records_present_means_the_crash_was_not_a_no_records_answer` /
+  `test_an_unreadable_envelope_is_not_a_no_records_answer` /
+  `test_a_probe_that_raises_is_not_a_no_records_answer`（#360 同一族）。
+- 适配器：`test_the_adapter_is_a_full_history_actions_only_source`、
+  `test_the_adapter_gives_back_the_whole_history_not_the_window`（D40）、
+  `test_the_adapter_names_the_code_it_was_asked_about`、
+  `test_an_unknown_row_survives_the_adapter_rather_than_becoming_nothing`、
+  `test_an_unsupported_market_is_refused_before_the_network`。
+- 链：`test_a_third_source_answers_when_the_first_two_cannot`（`test_registry.py`，
+  东财「查无」→ 同花顺「读不出」→ 巨潮有行，且 `confirmed_empty_by` 为空）。
+- 接线：`test_sources_pluggable.py` 的模块清单与能力断言、`test_bootstrap.py` 的 A 链
+  `("akshare", "akshare_ths", "akshare_cninfo")`、`test_data_sources.py` 的种子数 11→12。
+
+**落地时对 D316 的一处收细**：单行缺除权日 ⇒ 计数 + `logger.warning` 后丢弃（与一期同花顺那侧
+已审的口径一致，`akshare_ths.py:195` 同理），只有**一行都定不了位**时才抛 `EmptyResponse`。
+整批失败会把一只票 30 条除权换成一条都不入库；而「有记录却一行都读不出」必须抛，因为交回空帧
+会被 `corp_actions` 读成一句「这只票没除权过」并写下假覆盖确认。
+
 
 ## 7. 实机验证（上线后读什么）
 
-- 当晚 `task_runs` 的 `actions/A` 失败数：只做一期应掉到 **6**
+### 单票实机（11-05 13:39，serve 停机期间走 CLI，库为 `data/sams.duckdb`）
+
+`sams sync actions --market A --code 920289` 的实际读数：
+
+```
+920289     源=akshare_cninfo 取回=1 入库=1 确认至=2026-11-05（全历史：取回与入库不受请求窗口约束）
+           [降级: akshare✓ → akshare_ths✗ → akshare_cninfo✓]
+同花顺跳过未实施的公司行为 5 行（进度 {'董事会预案': 3, '股东大会预案': 2}）
+```
+
+- `corp_actions`：`A / 920289 / 2024-07-17 / transfer / ratio 2.25397 / src=akshare_cninfo`
+  —— 与 §2 探测到的原始行逐字对上（`转增比例 12.5397` ⇒ 每股 1.25397 ⇒ 乘数 2.25397）。
+- `corp_actions_coverage`：`920289 / src=akshare_cninfo / full_history=True /
+  covered_from 2024-07-17 / covered_to 2026-11-05`。同花顺当初就是这里给不出确认。
+- 同花顺那一侧按 D316 答的是「读不出」，正文带着定位不了的行：
+  `这张表里没有「A股除权除息日」列，读不出 1 行「实施方案」定位不到除权日：2024-07-09 10转12.5397股`。
+- **一条本轮踩到的装配次序**：`build_core` 在读 `data_source_routes` 时把降级链固化成 registry
+  的一份快照，而迁移在其后才跑（`cli/__init__.py:99-103` 先建容器再 `container.migrate()`；
+  `ServeParts.prepare()`（`bootstrap.py:1271`）同样在 `build_serve` 之后）。于是**加迁移的那一趟
+  看不到新源**：13:39 的第一次同步里链还是 7 个源、没有 `akshare_cninfo`，第二次才有。
+  当前进程（13:41 启动）已带上它。这条不改代码，记在 §8。
+
+### 当晚整趟（待今晚 `actions/A` 跑完回填）
+
+- 当晚 `task_runs` 的 `actions/A` 失败数：只做一期是 **6**
   （920289/920093/920079/920238/920162/001246，全部落到「读不出」这一类），
   一二期都上线后掉到 **2**（920162、001246——恰恰是巨潮也无记录、同花顺又不写日期的那两只）。
   note 的分母仍是 `N/503`。落不到的话以实际读数为准回写本节。
-- `data_source_records` 里 `akshare_ths` 的 `consecutive_failures` 归 0，`tmp/serve.log`
-  不再出现「源 akshare_ths 连续失败 N 次 …缺少必需列 ['A股除权除息日']」。
-- 二期后 `corp_actions` 出现 A/920289（transfer，ex_date 2024-07-17，ratio 2.25397）等四行，
-  `corp_actions_coverage` 里这四只各有一条 `src='akshare_cninfo'` 的全史确认。
+- `source_health`（表名以此为准，spec 初稿写的 `data_source_records` 不存在）里 `akshare_ths` 的
+  `consecutive_failures` 归 0。13:39 实测该行仍是 **39**、`ok=False`、
+  `last_error` 是 `FieldDrift: [akshare_ths] 分红送配响应缺少必需列 ['A股除权除息日']…`——
+  这个读数属于**一期之前的那个进程**（10:26 启动，一期 12:01 才提交），不是新代码还在这样判：
+  13:41 重启后的日志里这一句出现 **0** 次，`akshare_ths` 现在答的是
+  `回答无数据（A 920079），换源`（`no_answer` 那一类，不记连败，D317 的全部意义）。
+  39 这个数要等同花顺真的答成功一次才清得掉。`akshare_cninfo` 自身 `consecutive_failures=0`、
+  `ok=True`。
+- `tmp/serve.log` 不再出现「源 akshare_ths 连续失败 N 次 …缺少必需列 ['A股除权除息日']」：
+  13:41 重启后到 13:46 的出现次数为 0。
+- 二期后 `corp_actions` 里那四只北交所票各有 `src='akshare_cninfo'` 的全史确认。
+  **13:46 实机读数（新进程，补采队列正在跑）**：`920079`（除权日 2024-12-26）、
+  `920093`（2024-11-21）、`920238`（2025-05-30）、`920289`（2024-07-17）各 1 行，
+  四只的 `corp_actions_coverage` 都只有 `akshare_cninfo` 一条、`full_history=True`。
+  队列另外把 `920136 / 920156 / 920285 / 688221 / 920258` 判成「三源都说没有」，
+  各拿到 `akshare` + `akshare_ths` + `akshare_cninfo` 三条确认——这正是 D36 要的
+  「没有由源自己说」。收敛次序在日志里看得见：
+  `公司行为 akshare_ths 回答无数据（A 920079），换源` ⇒
+  `A 920079 公司行为 1 条（源 akshare_cninfo，确认至 2026-11-05，全历史）`。
+  `920162`、`001246` 两张表里都没有行，与 §1 的预测一致：巨潮也 `records: []`、
+  同花顺又不写日期，三个源没有一个能定住除权事件，于是既没有事实也没有确认，今晚仍挂在失败里。
 - 健康页对 920162/001246 那句话要说「同花顺这张表里读不出除权日」，不说「这只票没分过红」，
-  也不给任何手工命令（D146 的话术边界）。
+  也不给任何手工命令（D146 的话术边界）。**待今晚读数。**
+
 
 ## 8. 已知缺口与非目标
 
 - **同一个谎言在 A 股列那条路上也存在**：表里有 `A股除权除息日`、但某一行是 `NaT`
   （实测 600585 有一行）时，`expand_ths` 只计数丢弃（`akshare_ths.py:195`），剩下的行照样让
-  这个源答成「全史」——被丢掉的那一行因此被写成了「没有」。本期不修：要修的是「给覆盖标记带上
-  一个下限日」，动的服务层是 `coverage` 的写入形状（`covered_from`/`full_history` 是现成的列，
-  但把「部分确认」这件事说清需要单独一轮）。本期先把北交所这条最宽的口子扎住。
+  这个源答成「全史」——被丢掉的那一行因此被写成了「没有」。巨潮那侧本轮采用了同一口径
+  （`test_an_undated_row_does_not_discard_the_dated_ones` 把它钉成了显式决定，不是疏漏）。
+  本期不修：要修的是「给覆盖标记带上一个下限日」，动的服务层是 `coverage` 的写入形状
+  （`covered_from`/`full_history` 是现成的列，但把「部分确认」这件事说清需要单独一轮）。
+  本期先把北交所这条最宽的口子扎住。
+- **新注册的源要重启两次才上岗**：`build_core` 把 `data_source_routes` 读成 registry 的一份
+  链快照（`bootstrap.py:501-502`），而迁移排在其后——CLI 是 `cli/__init__.py:99` 先建容器再
+  `container.migrate()`，`serve` 是 `ServeParts.prepare()`（`bootstrap.py:1271`）在 `build_serve`
+  之后。11-05 实测：加 0047 的那一趟同步里链还是 7 个源、没有 `akshare_cninfo`，第二次才有。
+  本期不改（动的是装配次序：要么把迁移提到 `build_core` 之前，要么让 registry 每次取链时重读），
+  因为**改错了会让每次采集多一轮全表读**，而这条只在「加源当天」咬人——按上面的口径，
+  加完迁移再重启一次 serve 即可。
 - 不改冷却键的粒度（按源名、不按代码）。一期之后「读不出」不再计入连败，剩下的
   「一只票真把源打挂 → 全市场换下一个源」是 D279 本来的取舍。
 - 不动 #365（孤源链整夜撞墙）与 #370（T1a 话术），两条仍在等用户定的范围里。
