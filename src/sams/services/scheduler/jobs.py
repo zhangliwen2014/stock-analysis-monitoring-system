@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Callable
 from dataclasses import replace
@@ -43,6 +44,8 @@ from sams.services.scheduler.types import (
     JobSpec,
 )
 from sams.storage.repos.symbol_backfills import ACTIONS, BARS
+
+logger = logging.getLogger("sams.services.scheduler.jobs")
 
 #: 首次见到一只票时回补多久：对齐 PR 分位的样本地板 `MIN_SAMPLES = 250`
 #: （`analysis/valuation/percentile.py`：少于它，「分位说的是抽样噪声而不是估值位置」）。
@@ -87,6 +90,24 @@ def _units(ctx: JobContext) -> list[tuple[str, str]]:
     return [(ctx.market, code) for code in codes]
 
 
+def _breathe(deps: JobDeps) -> None:
+    """两只票之间给补数队列一次喘息（#381 / D313）。
+
+    为什么在这里而不是只在一拍开头（`service.py` 那一处）：一拍的长度由最慢的那条按只
+    循环决定（实测 45~60 分钟），把消化排在一拍开头等于让「有人正盯着的那个页面」等一拍。
+    而这里已经是单线程 —— 补数用的是同一条连接、同一个线程，不引入 DuckDB 的并发写。
+
+    吞掉一切异常是这条唯一的理由：补数是顺带做的事，它崩了的症状不该变成「公司概况
+    今天没跑成」——那会把一个止损机制变成新的噪音源。
+    """
+    if deps.backfill_pump is None:
+        return
+    try:
+        deps.backfill_pump()
+    except Exception as exc:
+        logger.warning("补数喘息口自己炸了，忽略并继续按只循环：%s", exc)
+
+
 def _collect(
     deps: JobDeps,
     units: list[tuple[str, str]],
@@ -126,6 +147,7 @@ def _collect(
             errors.append(f"{market} {code}: {exc}")
         else:
             done += 1
+        _breathe(deps)
     note = f"{done}/{len(units)} 只{label}"
     if errors:
         note += f"，{len(errors)} 只失败"

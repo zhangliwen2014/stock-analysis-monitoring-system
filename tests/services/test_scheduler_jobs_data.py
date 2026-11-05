@@ -994,3 +994,58 @@ def test_per_symbol_jobs_are_registered_with_the_configured_budget(db, settings)
     }
     for name in ("bars", "actions", "financials", "valuation", "flow", "profile"):
         assert specs[name].max_wall_s == 45 * 60, name
+
+
+# #381：把补数队列的喘息口开在两只票之间
+
+
+class CountingPump:
+    """记录自己被叫了几次的泵；`_collect` 只管「这里可以让别人喘口气」。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+
+
+def test_the_pump_gets_one_breath_per_symbol_and_none_after_the_budget(db, settings):
+    """泵的被调用次数 = 处理完的票数：一只票一次，到点收工之后不再叫。
+
+    这条钉的是「点开的那只票最多等下一只票」这个承诺（#381）。拍头的消化等不起：
+    一拍实测 45~60 分钟，而页面是给人看的。
+    """
+    adapter = RecordingBarsAdapter(frame=sample_bars(code="600519"))
+    pump = CountingPump()
+    d = replace(
+        deps(db, replace(settings, scheduler_job_max_min=20), bars=adapter),
+        backfills=SymbolBackfillRepo(db),
+        monotonic=SteppingMonotonic(600.0),
+        backfill_pump=pump,
+    )
+    outcome = run_bars(d, ctx("600519", "601088", "601857", deadline=1200.0))
+
+    assert pump.calls == 2  # 跑完的那两只各一次；被截断的第 3 只没有
+    assert outcome.truncated is True
+
+
+def test_a_broken_pump_does_not_break_the_job(db, settings):
+    """泵里炸出来的东西只该被说一句，不许把整条 job 崩掉。
+
+    补数是「顺带做的事」：它崩了的症状不该是「公司概况今天没跑成」，那会把一个止损
+    机制变成新的噪音源（`jobs.py` 里那句「噪音的下场是没人再读」是同一个理由）。
+    """
+
+    def exploding_pump() -> None:
+        raise RuntimeError("泵里的编程错误")
+
+    adapter = RecordingBarsAdapter(frame=sample_bars(code="600519"))
+    d = replace(
+        deps(db, settings, bars=adapter),
+        monotonic=lambda: 0.0,
+        backfill_pump=exploding_pump,
+    )
+    outcome = run_bars(d, ctx("600519", "601088"))
+
+    assert [call[1] for call in adapter.calls] == ["600519", "601088"]
+    assert outcome.ok and outcome.errors == ()

@@ -72,7 +72,7 @@ from sams.services.rules.recheck import Rechecker
 from sams.services.rules.snapshot import RuleData
 from sams.services.runtime import Runtime
 from sams.services.scheduler.alarms import SystemAlerter
-from sams.services.scheduler.backfill import BackfillConsumer
+from sams.services.scheduler.backfill import BackfillConsumer, BackfillPump
 from sams.services.scheduler.beatfile import beat_path
 from sams.services.scheduler.jobs import build_jobs
 from sams.services.scheduler.report import ScheduleData, collect
@@ -898,12 +898,15 @@ def _context_on(
         assumptions_store,
         clock=clock,
     )
+    # 补数队列的消费者（D144）：四入口排的行由调度线程吃掉。同一个实例服务两处——
+    # 一拍开头（D144）与两条 job 之间的那个喘息口（D313），所以那 3 条一口的额度是
+    # 两头共用的一份，不会因为这个喘息口变成每只票三口
+    backfill_consumer = BackfillConsumer(sync, corp_action_sync, backfills_store, cfg)
     deps = JobDeps(
         settings=cfg,
         registry=registry,
         sync=sync,
-        corp_actions=corp_action_sync,
-        fundamentals=fundamental_sync,
+        corp_actions=corp_action_sync,        fundamentals=fundamental_sync,
         f10=f10_sync,
         fx=fx_sync,
         calendar=calendar,
@@ -925,6 +928,8 @@ def _context_on(
         sim_accounts=sim_accounts,
         ledger=ledger,
         backfills=backfills_store,
+        # 两只票之间给补数队列一次喘息（#381 / D313）：点开的那只票不该等下一拍
+        backfill_pump=BackfillPump(backfill_consumer, clock=clock),
     )
     scheduler = Scheduler(
         cfg,
@@ -942,7 +947,7 @@ def _context_on(
         # 所有上下文共用同一只队列：只有调度线程跑循环，但谁都能往里放请求
         requests=core.requests,
         # 补数队列的每拍消费者（D144）：四入口排的行由调度线程按拍吃掉
-        backfill=BackfillConsumer(sync, corp_action_sync, backfills_store, cfg),
+        backfill=backfill_consumer,
     )
 
     return ServiceContext(

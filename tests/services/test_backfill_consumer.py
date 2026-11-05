@@ -4,10 +4,11 @@ from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pytest
+from support import FrozenClock
 
 from sams.core.errors import DatasourceError
 from sams.core.timeutil import HISTORY_START
-from sams.services.scheduler.backfill import BackfillConsumer
+from sams.services.scheduler.backfill import BackfillConsumer, BackfillPump
 from sams.services.sync import SyncSummary
 from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
 
@@ -119,3 +120,40 @@ def test_actions_failure_books_on_the_row(settings, db):
     row = repo.open_for("A", "600519", kind="actions")
     assert (row.status, row.tries) == ("pending", 1)
     assert row.last_error == "[akshare] 链上没有能采公司行为的源"
+
+
+class SteppingMonotonic:
+    """每问一次走一步的单调钟：那一步就是「两次喘息之间过了多久」。"""
+
+    def __init__(self, step_s: float) -> None:
+        self.step_s = step_s
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        value = self._now
+        self._now += self.step_s
+        return value
+
+
+def test_the_pump_gives_the_queue_a_breath_only_every_min_gap(db, settings):
+    """泵每 20 秒真动手一次：一条 505 只的循环里它会被叫五百次，绝大多数要看一眼就返回。
+
+    闸落在「上次真的动手」那一刻上，不是「上次被调用」——否则一直有队列可拿的那一段
+    会把闸不断往后推，反而补得更慢。
+    """
+    repo = SymbolBackfillRepo(db)
+    for code in ("600519", "000001", "600000", "601299"):
+        repo.enqueue("A", code)
+    sync = StubSync([_summary(), _summary(), _summary(), _summary()])
+    consumer = BackfillConsumer(sync, StubActions(), repo, settings, limit=1)
+    pump = BackfillPump(
+        consumer,
+        clock=FrozenClock(MOMENT),
+        monotonic=SteppingMonotonic(10.0),
+    )
+
+    pump()  # 0 秒：动手，消化一条
+    pump()  # 10 秒：离上次动手不到 20 秒，看一眼就返回
+    pump()  # 20 秒：又到期，再消化一条
+
+    assert [call[1] for call in sync.calls] == ["600519", "000001"]

@@ -12,8 +12,11 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
+from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import SamsError
 from sams.core.timeutil import HISTORY_START
@@ -22,6 +25,12 @@ from sams.services.scheduler.jobs import INITIAL_SYNC_DAYS
 from sams.storage.repos.symbol_backfills import ACTIONS
 
 logger = logging.getLogger("sams.services.scheduler.backfill")
+
+#: 泵两次真动手之间的最小间隔（秒，#381 / D313）。
+#: 取 20 秒不是为了省 CPU，是为了别让按只循环自己变慢：一次真动手是 3 个请求
+#: （每个 1~3 秒），把它塞在每两只票之间会把 505 只的那一趟拖成两倍长——而那条慢下来
+#: 的代价是其余那两百多只今天没数。20 秒意味着一条 1~3 秒的循环每六七只票喘一口气。
+MIN_GAP_S = 20.0
 
 
 class BackfillConsumer:
@@ -62,3 +71,37 @@ class BackfillConsumer:
             return False
         start = end - timedelta(days=INITIAL_SYNC_DAYS)
         return self.sync.sync_daily(row.market, row.code, start, end).empty
+
+
+class BackfillPump:
+    """把消费者接到「两只票之间」那个喘息口上的节流阀（#381 / D313）。
+
+    为什么要节流而不是直接叫消费者：`_collect` 会把它叫上五百次（一条 505 只的循环），
+    绝大多数应该看一眼就返回。闸落在**上次真的动手**那一刻，不是「上次被调用」——
+    一直有队列可拿的那一段若按调用时刻算闸，闸会被自己往后推，反而补得更慢。
+
+    它不是线程也不是第二条 DuckDB 连接：调度线程本来就有 99% 的时间在等网络，
+    把其中一小段换成替页面补数，不引入任何并发写（这是这条设计的前提，不是妥协）。
+    """
+
+    def __init__(
+        self,
+        consumer: BackfillConsumer,
+        *,
+        clock: Clock = SYSTEM_CLOCK,
+        monotonic: Callable[[], float] = time.monotonic,
+        min_gap_s: float = MIN_GAP_S,
+    ) -> None:
+        self.consumer = consumer
+        self.clock = clock
+        self.monotonic = monotonic
+        self.min_gap_s = min_gap_s
+        #: 下一次允许真动手的单调时刻；None 表示从没动过手
+        self._next_at: float | None = None
+
+    def __call__(self) -> int:
+        now = self.monotonic()
+        if self._next_at is not None and now < self._next_at:
+            return 0
+        self._next_at = now + self.min_gap_s
+        return self.consumer.consume(self.clock.now_utc())

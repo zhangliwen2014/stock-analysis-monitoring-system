@@ -157,3 +157,9 @@ class JobDeps:
     #: 注入它而不是在 `_collect` 里直接 `time.monotonic()`，为的是「跑到第几只收工」
     #: 能在测试里被写死，不必真等 30 分钟
     monotonic: Callable[[], float] = time.monotonic
+    #: 补数队列的喘息口（#381 / D313）：`_collect` 每处理完一只票就叫它一次。
+    #: 类型是「无参数的回调」而不是消费者：按只循环不需要知道队列、limit、失败记账那些事，
+    #: 它只知道这里可以让别人喘口气。留 `None` 的场景（CLI 单拍、测试、没装补数的部署）
+    #: 一行都不多跑。放在 `monotonic` 之后是必需的：那两条带默认值的字段是这个 dataclass
+    #: 的尾巴，插到中间会让所有位置参数构造它的调用方错位
+    backfill_pump: Callable[[], None] | None = None
