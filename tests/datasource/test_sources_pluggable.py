@@ -16,6 +16,7 @@ from sams.datasource.sources import catalog, discover, kinds, known, markets_of,
 #: 本包里的适配器模块：每个都必须往注册表里放至少一个实现
 ADAPTER_MODULES = {
     "akshare_cn",
+    "akshare_cninfo",
     "akshare_hk",
     "akshare_ths",
     "eastmoney",
@@ -76,6 +77,7 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
     assert entries["akshare_hk"].capabilities == ("corp_actions", "symbol_list")
     assert entries["nasdaq_trader"].capabilities == ("symbol_list",)
     assert entries["akshare_ths"].capabilities == ("corp_actions",)
+    assert entries["akshare_cninfo"].capabilities == ("corp_actions",)
     assert entries["tencent"].capabilities == (
         "daily_bars",
         "quote",

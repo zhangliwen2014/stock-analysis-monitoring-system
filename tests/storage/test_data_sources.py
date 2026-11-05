@@ -44,6 +44,8 @@ def test_migration_seeds_sources_and_chains(repo):
     assert repo.chains() == {
         # akshare_ths 只报公司行为（D38）：东财那张分红送配表对 002450 这类票回
         # 「返回数据为空」，A 股因此不能只有单源——漏记一次派息是 D37 抓不住的（1~6% < 15%）
+        # akshare_cninfo 也只报公司行为（D318）：同花顺对北交所不写 A 股除权日，
+        # 920289 那次 10 转 12.5397 只有交易所自己的披露平台定了位（除权日 2024-07-17）
         # sina_quote 只报报价（D114）：它在两条数据链上都可见，但按能力过滤后
         # 日线链看不见它，报价链上它是腾讯之后的第二个故障域
         # eastmoney_f10 / eastmoney_hk_f10 只报概况、公告与港股指标（D214–D216）：
@@ -55,6 +57,7 @@ def test_migration_seeds_sources_and_chains(repo):
             "tencent",
             "sina",
             "akshare_ths",
+            "akshare_cninfo",
             "eastmoney_f10",
             "sina_quote",
         ),
@@ -68,7 +71,7 @@ def test_migration_seeds_sources_and_chains(repo):
         ),
         "US": ("yfinance", "tencent", "sina_quote", "eastmoney_us_f10"),
     }
-    assert len(repo.list()) == 11
+    assert len(repo.list()) == 12
 
 
 def test_seeded_kinds_match_names(repo):
@@ -78,7 +81,7 @@ def test_seeded_kinds_match_names(repo):
 
 def test_migrations_are_idempotent_for_the_seed(repo):
     apply_migrations(repo.db)
-    assert len(repo.list()) == 11
+    assert len(repo.list()) == 12
 
 
 def test_upsert_and_get_roundtrip_with_options(repo):

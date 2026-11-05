@@ -576,6 +576,25 @@ def test_an_unanswerable_code_does_not_cool_the_source_down():
 # --- 降级链收敛成一份之后，两类取数的不同语义仍各归各（M2-C T-0） ----------------
 
 
+def test_a_third_source_answers_when_the_first_two_cannot():
+    """920289 那次 10 转 12.5397：东财说没有、同花顺读不出日期、巨潮给了除权日（D318）。
+
+    链的次序就是答案的次序：前两个源各自说完自己那半句，第三个源的事实才轮得到——
+    而它答上来之后，这只票不再挂在每晚的失败里。
+    """
+    quiet = ActionsAdapter("akshare", outcome=empty_actions())
+    unplaceable = ActionsAdapter(
+        "akshare_ths", error=EmptyResponse("akshare_ths", "不写 A 股除权日")
+    )
+    exchange = ActionsAdapter("akshare_cninfo")
+    reg = registry(quiet, unplaceable, exchange)
+    result = reg.fetch_actions("A", "920289", D1, D2)
+    assert result.source == "akshare_cninfo"
+    assert result.frame.height == 1
+    assert result.confirmed_empty_by == ()
+    assert [a.source for a in result.attempts] == ["akshare", "akshare_ths", "akshare_cninfo"]
+
+
 def test_the_chain_stops_at_the_first_source_that_answers():
     """降级链不是广播：命中之后不该再敲后面的源——限速预算和延迟都在这句话里。
 
