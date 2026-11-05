@@ -25,10 +25,16 @@ OPEN = datetime(2026, 10, 30, 2, 0, tzinfo=UTC)
 CLOSED = datetime(2026, 10, 31, 4, 0, tzinfo=UTC)
 #: 周五北京 14:47（UTC 06:47）：盘中被最后一拍记下的那个价
 AT_1447 = datetime(2026, 10, 30, 6, 47, 13, tzinfo=UTC)
+#: 周五北京 09:00（开市前一刻）：源断了一截之后板上残留的那口价，比 `OPEN` 早一小时
+AT_0900 = datetime(2026, 10, 30, 1, 0, tzinfo=UTC)
 
 
-def _seed_bars(context, code="600519", *, closes=(1390.0, 1392.05)):
-    days = [date(2026, 10, 29), date(2026, 10, 30)][-len(closes) :]
+#: `_seed_bars` 默认铺的两根日线：昨天（周四）与今天（周五）
+BAR_DAYS = [date(2026, 10, 29), date(2026, 10, 30)]
+
+
+def _seed_bars(context, code="600519", *, closes=(1390.0, 1392.05), days=None):
+    days = BAR_DAYS[-len(closes) :] if days is None else list(days)
     context.bars.upsert(
         pl.DataFrame(
             {
@@ -115,6 +121,23 @@ def test_a_stale_quote_with_no_bars_is_labelled_as_the_old_price(web_app):
     assert view.kind == "stale"
     assert view.label == "10-30 14:47 旧价"
     assert view.detail == "腾讯"
+
+
+def test_yesterdays_close_loses_to_todays_last_quote_when_the_feed_then_dies(web_app):
+    """D320：回落比的是**数据日**，不是「库里有没有日线」。
+
+    今天的日线要晚上才落库，而盘中的源在这之前断了一截：把昨天那根收盘顶上来，
+    屏幕上就少了一个交易日——11-05 那天美团 +7.5% 被读成昨天的 +1.14% 就是这么来的。
+    """
+    _seed_bars(web_app.context, closes=(1390.0,), days=[date(2026, 10, 29)])  # 只有昨天那一根
+    _push_quote(web_app.core, ts=AT_0900)
+
+    view = quote_reader(web_app.context, web_app.core, OPEN).view("A", "600519")
+
+    assert view.kind == "stale" and view.state == "stale"
+    assert view.price == pytest.approx(1390.46)
+    assert view.day == date(2026, 10, 30)
+    assert view.label == "10-30 09:00 旧价"
 
 
 def test_no_quote_and_no_bars_is_no_price_not_zero(web_app):

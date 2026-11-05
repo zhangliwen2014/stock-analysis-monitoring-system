@@ -189,7 +189,12 @@ class QuoteReader:
         tz = market_timezone(self._ctx, market)
         currency = currency_of(self._ctx, market, code)
         unit = currency_label(currency)
-        if bar is not None:
+        # 回落比的是**数据日**，不是「库里有没有日线」（D320）：今天的日线要晚上才落库，
+        # 源在这一截里断了，拿昨天的收盘顶上来就是少说一个交易日——屏幕上那个涨跌幅
+        # 会整整滞后一天，而标着「停更」看着像已经如实说过这件事。
+        # 同一天必须让日线赢：那根是权威收盘价，板上那口只是 14:47 的盘中价（D232）。
+        quote_day = None if quote is None else local_day(quote.ts, ZoneInfo(tz))
+        if bar is not None and (quote_day is None or quote_day <= bar.day):
             pct = None
             if bar.prev_close is not None and bar.prev_close > 0:
                 pct = (bar.close / bar.prev_close - 1) * 100
@@ -208,19 +213,18 @@ class QuoteReader:
                 detail=f"不复权 · {source_label(bar.source)}",
             )
         if quote is not None:
-            day = local_day(quote.ts, ZoneInfo(tz))
             return QuoteView(
                 price=quote.price,
                 pct=quote.pct_chg,
                 kind="stale",
                 state=state,
-                day=day,
+                day=quote_day,
                 at=quote.ts,
                 source=quote.source,
                 currency=currency,
                 unit=unit,
                 adjustment=RAW_ADJUSTMENT,
-                label=price_point_label("stale", day, quote.ts, tz),
+                label=price_point_label("stale", quote_day, quote.ts, tz),
                 detail=source_label(quote.source),
             )
         return QuoteView(
