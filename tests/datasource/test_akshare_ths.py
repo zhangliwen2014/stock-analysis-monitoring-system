@@ -16,7 +16,7 @@ from datetime import date
 import polars as pl
 import pytest
 
-from sams.core.errors import FieldDrift
+from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift
 from sams.datasource.akshare_ths import AkshareThsAdapter, expand_ths
 from sams.datasource.sources import catalog
 
@@ -197,6 +197,99 @@ def test_empty_input_gives_the_empty_standard_frame_with_the_right_schema():
         "note",
     ]
     assert out.is_empty()
+
+
+# --- 北交所版式：同花顺自己不写 A 股除权日（D316/D317） --------------------------------
+
+#: 920156 的实测列集。akshare 的解析器按 `if "A股股权登记日" in columns ... else ...`
+#: 分支走，同花顺给北交所标的把日期列挂在了「B股」名下——而且那些列全是 NaT。
+_BEIJING_COLUMNS = (
+    "报告期",
+    "董事会日期",
+    "股东大会预案公告日期",
+    "实施公告日",
+    "分红方案说明",
+    "B股股权登记日",
+    "B股除权除息日",
+    "分红总额",
+    "方案进度",
+    "股利支付率",
+    "税前分红率",
+)
+
+
+def _beijing(*rows) -> pl.DataFrame:
+    """一行方案：`(报告期, 实施公告日, 说明, 进度)`，其余列按实测留空。"""
+    return pl.DataFrame(
+        [
+            dict(
+                zip(
+                    _BEIJING_COLUMNS,
+                    (period, None, None, announced, text, None, None, None, progress, None, None),
+                    strict=True,
+                )
+            )
+            for period, announced, text, progress in rows
+        ]
+    )
+
+
+def test_the_beijing_layout_with_nothing_implemented_answers_no_records():
+    """缺 A 股除权列不是改版：这张表里只有预案/不分配，源说的是「没发生过的除权」。
+
+    判成 `FieldDrift` 的代价不在这一只票，而在它把同花顺整源的连败计数往上推
+    （冷却按源名记、不分代码），于是全市场每一个「东财说没有」的代码都收不到第二源答复。
+    """
+    out = expand_ths(
+        _beijing(
+            ("2024三季报", None, "不分配不转增", "股东大会预案"),
+            ("2023年报", None, "不分配不转增", "董事会预案"),
+        )
+    )
+    assert out.is_empty()
+
+
+def test_an_implemented_scheme_without_a_datable_ex_date_is_unanswerable():
+    """920289 实测：表里躺着「实施方案 10转12.5397股」，可这张表没有 A 股除权日。
+
+    这不是「没有」（把一次真发生过的 10 转 12.5 洗成从没分红），也不是源故障
+    （重试永远不会让同花顺开始写北交所的日期）。它是 `EmptyResponse` 那句话：
+    源连「没有」都没说清，不能替它写成查过（D36）。
+    """
+    with pytest.raises(EmptyResponse, match="实施方案"):
+        expand_ths(_beijing(("2023年报", date(2024, 7, 9), "10转增12.5397股", "实施方案")))
+
+
+def test_a_response_missing_the_scheme_columns_is_still_a_redesign():
+    """一期把必需列收缩到「这张表是不是分红送配表」，真改版的报警能力不能跟着掉。"""
+    with pytest.raises(FieldDrift, match="缺少必需列"):
+        expand_ths(pl.DataFrame({"报告期": ["2010年报"], "B股除权除息日": [None]}))
+
+
+def test_a_page_with_no_table_at_all_is_unanswerable_not_a_failure():
+    """001246 实测：200、标题是「分红融资」、页面里一张 `<table>` 都没有 → `No tables found`。
+
+    这副脸有两解：新股从没分红会这样，同花顺改版也会这样，而页面上没有一句正面的「暂无」
+    可依据（实测 600519 那页也出现「暂无」一次）。判成「查无」可能写下假确认，
+    判成源故障会继续烧同花顺的冷却（D317）。只有「读不出」是实话。
+    """
+
+    def no_table_page(symbol: str) -> pl.DataFrame:
+        raise ValueError("No tables found")
+
+    with pytest.raises(EmptyResponse, match="没有分红送配表"):
+        AkshareThsAdapter(plans_fetch=no_table_page).corp_actions(
+            "A", "001246", date(2024, 1, 1), date(2024, 3, 1)
+        )
+
+
+def test_a_real_source_failure_is_still_a_real_failure():
+    """收缩分类不能把别的 ValueError 也收进「读不出」——那是把故障说成一句答复。"""
+    with pytest.raises(DatasourceError) as excinfo:
+        AkshareThsAdapter(
+            plans_fetch=lambda symbol: (_ for _ in ()).throw(ValueError("could not convert"))
+        ).corp_actions("A", "600000", date(2024, 1, 1), date(2024, 3, 1))
+    assert not isinstance(excinfo.value, EmptyResponse)
 
 
 # --- 适配器与路由 -----------------------------------------------------------------

@@ -543,6 +543,36 @@ def test_a_window_scoped_source_cannot_corroborate_a_full_history_claim():
     assert reg.fetch_actions("A", "600000", D1, D2).full_history is False
 
 
+def test_an_unanswerable_code_does_not_cool_the_source_down():
+    """「读不出」走 `EmptyResponse` 而不是源故障——冷却按源名记、不分代码（D279/D317）。
+
+    北交所那批票有三种说法，只有这一种可以接受：既不给「从没分红」写假确认，也不让五只票
+    把同花顺整源冷却掉。冷却之后，全市场「东财说没有」的代码都收不到第二源答复，
+    而那正是 11-05 实机看到的形状：`actions/A` 13 只失败，日志里同花顺是「冷却中」不是「答不出」。
+    """
+    quiet = ActionsAdapter("akshare", outcome=empty_actions())
+    unplaceable = ActionsAdapter(
+        "akshare_ths", error=EmptyResponse("akshare_ths", "读不出实施方案的除权日")
+    )
+    reg = registry(quiet, unplaceable)
+    for i in range(12):
+        with pytest.raises(DatasourceError, match="读不出"):
+            reg.fetch_actions("A", f"9200{i:02d}", D1, D2)
+
+    assert unplaceable.calls == 12, "一次都没冷却：每只票都还在问它"
+    record = {r.name: r for r in reg.health()}["akshare_ths"]
+    assert record.consecutive_failures == 0, "「没答上来」不是「挂了」"
+
+    # 对照：同一只链上，源故障到第 10 次就被整源冷却（实测 12 轮只调 10 次）。
+    # 没有这条对照，上面那个 12 次可能只是「公司行为链上冷却根本没生效」
+    broken = ActionsAdapter("akshare_ths", error=FieldDrift("akshare_ths", "列名改版"))
+    reg2 = registry(ActionsAdapter("akshare", outcome=empty_actions()), broken)
+    for i in range(12):
+        with pytest.raises(DatasourceError):
+            reg2.fetch_actions("A", f"9200{i:02d}", D1, D2)
+    assert broken.calls == 10
+
+
 # --- 降级链收敛成一份之后，两类取数的不同语义仍各归各（M2-C T-0） ----------------
 
 

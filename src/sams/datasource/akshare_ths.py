@@ -30,7 +30,7 @@ from datetime import date, datetime
 import polars as pl
 
 from sams.core.codes import canonical_code
-from sams.core.errors import DatasourceError, FieldDrift
+from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift
 from sams.datasource.actions import empty_actions, normalize_actions
 from sams.datasource.base import classify_error
 from sams.datasource.sources import source
@@ -41,13 +41,24 @@ _EX_DATE = "A股除权除息日"
 _SCHEME = "分红方案说明"
 _PROGRESS = "方案进度"
 _REPORT_DATE = "报告期"
-_REQUIRED = (_EX_DATE, _PROGRESS, _SCHEME)
+_ANNOUNCED = "实施公告日"
+#: 判定「这张表还是不是分红送配表」的两列（D316）。
+#: `A股除权除息日` **不在**这份名单里：同花顺对北交所标的把日期列挂在「B股」名下
+#: （akshare 的解析器自己就是 `if "A股股权登记日" in columns ... else ...`），
+#: 那些列还全是 `NaT`。缺它不是改版，是这张表不写这个日期——把它判成 `FieldDrift`
+#: 的真实代价在链路外：那是一次源故障计数，而冷却按源名记、不分代码（D279），
+#: 于是五只北交所票每晚能把同花顺整源冷却掉，连带全市场「东财说没有」的代码
+#: 都收不到第二源答复，「没有」写不成覆盖标记（11-05 实机：`actions/A` 13 只失败）。
+_REQUIRED = (_PROGRESS, _SCHEME)
 
 #: 同花顺的进度写法与东财不同（实施方案 vs 实施分配），共同点是都得含「实施」才算已发生
 _IMPLEMENTED = re.compile(r"实施")
 #: 「不分配不转增」是一句完整答复，不是一个折不出数的事件：留下 unknown 会让整只票拒绝出数
 _NOTHING = re.compile(r"不(分配|派发|转增|送转)")
 _MARKET_PREFIX = re.compile(r"^([ABH])股")
+#: pandas `read_html` 在页面上没有 `<table>` 时抛这句话（D317）。它是 akshare 的解析器
+#: 崩在源返回了一个能取到、但没有表的页面上，既不是「这只票没分红」也不是源故障。
+_NO_TABLE = re.compile(r"No tables found")
 #: 基数：`10派…` / `10股派…` / `每10股派…` / `20派…`
 _BASE = re.compile(r"^每?\s*(\d+(?:\.\d+)?)\s*股?")
 _CASH = re.compile(r"(?:派|分红)\s*(\d+(?:\.\d+)?)\s*元")
@@ -65,6 +76,11 @@ _SCHEMA = {
 
 
 def required_columns(frame: pl.DataFrame) -> None:
+    """这张表还是不是同花顺的分红送配表？不是才算改版（D316）。
+
+    按位置重命名的列一旦错位，`A股除权除息日` 里可能装着金额——所以这两列缺一个就整批失败，
+    比逐行猜安全。日期列本身不在检查范围内，理由见 `_REQUIRED` 的注释。
+    """
     needed = [c for c in _REQUIRED if c not in frame.columns]
     if needed:
         raise FieldDrift(
@@ -161,10 +177,17 @@ def expand_ths(raw: pl.DataFrame) -> pl.DataFrame:
     rows: list[dict] = []
     skipped: dict[str, int] = {}
     undated = 0
+    #: 这张表有没有 A 股除权日这一列（北交所没有，见 `_REQUIRED`）
+    datable = _EX_DATE in raw.columns
+    unplaceable: list[str] = []
     for row in raw.iter_rows(named=True):
         progress = (row.get(_PROGRESS) or "").strip()
         if not _IMPLEMENTED.search(progress):
             skipped[progress or "(空)"] = skipped.get(progress, 0) + 1
+            continue
+        if not datable:
+            # 「已经实施」+「这张表不写日期」：一句我们读不出的答复，不是「没有」（D316）
+            unplaceable.append(f"{row.get(_ANNOUNCED)} {row.get(_SCHEME)}")
             continue
         ex_date = _to_date(row.get(_EX_DATE))
         if ex_date is None:
@@ -194,6 +217,12 @@ def expand_ths(raw: pl.DataFrame) -> pl.DataFrame:
         )
     if undated:
         logger.warning("同花顺有 %d 行「实施方案」没有除权日，无法定位到序列上的某一天", undated)
+    if unplaceable:
+        raise EmptyResponse(
+            "akshare_ths",
+            f"这张表里没有「{_EX_DATE}」列，读不出 {len(unplaceable)} 行"
+            f"「实施方案」定位不到除权日：{'；'.join(unplaceable[:3])}",
+        )
     out = pl.DataFrame(rows, schema=_SCHEMA)
     # 同一方案在两个公告阶段各出现一次时只能算一次：D41 的相加针对的是不同的事实
     out = out.unique(subset=["ex_date", "kind", "cash_per_share", "ratio"], keep="first")
@@ -241,6 +270,12 @@ class AkshareThsAdapter:
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001 — 边界处统一归类，见 classify_error
+            if _NO_TABLE.search(str(exc)):
+                # 判成「查无」= 可能给这只票写一句假确认；判成源故障 = 继续烧整源冷却（D279）。
+                # `EmptyResponse` 是第三条路：源答了，但我们没有一张能读出结论的表（D317）
+                raise EmptyResponse(
+                    self.name, f"{symbol} 的同花顺页面没有分红送配表可读：{exc}"
+                ) from exc
             raise classify_error(self.name, exc) from exc
         return actions
 
