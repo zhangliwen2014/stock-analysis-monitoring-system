@@ -188,6 +188,7 @@ F1 不通过时：主档行照建（否则 `SymbolInterest` 的四入口语义�
 `test_dashboard.py` 27、`test_symbol.py` 48、`test_symbol_f10.py` 25、
 `test_symbol_master.py + test_scheduler_jobs_data.py` 52、`test_symbol_interest.py` 14、
 `test_scheduler_universe.py` 6、`test_symbol_list.py` 12 全绿；§5 的七条用例逐条先看它红过。
+全量回归 `pytest -q`：**5625 passed, 21 deselected**（1:12:10）。
 `ruff check src tests` 每次提交前干净。
 
 实机读数（重启后 90 秒内，`task_runs`）：
@@ -209,4 +210,6 @@ failed  actions   490/503 只公司行为，13 只失败，3 条顺延的补采�
   「立即排一拍」出现 0 次。
 - 日志：四条出队告警（`999999`/`000996` 走 D314，`00700`/`平安` 走 D210）在 10:22:23 出现两轮，
   此后每分钟一次的清单重建不再刷——去重的那句 `_reported` 起作用了。
+- §4 那条「不删 `A/000996` 的 deferred 行」在实机上成立：重启前后两次快照里它的 `status` 与
+  `tries` 都是 `deferred / 3`，一小时没有任何一趟补采拉起过它。
 
