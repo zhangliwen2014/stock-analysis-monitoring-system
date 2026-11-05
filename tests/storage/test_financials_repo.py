@@ -50,6 +50,27 @@ def test_upsert_is_idempotent(fin, db):
     assert db.row_count("financials") == 1, "同一期报表重跑不能长出两行"
 
 
+def test_a_source_without_a_publication_date_cannot_erase_a_known_one(fin):
+    """备份源（新浪）不给披露日：它的 NULL 是「这个源不知道」，不是「这一期没公开日」。
+
+    同一期第二次写入来自另一个源时，披露日必须留在库里；其余列照常按后写覆盖
+    （D45：同一期的两次报道不是两条冲突事实）。抹掉披露日的后果不是少一列：
+    这只票在 A 股的 PIT 读取里整期消失，PR 从「算得出」变成「算不出」——
+    一次主源故障借备份源的手删掉了主源已经确认过的事实。
+    """
+    fin.upsert(pl.DataFrame([row()]))
+    fin.upsert(
+        pl.DataFrame(
+            [row(published_date=None, roe=0.21, source="sina")],
+            schema_overrides={"published_date": pl.Date},
+        )
+    )
+    got = fin.recent("A", "601088", limit=1)
+    assert got["published_date"].to_list() == [PUBLISHED_Q1]
+    assert got["roe"].to_list() == [0.21]
+    assert got["source"].to_list() == ["sina"]
+
+
 def test_a_period_published_after_the_as_of_date_is_not_visible(fin):
     """反未来函数专项：2024Q1 的 ROE 在 4 月 26 日之前不存在，哪怕行已经在库里。
 

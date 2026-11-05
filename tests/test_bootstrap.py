@@ -135,6 +135,9 @@ def test_registry_chain_comes_from_the_database(migrated):
         assert built.registry.chain_for("US", "company_profile") == ()
         assert built.registry.chain_for("HK", "financials") == ("eastmoney_hk_f10",)
         assert built.registry.chain_for("US", "financials") == ("eastmoney_us_f10",)
+        # 0048：A 股基本面第二源是新浪（D324）。它在日线链上排第 4，财务能力只由
+        # 方法现身，所以这条链是「按优先级过滤后的能力链」，不是日线链的前缀
+        assert built.registry.chain_for("A", "financials") == ("akshare", "sina")
     finally:
         built.close()
 

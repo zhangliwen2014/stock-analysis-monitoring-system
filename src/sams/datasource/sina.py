@@ -22,8 +22,10 @@ from datetime import date
 import polars as pl
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
+from sams.core.codes import canonical_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift, RateLimited
 from sams.datasource.base import a_share_symbol, classify_error, normalize_bars
+from sams.datasource.fundamentals import empty_financials, normalize_financials
 from sams.datasource.fx import normalize_fx
 from sams.datasource.sources import source
 
@@ -195,6 +197,82 @@ def parse_sina_fx(payload: object, *, base: str, quote: str) -> pl.DataFrame:
     return normalize_fx(pl.DataFrame(rows), base=base, quote=quote, source="sina")
 
 
+#: 财务指标（新浪「财务分析-财务指标」）：中文全称 → 标准列。只取能对上的那几列：
+#: 营收、净利金额与市值这张表里没有，留 NULL，不去别的接口凑（D323）。
+#:
+#: `股息发放率(%)` **不映射**：它是分红 ÷ 净利（payout ratio），不是股价的股息率。
+#: 映射进去，一只 55% 分红率的票会凭空多出 0.55 的股息率——方向还正好是「更便宜」。
+FINANCIAL_MAP = {
+    "report_date": "日期",
+    "eps": "摊薄每股收益(元)",
+    "bps": "每股净资产_调整前(元)",
+    "ocf_per_share": "每股经营性现金流(元)",
+    # 与东财那一族的 `ROEJQ`（加权）同口径：季报是累计值，PR 的口径话由 core 说明
+    "roe": "加权净资产收益率(%)",
+    "revenue_yoy": "主营业务收入增长率(%)",
+    "profit_yoy": "净利润增长率(%)",
+    "gross_margin": "销售毛利率(%)",
+    "net_margin": "销售净利率(%)",
+    "roa": "总资产净利润率(%)",
+    "debt_ratio": "资产负债率(%)",
+    "current_ratio": "流动比率",
+    "quick_ratio": "速动比率",
+    "inventory_turnover": "存货周转率(次)",
+    "total_asset_turnover": "总资产周转率(次)",
+}
+#: 表里带 `(%)` 的那几列是百分数，由 `normalize_financials` 统一 ÷100（D58）。
+#: 流动/速动比率与周转率是倍或次，永远不进这张名单。
+FINANCIAL_PERCENT = (
+    "roe",
+    "revenue_yoy",
+    "profit_yoy",
+    "gross_margin",
+    "net_margin",
+    "roa",
+    "debt_ratio",
+)
+#: 三列值列整列消失 = 改版，当场失败：填 NULL 继续走会写出一库空的 ROE 与增速，
+#: 读取侧只会说「这只票算不出 PR」，而真相是采集把列弄丢了。
+FINANCIAL_REQUIRED = ("加权净资产收益率(%)", "主营业务收入增长率(%)", "净利润增长率(%)")
+
+
+def sina_financials_indicator(symbol: str, start_year: str) -> pl.DataFrame:
+    """真实网络调用：新浪财务分析指标（按报告期）。`symbol` 是 6 位裸代码。
+
+    接口按年份逐页抓（每页一次请求），`start_year` 限定起始年；600519 的全史
+    实测 104 行 / 2.8 s。它**不给披露日**，也没有营收/净利金额列。
+    """
+    import akshare as ak
+
+    frame = ak.stock_financial_analysis_indicator(symbol=symbol, start_year=start_year)
+    if frame is None or len(frame) == 0:
+        return pl.DataFrame()
+    return pl.from_pandas(frame)
+
+
+def parse_sina_financials(
+    raw: pl.DataFrame, *, code: str, start: date, end: date
+) -> pl.DataFrame:
+    """纯解析：新浪财务指标表 → `FINANCIAL_COLUMNS`，按报告期裁窗口。
+
+    空表是「这个源对这只票没有记录」（交给链上的下一个源），不是故障（D43）。
+    """
+    if raw.is_empty():
+        return empty_financials()
+    absent = [name for name in FINANCIAL_REQUIRED if name not in raw.columns]
+    if absent:
+        raise FieldDrift("sina", f"财务指标缺少必需列 {absent}，实际列 {list(raw.columns)}")
+    out = normalize_financials(
+        raw,
+        market="A",
+        code=code,
+        source="sina",
+        column_map=FINANCIAL_MAP,
+        percent_columns=FINANCIAL_PERCENT,
+    )
+    return out.filter(pl.col("report_date").is_between(start, end))
+
+
 class SinaAdapter:
     name = "sina"
     markets = frozenset({"A"})
@@ -206,11 +284,13 @@ class SinaAdapter:
         *,
         get: Callable[..., object] = http_get,
         fx_get: Callable[..., object] = http_get_text,
+        financials_fetch: Callable[[str, str], pl.DataFrame] = sina_financials_indicator,
         timeout: int = 15,
         clock: Clock = SYSTEM_CLOCK,
     ) -> None:
         self._get = get
         self._fx_get = fx_get
+        self._financials_fetch = financials_fetch
         self._timeout = timeout
         self._clock = clock
 
@@ -308,6 +388,25 @@ class SinaAdapter:
             raise classify_error(self.name, exc) from exc
         return parse_sina_fx(payload, base=base, quote=quote)
 
+    def financials(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+        """按报告期的财务指标：A 股基本面链的第二源（#387 / D324）。
+
+        它**不给披露日**：`published_date` 全 NULL，按 D61 这些期进不了 A 股的 PIT 读取，
+        只进个股页的「最近几期」；主源坏掉的那晚别的东西也拿不到，这不是把范围缩小，
+        而是把能留下的留下。仓库层也不会让这些 NULL 覆盖库里已有的日期。
+        """
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        # 财务页用的是 6 位裸代码（`600519`），不是行情那一路的 `sh600519`
+        symbol = canonical_code("A", code)
+        try:
+            raw = self._financials_fetch(symbol, str(start.year))
+        except Exception as exc:  # noqa: BLE001 — 只包网络这一跳，解析异常留在下面
+            raise classify_error(self.name, exc) from exc
+        return parse_sina_financials(raw, code=code, start=start, end=end)
+
     def minute_bars(
         self, market: str, code: str, start: date, end: date, *, scale: int, count: int
     ) -> pl.DataFrame:
@@ -340,5 +439,5 @@ class SinaAdapter:
 source(
     "sina",
     options=("timeout",),
-    note="新浪 A 股日线 + 指数日线 + 分钟K + 人民币汇率日线，日线只覆盖最近约 1023 根",
+    note="新浪 A 股日线 + 指数日线 + 分钟K + 财务指标 + 人民币汇率日线，日线只覆盖最近约 1023 根",
 )(SinaAdapter)

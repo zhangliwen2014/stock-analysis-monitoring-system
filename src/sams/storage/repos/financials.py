@@ -257,6 +257,12 @@ class FinancialRepo:
         这里**不**做跨源冲突拒绝（D45 那一套只属于公司行为）：财务指标的修订是常态，
         同一期报表被源改过一次不是两条互相矛盾的事实，而是同一个事实的两次报道——
         谁写的记在 `source` 里，读的人查得到。
+
+        唯一的例外是 `published_date`：来行是 NULL 时保留库里已有的日期。NULL 在这里
+        是「**这个源**不知道何时公开」，不是「这一期没有公开日」——新浪那一路就完全不给
+        披露日（#387）。让 NULL 覆盖已确认的日期，一次主源故障会借备份源的手把这期从
+        A 股的 PIT 读取里抹掉（D61），PR 随之从「算得出」变成「算不出」，而屏幕上只会写
+        「未披露」。其余列照常覆盖：数值的修订该换新的，日期的事实不该被沉默抹掉。
         """
         if df.is_empty():
             return 0
@@ -289,13 +295,17 @@ class FinancialRepo:
                      gross_margin, net_margin, roa, roic, debt_ratio,
                      current_ratio, quick_ratio, inventory_turnover,
                      total_asset_turnover, source)
-                SELECT market, code, report_date, published_date, report_type,
-                       roe, revenue_yoy, profit_yoy, dividend_yield, market_cap,
-                       revenue, net_profit, eps, bps, ocf_per_share,
-                       gross_margin, net_margin, roa, roic, debt_ratio,
-                       current_ratio, quick_ratio, inventory_turnover,
-                       total_asset_turnover, source
-                FROM {view}
+                SELECT i.market, i.code, i.report_date,
+                       COALESCE(i.published_date, f.published_date),
+                       i.report_type,
+                       i.roe, i.revenue_yoy, i.profit_yoy, i.dividend_yield, i.market_cap,
+                       i.revenue, i.net_profit, i.eps, i.bps, i.ocf_per_share,
+                       i.gross_margin, i.net_margin, i.roa, i.roic, i.debt_ratio,
+                       i.current_ratio, i.quick_ratio, i.inventory_turnover,
+                       i.total_asset_turnover, i.source
+                FROM {view} AS i
+                LEFT JOIN {self.TABLE} AS f
+                  ON f.market = i.market AND f.code = i.code AND f.report_date = i.report_date
                 """
             )
         finally:
