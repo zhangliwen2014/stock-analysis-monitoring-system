@@ -110,10 +110,23 @@ def test_registry_chain_comes_from_the_database(migrated):
                 "sina_quote",
                 # 0049：港股的按日估值原来只有 yfinance 一家
                 "baidu_valuation",
+                # 0050：新浪港美股日线只报 daily_bars / US 的 index_daily，挂链尾（D324）
+                "sina_global",
             ),
-            "US": ("yfinance", "tencent", "sina_quote", "eastmoney_us_f10"),
+            "US": ("yfinance", "tencent", "sina_quote", "eastmoney_us_f10", "sina_global"),
         }
-        assert built.registry.chain_for("HK", "daily_bars") == ("yfinance", "tencent")
+        assert built.registry.chain_for("HK", "daily_bars") == (
+            "yfinance",
+            "tencent",
+            "sina_global",
+        )
+        # 0050：美股日线第三跳与美股指数日线第二跳（腾讯之后）都是新浪
+        assert built.registry.chain_for("US", "daily_bars") == (
+            "yfinance",
+            "tencent",
+            "sina_global",
+        )
+        assert built.registry.chain_for("US", "index_daily") == ("tencent", "sina_global")
         assert built.registry.chain_for("HK", "corp_actions") == ("yfinance", "akshare_hk")
         assert built.registry.chain_for("A", "corp_actions") == (
             "akshare",

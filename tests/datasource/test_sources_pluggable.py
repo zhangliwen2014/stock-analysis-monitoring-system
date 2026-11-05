@@ -26,6 +26,7 @@ ADAPTER_MODULES = {
     "eastmoney_us_f10",
     "nasdaq_trader",
     "sina",
+    "sina_global",
     "sina_quote",
     "tencent",
     "yfinance_us",
