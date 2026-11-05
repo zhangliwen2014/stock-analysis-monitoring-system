@@ -52,6 +52,22 @@ def _seed_symbol(ctx, market="A", code="600519"):
     )
 
 
+def _seed_master(ctx, market="A", code="600519"):
+    """代码表里有一份**非空**的在册名单，里面只有这一只：准入闸从此有了否决权（D314）。"""
+    ctx.symbol_list_store.upsert_batch(
+        market,
+        [
+            {
+                "code": code,
+                "name": "贵州茅台",
+                "py_initials": "gzym",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            }
+        ],
+    )
+
+
 def _add_watch(logged, market: str, code: str, note: str | None = None) -> None:
     """加一只票进自选：走真实端点，不直接写仓库——补数登记那条 Side effect 也在路上。"""
     data = {"csrf": logged.csrf, "market": market, "code": code}
@@ -207,6 +223,44 @@ def test_watchlist_rejects_a_code_whose_shape_belongs_to_another_market(logged):
     assert "形态" in response.text
     assert not logged.context.watchlists.contains(user.id, "A", "00700")
     assert logged.context.backfills_store.open_for("A", "00700") is None
+
+
+def test_watchlist_rejects_a_code_the_table_does_not_know(logged):
+    """六位数字、但不是任何一只在市个股：形态闸放它过去，代码表拦它（D314）。
+
+    实机的两只：`A/999999` 是上证指数、`A/000996` 已退市。放进来之后它们进了每一条按只
+    循环的 job 并且每一条都失败——11-03 起 `financials/A` 标红 39 次、`profile/A` 35 次，
+    一只永远取不到的票把真故障淹了（#382 §1）。屏幕上留一行空白名字 + 一个点开永远填不上数
+    的链接，比拒绝它贵得多。
+    """
+    user = logged.context.users.get_by_username("alice")
+    _seed_master(logged.context)  # A 市场有一份非空在册名单，里面只有 600519
+    response = logged.client.post(
+        "/watchlist/add", data={"csrf": logged.csrf, "market": "A", "code": "999999"}
+    )
+    assert response.status_code == 200
+    assert "代码表里没有" in response.text
+    assert not logged.context.watchlists.contains(user.id, "A", "999999")
+    assert logged.context.backfills_store.open_for("A", "999999") is None
+    assert logged.context.symbols.get("A", "999999") is None
+    # 这条拒绝不是「这个市场什么都别加」：在册的那只照常进，仍然 303
+    ok = logged.client.post(
+        "/watchlist/add",
+        data={"csrf": logged.csrf, "market": "A", "code": "600519"},
+        follow_redirects=False,
+    )
+    assert ok.status_code == 303
+
+
+def test_watchlist_add_still_works_before_the_first_code_table_sync(logged):
+    """整表还没同步过时代码表没有否决权（D314）：新装库第一晚不能什么都加不进去。"""
+    response = logged.client.post(
+        "/watchlist/add",
+        data={"csrf": logged.csrf, "market": "A", "code": "600036"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "代码表里没有" not in logged.client.get("/watchlist").text
 
 
 def test_watchlist_is_private_per_user(web_app):

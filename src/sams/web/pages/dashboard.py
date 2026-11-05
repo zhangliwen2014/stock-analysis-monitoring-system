@@ -398,6 +398,14 @@ def watchlist_add(
                 f"{market} 里没有 {code.strip()} 这种形态："
                 "A 股 6 位数字、港股 5 位数字"
             )
+        # 形态对不等于「这是这个市场的一只在市个股」：999999 是上证指数、000996 早退市，
+        # 两位都是六位数字，形态闸放行。放进来的代价不是这一行空着，而是每一条按只循环的
+        # 链每晚整条标红（#382 §1），所以准入就问代码表这一份名册（D314）。
+        if not ctx.symbol_list_store.admits(market, cleaned):
+            raise ValidationError(
+                f"代码表里没有 {market} {cleaned}：退市股、指数、或代码表还没跟上的新股都不在册。"
+                "个股可在上面的搜索框按代码/拼音/名称找。"
+            )
         ctx.watchlists.add(
             request.state.sams_user.id, market, cleaned, note=note.strip() or None
         )
