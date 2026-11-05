@@ -34,6 +34,7 @@ from sams.core.fundamentals import (
 )
 from sams.core.screener_fields import Condition, fields_for
 from sams.services.screen import PrHit
+from sams.services.screener import NONPOSITIVE_VALUATION
 
 PR_USAGE = "例如 0.4（PR 是小数口径的比值，不是百分数：`PR ≤ 0.4` 写 0.4）"
 
@@ -241,9 +242,12 @@ def _print_spot(result, code: int) -> int:
     if result.truncated:
         print(f"  …还有 {result.truncated} 只未列（--limit 截的；总数照报）")
     for missing_group in result.missing:
+        reason = missing_group.reason
+        if reason == NONPOSITIVE_VALUATION:
+            # 共享串只讲事实；命令行的下一步由 CLI 自己附加（D283）
+            reason += "；命令行加 --include-negatives 可一起比较"
         print(
-            f"无数 {len(missing_group.codes)} 只  {missing_group.field}："
-            f"{missing_group.reason}"
+            f"无数 {len(missing_group.codes)} 只  {missing_group.field}：{reason}"
         )
         shown = missing_group.codes[:20]
         print(

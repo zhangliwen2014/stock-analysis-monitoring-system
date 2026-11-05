@@ -213,6 +213,25 @@ def test_a_negative_valuation_is_missing_not_cheap_by_default(db):
     assert "估值不为正" in group.reason
 
 
+def test_the_nonpositive_reason_does_not_choose_a_surface(db):
+    """同一句原因同时上网页与命令行：它只讲事实，开关由两边各自指（D283/T1a）。
+
+    网页的下一条是勾选框、命令行的下一条是 `--include-negatives`；共享串里写死其中
+    一个，另一边就在说另一个房间的东西——R3-02 报的正是这一句。
+    """
+    seed(
+        db,
+        snap("600519", pe_dyn=5.0),
+        snap("000001", pe_dyn=-72980.5),
+        codes=("600519", "000001"),
+    )
+    (group,) = service(db).run("A", [Condition("pe_ttm", "<=", 8)]).missing
+    assert "估值不为正" in group.reason
+    assert "命令行" not in group.reason
+    assert "--include-negatives" not in group.reason
+    assert "勾选" not in group.reason
+
+
 def test_negative_valuations_can_be_included_on_request(db):
     seed(
         db,

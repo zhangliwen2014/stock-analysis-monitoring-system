@@ -128,7 +128,8 @@
   再把话术换上——这是一片独立的活，不塞进这里顺手做半截。
   扩哪几种、按什么判据算「缺」，#369 已把那五种各自挡了谁写清楚（`2026-11-03-expert-testing-round3.md`
   R3-02 逐条原话 + §5-D2）：`nav rebuild` 走页面按钮触发重算，`bars/financials` 扩 `kind` 进同一条队列，
-  `channel probe` 改页面「测试通道」，`--include-negatives` 改页面勾选框，
+  `channel probe` 改页面「测试通道」，`--include-negatives` 改页面勾选框（T1a 已在 11-06 先做：
+  勾选框本来就在表单里，共享句不再提命令行，CLI 自己把开关名接在后面），
   `profile/valuation`（HK/US）源本身没有，话术改成「这个市场暂时没有这个源」，不承诺补采。
   五种一起排是每天每票五条队列行的吞吐，而一拍至多消费 3 条。
 * **卡片不预告补采要等多久**（实机测得的两段）：`BackfillConsumer` 排在一拍的**开头**（`requests.drain()`

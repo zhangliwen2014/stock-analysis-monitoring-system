@@ -187,6 +187,13 @@ def test_a_market_that_has_no_snapshot_says_so_instead_of_showing_an_empty_table
     assert "还没有全市场快照" in response.text
 
 
+def test_the_empty_snapshot_card_points_at_its_own_recollect_button(logged_screen):
+    """R3-02/T1a：「立即重采」就在同一张卡里，不该叫网页用户去跑命令行。"""
+    response = logged_screen.client.get("/screen", params={"market": "HK"})
+    assert "立即重采" in response.text
+    assert "sams sync spot" not in response.text
+
+
 def test_a_market_whose_columns_do_not_exist_says_why_the_fields_are_greyed(logged_screen):
     """灰着的字段本该在屏幕上自证：`disabled title` 只在鼠标悬停时说话，键盘与触屏看不到。"""
     response = logged_screen.client.get("/screen", params={"market": "HK"})
@@ -354,6 +361,23 @@ def test_negative_valuations_are_left_out_and_the_count_is_stated(logged_screen)
     assert "估值不为正" in page.text
     assert "其中 1 只" in page.text
     assert 'name="include_negatives"' in page.text
+
+
+def test_the_nonpositive_group_does_not_hand_the_web_user_a_command_line(logged_screen):
+    """R3-02/T1a：同一句原因也上网页。网页用户的下一步是上面那颗勾选框，
+    不是 `--include-negatives`——那句话要说给命令行听（D283：CLI 自己附加）。"""
+    seed(
+        logged_screen.context,
+        snap("600519", pe_dyn=5.0),
+        snap("000001", pe_dyn=-72980.5),
+    )
+    page = logged_screen.client.get(
+        "/screen",
+        params=[("market", "A"), ("f", "pe_ttm"), ("o", "<="), ("v", "8")],
+    )
+    assert "估值不为正" in page.text
+    assert "命令行" not in page.text
+    assert "--include-negatives" not in page.text
 
 
 def test_the_include_negatives_toggle_brings_the_row_back(logged_screen):

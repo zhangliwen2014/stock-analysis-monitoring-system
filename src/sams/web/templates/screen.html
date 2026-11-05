@@ -13,8 +13,7 @@
   {# 范围句（D288）：那个日期只属于快照那一批列，价格列有自己的时点，不能让一句日期替两批数说话 #}
   <p class="muted">下面除「价格」外的列都是这一天的数；价格列另标它自己的时点。</p>
   {% else %}
-  <p class="muted">{{ market }} 股还没有全市场快照：点「立即重采」排队，或先跑
-    <code>sams sync spot --market {{ market }}</code></p>
+  <p class="muted">{{ market }} 股还没有全市场快照：点下面的「立即重采」排队即可</p>
   {% endif %}
   {% if basis_note %}<p class="muted">{{ basis_note }}</p>{% endif %}
   {% if financial_coverage %}

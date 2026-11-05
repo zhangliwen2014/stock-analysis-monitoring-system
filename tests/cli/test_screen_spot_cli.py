@@ -213,6 +213,16 @@ def test_negative_valuations_and_st_rows_sit_out_unless_asked(db, settings, caps
     assert "ST/退市" not in out
 
 
+def test_the_cli_appends_its_own_switch_to_the_nonpositive_reason(db, settings, capsys):
+    """共享串不偏袒任何界面（D283）：命令行自己把开关名接在后面。"""
+    container = container_for(db, settings, snap("600519", pe_dyn=5.0), snap("000001", pe_dyn=-5.0))
+    capsys.readouterr()
+    assert run(container, ["screen", "spot", "--market", "A", "--where", "pe_ttm<=8"]) == 0
+    out = capsys.readouterr().out
+    assert "估值不为正" in out
+    assert "--include-negatives" in out
+
+
 def test_json_carries_three_counts_and_the_missing_groups(db, settings, capsys):
     container = container_for(
         db, settings, snap("600519", pe_dyn=5.0), snap("000001", pe_dyn=-5.0)
