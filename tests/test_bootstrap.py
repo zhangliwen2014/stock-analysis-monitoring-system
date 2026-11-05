@@ -91,9 +91,11 @@ def test_registry_chain_comes_from_the_database(migrated):
                 "tencent",
                 "sina",
                 "akshare_ths",
-                "akshare_cninfo",
                 "eastmoney_f10",
                 "sina_quote",
+                # 0048：巨潮要排在东财之后（它是概况/公告的备源，D324），
+                # 而它在 0047 里与东财同号、按名字排会抢到第 1 位
+                "akshare_cninfo",
             ),
             # 链是「按市场的路由」，不是「谁能取日线」：akshare_hk 只报公司行为，
             # 采集时被跳过（D38），备源判据走 registry.chain_for(market, method)
@@ -119,7 +121,16 @@ def test_registry_chain_comes_from_the_database(migrated):
         assert built.registry.chain_for("HK", "quote") == ("tencent", "sina_quote")
         assert built.registry.chain_for("US", "quote") == ("tencent", "sina_quote")
         # F10（D214）：US 的链上没有概况/公告源；港股与美股的财务各有一个只服务它的源
-        assert built.registry.chain_for("A", "company_profile") == ("eastmoney_f10",)
+        assert built.registry.chain_for("A", "company_profile") == (
+            "eastmoney_f10",
+            "akshare_cninfo",
+        )
+        assert built.registry.chain_for("A", "announcements") == (
+            "eastmoney_f10",
+            "akshare_cninfo",
+        )
+        # 上市日期：akshare 主源，巨潮顶上（D324）；东财 F10 没有这个能力，不在链上
+        assert built.registry.chain_for("A", "listed_date") == ("akshare", "akshare_cninfo")
         assert built.registry.chain_for("HK", "announcements") == ("eastmoney_f10",)
         assert built.registry.chain_for("US", "company_profile") == ()
         assert built.registry.chain_for("HK", "financials") == ("eastmoney_hk_f10",)
@@ -143,9 +154,9 @@ def test_disabling_a_source_takes_it_out_of_the_next_container(migrated):
             "tencent",
             "sina",
             "akshare_ths",
-            "akshare_cninfo",
             "eastmoney_f10",
             "sina_quote",
+            "akshare_cninfo",
         )
         assert "akshare" not in second.registry.adapters, "停用源连适配器都不该建"
     finally:

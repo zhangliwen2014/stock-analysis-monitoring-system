@@ -17,6 +17,10 @@
 同花顺有 8~28 条）在巨潮同样是无记录。三个源是三家上游，谁都不是全集（D36）。
 
 配股不在这个接口里（与东财、同花顺一样，见 spec §18 U16），`price` 列恒空。
+
+D324 起它不止公司行为：公司概况（含上市日期）与公告也走巨潮自己的端点——
+`stock_profile_cninfo`（`p_sysapi1133`）与信息披露查询（`hisAnnouncement/query`）。
+两条都是**与东财不同的域名**（D322 的第一档），而不是给东财接口换一层 akshare 包装。
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from sams.core.codes import canonical_code
 from sams.core.errors import DatasourceError, EmptyResponse, FieldDrift
 from sams.datasource.actions import empty_actions, normalize_actions
 from sams.datasource.base import classify_error
+from sams.datasource.f10 import empty_announcements, empty_profile
 from sams.datasource.sources import source
 
 logger = logging.getLogger("sams.datasource")
@@ -86,6 +91,14 @@ def _number(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return None if number != number else number  # NaN != NaN
+
+
+def _text(value: object) -> str | None:
+    """空串与全空白按「源没给」处理；非空值原样交回（简介里的空格有语义）。"""
+    if value is None:
+        return None
+    text = str(value)
+    return text if text.strip() else None
 
 
 def _per_share(per_ten: float) -> float:
@@ -305,14 +318,177 @@ def akshare_cninfo_plans(
     return pl.from_pandas(frame)
 
 
+#: 公司概况的必需列：三个各自承担一件事（代码、名字、上市日），整列消失才算改版。
+#: 期数不等于必需：源对「查无此票」回的是 0 行而不是缺列（实测 `stock_profile_cninfo`）。
+_PROFILE_REQUIRED = ("A股代码", "A股简称", "上市日期")
+
+_PROFILE_TEXT = {
+    "name": "A股简称",
+    "full_name": "公司名称",
+    "name_en": "英文名称",
+    "industry": "所属行业",
+    "exchange": "所属市场",
+    "chairman": "法人代表",
+    "legal_person": "法人代表",
+    "phone": "联系电话",
+    "email": "电子邮箱",
+    "website": "官方网站",
+    "address": "办公地址",
+    "reg_address": "注册地址",
+}
+
+
+def akshare_cninfo_profile(symbol: str) -> pl.DataFrame:
+    """真实网络调用：巨潮个股概况（`p_sysapi1133`），一票一行，含上市日期。"""
+    import akshare as ak
+
+    frame = ak.stock_profile_cninfo(symbol=symbol)
+    if frame is None or len(frame) == 0:
+        return pl.DataFrame()
+    return pl.from_pandas(frame)
+
+
+def parse_cninfo_profile(
+    raw: pl.DataFrame, *, market: str, code: str, source: str
+) -> pl.DataFrame:
+    """巨潮概况 → `PROFILE_COLUMNS`。0 行是「这个源没有这只票的概况」，不是改版。
+
+    `所属市场` 在巨潮是「上交所 / 深交所主板 / 北交所」这种混合口径，所以放进 `exchange`，
+    `board` 留空：把「深交所主板」拆成交易所+板块需要一张我们没测过的对照表，猜错的那天
+    屏幕上会出现一个看着正常的错板块。
+    """
+    if raw.is_empty():
+        return empty_profile()
+    absent = [column for column in _PROFILE_REQUIRED if column not in raw.columns]
+    if absent:
+        raise FieldDrift(SOURCE, f"公司概况响应缺少必需列 {absent}，实际列 {list(raw.columns)}")
+    row = raw.row(0, named=True)
+    values = {name: _text(row.get(column)) for name, column in _PROFILE_TEXT.items()}
+    values.update(
+        {
+            "market": market,
+            "code": canonical_code(market, code),
+            "industry_csrc": None,
+            "board": None,
+            "listed_on": _to_date(row.get("上市日期")),
+            "founded_on": _to_date(row.get("成立日期")),
+            "isin": None,
+            "lot_size": None,
+            "president": None,
+            "secretary": None,
+            "employees": None,
+            "auditor": None,
+            "fiscal_year_end": None,
+            "hk_connect": None,
+            "stock_type": None,
+            "summary": _text(row.get("机构简介")) or _text(row.get("主营业务")),
+            "source": source,
+        }
+    )
+    return pl.DataFrame([values], schema=empty_profile().schema)
+
+
+#: 公告的必需列：代码用来挡串包，标题与链接是落库的两样，日期定窗口。
+_ANN_REQUIRED = ("代码", "公告标题", "公告时间", "公告链接")
+_ANN_ID = re.compile(r"announcementId=(\d+)")
+
+
+def akshare_cninfo_announcements(symbol: str, start: date, end: date) -> pl.DataFrame:
+    """真实网络调用：巨潮信息披露查询（`hisAnnouncement/query`，`market="沪深京"`）。
+
+    实测 920289 的 30 天窗口：34 行 / 4.8 秒（两页）；空窗口是**列齐全的 0 行帧**，
+    与「源答了没有公告」同形。这条端点是 `szse` 列，但覆盖沪深京三所（`szse_stock.json`
+    里北交所也在），所以不能拿交易所号段猜 `column`。
+    """
+    import akshare as ak
+
+    frame = ak.stock_zh_a_disclosure_report_cninfo(
+        symbol=symbol,
+        market="沪深京",
+        start_date=start.strftime("%Y%m%d"),
+        end_date=end.strftime("%Y%m%d"),
+    )
+    if frame is None:
+        return pl.DataFrame({column: [] for column in _ANN_REQUIRED})
+    return pl.from_pandas(frame)
+
+
+def parse_cninfo_announcements(
+    raw: pl.DataFrame,
+    *,
+    market: str,
+    code: str,
+    source: str,
+    start: date,
+    end: date,
+) -> pl.DataFrame:
+    """巨潮公告 → `ANNOUNCEMENT_COLUMNS`；窗口内 0 条是 0 行答复。
+
+    `art_code` 从详情链接里的 `announcementId` 取：巨潮那一页没有单独的编号列，
+    而链接自带编号是它的公开契约。取不出来的行不猜（跳过并记日志），
+    否则一堆空编号会在主键上互相覆盖。
+    """
+    absent = [column for column in _ANN_REQUIRED if column not in raw.columns]
+    if absent:
+        raise FieldDrift(SOURCE, f"公告响应缺少必需列 {absent}，实际列 {list(raw.columns)}")
+    canonical = canonical_code(market, code)
+    rows: list[dict] = []
+    skipped = 0
+    for item in raw.iter_rows(named=True):
+        echoed = _text(item.get("代码"))
+        if echoed and canonical_code(market, echoed) != canonical:
+            raise FieldDrift(
+                SOURCE, f"公告响应代码 {echoed} 与请求代码 {code} 不一致（串包或缓存错位）"
+            )
+        link = _text(item.get("公告链接"))
+        title = _text(item.get("公告标题"))
+        match = _ANN_ID.search(link) if link else None
+        published = _to_date(item.get("公告时间"))
+        if match is None or not title or published is None:
+            skipped += 1
+            continue
+        if not start <= published <= end:
+            continue
+        rows.append(
+            {
+                "market": market,
+                "code": canonical,
+                "art_code": match.group(1),
+                "published_on": published,
+                "title": title,
+                "category": None,
+                "url": link,
+                "source": source,
+            }
+        )
+    if skipped:
+        logger.warning("巨潮公告有 %d 行读不出编号、标题或日期，按读不出跳过", skipped)
+    if not rows:
+        return empty_announcements()
+    return (
+        pl.DataFrame(rows, schema=empty_announcements().schema)
+        .unique(subset=["art_code"], keep="last")
+        .sort("published_on", descending=True)
+    )
+
+
 class AkshareCninfoAdapter:
     name = SOURCE
     markets = frozenset({"A"})
-    #: 只有公司行为能力，没有日线：日线链上它会被显式跳过（D38），不算进备源计数
+    #: 历史分红是全史；概况/公告/上市日期是另外三个端点（D324），没有日线
     corp_actions_full_history = True
 
-    def __init__(self, plans_fetch: Callable[[str], pl.DataFrame] = akshare_cninfo_plans) -> None:
+    def __init__(
+        self,
+        plans_fetch: Callable[[str], pl.DataFrame] = akshare_cninfo_plans,
+        profile_fetch: Callable[[str], pl.DataFrame] = akshare_cninfo_profile,
+        announcements_fetch: Callable[[str, date, date], pl.DataFrame] = (
+            akshare_cninfo_announcements
+        ),
+    ) -> None:
         self._plans_fetch = plans_fetch
+        self._profile_fetch = profile_fetch
+        self._announcements_fetch = announcements_fetch
 
     def corp_actions(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         """全史交回去，**不按窗口切**（D40）：切掉的行是源已经给到的事实，而服务层照样会写
@@ -335,9 +511,61 @@ class AkshareCninfoAdapter:
             raise classify_error(self.name, exc) from exc
         return actions
 
+    def company_profile(
+        self, market: str, code: str, start: date, end: date
+    ) -> pl.DataFrame:
+        """公司概况一票一行（D324）。窗口对它没有意义，只为与降级链同形。"""
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        try:
+            raw = _as_polars(self._profile_fetch(canonical_code(market, code)))
+            return parse_cninfo_profile(raw, market=market, code=code, source=self.name)
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
+    def announcements(
+        self, market: str, code: str, start: date, end: date
+    ) -> pl.DataFrame:
+        """窗口内公告（D324）。0 条是 0 行答复；编号取不出的行跳过而不是猜。"""
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        try:
+            raw = _as_polars(self._announcements_fetch(canonical_code(market, code), start, end))
+            return parse_cninfo_announcements(
+                raw, market=market, code=code, source=self.name, start=start, end=end
+            )
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
+    def listed_date(self, market: str, code: str) -> date | None:
+        """上市首日：同一份概况里那一格（D324）。
+
+        `None` 是「巨潮没有这只票的概况」，一句答复；抛出去才是「答不上来」。
+        缺 `上市日期` 这一列也返回 None——源把这一列拿掉时，我们确实不知道哪天，
+        替它写一个日子或写「没上市」都是假话。
+        """
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        try:
+            raw = _as_polars(self._profile_fetch(canonical_code(market, code)))
+            if raw.is_empty() or "上市日期" not in raw.columns:
+                return None
+            return _to_date(raw["上市日期"][0])
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
 
 def _as_polars(frame: object) -> pl.DataFrame:
     return frame if isinstance(frame, pl.DataFrame) else pl.DataFrame(frame)  # type: ignore[arg-type]
 
 
-source("akshare_cninfo", note="巨潮 A 股历史分红（只有公司行为，没有日线）")(AkshareCninfoAdapter)
+source(
+    "akshare_cninfo",
+    note="巨潮 A 股：历史分红、公司概况、公告、上市日期（无日线）",
+)(AkshareCninfoAdapter)

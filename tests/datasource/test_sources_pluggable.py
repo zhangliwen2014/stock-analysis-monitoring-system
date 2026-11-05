@@ -77,7 +77,12 @@ def test_capabilities_come_from_the_methods_not_from_a_hand_kept_list():
     assert entries["akshare_hk"].capabilities == ("corp_actions", "symbol_list")
     assert entries["nasdaq_trader"].capabilities == ("symbol_list",)
     assert entries["akshare_ths"].capabilities == ("corp_actions",)
-    assert entries["akshare_cninfo"].capabilities == ("corp_actions",)
+    assert entries["akshare_cninfo"].capabilities == (
+        "corp_actions",
+        "company_profile",
+        "announcements",
+        "listed_date",
+    )
     assert entries["tencent"].capabilities == (
         "daily_bars",
         "quote",

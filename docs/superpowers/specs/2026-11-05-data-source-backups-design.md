@@ -69,8 +69,9 @@ US: yfinance → tencent → sina_quote → nasdaq_trader → eastmoney_us_f10
 | `stock_hk_valuation_baidu` | 百度股市通 | HK | 按日估值 | 365 行 / 2.0s |
 | `stock_financial_analysis_indicator` | 新浪 | A | 基本面（按报告期） | 11 行 / 1.0s |
 | `stock_financial_abstract_new_ths` | 同花顺 | A | 基本面（长表 metric/value） | 1200 行 / 0.6s |
-| `stock_profile_cninfo` | 巨潮 | A | 公司概况 + **上市日期** | 1 行 / 0.7s（列里有 `上市日期`） |
-| `stock_individual_notice_report` | 巨潮 | A | 公告 | 1079 行 / 34.4s |
+| `stock_profile_cninfo` | 巨潮 | A | 公司概况 + **上市日期** | 1 行 / 0.2–0.9s（600519/000001/920289 三所各答 1 行，列里有 `上市日期`） |
+| `stock_zh_a_disclosure_report_cninfo` | 巨潮 | A | 公告 | 920289 的 30 天窗口 34 行 / 4.8s（两页）；空窗口是列齐全的 0 行帧 |
+| ~~`stock_individual_notice_report`~~ | **东财**（不是巨潮） | A | 公告 | 1079 行 / 34.4s。**实现时订正**：它打的是 `np-anotice-stock.eastmoney.com`，与 `eastmoney_f10` 同域（D322 第二档），34 秒且不构成真备源——改用上一行的巨潮自有端点 |
 | `stock_hk_daily` | 新浪 | HK | 日线 | 1997 行 / 1.0s |
 | `stock_us_daily` | 新浪 | US | 日线 | 10068 行 / 2.3s |
 | `index_us_stock_sina` | 新浪 | US | 指数日线 | 5747 行 / 2.0s |
@@ -188,7 +189,11 @@ US 基本面、HK 上市日期接上之后走的是已有的 job、已有的表�
      实测列名 `date,open,high,low,close,volume[,amount]`）。
    * 东财 HK/US 分钟 K：`scale=5`、时间戳按市场时区，列名漂移 ⇒ `FieldDrift`。
    * 巨潮概况：`上市日期` 进 `listed_date`，缺这个键 ⇒ 返回 `None`（一句答复）而不是抛。
-   * 巨潮公告：1079 行形状的标准列 + `公告日期` 过滤窗口。
+   * 巨潮公告：`代码/公告标题/公告时间/公告链接` 映射到标准列（`art_code` 取自链接里的
+     `announcementId`），按窗口过滤；串包代码 ⇒ `FieldDrift`，编号读不出的行跳过。
+     北交所同样有答复（920289 的 30 天窗口 34 行），空窗口是列齐全的 0 行帧。
+   * `0048` 把巨潮的 `priority` 从 6 挪到 7：它在 0047 里与 `eastmoney_f10` 同号，
+     按名字排会抢到概况/公告链的第 1 位，而这两格的主源是东财（D324）。
    * `TypeError` 归类：假的「库内崩」异常 ⇒ `EmptyResponse`；同一段代码里换 `KeyError`
      ⇒ 照原样抛（钉住 D327 只认那一种形状）。
 3. **链上行为**：把 A 估值链的第 1 位弄坏（测试替身），`registry.fetch_valuation` 要走到百度并
