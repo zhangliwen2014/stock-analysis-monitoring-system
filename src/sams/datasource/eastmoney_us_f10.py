@@ -234,12 +234,89 @@ def _number(value: object) -> float | None:
         return None
 
 
-def _checked_code(code: str) -> str:
+def _checked_code(code: str, source: str) -> str:
     if not _CODE_PATTERN.match(code):
         raise DatasourceError(
-            "eastmoney_us_f10", f"美股代码 {code!r} 含有过滤器不接受的字符，已拒绝请求"
+            source, f"美股代码 {code!r} 含有过滤器不接受的字符，已拒绝请求"
         )
     return code
+
+
+def identify_us(
+    get: Callable[[str, dict[str, str]], dict], *, code: str, source: str
+) -> tuple[str | None, str]:
+    """SECURITY_CODE → (SECUCODE, 组织类型)。查无记录时返回 (None, "")。"""
+    payload = get(
+        US_INDICATOR_URL,
+        {
+            "reportName": PROFILE_REPORT,
+            "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,ORG_TYPE",
+            "filter": f'(SECURITY_CODE="{_checked_code(code, source)}")',
+            "pageNumber": "1",
+            "pageSize": "10",
+        },
+    )
+    if not isinstance(payload, dict) or "result" not in payload:
+        raise FieldDrift(
+            source, f"美股证券概览响应缺少 result（拿到 {type(payload).__name__}）"
+        )
+    result = payload["result"]
+    if result is None:
+        return None, ""
+    if not isinstance(result, dict):
+        raise FieldDrift(source, "美股证券概览的 result 不是对象")
+    data = result.get("data") or []
+    if not isinstance(data, list):
+        raise FieldDrift(source, "美股证券概览的 result.data 不是列表")
+    if not data:
+        return None, ""
+    row = data[0] if isinstance(data[0], dict) else {}
+    secucode = str(row.get("SECUCODE") or "").strip()
+    if not secucode:
+        raise FieldDrift(source, f"美股证券概览里没有 SECUCODE（拿到 {row}）")
+    if not _CODE_PATTERN.match(secucode):
+        raise FieldDrift(source, f"美股 SECUCODE {secucode!r} 含意外字符，已拒绝")
+    return secucode, str(row.get("ORG_TYPE") or "")
+
+
+def fetch_us_financials(
+    get: Callable[[str, dict[str, str]], dict],
+    *,
+    market: str,
+    code: str,
+    start: date,
+    end: date,
+    source: str,
+) -> pl.DataFrame:
+    """一只美股的年报行：先认组织类型，再取对应的那张表。查无此票是 0 行。"""
+    secucode, org_type = identify_us(get, code=code, source=source)
+    if secucode is None:
+        # 源不认识这只票：一句「查无记录」，不是故障（D43）
+        return empty_financials()
+    spec = report_for(org_type)
+    payload = get(
+        US_INDICATOR_URL,
+        {
+            "reportName": spec["report"],
+            "columns": spec["columns"],
+            "filter": f'(SECUCODE="{secucode}")(DATE_TYPE_CODE in ("{_ANNUAL_CODE}"))',
+            "pageNumber": "1",
+            "pageSize": "200",
+            "sortTypes": "-1",
+            "sortColumns": "REPORT_DATE",
+            "source": "SECURITIES",
+            "client": "PC",
+        },
+    )
+    return parse_us_financials(
+        payload,
+        market=market,
+        code=code,
+        source=source,
+        org_type=org_type,
+        start=start,
+        end=end,
+    )
 
 
 def _http_get(url: str, params: dict[str, str]) -> dict:
@@ -260,72 +337,18 @@ class EastmoneyUSF10Adapter:
         if market not in self.markets:
             raise ValueError(f"{self.name} 不支持市场 {market}")
         try:
-            secucode, org_type = self._identify(code)
-            if secucode is None:
-                # 源不认识这只票：一句「查无记录」，不是故障（D43）
-                return empty_financials()
-            spec = report_for(org_type)
-            payload = self._get(
-                US_INDICATOR_URL,
-                {
-                    "reportName": spec["report"],
-                    "columns": spec["columns"],
-                    "filter": f'(SECUCODE="{secucode}")(DATE_TYPE_CODE in ("{_ANNUAL_CODE}"))',
-                    "pageNumber": "1",
-                    "pageSize": "200",
-                    "sortTypes": "-1",
-                    "sortColumns": "REPORT_DATE",
-                    "source": "SECURITIES",
-                    "client": "PC",
-                },
-            )
-            return parse_us_financials(
-                payload,
+            return fetch_us_financials(
+                self._get,
                 market=market,
                 code=code,
-                source=self.name,
-                org_type=org_type,
                 start=start,
                 end=end,
+                source=self.name,
             )
         except DatasourceError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
-
-    def _identify(self, code: str) -> tuple[str | None, str]:
-        """SECURITY_CODE → (SECUCODE, 组织类型)。查无记录时返回 (None, "")。"""
-        payload = self._get(
-            US_INDICATOR_URL,
-            {
-                "reportName": PROFILE_REPORT,
-                "columns": "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,ORG_TYPE",
-                "filter": f'(SECURITY_CODE="{_checked_code(code)}")',
-                "pageNumber": "1",
-                "pageSize": "10",
-            },
-        )
-        if not isinstance(payload, dict) or "result" not in payload:
-            raise FieldDrift(
-                self.name, f"美股证券概览响应缺少 result（拿到 {type(payload).__name__}）"
-            )
-        result = payload["result"]
-        if result is None:
-            return None, ""
-        if not isinstance(result, dict):
-            raise FieldDrift(self.name, "美股证券概览的 result 不是对象")
-        data = result.get("data") or []
-        if not isinstance(data, list):
-            raise FieldDrift(self.name, "美股证券概览的 result.data 不是列表")
-        if not data:
-            return None, ""
-        row = data[0] if isinstance(data[0], dict) else {}
-        secucode = str(row.get("SECUCODE") or "").strip()
-        if not secucode:
-            raise FieldDrift(self.name, f"美股证券概览里没有 SECUCODE（拿到 {row}）")
-        if not _CODE_PATTERN.match(secucode):
-            raise FieldDrift(self.name, f"美股 SECUCODE {secucode!r} 含意外字符，已拒绝")
-        return secucode, str(row.get("ORG_TYPE") or "")
 
 
 source("eastmoney_us_f10", note="东方财富美股主要财务指标（仅 US）")(EastmoneyUSF10Adapter)

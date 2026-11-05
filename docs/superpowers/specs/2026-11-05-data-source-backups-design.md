@@ -123,7 +123,7 @@ US: yfinance → tencent → sina_quote → nasdaq_trader → eastmoney_us_f10
 |---|---|---|---|---|
 | `baidu_valuation` | 新建 `datasource/baidu_valuation.py` | A、HK | `valuation` | 估值链第 2 位（A 在 akshare 后、HK 在 yfinance 后） |
 | `sina_global` | 新建 `datasource/sina_global.py` | HK、US | `daily_bars`、`index_daily`(US) | HK/US 日线第 3 位；US 指数日线第 2 位 |
-| `eastmoney_global` | 新建 `datasource/eastmoney_global.py` | HK、US | `minute_bars`、`index_daily`(HK)、`listed_date`(HK)、`financials`、`market_snapshot` | 各自那条链的第 2 位（快照因 60/167s 排最后） |
+| `eastmoney_global` | 新建 `datasource/eastmoney_global.py` | HK、US | `minute_bars`、`index_daily`(HK)、`listed_date`(HK)、`financials`、`market_snapshot` | 各自那条链的第 2 位（快照因 35–60/167s 排最后） |
 | `akshare_cninfo` | 扩能（已存在，只加方法） | A | `company_profile`、`announcements`、`listed_date` | 概况/公告链第 2 位；上市日期链第 2 位 |
 | `sina` | 扩能（已存在，A 股那一路） | A | `financials` | 基本面链第 2 位 |
 
@@ -132,7 +132,7 @@ US: yfinance → tencent → sina_quote → nasdaq_trader → eastmoney_us_f10
 
 ### D325 慢源排最后，并把实测耗时写进 `note`
 
-快照备源一次要 60 秒（HK）到 167 秒（US）。降级链只会在家主源失败时才走到它，
+快照备源一次要 35–60 秒（HK）到 167 秒（US）。降级链只会在家主源失败时才走到它，
 所以这个代价平时不付；一旦付起来，屏幕与 `task_runs` 里要能看出「这次是那条慢的路」。
 `note` 里写实测数，不写「较慢」这种没法核对的话。
 

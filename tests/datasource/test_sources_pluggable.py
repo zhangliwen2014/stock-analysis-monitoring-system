@@ -22,6 +22,7 @@ ADAPTER_MODULES = {
     "baidu_valuation",
     "eastmoney",
     "eastmoney_f10",
+    "eastmoney_global",
     "eastmoney_hk_f10",
     "eastmoney_us_f10",
     "nasdaq_trader",

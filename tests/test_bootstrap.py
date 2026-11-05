@@ -105,6 +105,8 @@ def test_registry_chain_comes_from_the_database(migrated):
                 "yfinance",
                 "tencent",
                 "akshare_hk",
+                # 0051：东财港美股排在 3（与 akshare_hk 同号、按名字排在它后面）
+                "eastmoney_global",
                 "eastmoney_f10",
                 "eastmoney_hk_f10",
                 "sina_quote",
@@ -113,7 +115,15 @@ def test_registry_chain_comes_from_the_database(migrated):
                 # 0050：新浪港美股日线只报 daily_bars / US 的 index_daily，挂链尾（D324）
                 "sina_global",
             ),
-            "US": ("yfinance", "tencent", "sina_quote", "eastmoney_us_f10", "sina_global"),
+            "US": (
+                "yfinance",
+                "tencent",
+                # 0051：东财港美股在 3，与 sina_quote 同号按名字排在它前面
+                "eastmoney_global",
+                "sina_quote",
+                "eastmoney_us_f10",
+                "sina_global",
+            ),
         }
         assert built.registry.chain_for("HK", "daily_bars") == (
             "yfinance",
@@ -126,7 +136,13 @@ def test_registry_chain_comes_from_the_database(migrated):
             "tencent",
             "sina_global",
         )
-        assert built.registry.chain_for("US", "index_daily") == ("tencent", "sina_global")
+        # 0050：美股指数日线第二跳（腾讯之后）是新浪；0051 的东财港美股也挂着
+        # `index_daily` 方法（只答 HK），链按方法过滤，不爱答的市场由 EmptyResponse 顺延
+        assert built.registry.chain_for("US", "index_daily") == (
+            "tencent",
+            "eastmoney_global",
+            "sina_global",
+        )
         assert built.registry.chain_for("HK", "corp_actions") == ("yfinance", "akshare_hk")
         assert built.registry.chain_for("A", "corp_actions") == (
             "akshare",
@@ -150,8 +166,38 @@ def test_registry_chain_comes_from_the_database(migrated):
         assert built.registry.chain_for("A", "listed_date") == ("akshare", "akshare_cninfo")
         assert built.registry.chain_for("HK", "announcements") == ("eastmoney_f10",)
         assert built.registry.chain_for("US", "company_profile") == ()
-        assert built.registry.chain_for("HK", "financials") == ("eastmoney_hk_f10",)
-        assert built.registry.chain_for("US", "financials") == ("eastmoney_us_f10",)
+        # 0051：两地基本面都是「东财港美股（同源备份）→ 只服务该市场的 F10 源」
+        assert built.registry.chain_for("HK", "financials") == (
+            "eastmoney_global",
+            "eastmoney_hk_f10",
+        )
+        assert built.registry.chain_for("US", "financials") == (
+            "eastmoney_global",
+            "eastmoney_us_f10",
+        )
+        # 0051：分钟K、快照与 HK 指数日线都补在腾讯之后
+        assert built.registry.chain_for("HK", "minute_bars") == (
+            "tencent",
+            "eastmoney_global",
+        )
+        assert built.registry.chain_for("US", "minute_bars") == (
+            "tencent",
+            "eastmoney_global",
+        )
+        assert built.registry.chain_for("HK", "index_daily") == (
+            "tencent",
+            "eastmoney_global",
+            "sina_global",
+        )
+        assert built.registry.chain_for("HK", "market_snapshot") == (
+            "tencent",
+            "eastmoney_global",
+        )
+        assert built.registry.chain_for("US", "market_snapshot") == (
+            "tencent",
+            "eastmoney_global",
+        )
+        assert "eastmoney_global" in built.registry.chain_for("HK", "listed_date")
         # 0048：A 股基本面第二源是新浪（D324）。它在日线链上排第 4，财务能力只由
         # 方法现身，所以这条链是「按优先级过滤后的能力链」，不是日线链的前缀
         assert built.registry.chain_for("A", "financials") == ("akshare", "sina")
