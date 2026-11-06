@@ -45,9 +45,11 @@ def add_financial(
     db,
     code: str,
     *,
+    market: str = "A",
     roe: float | None = 0.2,
     report_date: date = FY,
     published: date | None = FY_PUBLISHED,
+    report_type: str | None = None,
 ) -> None:
     FinancialRepo(db).upsert(
         # 显式 schema：`published=None` 的那一行会让 polars 把整列推成 Null 类型，
@@ -55,12 +57,13 @@ def add_financial(
         pl.DataFrame(
             [
                 {
-                    "market": "A",
+                    "market": market,
                     "code": code,
                     "report_date": report_date,
                     "published_date": published,
                     "roe": roe,
-                    "source": "akshare",
+                    "report_type": report_type,
+                    "source": "akshare" if market == "A" else "eastmoney_hk_f10",
                 }
             ],
             schema={
@@ -69,6 +72,7 @@ def add_financial(
                 "report_date": pl.Date,
                 "published_date": pl.Date,
                 "roe": pl.Float64,
+                "report_type": pl.Utf8,
                 "source": pl.Utf8,
             },
         )
@@ -76,18 +80,24 @@ def add_financial(
 
 
 def add_valuation(
-    db, code: str, *, pe: float | None = 20.0, pb: float | None = 2.0, on: date = FRESH
+    db,
+    code: str,
+    *,
+    market: str = "A",
+    pe: float | None = 20.0,
+    pb: float | None = 2.0,
+    on: date = FRESH,
 ) -> None:
     ValuationRepo(db).upsert(
         pl.DataFrame(
             [
                 {
-                    "market": "A",
+                    "market": market,
                     "code": code,
                     "date": on,
                     "pe_ttm": pe,
                     "pb": pb,
-                    "source": "akshare",
+                    "source": "akshare" if market == "A" else "baidu_valuation",
                 }
             ]
         )
@@ -266,3 +276,63 @@ def test_periods_without_a_publication_date_are_counted(db):
     scan = screen(db).pr_max("A", 0.4)
     assert scan.dropped_unpublished == 1
     assert scan.hits[0].roe_used == pytest.approx(0.5), "被挡掉的那期没有替 PR 背书"
+
+
+# ---------- 无披露日的市场（D215/D228） ----------
+
+
+def test_a_hk_period_without_a_publication_date_is_adopted(db):
+    """港股源不给披露日（D215）：按「报告期 ≤ 截至日」采信，不是把每一期都挡掉。"""
+    add_financial(db, "00700", market="HK", roe=0.5, published=None)
+    add_valuation(db, "00700", market="HK", pe=18.0, pb=2.0)
+
+    scan = screen(db).pr_max("HK", 0.4)
+
+    assert scan.universe_size == 1
+    assert [hit.code for hit in scan.hits] == ["00700"]
+    assert scan.dropped_unpublished == 0, "报告期没晚于截至日，就不是被未来函数闸门挡的"
+
+
+def test_a_us_annual_row_is_adopted_and_the_period_survives_price_moves(db):
+    """美股年报按源给的报告类型认（D228）：9 月财年不该让 PR 消失。"""
+    add_financial(
+        db,
+        "AAPL",
+        market="US",
+        roe=0.5,
+        report_date=date(2023, 9, 30),
+        published=None,
+        report_type="年报",
+    )
+    add_valuation(db, "AAPL", market="US", pe=15.0, pb=6.0)
+
+    scan = screen(db).pr_max("US", 0.4)
+
+    assert [hit.code for hit in scan.hits] == ["AAPL"]
+    assert scan.hits[0].period == date(2023, 9, 30)
+
+
+def test_an_undated_market_with_future_periods_never_says_d61(db):
+    """开口之后只剩「报告期晚于截至日」一种缺法：那句话不能再说 D61。"""
+    add_financial(
+        db, "00700", market="HK", published=None, report_date=date(2024, 12, 31)
+    )
+    add_valuation(db, "00700", market="HK")
+
+    scan = screen(db).pr_max("HK", 0.4)
+
+    (exclusion,) = scan.excluded
+    assert "D61" not in exclusion.reason
+    assert "都晚于截至日" in exclusion.reason
+
+
+
+def test_a_us_high_roe_still_gets_a_pr(db):
+    """D228：选股与单票读数是同一个口径闸——美股 ROE 超过 100% 不该被当成忘了 ÷100。"""
+    add_financial(db, "AAPL", market="US", roe=1.714, report_type="年报")
+    add_valuation(db, "AAPL", market="US", pe=37.84, pb=44.62)
+
+    scan = screen(db).pr_max("US", 0.5)
+
+    assert [hit.code for hit in scan.hits] == ["AAPL"]
+    assert scan.hits[0].value == pytest.approx(37.84 / 1.714 / 100.0)

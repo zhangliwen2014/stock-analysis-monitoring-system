@@ -41,6 +41,7 @@ def financials_rows(**over) -> pl.DataFrame:
         "code": "601088",
         "report_date": FY,
         "published_date": FY_PUBLISHED,
+        "report_type": None,
         "roe": 0.2,
         "revenue_yoy": 0.12,
         "profit_yoy": 0.08,
@@ -49,7 +50,12 @@ def financials_rows(**over) -> pl.DataFrame:
         "source": "akshare",
     }
     row.update(over)
-    return pl.DataFrame([row])
+    # 显式类型：`published_date=None` 的一行会让整列推成 Null，而仓库层对日期列当场拒绝
+    return pl.DataFrame([row]).with_columns(
+        pl.col("report_date").cast(pl.Date),
+        pl.col("published_date").cast(pl.Date),
+        pl.col("report_type").cast(pl.Utf8),
+    )
 
 
 def interim_rows(**over) -> pl.DataFrame:
@@ -59,6 +65,7 @@ def interim_rows(**over) -> pl.DataFrame:
         "code": "601088",
         "report_date": H1,
         "published_date": H1_PUBLISHED,
+        "report_type": None,
         "roe": 0.08,
         "revenue_yoy": 0.12,
         "profit_yoy": 0.08,
@@ -67,7 +74,11 @@ def interim_rows(**over) -> pl.DataFrame:
         "source": "akshare",
     }
     row.update(over)
-    return pl.DataFrame([row])
+    return pl.DataFrame([row]).with_columns(
+        pl.col("report_date").cast(pl.Date),
+        pl.col("published_date").cast(pl.Date),
+        pl.col("report_type").cast(pl.Utf8),
+    )
 
 
 def valuation_rows(**over) -> pl.DataFrame:
@@ -488,3 +499,93 @@ def test_no_valuation_row_has_no_age_rather_than_zero_days(wired, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["valuation_on"] is None and payload["valuation_age_days"] is None
     assert payload["valuation_stale"] is False
+
+
+# ---------- 无披露日的市场（D215/D228） ----------
+
+
+def seed_rows(container, *, financials, valuation) -> None:
+    """HK/US 的基本面不走 A 股那条链：本节的用例直接把行写进仓库。"""
+    container.financials_store.upsert(financials)
+    container.valuation_store.upsert(valuation)
+
+
+def test_a_us_fiscal_year_end_is_named_and_dated_by_its_source(db, settings, capsys):
+    """美股年报的报告期是财年止日（D228）：叫「9 月末期」会让分母看起来是三季报。"""
+    container = seeded(db, settings)
+    seed_rows(
+        container,
+        financials=financials_rows(
+            market="US",
+            code="AAPL",
+            report_date=date(2023, 9, 27),
+            published_date=None,
+            report_type="年报",
+        ),
+        valuation=valuation_rows(market="US", code="AAPL"),
+    )
+    capsys.readouterr()
+    assert (
+        run(container, ["analysis", "fundamentals", "--market", "US", "--code", "AAPL"])
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "年报（财年止 09-27）" in out
+    assert "源不提供披露日（D215/D228）" in out
+    assert "9 月末期" not in out
+
+
+def test_the_basis_note_carries_the_undated_market_into_json(db, settings, capsys):
+    """港美股按报告期采信是口径而不是缺口：`--json` 的 `basis_note` 要说得出这句话。"""
+    container = seeded(db, settings)
+    seed_rows(
+        container,
+        financials=financials_rows(market="HK", code="00700", published_date=None),
+        valuation=valuation_rows(market="HK", code="00700"),
+    )
+    capsys.readouterr()
+    run(container, ["analysis", "fundamentals", "--market", "HK", "--code", "00700", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert "D215/D228" in payload["basis_note"]
+    assert payload["period"] == str(FY)
+
+
+def test_a_newer_undated_period_is_announced_without_the_word_none(db, settings, capsys):
+    """「披露 None」是一句机器话：那一格在港美股是源不提供，不是我们不知道。"""
+    container = seeded(db, settings)
+    seed_rows(
+        container,
+        financials=pl.concat(
+            [
+                financials_rows(market="HK", code="00700", published_date=None),
+                interim_rows(market="HK", code="00700", published_date=None),
+            ]
+        ),
+        valuation=valuation_rows(market="HK", code="00700"),
+    )
+    capsys.readouterr()
+    assert run(container, ["analysis", "fundamentals", "--market", "HK", "--code", "00700"]) == 0
+    out = capsys.readouterr().out
+    assert f"库里另有更新的一期 {H1}" in out
+    assert "披露 None" not in out
+    assert "源不提供披露日（D215/D228）" in out
+
+
+def test_a_future_undated_period_is_dropped_by_the_future_gate(db, settings, capsys):
+    """开口之后被挡下的只剩「报告期晚于截至日」：那句 ⚠ 不能说成「没有披露日（D61）」。"""
+    container = seeded(db, settings)
+    seed_rows(
+        container,
+        financials=financials_rows(
+            market="HK",
+            code="00700",
+            report_date=date(2024, 12, 31),
+            published_date=None,
+        ),
+        valuation=valuation_rows(market="HK", code="00700"),
+    )
+    capsys.readouterr()
+    assert run(container, ["analysis", "fundamentals", "--market", "HK", "--code", "00700"]) == 1
+    out = capsys.readouterr().out
+    assert "报告期晚于截至日" in out
+    assert "D61" not in out

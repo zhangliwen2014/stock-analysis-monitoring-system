@@ -167,6 +167,34 @@ HK 的 3 只票实际只有 `baidu_valuation` 在答。`eastmoney_global` 明明
   「源不提供披露日（D215/D228）」；`interim` 警告里的「披露 None」一并修掉。
 * `_hit_line(hit, market)`：美股年报那一期不再是「9 月末期」，而是「年报（财年止 09-27）」。
 
+### 4.4 实网验证揪出的第二处开口：可信上界要按市场取（D228 的余波）
+
+第一次实网跑 `screen pr --codes AAPL`，AAPL 仍被排除：
+
+```
+ROE=1.42257 … 达到可信上界（|ROE| ≥ 1 即不可信）
+```
+
+`MARKET_RATIO_BOUNDS = {("US", "roe"): 5.0}` 早已存在（D228：美股的 ROE 超过 100%
+是常态，苹果就是 142%），但只有 web 的 `Screener` 把 `market` 传进了
+`out_of_caliber`；`pr()` / `pr_now()` 与分位曲线三处都用了默认的 A 股上界 `1.0`。
+读侧一开口，这批票就从「披露日为空」的拒绝里出来、撞上第二道按 A 股设的闸。
+
+所以 `market` 要一路穿到底：
+
+| 位置 | 改动 |
+| --- | --- |
+| `analysis/fundamentals.py` | `pr(..., market=None)`、`pr_now(pe_dyn, pb, *, market=None)`：`market` 传给 `out_of_caliber`，拒绝理由里写**实际生效**的上界（`|ROE| ≥ 5` 而不是 `≥ 1`） |
+| `analysis/valuation/percentile.py` | `pr_percentile(..., market=None)` → `_pr_on(..., market)` → `pr(..., market=market)` |
+| `services/valuation.py` | `percentiles()` / `_percentile_readings()` 传 `market` |
+| `services/screener.py` | `pr_now(..., market=market)` |
+| `services/screen.py` / `services/fundamentals.py` | `_one` / `read()` 的 `pr(..., market=market)` |
+
+默认 `market=None` 保持 A 股口径（上界 1.0），A 股的测试与输出一字不动。
+
+已知未跟进的同类点：`analysis/valuation/scoring.py` 的 `roe_score` 仍按默认上界
+打分（web 的估值打分页），不在本期范围。
+
 ---
 
 ## 5. 落点
@@ -178,12 +206,16 @@ HK 的 3 只票实际只有 `baidu_valuation` 在答。`eastmoney_global` 明明
 | `src/sams/core/fundamentals.py` | `UNDATED_FINANCIAL_MARKETS`、`roe_basis_note(basis, market=None)` |
 | `src/sams/services/screener.py` | 改为 import 上面那个集合 |
 | `src/sams/services/screen.py` | `include_undated`、`no_usable_period` 分市场 |
-| `src/sams/services/fundamentals.py` | `include_undated`、`_missing_roe_reason` 分市场 |
+| `src/sams/services/fundamentals.py` | `include_undated`、`_missing_roe_reason` 分市场、`pr(..., market=market)` |
+| `src/sams/analysis/fundamentals.py` | `pr` / `pr_now` 认 `market`，按 D228 取上界并写进拒绝理由 |
+| `src/sams/analysis/valuation/percentile.py` | `pr_percentile(market=...)` 穿透到 `pr()` |
+| `src/sams/services/valuation.py` | `percentiles()` / `_percentile_readings()` 传 `market` |
 | `src/sams/cli/screen.py` | `roe_basis_note(..., market)`、`_hit_line(hit, market)`、`_warnings` |
 | `src/sams/cli/analysis.py` | `roe_basis_note(..., market)`、披露日文案、`dropped_unpublished` 文案 |
 | `tests/datasource/test_eastmoney_global.py` | 新能力的解析/适配器用例；`provided_by` 期望值加 `valuation` |
 | `tests/services/test_screen_pr.py` / `test_fundamentals_read.py` | HK/US 的 PR 能算出来；原因文案不再提 D61 |
 | `tests/cli/test_screen_json_adversarial.py` 等 | `basis_note` / warnings 的市场差别 |
+| `tests/test_bootstrap.py` | 容器链快照：HK 估值变成 `yfinance → eastmoney_global → baidu`，US 变成 `yfinance → eastmoney_global` |
 
 ## 6. 验证
 

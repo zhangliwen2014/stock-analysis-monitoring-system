@@ -99,3 +99,20 @@ def test_the_caliber_line_states_the_unit_and_the_two_grains():
     """这句要能被打印，所以它得自己说清「小数」和「两个粒度」这两件事（D54）。"""
     note = caliber_note()
     assert "0.20 = 20%" in note and "报告期" in note and "交易日" in note
+
+
+def test_the_basis_note_names_the_us_fiscal_year_and_the_undated_markets():
+    """口径话要跟着市场走：美股年报不是 12-31，港美股源也不给披露日（D215/D228）。"""
+    from sams.core.fundamentals import roe_basis_note
+
+    us = roe_basis_note("annual", market="US")
+    assert "财年" in us and "12-31 那一报告期" not in us
+    assert "D215/D228" in us
+
+    hk = roe_basis_note("annual", market="HK")
+    assert "12-31 那一报告期" in hk
+    assert "D215/D228" in hk
+
+    a = roe_basis_note("annual", market="A")
+    assert "12-31 那一报告期" in a and "D215/D228" not in a
+    assert roe_basis_note("annual") == a, "不传市场时是 A 股那句原文"

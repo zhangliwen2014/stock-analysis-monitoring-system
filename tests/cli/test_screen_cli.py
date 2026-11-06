@@ -33,6 +33,7 @@ FINANCIAL_SCHEMA = {
     "code": pl.Utf8,
     "report_date": pl.Date,
     "published_date": pl.Date,
+    "report_type": pl.Utf8,
     "roe": pl.Float64,
     "revenue_yoy": pl.Float64,
     "profit_yoy": pl.Float64,
@@ -103,23 +104,37 @@ def codes_in(out: str, head: str) -> list[str]:
     return [line.strip().split()[0] for line in block(out, head)[1:] if line.strip()]
 
 
-def add_financial(db, code: str, *, roe: float = 0.5, period: date = FY) -> None:
+#: 「没传」与「显式传 None（无披露日）」是两件事：默认值必须可区分
+_UNSET = object()
+
+
+def add_financial(
+    db,
+    code: str,
+    *,
+    market: str = "A",
+    roe: float = 0.5,
+    period: date = FY,
+    published: date | None | object = _UNSET,
+    report_type: str | None = None,
+) -> None:
+    if published is _UNSET:
+        published = FY_PUBLISHED if period == FY else date(2024, 4, 28)
     FinancialRepo(db).upsert(
         pl.DataFrame(
             [
                 {
-                    "market": "A",
+                    "market": market,
                     "code": code,
                     "report_date": period,
-                    "published_date": (
-                        FY_PUBLISHED if period == FY else date(2024, 4, 28)
-                    ),
+                    "published_date": published,
+                    "report_type": report_type,
                     "roe": roe,
                     "revenue_yoy": None,
                     "profit_yoy": None,
                     "dividend_yield": None,
                     "market_cap": None,
-                    "source": "akshare",
+                    "source": "akshare" if market == "A" else "eastmoney_hk_f10",
                 }
             ],
             # 显式 schema：仓库层对「日期列不是 pl.Date」当场拒绝，而 None 会让整列推成 Null 类型
@@ -128,12 +143,20 @@ def add_financial(db, code: str, *, roe: float = 0.5, period: date = FY) -> None
     )
 
 
-def add_valuation(db, code: str, *, pe: float = 15.0, pb: float = 2.0, on: date = FRESH) -> None:
+def add_valuation(
+    db,
+    code: str,
+    *,
+    market: str = "A",
+    pe: float = 15.0,
+    pb: float = 2.0,
+    on: date = FRESH,
+) -> None:
     ValuationRepo(db).upsert(
         pl.DataFrame(
             [
                 {
-                    "market": "A",
+                    "market": market,
                     "code": code,
                     "date": on,
                     "pe_ttm": pe,
@@ -406,3 +429,62 @@ def test_the_scan_is_archived_under_its_own_strategy_id(db, settings, capsys):
     assert repo.count() == 1, "同一天同一条规则重跑覆盖，不留三份「今天扫出什么」"
     run(container, ["screen", "pr", "--market", "A", "--pr-max", "0.2"])
     assert repo.count() == 2, "门槛不同是另一条规则；覆盖掉前一次等于抹掉那个答案"
+
+
+# ---------- 无披露日的市场（D215/D228） ----------
+
+
+def scan_on(market: str, *extra: str) -> list[str]:
+    return ["screen", "pr", "--market", market, "--pr-max", "0.4", *extra]
+
+
+def test_a_us_annual_period_is_named_by_its_fiscal_year_end(db, settings, capsys):
+    """美股年报由源标为「年报」的那一期认定（D228）：它的报告期不是 12-31。
+
+    按日历日把它叫「9 月末期」，读的人会以为 PR 的分母是三季报。
+    """
+    add_financial(
+        db,
+        "AAPL",
+        market="US",
+        period=date(2023, 9, 27),
+        published=None,
+        report_type="年报",
+    )
+    add_valuation(db, "AAPL", market="US")
+    capsys.readouterr()
+    assert run(container_for(db, settings), scan_on("US", "--codes", "AAPL")) == 0
+    out = capsys.readouterr().out
+    assert "年报（财年止 09-27）" in out
+    assert "9 月末期" not in out
+
+
+def test_the_basis_note_tells_the_undated_story_in_text_and_json(db, settings, capsys):
+    """源不提供披露日是口径而不是缺口：这句话要同时出现在屏幕与 `--json` 里（D215/D228）。"""
+    add_financial(db, "00700", market="HK", roe=0.5, published=None)
+    add_valuation(db, "00700", market="HK", pe=18.0)
+    capsys.readouterr()
+    assert run(container_for(db, settings), scan_on("HK", "--codes", "00700")) == 0
+    out = capsys.readouterr().out
+    assert "D215/D228" in out
+    assert "命中 1 只" in out
+    capsys.readouterr()
+    run(container_for(db, settings), scan_on("HK", "--codes", "00700", "--json"))
+    payload = json.loads(capsys.readouterr().out)
+    assert "D215/D228" in payload["basis_note"]
+    assert [h["code"] for h in payload["hits"]] == ["00700"]
+
+
+def test_a_period_newer_than_the_cutoff_is_dropped_as_a_future_gate_not_d61(
+    db, settings, capsys
+):
+    """开口之后被挡下的只剩「报告期晚于截至日」：那句 ⚠ 不能说成「没有披露日（D61）」。"""
+    add_financial(
+        db, "00700", market="HK", published=None, period=date(2024, 12, 31)
+    )
+    add_valuation(db, "00700", market="HK")
+    capsys.readouterr()
+    run(container_for(db, settings), scan_on("HK", "--codes", "00700"))
+    out = capsys.readouterr().out
+    assert "报告期晚于截至日" in out
+    assert "D61" not in out

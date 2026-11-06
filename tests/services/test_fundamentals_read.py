@@ -47,6 +47,7 @@ FINANCIAL_SCHEMA = {
     "profit_yoy": pl.Float64,
     "dividend_yield": pl.Float64,
     "market_cap": pl.Float64,
+    "report_type": TEXT,
     "source": TEXT,
 }
 VALUATION_SCHEMA = {
@@ -84,6 +85,7 @@ def seed_financials(db, *rows: dict) -> None:
         "profit_yoy": None,
         "dividend_yield": 0.051,
         "market_cap": 6.4e11,
+        "report_type": None,
         "source": "akshare",
     }
     FinancialRepo(db).upsert(
@@ -322,3 +324,71 @@ def test_dropped_unpublished_counts_only_periods_the_basis_could_adopt(db):
     # 年报那一期的披露日缺失时，它才该被计进「挡掉的行数」
     seed_financials(db, {"report_date": date(2024, 12, 31), "published_date": None, "roe": 0.2})
     assert service(db).read("A", "601088", as_of=TODAY).dropped_unpublished == 1
+
+
+# ---------- 无披露日的市场（D215/D228） ----------
+
+
+def test_a_hk_period_without_a_publication_date_is_adopted(db):
+    """港股源不给披露日：按「报告期 ≤ 截至日」采信，PR 照算（D215）。"""
+    seed_financials(db, {"market": "HK", "code": "00700", "published_date": None})
+    seed_valuation(db, {"market": "HK", "code": "00700"})
+
+    read = service(db).read("HK", "00700", as_of=TODAY)
+
+    assert read.pr.ok, read.pr.reason
+    assert read.period == Q4
+    assert read.published_on is None, "源没有这一格，不拿报告期加天数去猜"
+    assert read.dropped_unpublished == 0
+
+
+def test_a_us_fiscal_year_annual_row_is_adopted(db):
+    """美股年报按源给的报告类型认（D228）：9 月财年也要算得出 PR。"""
+    seed_financials(
+        db,
+        {
+            "market": "US",
+            "code": "AAPL",
+            "report_date": date(2023, 9, 30),
+            "published_date": None,
+            "report_type": "年报",
+        },
+    )
+    seed_valuation(db, {"market": "US", "code": "AAPL"})
+
+    read = service(db).read("US", "AAPL", as_of=TODAY)
+
+    assert read.pr.ok, read.pr.reason
+    assert read.period == date(2023, 9, 30)
+
+
+def test_an_undated_market_never_gets_the_d61_advice(db):
+    """开口之后，「披露日为空即不采信」对港美股就是一句反话。"""
+    seed_valuation(db, {"market": "HK", "code": "00700"})
+
+    read = service(db).read("HK", "00700", as_of=TODAY)
+
+    assert not read.pr.ok
+    assert "D61" not in read.pr.reason
+    assert "D215/D228" in read.pr.reason
+
+
+def test_a_us_annual_roe_above_one_hundred_percent_is_a_real_denominator(db):
+    """D228：读侧把市场交给算式——同一个 1.714 在 A 股是不可信，在美股是苹果的真实 ROE。"""
+    seed_financials(
+        db,
+        {
+            "market": "US",
+            "code": "AAPL",
+            "report_date": date(2023, 9, 27),
+            "published_date": None,
+            "report_type": "年报",
+            "roe": 1.714,
+        },
+    )
+    seed_valuation(db, {"market": "US", "code": "AAPL", "pe_ttm": 37.84})
+
+    read = service(db).read("US", "AAPL", as_of=TODAY)
+
+    assert read.pr.ok, read.pr.reason
+    assert read.pr.value == pytest.approx(37.84 / 1.714 / 100.0)

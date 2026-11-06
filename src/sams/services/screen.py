@@ -28,6 +28,7 @@ from sams.core.fundamentals import (
     ROE_BASIS_ANNUAL,
     ROE_BASIS_LATEST,
     STALE_VALUATION_DAYS,
+    UNDATED_FINANCIAL_MARKETS,
 )
 from sams.storage.repos.financials import FinancialRepo, ValuationRepo
 from sams.storage.repos.scan_results import ScanResultRepo
@@ -52,6 +53,16 @@ def no_usable_period(market: str, code: str, state: dict, until: date) -> str:
     「同步了却一期都用不上」有两种缺法，前者的下一步是重采、后者是换截至日（D61 + D64）；
     与 `NO_ANNUAL_ROE` 的分工是：那条说「有已披露的期，只是不是年报」。
     """
+    if market in UNDATED_FINANCIAL_MARKETS:
+        # 开口（D333）之后这个市场只剩一种缺法：报告期晚于截至日。再说 D61 就是反话
+        if not state["periods"]:
+            step = f"先重跑 `sams sync financials --market {market} --code {code}`"
+            return f"截至 {until} 库里没有这只票的财务报告——{step}"
+        return (
+            f"截至 {until} 没有一期可用（库里那 {state['periods']} 期都晚于截至日；"
+            f"{market} 的财务源不提供披露日，D215/D228：按「报告期 ≤ 截至日」采信）"
+            "——换一个不早于那些报告期的 `--as-of` 再看"
+        )
     gaps = []
     if state["unpublished"]:
         gaps.append(f"{state['unpublished']} 期的披露日是空的（D61：不知何时公开即不采信）")
@@ -214,7 +225,13 @@ class ScreenService:
         if not universe:
             return PrScan(hits=[], excluded=[], **common)
 
-        reported, dropped = self.financials.load_as_of(market, universe, until, basis=roe_basis)
+        reported, dropped = self.financials.load_as_of(
+            market,
+            universe,
+            until,
+            basis=roe_basis,
+            include_undated=market in UNDATED_FINANCIAL_MARKETS,
+        )
         newest = self._newest_periods(market, universe, until, roe_basis)
         valued = self.valuation.latest(market, universe, until)
         by_report, by_newest, by_value = _index(reported), _index(newest), _index(valued)
@@ -271,7 +288,13 @@ class ScreenService:
         """年报口径下顺手问一次「最新已披露到哪一期」：排除那句要说出具体的期。"""
         if roe_basis == ROE_BASIS_LATEST:
             return pl.DataFrame()
-        return self.financials.load_as_of(market, universe, until, basis=ROE_BASIS_LATEST)[0]
+        return self.financials.load_as_of(
+            market,
+            universe,
+            until,
+            basis=ROE_BASIS_LATEST,
+            include_undated=market in UNDATED_FINANCIAL_MARKETS,
+        )[0]
 
 
 def _one(
@@ -303,7 +326,9 @@ def _one(
         )
     # 这里不传 `--roe-estimate`：选股要的是「这只票自己的已披露 ROE 配现值 PB」，
     # 拿一个手填的数排进一篮子，那个篮子量的就是我的猜测而不是它的便宜
-    ratio = pr(pe_ttm=valued["pe_ttm"], pb=valued["pb"], roe=reported["roe"])
+    ratio = pr(
+        pe_ttm=valued["pe_ttm"], pb=valued["pb"], roe=reported["roe"], market=market
+    )
     if not ratio.ok:
         # D59：拒绝不是 0，也不是一条通用文案——原因由算式那一层给，这里只搬运
         return PrExclusion(code, ratio.reason)

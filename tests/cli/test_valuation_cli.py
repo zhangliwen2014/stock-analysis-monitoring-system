@@ -198,7 +198,11 @@ def test_no_bars_refuses_the_whole_read(db, settings, capsys):
 
 
 def test_a_market_without_fundamental_rows_names_the_next_command(db, settings, capsys):
-    """港美股在库里没有基本面行：屏幕上要有一句能跑的下一步（D43）。"""
+    """港美股在库里没有基本面行：屏幕上要有一句能跑的下一步（D43）。
+
+    这两个市场的源不提供披露日（D215/D228），所以那句「没有已披露的财务数据」是反话：
+    缺的是「报告期不晚于截至日」的行。
+    """
     container = make_container(db, settings, market="HK", code="00700", with_fundamentals=False)
     capsys.readouterr()
     args = cli.build_parser().parse_args(
@@ -208,7 +212,8 @@ def test_a_market_without_fundamental_rows_names_the_next_command(db, settings, 
     body = capsys.readouterr().out
     assert code == 1
     assert "sams sync financials" in body
-    assert "没有已披露的财务数据" in body
+    assert "报告期不晚于截至日" in body
+    assert "D215/D228" in body
 
 
 def test_the_style_flag_switches_the_template(db, settings, capsys):

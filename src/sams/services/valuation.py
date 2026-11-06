@@ -230,7 +230,7 @@ class ValuationService:
         rows = _valuation_days(self.valuation.series(market, code))
         periods = _disclosed_periods(self.financials.periods(market, code))
         percentiles = _percentile_readings(
-            template, rows, periods, until, basis=roe_basis
+            template, rows, periods, until, basis=roe_basis, market=market
         )
         flow_days = tuple(daily.table["date"].to_list()[-FLOW_WINDOW_DAYS:])
         frame = (
@@ -301,7 +301,9 @@ class ValuationService:
         rows = _valuation_days(self.valuation.series(market, code))
         periods = _disclosed_periods(self.financials.periods(market, code))
         readings = (
-            pr_percentile(rows, periods, until, basis=basis, window_years=window_years),
+            pr_percentile(
+                rows, periods, until, basis=basis, window_years=window_years, market=market
+            ),
             metric_percentile(rows, "pe_ttm", until, window_years=window_years),
             metric_percentile(rows, "pb", until, window_years=window_years),
         )
@@ -385,12 +387,17 @@ def _percentile_readings(
     until: date,
     *,
     basis: str,
+    market: str,
 ) -> list[Percentile]:
     window = int(template.param("percentile_window_years"))
     asked = set(template.asked())
     out: list[Percentile] = []
     if _wants_pr_curve(template):
-        out.append(pr_percentile(rows, periods, until, basis=basis, window_years=window))
+        out.append(
+            pr_percentile(
+                rows, periods, until, basis=basis, window_years=window, market=market
+            )
+        )
     for metric in ("pe_ttm", "pb"):
         if _PERCENTILE_ITEM[metric] in asked:
             out.append(metric_percentile(rows, metric, until, window_years=window))

@@ -173,6 +173,152 @@ def test_us_minute_asks_the_beijing_dates_around_the_new_york_day():
     assert out["date"].to_list() == [D0, D0], "出帧仍只留纽约的 D0"
 
 
+# ---------- 按日估值（D331/D332） ----------
+
+
+#: push2 实测读数（2026-11-06，fltt=2&invt=2）。f86 是秒级时间戳：
+#: AAPL 1793912400 = 11-05 16:00 纽约（北京 11-06 05:00）；00700 1793952485 = 11-06 16:08 香港
+US_QUOTE = {
+    "rc": 0,
+    "data": {
+        "f57": "AAPL",
+        "f86": 1793912400,
+        "f162": "-",
+        "f164": 37.84,
+        "f167": 44.62,
+        "f116": 5001541078940.0,
+    },
+}
+HK_QUOTE = {
+    "rc": 0,
+    "data": {
+        "f57": "00700",
+        "f86": 1793952485,
+        "f162": "-",
+        "f164": 14.30,
+        "f167": 2.92,
+        "f116": 3817092299214.2,
+    },
+}
+#: SPY 实测：ETF 没有 PE/PB，三格都是 "-"（不是 0）
+SPY_QUOTE = {
+    "rc": 0,
+    "data": {"f57": "SPY", "f86": 1793912400, "f116": "-", "f164": "-", "f167": "-"},
+}
+#: 不存在的代码：rc=100、data 为 null
+UNKNOWN_QUOTE = {"rc": 100, "rt": 1, "data": None}
+
+
+class FakeQuote:
+    def __init__(self, payloads: dict[str, dict] | None = None) -> None:
+        self.payloads = payloads or {}
+        self.calls: list[str] = []
+
+    def __call__(self, secid: str) -> dict:
+        self.calls.append(secid)
+        return self.payloads.get(secid, {"data": None})
+
+
+def test_hk_valuation_snapshot_maps_pe_pb_and_native_market_cap():
+    from sams.core.fundamentals import VALUATION_COLUMNS
+    from sams.datasource.eastmoney_global import parse_em_valuation
+
+    out = parse_em_valuation(HK_QUOTE, market="HK", code="700", start=D1, end=D1)
+
+    assert out.columns == list(VALUATION_COLUMNS)
+    row = out.row(0, named=True)
+    assert row["code"] == "00700"
+    assert row["date"] == D1
+    assert (row["pe_ttm"], row["pb"]) == (14.30, 2.92)
+    assert row["market_cap"] == 3817092299214.2, "市值不换算：caliber 声明金额是本币原值"
+    assert row["dividend_yield"] is None, "这一路没有股息率，不拿别的数替代"
+    assert row["source"] == "eastmoney_global"
+
+
+def test_us_valuation_snapshot_dates_the_row_in_new_york():
+    """快照时间是纽约 11-05 16:00：行属于纽约的 D0，不属于北京的 D1。"""
+    from sams.datasource.eastmoney_global import parse_em_valuation
+
+    out = parse_em_valuation(US_QUOTE, market="US", code="AAPL", start=D0, end=D0)
+
+    assert out.height == 1
+    assert out["date"].to_list() == [D0]
+    assert out.row(0, named=True)["market_cap"] == 5001541078940.0
+
+    other = parse_em_valuation(US_QUOTE, market="US", code="AAPL", start=D1, end=D1)
+    assert other.is_empty(), "日期在窗口外是 0 行，不是故障"
+
+
+def test_valuation_snapshot_keeps_negative_pe_and_dash_cells_are_null():
+    """负 PE 是一个真数（D59 靠它分叉）；`-` 是「不知道」，不是 0。"""
+    from sams.datasource.eastmoney_global import parse_em_valuation
+
+    rivn = {
+        "data": {
+            "f57": "RIVN",
+            "f86": 1793912400,
+            "f164": -6.52,
+            "f167": 3.41,
+            "f116": 19400000000.0,
+        }
+    }
+    out = parse_em_valuation(rivn, market="US", code="RIVN", start=D0, end=D0)
+    assert out.row(0, named=True)["pe_ttm"] == -6.52
+
+    with pytest.raises(EmptyResponse):
+        # 一个 ETF 的三个数都是 "-"：空白页不是「它没有估值」，不能写成 0 行发确认
+        parse_em_valuation(SPY_QUOTE, market="US", code="SPY", start=D0, end=D0)
+
+
+def test_valuation_snapshot_null_data_is_a_no_record_answer_but_no_clock_is_drift():
+    from sams.datasource.eastmoney_global import parse_em_valuation
+
+    with pytest.raises(EmptyResponse):
+        parse_em_valuation(UNKNOWN_QUOTE, market="US", code="ZZZZQQ", start=D0, end=D0)
+
+    no_clock = {"data": {"f57": "AAPL", "f164": 1.0, "f167": 1.0, "f116": 1.0}}
+    with pytest.raises(FieldDrift):
+        parse_em_valuation(no_clock, market="US", code="AAPL", start=D0, end=D0)
+
+
+def test_the_adapter_valuation_uses_the_secid_and_caches_us_resolution():
+    from sams.datasource.eastmoney_global import EastmoneyGlobalAdapter
+
+    quote = FakeQuote({"116.00700": HK_QUOTE, "105.AAPL": US_QUOTE})
+    resolved: list[str] = []
+
+    def resolve(symbol: str) -> str | None:
+        resolved.append(symbol)
+        return "105.AAPL"
+
+    adapter = EastmoneyGlobalAdapter(quote_fetch=quote, us_secid_fetch=resolve)
+    hk = adapter.valuation("HK", "700", D1, D1)
+    first = adapter.valuation("US", "AAPL", D0, D0)
+    second = adapter.valuation("US", "AAPL", D0, D0)
+
+    assert quote.calls[0] == "116.00700"
+    assert hk.height == first.height == second.height == 1
+    assert resolved == ["AAPL"], "同一只票的 secid 只探一次"
+
+
+def test_a_snapshot_source_refuses_a_window_wider_than_a_week():
+    """快照只有一天：长窗口说「答不了」，chain 才会继续问能给序列的源（D332）。
+
+    不设这道闸，HK 一次三年回补会被「今天这一行」答掉，baidu 的逐日序列根本不会被问到。
+    """
+    from sams.datasource.eastmoney_global import EastmoneyGlobalAdapter
+
+    quote = FakeQuote({"116.00700": HK_QUOTE})
+    adapter = EastmoneyGlobalAdapter(quote_fetch=quote)
+
+    with pytest.raises(EmptyResponse):
+        adapter.valuation("HK", "700", date(2023, 1, 1), D1)
+    assert quote.calls == [], "答不了的窗口不该先花一次请求"
+
+    week = adapter.valuation("HK", "700", date(2026, 10, 31), D1)
+    assert week.height == 1, "周末与公假后的补数窗口照常答"
+
+
 # ---------- HK 指数日线 ----------
 
 #: 恒指实测 klt=101 最后三根（列序：日期/开/收/高/低/量/额；第三格是 latest 即收盘）
@@ -593,12 +739,13 @@ def test_the_adapter_snapshot_fetches_the_whole_market_once_per_call():
         adapter.market_snapshot("US", ["AAPL"])
 
 
-def test_the_global_source_provides_the_five_capabilities():
+def test_the_global_source_provides_six_capabilities():
     from sams.datasource.capabilities import provided_by
     from sams.datasource.eastmoney_global import EastmoneyGlobalAdapter
 
     assert provided_by(EastmoneyGlobalAdapter) == (
         "financials",
+        "valuation",
         "listed_date",
         "index_daily",
         "minute_bars",

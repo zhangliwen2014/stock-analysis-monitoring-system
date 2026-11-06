@@ -159,3 +159,31 @@ def test_pr_now_says_which_column_is_missing():
     assert "PB" in pr_now(10.0, None).reason
     assert pr_now(10.0, None).kind == "PB 缺失"
 
+
+
+def test_a_us_roe_above_one_hundred_percent_is_a_real_denominator():
+    """D228：美股回购把股东权益压得很小，苹果年报 ROE 171% 是真实值。
+
+    默认闸（|ROE| ≥ 1 即「忘了 ÷100」）在 A 股是对的，在美股会把真实值静默拒掉；
+    市场覆盖只放宽到 500%，「1714%」这种真正没除数的写法照样被拦。
+    """
+    result = pr(pe_ttm=37.84, roe=1.714, market="US")
+    assert result.ok, result.reason
+    assert result.value == pytest.approx(37.84 / 1.714 / 100.0)
+    assert not pr(pe_ttm=37.84, roe=1.714).ok, "不传市场时仍走 A 股的默认闸"
+    assert not pr(pe_ttm=37.84, roe=6.0, market="US").ok, "上界仍是 5.0"
+
+
+def test_the_caliber_refusal_names_the_bound_that_actually_applies():
+    """拒绝那句里的上界必须是**这一次**用的那个数，否则读的人会按它去改错方向。"""
+    a_share = pr(pe_ttm=10.0, roe=2.0)
+    us = pr(pe_ttm=10.0, roe=6.0, market="US")
+    assert "|ROE| ≥ 1 即不可信" in a_share.reason
+    assert "|ROE| ≥ 5 即不可信" in us.reason
+
+
+def test_pr_now_lets_a_us_implied_roe_above_one_hundred_percent_through():
+    """现值 PR 推出的 ROE 同走市场覆盖（D228）：苹果 PB/PE ≈ 118%，那不是漏了 ÷100。"""
+    got = pr_now(37.84, 44.62, market="US")
+    assert got.value == pytest.approx(37.84**2 / (100 * 44.62))
+    assert pr_now(37.84, 44.62).value is None, "A 股默认闸不动"

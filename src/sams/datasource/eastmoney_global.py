@@ -1,4 +1,4 @@
-"""东财港美股：分钟 K、HK 指数日线、HK 上市日期、HK/US 基本面、全市场快照（D324）。
+"""东财港美股：分钟 K、HK 指数日线、HK 上市日期、HK/US 基本面、全市场快照、按日估值（D324/D331）。
 
 这一路补的是港美股的「链上第二个源」，不是新数据族。几条实测事实决定了每个分支：
 
@@ -17,6 +17,11 @@
   所以它挂在快照链的最后（D325），而 `note` 里写的是实测秒数，不是「较慢」。
 * **同一份基本面接口**：HK 用 F10 主要指标全史，US 与 `eastmoney_us_f10` 同一个
   数据中心的报表——按 D322 第 2 档，`note` 里必须写明「同源」。
+* **按日估值是报价快照**（D331）：同一个 push2 域名的 `stock/get`，f164 PE(TTM)、
+  f167 PB、f116 总市值（本币元）、f86 最新行情时间。实测 AAPL 37.84/44.62/5.00 万亿、
+  00700 14.30/2.92/3.82 万亿（2026-11-06）。`invt=2` 让缺值回 `"-"` 而不是 `0.0`；
+  三个数全空（SPY 这类 ETF）是「这页没读到」而不是「0 倍」。快照只有一天，
+  长窗口要交给能给逐日序列的源（D332）。
 
 US 分钟 K 与 HK 指数日线的请求都按 `[start, end]` 传 `beg/end`：接口对这两个参数
 是过滤而不是截断，历史很短时也不会漏根。
@@ -40,6 +45,7 @@ from sams.datasource.base import classify_error, normalize_bars
 from sams.datasource.eastmoney_hk_f10 import parse_hk_financials
 from sams.datasource.eastmoney_us_f10 import fetch_us_financials
 from sams.datasource.f10 import _as_date
+from sams.datasource.fundamentals import normalize_valuation
 from sams.datasource.minute import empty_minute_bars
 from sams.datasource.sina_global import sina_us_ticker
 from sams.datasource.sources import source
@@ -214,6 +220,83 @@ def _http_get(url: str, params: dict[str, str]) -> dict:
     return http_get(url, params)
 
 
+# ---------- 按日估值快照（D331/D332） ----------
+
+#: 一个快照只能回答一天。窗口再宽时明说「答不了」，让链去找能给序列的源（D332）：
+#: `_fetch_frame` 见到非空帧就停，一行「今天」会把三年回补冒充成一次成功同步。
+SNAPSHOT_WINDOW_DAYS = 7
+
+#: f164 PE(TTM)、f167 PB、f116 总市值（本币）、f86 最新行情时间（秒）
+_QUOTE_FIELDS = "f57,f86,f116,f164,f167"
+
+
+def fetch_quote(secid: str) -> dict:
+    """真实网络调用：一只票的报价快照。`invt=2` 让缺值回 `"-"` 而不是 `0.0`。"""
+    return _http_get(
+        STOCK_URL,
+        {"secid": secid, "fields": _QUOTE_FIELDS, "fltt": "2", "invt": "2"},
+    )
+
+
+def _quote_number(data: dict, field: str) -> float | None:
+    """`"-"` 与空串是「源不知道这一格」；解析不出也给 None，不编 0。"""
+    try:
+        return float(data.get(field))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _quote_day(value: object, zone: ZoneInfo) -> date | None:
+    try:
+        moment = datetime.fromtimestamp(float(value), UTC)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    return moment.astimezone(zone).date()
+
+
+def parse_em_valuation(
+    payload: object,
+    *,
+    market: str,
+    code: str,
+    start: date,
+    end: date,
+    zone: ZoneInfo | None = None,
+) -> pl.DataFrame:
+    """报价快照 → `VALUATION_COLUMNS` 的一行；日期按市场时区折回（D331）。
+
+    三个数全空是「这一页没读到东西」（SPY 这类 ETF 也是），抛 `EmptyResponse`：
+    写成 0 行会让链把「没读到」当成「查无记录」并落下一次覆盖确认（D43）。日期落在
+    窗口外才是 0 行——那是「这段没有」，可以继续问下一个源。
+    """
+    market = canonical_market(market)
+    zone = zone or MARKET_ZONES[market]
+    what = f"{market} {code} 的估值快照"
+    data = _payload_data(payload, what=what)
+    day = _quote_day(data.get("f86"), zone)
+    if day is None:
+        raise FieldDrift(SOURCE, f"{what}没有可解析的最新行情时间（f86={data.get('f86')!r}）")
+    row = {
+        "date": day,
+        "pe_ttm": _quote_number(data, "f164"),
+        "pb": _quote_number(data, "f167"),
+        "market_cap": _quote_number(data, "f116"),
+        # 这一路没有股息率，也不拿别的字段替代
+        "dividend_yield": None,
+    }
+    if all(row[name] is None for name in ("pe_ttm", "pb", "market_cap")):
+        raise EmptyResponse(SOURCE, f"{what}的 PE(TTM)/PB/总市值三个数都是空（f164/f167/f116）")
+    frame = normalize_valuation(
+        pl.DataFrame([row]),
+        market=market,
+        code=code,
+        source=SOURCE,
+        column_map={name: name for name in row},
+        percent_columns=(),
+    )
+    return frame.filter(pl.col("date").is_between(start, end))
+
+
 class EastmoneyGlobalAdapter:
     name = SOURCE
     markets = frozenset({"HK", "US"})
@@ -227,11 +310,13 @@ class EastmoneyGlobalAdapter:
         us_secid_fetch: Callable[[str], str | None] = resolve_us_secid,
         get: Callable[[str, dict[str, str]], dict] | None = None,
         spot_fetch: Callable[[str], list[dict]] | None = None,
+        quote_fetch: Callable[[str], dict] = fetch_quote,
     ) -> None:
         self._kline = kline_fetch
         self._us_secid = us_secid_fetch
         self._get = get or _http_get
         self._spot = spot_fetch or fetch_snapshot
+        self._quote = quote_fetch
         self._secids: dict[str, str] = {}
 
     def _secid_for(self, market: str, code: str) -> str:
@@ -322,6 +407,36 @@ class EastmoneyGlobalAdapter:
         except Exception as exc:  # noqa: BLE001
             raise classify_error(self.name, exc) from exc
 
+    def valuation(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
+        """当日一行的估值快照：PE(TTM)/PB/总市值（本币原值），日期取自最新行情时间。
+
+        粒度是快照不是序列：窗口超过 `SNAPSHOT_WINDOW_DAYS` 时明说「答不了」，
+        让链继续问能给逐日序列的源（D332）。负 PE/PB 原样保留（D59 靠它分叉）。
+        """
+        market = canonical_market(market)
+        if market not in self.markets:
+            raise ValueError(f"{self.name} 不支持市场 {market}")
+        if end < start:
+            raise ValueError(f"区间反向: {start} > {end}")
+        if (end - start).days > SNAPSHOT_WINDOW_DAYS:
+            raise EmptyResponse(
+                self.name,
+                f"{market} {code} 的估值快照只能回答一天，"
+                f"{start}~{end} 共 {(end - start).days + 1} 天：换能给逐日序列的源",
+            )
+        try:
+            return parse_em_valuation(
+                self._quote(self._secid_for(market, code)),
+                market=market,
+                code=code,
+                start=start,
+                end=end,
+            )
+        except DatasourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise classify_error(self.name, exc) from exc
+
     def financials(self, market: str, code: str, start: date, end: date) -> pl.DataFrame:
         """HK 复用港股 F10 的主要指标全史；US 复用美股 F10 的年报行（同源备份，D322）。"""
         market = canonical_market(market)
@@ -393,8 +508,9 @@ class EastmoneyGlobalAdapter:
 source(
     "eastmoney_global",
     note=(
-        "东方财富港美股（分钟K、HK指数日线、HK上市日期、HK/US基本面与快照；"
+        "东方财富港美股（分钟K、HK指数日线、HK上市日期、HK/US基本面与按日估值快照；"
         "基本面与 eastmoney_hk_f10 / eastmoney_us_f10 同源；"
+        "估值只有当日一行，长窗口交给能给序列的源；"
         "快照整表分页，实测 HK 约 35–60s / US 约 100–170s）"
     ),
 )(EastmoneyGlobalAdapter)

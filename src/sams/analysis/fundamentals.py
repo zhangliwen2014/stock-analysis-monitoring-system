@@ -22,6 +22,7 @@ from sams.core.fundamentals import (
     BASIS_PE,
     BASIS_REFUSED,
     out_of_caliber,
+    ratio_bound,
 )
 
 __all__ = [
@@ -92,11 +93,18 @@ def _computed(
     return MarketProfitRatio(value, basis, roe_used=used, estimated=estimated)
 
 
-def _implausible_denominator(used: float, *, whence: str) -> MarketProfitRatio:
-    """分母落进口径死区（D66）：宁可不出数，也不给一个短两个数量级的「便宜」。"""
+def _implausible_denominator(
+    used: float, *, whence: str, market: str | None = None
+) -> MarketProfitRatio:
+    """分母落进口径死区（D66）：宁可不出数，也不给一个短两个数量级的「便宜」。
+
+    上界按市场取（D228）：那句「≥ 1 即不可信」在美股是错的，拒绝理由必须说这一次
+    真正用的那个数，否则读的人会按它去改错方向。
+    """
+    bound = ratio_bound("roe", market=market) or 1.0
     return _refused(
         f"{whence}的 ROE={used:g} 在小数口径里只能读成 {_percent(used)}，达到可信上界"
-        "（|ROE| ≥ 1 即不可信）："
+        f"（|ROE| ≥ {bound:g} 即不可信）："
         f"这更像是「{used * 100:g}%」忘了 ÷100，而拿它当分母会把 PR 算小两个数量级，"
         "方向永远是「极度便宜」。两种解释不可区分时选不出数"
         "——请先核对这只票的财务指标（`sams sync financials`）"
@@ -109,16 +117,21 @@ def pr(
     pb: float | None = None,
     roe: float | None = None,
     roe_estimate: float | None = None,
+    market: str | None = None,
 ) -> MarketProfitRatio:
-    """市赚率。两条分支、四种算不出，全在这里，别处不再算第二遍。"""
+    """市赚率。两条分支、四种算不出，全在这里，别处不再算第二遍。
+
+    `market` 只影响口径闸的上界（D228：美股真实 ROE 可以超过 100%）。不给就用
+    默认闸——A 股那一段的判据一字不变。
+    """
     if pe_ttm is not None and pe_ttm > 0:
         if roe is None or roe <= 0:
             return _refused(
                 f"PE(TTM)={pe_ttm:g} 可用，但 ROE {'缺失' if roe is None else f'为 {roe:g}'}："
                 "分母没有，PR 无从谈起——先补这只票的财务指标（`sams sync financials`）"
             )
-        if out_of_caliber("roe", roe):
-            return _implausible_denominator(roe, whence="已披露那期")
+        if out_of_caliber("roe", roe, market=market):
+            return _implausible_denominator(roe, whence="已披露那期", market=market)
         return _computed(
             pe_ttm / roe / 100.0,
             formula="PE ÷ ROE ÷ 100",
@@ -143,9 +156,11 @@ def pr(
             f"{missing}，PB={pb:g}，{named}：这一支算的是「扭亏后能赚多少」，"
             "缺一个为正的 ROE 就没有 PR 可给（传 `--roe-estimate 0.15` 这种小数）"
         )
-    if out_of_caliber("roe", used):
+    if out_of_caliber("roe", used, market=market):
         return _implausible_denominator(
-            used, whence="预估" if roe_estimate is not None else "最近一期已披露"
+            used,
+            whence="预估" if roe_estimate is not None else "最近一期已披露",
+            market=market,
         )
     return _computed(
         pb / used / used / 100.0,
@@ -170,7 +185,9 @@ class PriceProfitRatio:
     kind: str | None = None
 
 
-def pr_now(pe_dyn: float | None, pb: float | None) -> PriceProfitRatio:
+def pr_now(
+    pe_dyn: float | None, pb: float | None, *, market: str | None = None
+) -> PriceProfitRatio:
     """现值市赚率 `PE(动)² ÷ (100 × PB)`（D177）。
 
     与 `pr()` 不是同一件事：这一条的分母是价推出来的 ROE（`PB ÷ PE`），随价格变；
@@ -178,7 +195,7 @@ def pr_now(pe_dyn: float | None, pb: float | None) -> PriceProfitRatio:
 
     亏损票的 PE 为负、平方后变正——不拦的话 `<= 0.5` 会把亏损票筛成「便宜」（D190）。
     PB 为负同理（净资产为负，PR 的方向会反过来）。推出的 ROE 仍走 `out_of_caliber`
-    的那条上界，不另写一份判断。
+    的那条上界，不另写一份判断；`market` 让它走市场覆盖（D228：美股推出来 118% 是常态）。
     """
     if pe_dyn is None:
         return PriceProfitRatio(None, "PE(动) 缺失（快照没给这一列）", "PE(动) 缺失")
@@ -197,10 +214,12 @@ def pr_now(pe_dyn: float | None, pb: float | None) -> PriceProfitRatio:
             "净资产为负（PB ≤ 0）",
         )
     implied = pb / pe_dyn
-    if out_of_caliber("roe", implied):
+    if out_of_caliber("roe", implied, market=market):
+        bound = ratio_bound("roe", market=market) or 1.0
         return PriceProfitRatio(
             None,
-            f"PE(动) 与 PB 推出的 ROE={implied:.3g} 达到口径上界（|ROE| ≥ 1），这个数不可信",
-            "推出来的 ROE 过界（|ROE| ≥ 1）",
+            f"PE(动) 与 PB 推出的 ROE={implied:.3g} 达到口径上界（|ROE| ≥ {bound:g}），"
+            "这个数不可信",
+            f"推出来的 ROE 过界（|ROE| ≥ {bound:g}）",
         )
     return PriceProfitRatio(pe_dyn**2 / (100.0 * pb), None)

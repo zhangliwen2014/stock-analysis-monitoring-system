@@ -203,11 +203,19 @@ def test_registry_chain_comes_from_the_database(migrated):
         # 0048：A 股基本面第二源是新浪（D324）。它在日线链上排第 4，财务能力只由
         # 方法现身，所以这条链是「按优先级过滤后的能力链」，不是日线链的前缀
         assert built.registry.chain_for("A", "financials") == ("akshare", "sina")
-        # 0049：A 股估值的备源是百度（排在 akshare 后）；港股原来只有 yfinance 一家
+        # 0049：A 股估值的备源是百度（排在 akshare 后）；港股原来只有 yfinance 一家，
+        # 0053 东财港美股补上 valuation（优先级 3，排在 baidu 的 5 之前，D331）
         assert built.registry.chain_for("A", "valuation") == ("akshare", "baidu_valuation")
-        assert built.registry.chain_for("HK", "valuation") == ("yfinance", "baidu_valuation")
-        # 美股估值没有第二个域（§4），这一路不进 US 的链
-        assert "baidu_valuation" not in built.registry.chain_for("US", "valuation")
+        assert built.registry.chain_for("HK", "valuation") == (
+            "yfinance",
+            "eastmoney_global",
+            "baidu_valuation",
+        )
+        # 美股估值曾没有第二个域（§4），现在东财的当日快照顶上 yfinance 的 429（D331）
+        assert built.registry.chain_for("US", "valuation") == (
+            "yfinance",
+            "eastmoney_global",
+        )
     finally:
         built.close()
 

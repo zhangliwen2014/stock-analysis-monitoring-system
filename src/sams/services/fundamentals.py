@@ -25,7 +25,11 @@ import polars as pl
 from sams.analysis.fundamentals import BASIS_REFUSED, MarketProfitRatio, pr
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
-from sams.core.fundamentals import ROE_BASIS_ANNUAL, ROE_BASIS_LATEST
+from sams.core.fundamentals import (
+    ROE_BASIS_ANNUAL,
+    ROE_BASIS_LATEST,
+    UNDATED_FINANCIAL_MARKETS,
+)
 from sams.datasource.registry import AdapterRegistry, Attempt
 from sams.storage.repos.financials import FinancialRepo, FundingFlowRepo, ValuationRepo
 from sams.storage.repos.symbols import SymbolRepo
@@ -246,7 +250,13 @@ class FundamentalService:
         market = canonical_market(market)
         code = canonical_code(market, code)
         until = as_of if as_of is not None else self.clock.today()
-        frame, dropped = self.financials.load_as_of(market, [code], until, basis=roe_basis)
+        frame, dropped = self.financials.load_as_of(
+            market,
+            [code],
+            until,
+            basis=roe_basis,
+            include_undated=market in UNDATED_FINANCIAL_MARKETS,
+        )
         reported = _first(frame)
         valued = _first(self.valuation.latest(market, [code], until))
         valuation_on = _get(valued, "date")
@@ -256,7 +266,13 @@ class FundamentalService:
             None
             if roe_basis == ROE_BASIS_LATEST
             else _first(
-                self.financials.load_as_of(market, [code], until, basis=ROE_BASIS_LATEST)[0]
+                self.financials.load_as_of(
+                    market,
+                    [code],
+                    until,
+                    basis=ROE_BASIS_LATEST,
+                    include_undated=market in UNDATED_FINANCIAL_MARKETS,
+                )[0]
             )
         )
         interim = _newer_than_adopted(newest, reported)
@@ -274,6 +290,7 @@ class FundamentalService:
                 pb=_get(valued, "pb"),
                 roe=_get(reported, "roe"),
                 roe_estimate=roe_estimate,
+                market=market,
             )
         return FundamentalRead(
             market=market,
@@ -308,7 +325,20 @@ def _missing_roe_reason(
     market: str, code: str, until: date, valued: dict | None, interim: dict | None, basis: str
 ) -> str:
     """PR 算不出，但「为什么」有三种，各自的下一步命令不同（D62 + D43）。"""
+    undated = market in UNDATED_FINANCIAL_MARKETS
+    # D215/D228：这两个市场的财务源根本没有披露日这一格，所以「披露日为空即不采信」
+    # 在这里是反话——采信与否由报告期对截至日说了算
+    loose = (
+        f"（{market} 的财务源不提供披露日，D215/D228：按「报告期 ≤ 截至日」采信，"
+        "公开时点无从核对）"
+    )
     if valued is None and interim is None:
+        if undated:
+            return (
+                f"{market} {code} 库里截至 {until} 没有报告期不晚于截至日的财务数据，"
+                "也没有按日估值：先跑 `sams sync financials` 与 `sams sync valuation`"
+                f"{loose}"
+            )
         return (
             f"{market} {code} 库里截至 {until} 没有已披露的财务数据，也没有按日估值："
             "先跑 `sams sync financials` 与 `sams sync valuation`"
@@ -320,6 +350,11 @@ def _missing_roe_reason(
             f"{ROE_BASIS_LATEST} 口径下的一期），没有已披露的**年报**可用："
             "年报口径算不出 PR——传 `--roe-basis latest` 可以用那一期，"
             "但那里的 ROE 是该期累计值、与 PE(TTM) 的十二个月不同周期"
+        )
+    if undated:
+        return (
+            f"{market} {code} 截至 {until} 库里没有报告期不晚于截至日的财务数据"
+            f"（口径 {basis}）：先跑 `sams sync financials`{loose}"
         )
     return (
         f"{market} {code} 截至 {until} 库里没有已披露的财务数据"

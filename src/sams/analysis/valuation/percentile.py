@@ -173,7 +173,11 @@ def _quantiles(values: Sequence[float]) -> tuple[float | None, float | None, flo
 
 
 def _pr_on(
-    day: ValuationDay, periods: Sequence[DisclosedPeriod], *, basis: str
+    day: ValuationDay,
+    periods: Sequence[DisclosedPeriod],
+    *,
+    basis: str,
+    market: str | None = None,
 ) -> tuple[float | None, str]:
     """返回 (值, 丢掉它的原因)；原因是空串时值一定可用。"""
     roe, _ = _pit_roe(periods, day.day, basis=basis)
@@ -182,7 +186,7 @@ def _pr_on(
         return None, "no_pe"
     if roe is None or roe <= 0:
         return None, "no_roe"
-    result = pr(pe_ttm=day.pe_ttm, roe=roe)
+    result = pr(pe_ttm=day.pe_ttm, roe=roe, market=market)
     if not result.ok or result.basis != BASIS_PE:
         # 剩下的两种：分母落进口径死区（D66），或那个比值溢出成非有限值
         return None, "caliber"
@@ -235,10 +239,13 @@ def pr_percentile(
     *,
     basis: str = ROE_BASIS_ANNUAL,
     window_years: int = DEFAULT_WINDOW_YEARS,
+    market: str | None = None,
 ) -> Percentile:
     """PR 的历史分位：逐日「当天的 PE(TTM) ÷ 当天已披露的那一期 ROE」。
 
     `as_of` 必填（D54 那一族的规矩：没有「默认今天」这条路），它同时是窗口的右端。
+    `market` 只影响口径闸（D228）：美股的真实 ROE 可以超过 100%，曲线不该整条变成
+    「口径可疑」；不给时按默认闸判。
     """
     if basis not in ROE_BASIS:
         raise ValidationError(
@@ -259,11 +266,11 @@ def pr_percentile(
         )
 
     today = in_window[-1]
-    current, today_why = _pr_on(today, periods, basis=basis)
+    current, today_why = _pr_on(today, periods, basis=basis, market=market)
     buckets = {"no_pe": 0, "no_roe": 0, "caliber": 0}
     values: list[float] = []
     for row in in_window[:-1]:
-        value, why = _pr_on(row, periods, basis=basis)
+        value, why = _pr_on(row, periods, basis=basis, market=market)
         if value is None:
             buckets[why] += 1
         else:

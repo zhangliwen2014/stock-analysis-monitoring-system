@@ -222,6 +222,12 @@ ROE_BASIS = (ROE_BASIS_ANNUAL, ROE_BASIS_LATEST)
 #: 不认日历日；A 股与港股仍按 12-31 判（D62 的那条结论）。
 FISCAL_YEAR_ANNUAL_MARKETS = frozenset({"US"})
 
+#: 财务源根本不提供披露日的市场（D215 港股指标源 / D228 美股 F10）：这些行按
+#: `report_date <= as_of` 采信，但同一只票已有带披露日的行时，带日期的那期优先。
+#: 名单只在这里写一次：读侧的开口（`load_as_of(include_undated=…)`）与口径话
+#: （`roe_basis_note`）都引用它，漏掉一处就会出现「web 算得出、CLI 算不出」。
+UNDATED_FINANCIAL_MARKETS = frozenset({"HK", "US"})
+
 #: `MarketProfitRatio.basis` 的三个取值（D59）。词表放 core 而不是 analysis：命令行要按
 #: 它分支措辞，而分层守卫不许 `cli` import `analysis`——把名单挪到 analysis 里等于
 #: 让每个打印方自己重打一遍字符串，打错的那一处不会报错，只会把话说反。
@@ -241,21 +247,50 @@ def is_year_end(day: date | None) -> bool:
     return day is not None and day.month == 12 and day.day == 31
 
 
-def roe_basis_note(basis: str) -> str:
-    """跟着 PR 出门的第二句口径话：分母那一期的**周期长度**。
+def period_label(day: date, market: str, *, basis: str = ROE_BASIS_ANNUAL) -> str:
+    """报告那一期的名字：`年报` / `年报（财年止 09-27）` / `N 月末期`。
+
+    年报口径下美股那一期是源标为「年报」的行（D228），报告期可以不是 12-31；
+    按日历日叫它「9 月末期」，读的人会以为 PR 的分母是三季报。
+    """
+    if basis == ROE_BASIS_ANNUAL and market in FISCAL_YEAR_ANNUAL_MARKETS:
+        return "年报" if is_year_end(day) else f"年报（财年止 {day:%m-%d}）"
+    return "年报" if is_year_end(day) else f"{day.month} 月末期"
+
+
+def roe_basis_note(basis: str, market: str | None = None) -> str:
+    """跟着 PR 出门的第二句口径话：分母那一期的**周期长度**与采信条件。
 
     为什么单独立一条：源的 `ROEJQ` 是该期累计加权 ROE（Q1 是三个月、H1 是六个月），
     而 PE(TTM) 是滚动十二个月。实测 601088 在 PE≈20 不变时，按最新一期能给到
     PR=8.41（Q1）与 3.51（H1），按年报是 ~1.6——那个数主要在读「最近报的是哪个季度」。
     不说清这一条，`PR ≤ 0.4` 的排序就把「reporting 日历」当成了「便宜」。
+
+    `market` 决定另外两句（都是「这句话不写就是反话」的那类）：
+
+    * 美股的年报不是 12-31（D228），按日历日说会让人以为取错了期；
+    * 港美股的源不提供披露日（D215/D228），按报告期采信是口径而不是缺口。
     """
     if basis == ROE_BASIS_ANNUAL:
-        return (
-            "分母口径：ROE 取最新已披露年报（12-31 那一报告期）的加权值——十二个月，"
+        annual = (
+            f"ROE 取最新已披露年报（源标为「年报」的那一期；{market} 的财年止日"
+            "可以不是 12-31）"
+            if market in FISCAL_YEAR_ANNUAL_MARKETS
+            else "ROE 取最新已披露年报（12-31 那一报告期）"
+        )
+        note = (
+            f"分母口径：{annual}的加权值——十二个月，"
             "与 PE(TTM) 同周期；年报尚未披露时用的是上一份年报，可能滞后近一年"
         )
-    return (
-        "分母口径：ROE 取最新已披露一期的累计加权值——季报是三个月、半年报是六个月，"
-        "而 PE(TTM) 是十二个月：这个 PR 会随最近报的是哪个季度而跳动，"
-        "不能与年报口径的 PR 放在一篮子里排序"
-    )
+    else:
+        note = (
+            "分母口径：ROE 取最新已披露一期的累计加权值——季报是三个月、半年报是六个月，"
+            "而 PE(TTM) 是十二个月：这个 PR 会随最近报的是哪个季度而跳动，"
+            "不能与年报口径的 PR 放在一篮子里排序"
+        )
+    if market in UNDATED_FINANCIAL_MARKETS:
+        note += (
+            f"；{market} 的财务源不提供披露日（D215/D228）："
+            "该期按「报告期 ≤ 截至日」采信，公开时点无从核对"
+        )
+    return note

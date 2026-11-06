@@ -106,6 +106,14 @@ def test_the_same_domain_financials_rows_say_so_in_their_note(repo):
         assert "同源" in (repo.get(name).note or ""), name
 
 
+def test_the_global_valuation_note_says_it_answers_only_one_day(repo):
+    """D331/D332：快照源只答当日一行，长窗口交给能给序列的源——备注要拦住这种误读。"""
+    note = repo.get("eastmoney_global").note or ""
+    assert "按日估值" in note
+    assert "只有当日一行" in note
+    assert "同源" in note, "D322 的那句在 0053 里不能被删掉"
+
+
 def test_migrations_are_idempotent_for_the_seed(repo):
     apply_migrations(repo.db)
     assert len(repo.list()) == 15

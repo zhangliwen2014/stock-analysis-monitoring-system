@@ -222,3 +222,15 @@ def test_metric_percentile_refuses_a_column_that_is_not_a_multiple():
     with pytest.raises(Exception) as exc:
         metric_percentile(span(300), "roe", date(2026, 10, 16))
     assert "roe" in str(exc.value)
+
+
+def test_a_us_high_roe_keeps_the_pr_curve_instead_of_falling_into_the_caliber_bucket():
+    """D228：分位曲线与单票读数问的是同一个问题，口径闸不能一边放宽一边不放。"""
+    known = periods(("2025-12-31", 1.714, "2026-03-31"))
+    rows = span(MIN_SAMPLES + 2, end=date(2026, 6, 1), pe=37.84)
+    got = pr_percentile(
+        rows, known, date(2026, 6, 1), market="US", window_years=1
+    )
+    assert got.current == pytest.approx(37.84 / 1.714 / 100.0)
+    default = pr_percentile(rows, known, date(2026, 6, 1), window_years=1)
+    assert default.current is None, "A 股默认闸不动"

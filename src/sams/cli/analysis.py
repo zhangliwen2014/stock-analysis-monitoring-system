@@ -30,8 +30,9 @@ from sams.core.fundamentals import (
     ROE_BASIS_ANNUAL,
     ROE_BASIS_LATEST,
     STALE_VALUATION_DAYS,
+    UNDATED_FINANCIAL_MARKETS,
     caliber_note,
-    is_year_end,
+    period_label,
     roe_basis_note,
 )
 from sams.core.timeutil import gap_days
@@ -119,7 +120,7 @@ def _print_fundamentals(read, code: int) -> int:
     print(f"  估值日  {_valuation_line(read)}")
     ratio = f"PR = {read.pr.value:.3f}" if read.pr.ok else "PR = 无"
     print(f"  市赚率  {ratio:<12} ← {read.pr.explain()}")
-    print(f"  {roe_basis_note(read.roe_basis)}")
+    print(f"  {roe_basis_note(read.roe_basis, read.market)}")
     print(f"  {caliber_note()}")
     for line in _fundamentals_warnings(read):
         print(f"  {line}")
@@ -134,12 +135,14 @@ def _period_line(read) -> str:
             f"无 ← 库里没有 {read.market} {read.code} 在「{read.roe_basis}」口径下"
             "已披露的财务数据（先跑 `sams sync financials`）"
         )
-    kind = "年报" if is_year_end(read.period) else f"{read.period.month} 月末期"
-    head = (
-        f"{read.period} {kind}（披露 {read.published_on}，源 {read.source}）"
-        if read.published_on
-        else f"{read.period} {kind}（无披露日，源 {read.source}）"
-    )
+    kind = period_label(read.period, read.market, basis=read.roe_basis)
+    if read.published_on:
+        public = f"披露 {read.published_on}"
+    elif read.market in UNDATED_FINANCIAL_MARKETS:
+        public = "源不提供披露日（D215/D228）"
+    else:
+        public = "无披露日"
+    head = f"{read.period} {kind}（{public}，源 {read.source}）"
     return (
         f"{head}  ROE {_ratio(read.roe)}  营收 {_signed(read.revenue_yoy)}"
         f"  利润 {_signed(read.profit_yoy)}  股息率 {_ratio(read.dividend_yield)}"
@@ -176,16 +179,29 @@ def _fundamentals_warnings(read) -> list[str]:
             f"--code {read.code}`"
         )
     if read.interim_period is not None:
+        if read.interim_published_on:
+            public = f"披露 {read.interim_published_on}"
+        elif read.market in UNDATED_FINANCIAL_MARKETS:
+            public = "源不提供披露日（D215/D228）"
+        else:
+            public = "披露日为空"
         out.append(
             f"⚠ 库里另有更新的一期 {read.interim_period}（ROE {_ratio(read.interim_roe)}，"
-            f"披露 {read.interim_published_on}）未用于 PR：那个 ROE 是该期累计值，"
+            f"{public}）未用于 PR：那个 ROE 是该期累计值，"
             f"与 PE(TTM) 的十二个月不同周期（要用它：`--roe-basis {ROE_BASIS_LATEST}`）"
         )
     if read.dropped_unpublished:
-        out.append(
-            f"⚠ 另有 {read.dropped_unpublished} 行没有披露日、未被采信（D61）："
-            "这不等于那几期不存在，也不等于它们已经公开"
-        )
+        if read.market in UNDATED_FINANCIAL_MARKETS:
+            out.append(
+                f"⚠ 另有 {read.dropped_unpublished} 行报告期晚于截至日、未被采信（未来函数闸门）："
+                f"{read.market} 的财务源不提供披露日（D215/D228），"
+                "采信与否由「报告期 ≤ 截至日」说了算——换一个不早于那些报告期的 `--as-of` 再看"
+            )
+        else:
+            out.append(
+                f"⚠ 另有 {read.dropped_unpublished} 行没有披露日、未被采信（D61）："
+                "这不等于那几期不存在，也不等于它们已经公开"
+            )
     if read.valuation_on is None and read.market_cap is not None:
         out.append(
             f"⚠ 那个市值来自报告期 {read.period} 那一行（没有按日估值可配）："
@@ -258,7 +274,7 @@ def _fundamentals_payload(read, code: int) -> dict:
             "reason": read.pr.reason or read.pr.explain(),
         },
         "caliber": caliber_note(),
-        "basis_note": roe_basis_note(read.roe_basis),
+        "basis_note": roe_basis_note(read.roe_basis, read.market),
         # 屏幕上那些 ⚠ 就是机器读者该读到的同一批话（D57）：不给这一项，
         # 脚本只能在中文文案里正则找「旧过」
         "warnings": _fundamentals_warnings(read),
@@ -1014,7 +1030,7 @@ def _valuation_payload(read, code: int) -> dict:
         "notes": list(read.notes),
         "warnings": _valuation_warnings(read),
         "caliber": caliber_note(),
-        "basis_note": roe_basis_note(fun.roe_basis),
+        "basis_note": roe_basis_note(fun.roe_basis, read.market),
     }
 
 

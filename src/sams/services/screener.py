@@ -24,16 +24,16 @@ import polars as pl
 from sams.analysis.fundamentals import pr_now
 from sams.core.codes import canonical_market
 from sams.core.errors import ValidationError
-from sams.core.fundamentals import ROE_BASIS_ANNUAL, out_of_caliber
+from sams.core.fundamentals import (
+    ROE_BASIS_ANNUAL,
+    UNDATED_FINANCIAL_MARKETS,
+    out_of_caliber,
+)
 from sams.core.screener_fields import FIELDS, Condition, Field, field, validate
 from sams.services.technical import TechnicalService
 from sams.storage.repos.financials import FinancialRepo
 from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
-
-#: 财务源不提供披露日的市场（D215/D228）：这些行的 PIT 只能按报告期止日采信。
-#: 只在这个集合里放开，A 股仍只认 `published_date <= 快照日`。
-UNDATED_FINANCIAL_MARKETS = frozenset({"HK", "US"})
 
 #: 上面那条放宽一旦被条件用到，结果行就必须自己说出来：屏幕上的「年报 ROE」
 #: 在这里是「报告期 ≤ 快照日的最新一期年报」，没有公开日可核。两个市场的理由不同：
@@ -248,7 +248,7 @@ class ScreenerService:
         if "pr_now" in specs:
             values = []
             for code, pe_dyn, pb in universe.select("code", "pe_dyn", "pb").iter_rows():
-                outcome = pr_now(pe_dyn, pb)
+                outcome = pr_now(pe_dyn, pb, market=market)
                 values.append(outcome.value)
                 if outcome.value is None:
                     kinds[code] = outcome.kind or "现值 PR 没有数"

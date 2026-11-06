@@ -28,8 +28,9 @@ from sams.core.fundamentals import (
     PR_SCALE_DECIMALS,
     ROE_BASIS,
     ROE_BASIS_ANNUAL,
+    UNDATED_FINANCIAL_MARKETS,
     caliber_note,
-    is_year_end,
+    period_label,
     roe_basis_note,
 )
 from sams.core.screener_fields import Condition, fields_for
@@ -297,13 +298,13 @@ def _print(scan, code: int) -> int:
         f"（按日估值旧过 {scan.stale_within_days} 天的票进「排除」，不算落选）"
     )
     print(f"扫描范围 {_universe_line(scan)}")
-    print(roe_basis_note(scan.roe_basis))
+    print(roe_basis_note(scan.roe_basis, scan.market))
     if code == 1:
         print(_empty_line(scan))
         return code
     print(f"命中 {len(scan.hits)} 只（{_order_note(scan)}）：")
     for hit in scan.hits:
-        print(f"  {_hit_line(hit)}")
+        print(f"  {_hit_line(hit, scan.market, scan.roe_basis)}")
     _print_unmatched(scan)
     if scan.excluded:
         print(f"排除 {len(scan.excluded)} 只（算不出 PR，或按默认口径不与其他票同列）：")
@@ -390,9 +391,9 @@ def _universe_line(scan) -> str:
     return f"{head}；主档 {scan.market_size} 只在市——本次已覆盖主档里的全部"
 
 
-def _hit_line(hit: PrHit) -> str:
+def _hit_line(hit: PrHit, market: str, roe_basis: str) -> str:
     period = (
-        f"{hit.period} {'年报' if is_year_end(hit.period) else f'{hit.period.month} 月末期'}"
+        f"{hit.period} {period_label(hit.period, market, basis=roe_basis)}"
         if hit.period
         else "无期"
     )
@@ -414,10 +415,17 @@ def _warnings(scan) -> list[str]:
             "别把它的 0.06 读成比 PE 那一支的 0.30 更便宜"
         )
     if scan.dropped_unpublished:
-        lines.append(
-            f"另有 {scan.dropped_unpublished} 行没有披露日、未被采信（D61）："
-            "这不等于那几期不存在，也不等于它们已经公开"
-        )
+        if scan.market in UNDATED_FINANCIAL_MARKETS:
+            lines.append(
+                f"另有 {scan.dropped_unpublished} 行报告期晚于截至日、未被采信（未来函数闸门）："
+                f"{scan.market} 的财务源不提供披露日（D215/D228），"
+                "采信与否由「报告期 ≤ 截至日」说了算——换一个不早于那些报告期的 `--as-of` 再看"
+            )
+        else:
+            lines.append(
+                f"另有 {scan.dropped_unpublished} 行没有披露日、未被采信（D61）："
+                "这不等于那几期不存在，也不等于它们已经公开"
+            )
     return lines
 
 
@@ -451,7 +459,7 @@ def _payload(scan, code: int) -> dict:
         "dropped_unpublished": scan.dropped_unpublished,
         "stale_within_days": scan.stale_within_days,
         "caliber": caliber_note(),
-        "basis_note": roe_basis_note(scan.roe_basis),
+        "basis_note": roe_basis_note(scan.roe_basis, scan.market),
     }
 
 
