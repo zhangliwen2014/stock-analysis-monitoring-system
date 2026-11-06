@@ -269,13 +269,20 @@ PR 从「算得出」变成「算不出」，而屏幕上只写「未披露」�
 * **A 股估值（服务层）**：`sync valuation --market A --code 600519` →
   `源=akshare 取回=1 入库=1`；百度是本格备源，akshare 没坏时不会被走到。
 
-**未在线上进程里做的两件事**（都要求重启 serve，当前进程仍握着库）：
+**线上进程重启落库（2026-11-06 09:00:53，用户批准）**：
 
-1. 0048–0052 还没落到 `data/sams.duckdb`：下一次 `sams serve` 启动时由
-   `migrate_before_start` 补，且这一趟的链快照就含新源（#384 的验收就是这个顺序）。
-2. 线上 `/admin` 与 `/health` 看到新源的时间点同样是那次重启之后。
+1. 旧进程（PID 59180）SIGTERM 后 3 秒内干净退出，`data/sams.duckdb.wal` 已合并进主库。
+2. 新进程（PID 94576）一次启动就落完 0048–0052（`schema_migrations.applied_at` 均为
+   09:00:53），链快照随即含新源：A 链 `… > sina_quote > eastmoney_f10 > akshare_cninfo >
+   baidu_valuation`，HK 链 `yfinance > tencent > akshare_hk > eastmoney_global > sina_quote >
+   eastmoney_hk_f10 > eastmoney_f10 > baidu_valuation > sina_global`，US 链
+   `yfinance > tencent > sina_quote > eastmoney_global > nasdaq_trader > eastmoney_us_f10 >
+   sina_global`。#384 的「一次启动即上岗」在线上成立：重启后的公司行为日志里已经能看到
+   `跳过 baidu_valuation（A 920162 链上没有这个能力）`——新源在链上，只是没有那个能力。
+3. 三家东财 note 已带「同源」与实测区间（`HK 约 35–60s / US 约 100–170s`）。
+4. `/login` 200、`/` 303（未登录跳登录页），进程与会话恢复。
 
-单测已把这两件事钉住：`test_migrating_before_the_container_puts_the_newest_seed_on_the_chain`
+单测已把「一次启动即上岗」钉住：`test_migrating_before_the_container_puts_the_newest_seed_on_the_chain`
 （旧库 + 一次入口 → 链上有 0051 的源）、`test_one_start_puts_a_newly_seeded_source_on_the_chain`
 （CLI 真实入口）、`test_start_migrates_before_it_builds_the_chain_snapshot`（serve 的调用顺序）。
 
