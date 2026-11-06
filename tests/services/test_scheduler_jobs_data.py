@@ -55,7 +55,9 @@ from sams.storage.repos.symbol_backfills import (
     ACTIONS,
     BARS,
     DEFERRED,
+    FINANCIALS,
     PENDING,
+    VALUATION,
     SymbolBackfillRepo,
 )
 from sams.storage.repos.symbols import SymbolRepo
@@ -196,6 +198,7 @@ def deps(
     *,
     bars=None,
     finance=None,
+    finance2=None,
     hk=None,
     index=None,
     with_indices=True,
@@ -217,6 +220,9 @@ def deps(
         "A": ("akshare", "eastmoney"),
         "HK": ("yfinance",),
     }
+    if finance2 is not None:
+        adapters[finance2.name] = finance2
+        market_sources["A"] = (*market_sources["A"], finance2.name)
     if index is not None:
         adapters[index.name] = index
         market_sources["A"] = (*market_sources["A"], index.name)
@@ -956,6 +962,100 @@ def test_a_fundamentals_job_truncates_without_a_queue(db, settings):
     assert outcome.ok
     assert "留待下一轮" in outcome.note
     assert db.row_count("symbol_backfills") == 0
+
+
+def test_a_singleton_source_that_fails_ten_times_defers_the_rest_of_the_job(db, settings):
+    """D330：孤源连败 10 次就收手，把没跑的票写进 deferred——不是继续一只只撞。
+
+    被撞的那 10 只仍留在 `errors` 里（这一趟确实坏了），`truncated` 与 deadline 那条
+    同义：不是失败，但不假装把整批跑完了。
+    """
+    finance = StubFundamentalsAdapter(["A"], fail=DatasourceError("eastmoney", "boom"))
+    backfills = SymbolBackfillRepo(db)
+    d = replace(deps(db, settings, finance=finance), backfills=backfills)
+    codes = [f"6000{i:02d}" for i in range(15)]
+    outcome = run_financials(d, ctx(*codes))
+
+    assert outcome.truncated is True
+    assert len(outcome.errors) == 10
+    assert "孤源 eastmoney 连败 10 次" in outcome.note
+    assert "其余 5 只已顺延" in outcome.note
+    for code in codes[10:]:
+        row = backfills.open_for("A", code, kind=FINANCIALS)
+        assert (row.status, row.tries) == (DEFERRED, 0)
+    # 真问过的那只不进队列：它已经试过了，下次由 job 自己轮回来
+    assert backfills.open_for("A", codes[0], kind=FINANCIALS) is None
+
+
+def test_two_sources_are_not_a_singleton_and_keep_going(db, settings):
+    """链长 ≥ 2 时 D279 的冷却负责换源，这里不抢它的活：10 次失败照旧跑完整批。"""
+    first = StubFundamentalsAdapter(["A"], fail=DatasourceError("eastmoney", "boom"))
+    second = StubFundamentalsAdapter(["A"], fail=DatasourceError("stubfin", "boom"))
+    d = deps(db, settings, finance=first, finance2=second)
+    outcome = run_financials(d, ctx(*(f"6000{i:02d}" for i in range(15))))
+
+    assert first.calls and second.calls  # 两家都被问过：没有在第 10 只提前收手
+    assert outcome.truncated is False
+    assert len(outcome.errors) == 15
+
+
+class FlakyFundamentals(StubFundamentalsAdapter):
+    """按脚本失败/答复的源：用来把「连败」和「累计失败」分开。"""
+
+    def __init__(self, outcomes) -> None:
+        super().__init__(["A"])
+        self.outcomes = list(outcomes)
+
+    def _answer(self, method, frame, market, code):
+        self.calls.append(method)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return frame.filter((pl.col("market") == market) & (pl.col("code") == code))
+
+
+def test_a_success_resets_the_singleton_failure_run(db, settings):
+    """止损数的是连败：9 败 + 1 成 + 9 败 + 1 成 + 6 败不该触发（D330）。
+
+    失败用不可重试的 `DatasourceError`：脚本按「一只票一次答复」写，而 `RateLimited`
+    会被 `call_with_backoff` 一次吃掉三个答复，脚本与票就错位了。
+    """
+    boom = DatasourceError("eastmoney", "boom")
+    finance = FlakyFundamentals([boom] * 9 + [None] + [boom] * 9 + [None] + [boom] * 6)
+    d = deps(db, settings, finance=finance)
+    outcome = run_financials(d, ctx(*(f"6000{i:02d}" for i in range(26))))
+
+    assert outcome.truncated is False
+    assert len(outcome.errors) == 24
+
+
+def test_a_caught_up_no_op_resets_the_singleton_failure_run(db, settings):
+    """已追平的空转不算失败：9 败 + 1 空转 + 9 败不该触发（D330）。
+
+    「空转」是 `_window` 返回 None 的那一只——它一次请求都没发，但 job 确实处理过它。
+    把它算进连败会让「库里已经齐了」的那几只把孤源止损推到阈值。
+    """
+    ValuationRepo(db).upsert(valuation([AS_OF]))
+    finance = StubFundamentalsAdapter(["A"], fail=DatasourceError("eastmoney", "boom"))
+    codes = [f"6000{i:02d}" for i in range(9)] + ["601088"] + [
+        f"6100{i:02d}" for i in range(9)
+    ]
+    outcome = run_valuation(deps(db, settings, finance=finance), ctx(*codes))
+
+    assert outcome.truncated is False
+    assert len(outcome.errors) == 18
+
+
+def test_the_valuation_job_rearms_yesterdays_deferred_rows(db, settings):
+    """顺延的行在下一趟开跑时重新有预算，否则消费者那句「等下一趟」是空的（D330）。"""
+    backfills = SymbolBackfillRepo(db)
+    backfills.defer("A", "601299", VALUATION, "孤源 yfinance 连败 10 次")
+    d = replace(deps(db, settings), backfills=backfills)
+    outcome = run_valuation(d, ctx("600519"))
+
+    row = backfills.open_for("A", "601299", kind=VALUATION)
+    assert (row.status, row.tries) == (PENDING, 0)
+    assert "1 条" in outcome.note
 
 
 def test_a_truncated_round_asks_a_different_batch_next_time(db, settings):

@@ -903,7 +903,13 @@ def _context_on(
     # 补数队列的消费者（D144）：四入口排的行由调度线程吃掉。同一个实例服务两处——
     # 一拍开头（D144）与两条 job 之间的那个喘息口（D313），所以那 3 条一口的额度是
     # 两头共用的一份，不会因为这个喘息口变成每只票三口
-    backfill_consumer = BackfillConsumer(sync, corp_action_sync, backfills_store, cfg)
+    backfill_consumer = BackfillConsumer(
+        sync,
+        corp_action_sync,
+        backfills_store,
+        cfg,
+        fundamentals=fundamental_sync,
+    )
     deps = JobDeps(
         settings=cfg,
         registry=registry,

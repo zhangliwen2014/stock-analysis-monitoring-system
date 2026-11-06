@@ -5,6 +5,10 @@
 NULL）是去重键：DuckDB 没有 partial unique index，唯一索引里 NULL 互不冲突，于是
 「同一票同一活开放期只许一条」就靠非空那一份。
 状态只有三个：pending（可试）、deferred（今日试满 3 次，让位盘后任务）、done。
+
+D330 之后 `kind` 又多三种：`financials` / `valuation` / `flow`。它们不是「页面点了补采」，
+而是孤源 job 止损时把没跑的票整批顺延下来的（见 `scheduler/jobs.py::_collect`），
+初始状态直接是 deferred。
 """
 
 from __future__ import annotations
@@ -25,6 +29,12 @@ DEFERRED = "deferred"
 #: 加列之前那就是队列唯一的一种活（spec 2026-11-03 §3.3）
 BARS = "bars"
 ACTIONS = "actions"
+
+#: D330：孤源止损的顺延账。名字跟 job 走（`_DATA_JOBS` 里的 financials/valuation/flow），
+#: 消费者按同一个名字分派。
+FINANCIALS = "financials"
+VALUATION = "valuation"
+FLOW = "flow"
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,28 @@ class SymbolBackfillRepo:
                 " (id, market, code, tries, status, open_key, created_at, kind)"
                 " VALUES (?, ?, ?, 0, 'pending', ?, now(), ?)",
                 [uuid4().hex, market, code, key, kind],
+            )
+        return True
+
+    def defer(self, market: str, code: str, kind: str, reason: str) -> bool:
+        """直接排成一行的 `deferred`（D330 的孤源止损）。
+
+        不先 `enqueue` 再记三次失败：那样 `tries` 会写成 3，读起来像消费者真试过三次，
+        实际一次都没有。开放行已经存在时返回 False（去重键与 `enqueue` 同一条）。
+        """
+        key = f"{market}|{code}|{kind}"
+        first_line = (reason.splitlines() or [""])[0][:200]
+        with self.db.transaction():
+            existing = self.db.scalar(
+                "SELECT open_key FROM symbol_backfills WHERE open_key = ?", [key]
+            )
+            if existing is not None:
+                return False
+            self.db.execute(
+                "INSERT INTO symbol_backfills"
+                " (id, market, code, tries, status, open_key, created_at, kind, last_error)"
+                " VALUES (?, ?, ?, 0, ?, ?, now(), ?, ?)",
+                [uuid4().hex, market, code, DEFERRED, key, kind, first_line],
             )
         return True
 

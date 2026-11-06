@@ -4,6 +4,10 @@
 「有人打开了这只票的页面，但它的区间涨跌还没过复权闸」那件事的唯一自动出路：Web 不能替
 调度线程去取数，DuckDB 单写者也让用户在 serve 跑着的时候敲不了 `sams sync actions`。
 
+D330 之后还多三种：`financials` / `valuation` / `flow`。它们只由孤源 job 的止损写进来
+（`jobs.py::_collect`），所以消费者必须认识它们，否则昨晚顺延的票今天也没有人去补。
+这三种的「0 行」都是合法答复（D36）：没有披露、没有数据不代表补数失败。
+
 不进 task_runs 是因为那份历史回答「哪个 job 跑没跑」，这里积压的是单票属性——
 混进去之后「bars 跑成功了但三只票还欠着」两种真相分不开。失败三次转 deferred：
 今天的重试预算用光，等今晚的盘后日线任务收尾（`SyncService.sync_daily` 的结案钩子）。
@@ -18,11 +22,11 @@ from datetime import datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
-from sams.core.errors import SamsError
+from sams.core.errors import DatasourceError, SamsError
 from sams.core.timeutil import HISTORY_START
 from sams.services.scheduler.due import local_today
-from sams.services.scheduler.jobs import INITIAL_SYNC_DAYS
-from sams.storage.repos.symbol_backfills import ACTIONS
+from sams.services.scheduler.jobs import INITIAL_SYNC_DAYS, _window
+from sams.storage.repos.symbol_backfills import ACTIONS, FINANCIALS, FLOW, VALUATION
 
 logger = logging.getLogger("sams.services.scheduler.backfill")
 
@@ -35,13 +39,21 @@ MIN_GAP_S = 20.0
 
 class BackfillConsumer:
     def __init__(
-        self, sync, corp_actions, backfills, settings: Settings, *, limit: int = 3
+        self,
+        sync,
+        corp_actions,
+        backfills,
+        settings: Settings,
+        *,
+        limit: int = 3,
+        fundamentals=None,
     ) -> None:
         self.sync = sync
         self.corp_actions = corp_actions
         self.backfills = backfills
         self.settings = settings
         self.limit = limit
+        self.fundamentals = fundamentals
 
     def consume(self, moment: datetime) -> int:
         processed = 0
@@ -61,7 +73,11 @@ class BackfillConsumer:
         return processed
 
     def _fetch(self, row, end) -> bool:
-        """跑一行，返回「这次算不算白跑」。"""
+        """跑一行，返回「这次算不算白跑」。
+
+        `bars` 的 0 行是「没补上」，其余几种的 0 行都是合法答复（D36）：公司行为没记录、
+        财务没披露、估值/资金流当天没数据，各自都有落库或不落库的证据，不该记成失败。
+        """
         if row.kind == ACTIONS:
             # 全历史到今天，不按 730 天：覆盖确认写的是「这只票截至今天的除权记录就这些」，
             # 按窗口拉会留下更早的空白，而闸问的恰恰是那个空白
@@ -69,8 +85,35 @@ class BackfillConsumer:
             # 0 条公司行为是合法答复：确认照样落 `corp_actions_coverage`，那才是
             # 「这只票没分过红」的证据。日线那边没有这种答复——一根 K 线都没有就是没补上
             return False
+        if row.kind == FINANCIALS:
+            # 与 job 同一个口径：报告期是重述的，增量窗口会漏掉旧期的修正
+            self._fundamentals().sync_financials(
+                row.market, row.code, HISTORY_START, end
+            )
+            return False
+        if row.kind in (VALUATION, FLOW):
+            return self._catch_up_daily_fundamental(row, end)
         start = end - timedelta(days=INITIAL_SYNC_DAYS)
         return self.sync.sync_daily(row.market, row.code, start, end).empty
+
+    def _fundamentals(self):
+        if self.fundamentals is None:
+            # 没接服务时不许把它当成 done：那会把一条顺延的账悄悄抹掉
+            raise DatasourceError("backfill", "补数消费者没有基本面服务")
+        return self.fundamentals
+
+    def _catch_up_daily_fundamental(self, row, end) -> bool:
+        """估值/资金流按库内最新一天续上；已经追平就无事可做（与 job 的 `_window` 同口径）。"""
+        service = self._fundamentals()
+        when, sync = (
+            (service.valuation.latest_date, service.sync_valuation)
+            if row.kind == VALUATION
+            else (service.flow.latest_date, service.sync_flow)
+        )
+        start = _window(when(row.market, row.code), end)
+        if start is not None:
+            sync(row.market, row.code, start, end)
+        return False
 
 
 class BackfillPump:

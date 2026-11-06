@@ -10,7 +10,12 @@ from sams.core.errors import DatasourceError
 from sams.core.timeutil import HISTORY_START
 from sams.services.scheduler.backfill import BackfillConsumer, BackfillPump
 from sams.services.sync import SyncSummary
-from sams.storage.repos.symbol_backfills import SymbolBackfillRepo
+from sams.storage.repos.symbol_backfills import (
+    FINANCIALS,
+    FLOW,
+    VALUATION,
+    SymbolBackfillRepo,
+)
 
 MOMENT = datetime(2026, 10, 26, 3, 0, tzinfo=UTC)
 class StubSync:
@@ -120,6 +125,123 @@ def test_actions_failure_books_on_the_row(settings, db):
     row = repo.open_for("A", "600519", kind="actions")
     assert (row.status, row.tries) == ("pending", 1)
     assert row.last_error == "[akshare] 链上没有能采公司行为的源"
+
+
+class StubFundamentals:
+    """三种基本面活的最小替身：记下每次同步的窗口，按需失败或答 0 行。"""
+
+    def __init__(self, *, latest: date | None = None, fail: Exception | None = None):
+        self.calls: list[tuple[str, str, str, date, date]] = []
+        self.latest = latest
+        self.fail = fail
+        self.empty = False
+        self.valuation = SimpleNamespace(latest_date=self._latest)
+        self.flow = SimpleNamespace(latest_date=self._latest)
+
+    def _latest(self, market, code):
+        return self.latest
+
+    def _answer(self, kind, market, code, start, end):
+        if self.fail is not None:
+            raise self.fail
+        self.calls.append((kind, market, code, start, end))
+        return SimpleNamespace(written=0 if self.empty else 2, empty=self.empty)
+
+    def sync_financials(self, market, code, start, end):
+        return self._answer("financials", market, code, start, end)
+
+    def sync_valuation(self, market, code, start, end):
+        return self._answer("valuation", market, code, start, end)
+
+    def sync_flow(self, market, code, start, end):
+        return self._answer("flow", market, code, start, end)
+
+
+def test_a_financials_row_walks_the_whole_history(settings, db):
+    """D330 顺延下来的财务行：报告期会重述，增量窗口会漏掉旧期的修正（与 job 同口径）。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=FINANCIALS)
+    fundamentals = StubFundamentals()
+    consumer = BackfillConsumer(
+        StubSync([]), StubActions(), repo, settings, fundamentals=fundamentals
+    )
+
+    assert consumer.consume(MOMENT) == 1
+    assert fundamentals.calls == [
+        ("financials", "A", "600519", HISTORY_START, date(2026, 10, 26))
+    ]
+    assert repo.open_for("A", "600519", kind=FINANCIALS) is None
+
+
+def test_a_valuation_row_starts_after_the_latest_day_on_file(settings, db):
+    """估值/资金流不是全历史活：从库内最新一天续上，已追平就不问。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=VALUATION)
+    fundamentals = StubFundamentals(latest=date(2026, 10, 20))
+    consumer = BackfillConsumer(
+        StubSync([]), StubActions(), repo, settings, fundamentals=fundamentals
+    )
+
+    consumer.consume(MOMENT)
+    assert fundamentals.calls == [
+        ("valuation", "A", "600519", date(2026, 10, 21), date(2026, 10, 26))
+    ]
+    assert repo.open_for("A", "600519", kind=VALUATION) is None
+
+
+def test_a_caught_up_flow_row_closes_without_a_request(settings, db):
+    """已经追平的行没有可问的窗口：不该空打一次源，也不该把它留在队列里。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=FLOW)
+    fundamentals = StubFundamentals(latest=date(2026, 10, 26))
+    consumer = BackfillConsumer(
+        StubSync([]), StubActions(), repo, settings, fundamentals=fundamentals
+    )
+
+    consumer.consume(MOMENT)
+    assert fundamentals.calls == []
+    assert repo.open_for("A", "600519", kind=FLOW) is None
+
+
+def test_a_flow_failure_is_booked_and_stays_pending(settings, db):
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=FLOW)
+    fundamentals = StubFundamentals(
+        latest=date(2026, 10, 20), fail=DatasourceError("akshare", "源挂了")
+    )
+    consumer = BackfillConsumer(
+        StubSync([]), StubActions(), repo, settings, fundamentals=fundamentals
+    )
+
+    consumer.consume(MOMENT)
+    row = repo.open_for("A", "600519", kind=FLOW)
+    assert (row.status, row.tries, row.last_error) == ("pending", 1, "[akshare] 源挂了")
+
+
+def test_zero_rows_is_a_legal_answer_for_the_new_kinds(settings, db):
+    """0 行不是失败（D36）：没有披露/没有数据是答复，不是「没补上」。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=FINANCIALS)
+    fundamentals = StubFundamentals()
+    fundamentals.empty = True
+    consumer = BackfillConsumer(
+        StubSync([]), StubActions(), repo, settings, fundamentals=fundamentals
+    )
+
+    consumer.consume(MOMENT)
+    assert repo.open_for("A", "600519", kind=FINANCIALS) is None
+
+
+def test_without_the_service_a_new_kind_row_is_not_silently_closed(settings, db):
+    """消费者没接基本面服务时，把顺延行当 done 等于悄悄抹掉一笔账。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=VALUATION)
+    consumer = BackfillConsumer(StubSync([]), StubActions(), repo, settings)
+
+    consumer.consume(MOMENT)
+    row = repo.open_for("A", "600519", kind=VALUATION)
+    assert (row.status, row.tries) == ("pending", 1)
+    assert "没有基本面服务" in row.last_error
 
 
 class SteppingMonotonic:

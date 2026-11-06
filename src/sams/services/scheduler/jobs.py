@@ -43,7 +43,13 @@ from sams.services.scheduler.types import (
     JobOutcome,
     JobSpec,
 )
-from sams.storage.repos.symbol_backfills import ACTIONS, BARS
+from sams.storage.repos.symbol_backfills import (
+    ACTIONS,
+    BARS,
+    FINANCIALS,
+    FLOW,
+    VALUATION,
+)
 
 logger = logging.getLogger("sams.services.scheduler.jobs")
 
@@ -55,6 +61,11 @@ INITIAL_SYNC_DAYS = 730
 
 #: 日线定稿余量（日历天）：约十个交易日，够盖过一场长假。
 SETTLE_DAYS = 14
+
+#: 孤源链连败到几次就停止本趟（D330）。与 D279 的 `COOLDOWN_AFTER_FAILURES` 同一口径：
+#: 一次判定是 3 个请求 + 1/4 秒退避，10 次 ≈ 30 个请求 + 半分钟，足够说清「它今天就是不答」，
+#: 又不至于被一两只票的偶发抖动触发。
+SINGLETON_GIVE_UP = 10
 
 
 def _window(latest: date | None, as_of: date) -> date | None:
@@ -116,6 +127,9 @@ def _collect(
     *,
     deadline: float | None = None,
     defer_kind: str | None = None,
+    capability: str | None = None,
+    give_up_kind: str | None = None,
+    give_up_after: int = SINGLETON_GIVE_UP,
 ) -> JobOutcome:
     """按只跑完这批单位，闸落在**两只票之间**，一条规则八种 job 共用。
 
@@ -123,18 +137,26 @@ def _collect(
     约一分钟，而中间打断会把半截 HTTP 响应留在栈上。
 
     到点之后剩下的不许被忘掉，收尾分两种，取决于补数队列表里有没有这一种活：
-    `defer_kind` 非空（日线、公司行为——`symbol_backfills` 只有这两个 kind，消费者也只服务
-    这两样）时交给队列，每拍 3 条慢慢消化；其余那几样不新建 kind——那要给每一种都写一条
-    消费者分派，而换回来的只是「今晚没跑到的那只今晚也不会跑到」（D311）。它们靠 `_units`
-    的每轮换序保证覆盖，note 说的是留待下一轮。
+    `defer_kind` 非空（日线、公司行为）时交给队列，每拍 3 条慢慢消化；其余那几样
+    不接 deadline 截断——那要把「到点没跑到」也做成一条消费者分派，而换回来的只是
+    「今晚没跑到的那只今晚也不会跑到」（D311；`financials`/`valuation`/`flow` 这三个
+    kind 只服务下面的孤源止损，见 D330）。它们靠 `_units` 的每轮换序保证覆盖，
+    note 说的是留待下一轮。
 
-    **截断不是失败**：`errors` 保持空，所以 `task_runs` 那行是 ok，不进连续失败计数——
-    天天被截断的链会把真故障淹掉。
+    **孤源止损（D330）**：`capability` 非空时，同一市场连续失败 `give_up_after` 次
+    且这条能力的链上只有一个源，就停止本趟；`give_up_kind` 非空的把没跑的票直接写进
+    `deferred`（消费者与下一趟 job 会接），否则只报「留待下一轮」。连败计数在任意一次
+    成功（含已追平的空转）时清零——被零星空转打断的失败不该算成十连败。
+
+    **截断不是失败**：`errors` 保持那一批失败原样，`truncated` 为真但 `task_runs`
+    不因此判 ok 以外的东西——天天被截断的链会把真故障淹掉。这句话适用于两种闸。
     """
     rows = 0
     done = 0
     errors: list[str] = []
     stopped = len(units)
+    give_up: str | None = None
+    failures = 0
     for index, (market, code) in enumerate(units):
         if deadline is not None and deps.monotonic() >= deadline:
             stopped = index
@@ -145,8 +167,16 @@ def _collect(
             # 只接本项目的失败：一个编程错误（AttributeError 之类）不许在这里被接住，
             # 否则它出门的那一句就是「这只票取不到」，而该修的那行代码永远没人去修
             errors.append(f"{market} {code}: {exc}")
+            failures += 1
+            if capability is not None and failures >= give_up_after:
+                only = _singleton_source(deps, market, capability)
+                if only is not None:
+                    give_up = f"{market} 孤源 {only} 连败 {failures} 次"
+                    stopped = index + 1
+                    break
         else:
             done += 1
+            failures = 0
         _breathe(deps)
     note = f"{done}/{len(units)} 只{label}"
     if errors:
@@ -154,19 +184,41 @@ def _collect(
     truncated = stopped < len(units)
     if truncated:
         left = units[stopped:]
-        note += f"，到 {deps.settings.scheduler_job_max_min} 分钟收工"
-        if defer_kind is not None and deps.backfills is not None:
-            for market, code in left:
-                deps.backfills.enqueue(market, code, defer_kind)
-            note += f"，其余 {len(left)} 只已排队"
+        if give_up is not None:
+            note += f"，{give_up}"
+            if give_up_kind is not None and deps.backfills is not None:
+                for market, code in left:
+                    deps.backfills.defer(market, code, give_up_kind, give_up)
+                note += f"，其余 {len(left)} 只已顺延"
+            else:
+                note += f"，其余 {len(left)} 只留待下一轮"
         else:
-            note += f"，其余 {len(left)} 只留待下一轮"
+            note += f"，到 {deps.settings.scheduler_job_max_min} 分钟收工"
+            if defer_kind is not None and deps.backfills is not None:
+                for market, code in left:
+                    deps.backfills.enqueue(market, code, defer_kind)
+                note += f"，其余 {len(left)} 只已排队"
+            else:
+                note += f"，其余 {len(left)} 只留待下一轮"
     return JobOutcome(
         rows_affected=rows,
         note=note,
         errors=tuple(errors),
         truncated=truncated,
     )
+
+
+def _singleton_source(deps: JobDeps, market: str, capability: str) -> str | None:
+    """这条能力在这个市场只有一个源时返回它的名字。
+
+    整块没配源时 `chain_for` 抛 `DatasourceError`：那与「不是孤源」是同一答案——
+    这个 job 本来就不会登记，止损也不该在这里发明一个新错误。
+    """
+    try:
+        chain = deps.registry.chain_for(market, capability)
+    except DatasourceError:
+        return None
+    return chain[0] if len(chain) == 1 else None
 
 
 def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
@@ -202,11 +254,26 @@ def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return outcome
 
 
+def _rearm(deps: JobDeps, kind: str) -> int:
+    """上一趟顺延下来的行今天重新有预算（D330；与 `run_actions` 同一条规矩）。"""
+    return deps.backfills.rearm_deferred(kind) if deps.backfills is not None else 0
+
+
+def _settle(deps: JobDeps, market: str, code: str, kind: str) -> None:
+    """这只票今晚已经由 job 亲手处理过，队列里那条顺延就算结清（D330 §3.3）。"""
+    if deps.backfills is not None:
+        deps.backfills.mark_done_by_code(market, code, kind)
+
+
+def _note_rearmed(outcome: JobOutcome, rearmed: int) -> JobOutcome:
+    if not rearmed:
+        return outcome
+    return replace(outcome, note=f"{outcome.note}，{rearmed} 条顺延的补采重新排队")
+
+
 def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     # 昨天没补上的行今天重新有预算：这一下是 consumer 那句「等今晚」唯一的兑现（D283）
-    rearmed = (
-        deps.backfills.rearm_deferred(ACTIONS) if deps.backfills is not None else 0
-    )
+    rearmed = _rearm(deps, ACTIONS)
     covered = deps.corp_actions.coverage
 
     def one(market: str, code: str) -> int:
@@ -218,8 +285,7 @@ def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     outcome = _collect(
         deps, _units(ctx), one, "公司行为", deadline=ctx.deadline, defer_kind=ACTIONS
     )
-    if rearmed:
-        outcome = replace(outcome, note=f"{outcome.note}，{rearmed} 条顺延的补采重新排队")
+    outcome = _note_rearmed(outcome, rearmed)
     if outcome.rows_affected > 0:
         # 公司行为改的是复权口径：缓存的日线读数同样作废
         deps.versions.bump("bars")
@@ -239,36 +305,73 @@ def _bump_fundamentals(deps: JobDeps, outcome: JobOutcome) -> JobOutcome:
 
 
 def run_financials(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    def one(market: str, code: str) -> int:
-        return deps.fundamentals.sync_financials(market, code, HISTORY_START, ctx.as_of).written
+    rearmed = _rearm(deps, FINANCIALS)
 
-    return _bump_fundamentals(
-        deps, _collect(deps, _units(ctx), one, "财务", deadline=ctx.deadline)
+    def one(market: str, code: str) -> int:
+        written = deps.fundamentals.sync_financials(
+            market, code, HISTORY_START, ctx.as_of
+        ).written
+        _settle(deps, market, code, FINANCIALS)
+        return written
+
+    outcome = _collect(
+        deps,
+        _units(ctx),
+        one,
+        "财务",
+        deadline=ctx.deadline,
+        capability="financials",
+        give_up_kind=FINANCIALS,
     )
+    return _bump_fundamentals(deps, _note_rearmed(outcome, rearmed))
 
 
 def run_valuation(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    rearmed = _rearm(deps, VALUATION)
+
     def one(market: str, code: str) -> int:
         start = _window(deps.fundamentals.valuation.latest_date(market, code), ctx.as_of)
         if start is None:
+            _settle(deps, market, code, VALUATION)
             return 0
-        return deps.fundamentals.sync_valuation(market, code, start, ctx.as_of).written
+        written = deps.fundamentals.sync_valuation(market, code, start, ctx.as_of).written
+        _settle(deps, market, code, VALUATION)
+        return written
 
-    return _bump_fundamentals(
-        deps, _collect(deps, _units(ctx), one, "按日估值", deadline=ctx.deadline)
+    outcome = _collect(
+        deps,
+        _units(ctx),
+        one,
+        "按日估值",
+        deadline=ctx.deadline,
+        capability="valuation",
+        give_up_kind=VALUATION,
     )
+    return _bump_fundamentals(deps, _note_rearmed(outcome, rearmed))
 
 
 def run_flow(deps: JobDeps, ctx: JobContext) -> JobOutcome:
+    rearmed = _rearm(deps, FLOW)
+
     def one(market: str, code: str) -> int:
         start = _window(deps.fundamentals.flow.latest_date(market, code), ctx.as_of)
         if start is None:
+            _settle(deps, market, code, FLOW)
             return 0
-        return deps.fundamentals.sync_flow(market, code, start, ctx.as_of).written
+        written = deps.fundamentals.sync_flow(market, code, start, ctx.as_of).written
+        _settle(deps, market, code, FLOW)
+        return written
 
-    return _bump_fundamentals(
-        deps, _collect(deps, _units(ctx), one, "资金流", deadline=ctx.deadline)
+    outcome = _collect(
+        deps,
+        _units(ctx),
+        one,
+        "资金流",
+        deadline=ctx.deadline,
+        capability="funding_flow",
+        give_up_kind=FLOW,
     )
+    return _bump_fundamentals(deps, _note_rearmed(outcome, rearmed))
 
 
 #: 公告的盘后窗口：只要最近 30 天。源一次最多给 100 条，今晚没抓到的旧公告

@@ -82,6 +82,21 @@ def test_the_bars_wrap_up_does_not_close_the_actions_row(db):
     assert [row.kind for row in repo.take_pending()] == ["actions"]
 
 
+def test_defer_parks_a_row_without_pretending_the_consumer_tried(db):
+    """孤源止损顺延的行直接进 deferred（D330）。
+
+    先 `enqueue` 再记三次失败会把 `tries` 写成 3，读起来像「消费者真试过三次」——
+    实际一次都没有；顺延是 job 在被撞之前就替它们做的决定。
+    """
+    repo = SymbolBackfillRepo(db)
+    assert repo.defer("A", "600519", "valuation", "A 孤源 yfinance 连败 10 次") is True
+    row = repo.open_for("A", "600519", kind="valuation")
+    assert (row.status, row.tries) == ("deferred", 0)
+    assert row.last_error == "A 孤源 yfinance 连败 10 次"
+    assert repo.take_pending() == [], "deferred 不占一拍的三条额度"
+    assert repo.defer("A", "600519", "valuation", "again") is False, "已有开放行就吸收掉"
+
+
 def test_rearm_deferred_gives_the_next_day_a_new_budget(db):
     """deferred 的原文承诺是「今天预算用光，明天再来」：跨天顺延要真的把它排回去。"""
     repo = SymbolBackfillRepo(db)
