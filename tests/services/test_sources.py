@@ -51,6 +51,23 @@ def make_hk_single_source(admin):
     admin.reorder("HK", ["yfinance"])
 
 
+#: #387 补源之前 HK 的整条链。0050/0051 又挂了 sina_global 与 eastmoney_global，
+#: 它们的日线让「tencent 是最后一个能取日线的源」不再成立；下面几枚用例要测的是
+#: 那条判据本身，所以先把链路收窄回判据成立时的形状。
+HK_LEGACY_CHAIN = (
+    "yfinance",
+    "tencent",
+    "akshare_hk",
+    "eastmoney_f10",
+    "eastmoney_hk_f10",
+    "sina_quote",
+)
+
+
+def make_hk_legacy_chain(admin):
+    admin.reorder("HK", list(HK_LEGACY_CHAIN))
+
+
 def test_seed_gives_hk_and_us_a_second_source(admin):
     """spec §18 U5 结案的那条：港美股不再是单源。"""
     assert len(admin.chains()["HK"]) > 1 and len(admin.chains()["US"]) > 1
@@ -127,6 +144,7 @@ def test_remove_follows_the_same_rule_as_disable(admin):
 
 
 def test_unroute_is_refused_for_the_last_source(admin):
+    make_hk_legacy_chain(admin)
     admin.unroute("HK", "tencent")
     with pytest.raises(ValidationError, match="先加备源"):
         admin.unroute("HK", "yfinance")
@@ -144,6 +162,7 @@ def test_unroute_joins_the_market_the_way_the_routes_are_stored(admin):
 
 
 def test_unroute_names_the_canonical_market_when_the_chain_would_go_dark(admin):
+    make_hk_legacy_chain(admin)
     admin.unroute("hk", "tencent")
     with pytest.raises(ValidationError, match="市场 HK"):
         admin.unroute("Hk", "yfinance")
@@ -155,12 +174,14 @@ def test_an_actions_only_source_is_not_a_backup_for_bars(admin):
     「还剩几个源」不是判据，「还剩几个能取日线的源」才是（D38）：按前者放行，
     `sams health` 会说 HK 有两个源，而采集要到下一次才发现 HK 失明。
     """
+    make_hk_legacy_chain(admin)
     assert admin.unroute("HK", "tencent")
     with pytest.raises(ValidationError, match="先加备源"):
         admin.unroute("HK", "yfinance")
 
 
 def test_disable_follows_the_same_capability_rule(admin):
+    make_hk_legacy_chain(admin)
     admin.unroute("HK", "tencent")
     with pytest.raises(ValidationError, match="完全取不到数"):
         admin.set_enabled("yfinance", False)
