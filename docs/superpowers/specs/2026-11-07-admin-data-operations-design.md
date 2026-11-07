@@ -32,3 +32,10 @@
 ## 验证
 
 逐行为红绿测试：源新增/重复/非法实现及参数/启停实际路由、最后源保护；请求生命周期与取消竞争、跳过及失败结果、重试暂缓记录、筛选分页；管理员授权、CSRF、错误脱敏与导航。串行运行 pytest，执行 Ruff 及 diff 检查。使用独立临时数据库启动 Web，通过真实浏览器登录、导航、新增、启停、提交/取消与查看状态，并验证普通用户不能访问。不操作生产通道、不在本次开发中重启生产服务、不读出密钥。
+
+## 回归结果（2026-11-07，按市场分组改版）
+
+- `pytest tests/web/test_admin_web.py tests/services/test_sources.py -q`：103 passed；`ruff check src tests`：通过。
+- 真实库副本 + 临时 Web（127.0.0.1:8799）管理员登录：A 股/港股/美股三节顺序与库内路由一致，能力列逐源显示，运行状态合并为一列；截图 `tmp/verify_admin/20-sources-by-market.png`。
+- 生产 Web 经授权重启（PID 90153）；`GET /admin/sources` 与 `GET /admin/sync` 均 303（跳登录），新处理器与模板一致。
+
