@@ -196,6 +196,32 @@ class TaskRunRepo:
         )
         return [_to_run(row) for row in rows.to_dicts()]
 
+    def history(
+        self,
+        *,
+        market: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        per_page: int = 20,
+    ) -> tuple[list[TaskRun], int]:
+        """管理页的固定分页台账；筛选值由调用方先校验，这里只拼参数。"""
+        clauses: list[str] = []
+        params: list = []
+        if market:
+            clauses.append("market = ?")
+            params.append(market)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        total = int(self.db.scalar(f"SELECT count(*) FROM task_runs{where}", params) or 0)
+        rows = self.db.query(
+            f"SELECT {_COLUMNS} FROM task_runs{where}"
+            " ORDER BY started_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            [*params, per_page, (page - 1) * per_page],
+        )
+        return [_to_run(row) for row in rows.to_dicts()], total
+
     def failed_names_for(
         self, market: str, period_key: str, *, exclude: Sequence[str] = ()
     ) -> tuple[str, ...]:

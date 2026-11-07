@@ -62,6 +62,7 @@ from sams.web.display import (
 from sams.web.pages import (
     admin,
     admin_annotations,
+    admin_sync,
     alerts,
     annotations,
     calendar,
@@ -201,6 +202,7 @@ def create_app(
     app.include_router(annotations.router)
     app.include_router(admin.router)
     app.include_router(admin_annotations.router)
+    app.include_router(admin_sync.router)
     app.include_router(alerts.router)
     app.include_router(calendar.router)
     app.include_router(dashboard.router)

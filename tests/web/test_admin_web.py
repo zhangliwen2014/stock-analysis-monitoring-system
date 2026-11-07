@@ -615,3 +615,126 @@ def test_disabling_the_last_daily_source_reaches_the_page_as_400(logged):
     assert response.status_code == 400
     assert "sina" in response.text
     assert ctx.data_sources.get("sina").enabled is True, "被拒的一次不许留下半个写入"
+
+
+def test_settings_links_to_data_operations_for_admin_only(logged):
+    page = logged.client.get("/settings")
+    assert 'href="/admin/sources"' in page.text
+    assert 'href="/admin/sync"' in page.text
+    _make_bob(logged.context)
+    _login(logged.client, "bob", "another-correct-horse")
+    page = logged.client.get("/settings")
+    assert 'href="/admin/sources"' not in page.text
+    assert 'href="/admin/sync"' not in page.text
+
+
+def test_admin_can_create_a_source_from_registered_kinds(logged):
+    page = logged.client.get("/admin/sources")
+    assert 'action="/admin/sources/create"' in page.text
+    assert 'href="/settings"' in page.text
+    response = _post(
+        logged.client, "/admin/sources/create", logged.csrf,
+        name="sina_backup", kind="sina", markets="A", options="{}", note="备用通道",
+    )
+    assert response.status_code == 303, response.text
+    saved = logged.context.data_sources.get("sina_backup")
+    assert saved.kind == "sina" and saved.enabled
+    assert logged.core.registry.sources_for("A")[-1] == "sina_backup"
+    page = logged.client.get(response.headers["location"])
+    assert "sina_backup" in page.text and "备用通道" in page.text
+    duplicate = _post(
+        logged.client, "/admin/sources/create", logged.csrf,
+        name="sina_backup", kind="eastmoney", markets="A", options="{}",
+    )
+    assert duplicate.status_code == 400
+    assert logged.context.data_sources.get("sina_backup").kind == "sina"
+
+
+@pytest.mark.parametrize("options", ["[1]", "null", "{broken", '{"unexpected":"private-value"}'])
+def test_source_form_rejects_bad_options_without_echoing_values(logged, options):
+    response = _post(
+        logged.client, "/admin/sources/create", logged.csrf,
+        name="sina_backup", kind="sina", markets="A", options=options,
+    )
+    assert response.status_code == 400
+    assert "private-value" not in response.text
+    assert logged.context.data_sources.get("sina_backup") is None
+
+
+def test_source_page_separates_runtime_health_and_masks_errors(logged):
+    from sams.core.quotes import QuoteSourceRecord
+    from sams.core.sources import SourceRecord
+
+    ctx = logged.context
+    ctx.source_health.save(SourceRecord(
+        name="sina", markets=("A",), ok=False, consecutive_failures=7,
+        last_error="Timeout https://feed.invalid?api_key=do-not-show",
+    ))
+    ctx.quote_health.save(QuoteSourceRecord(
+        name="sina", markets=("A",), ok=True, last_ok_at=datetime.now(UTC),
+    ))
+    ctx.registry.cooling_until["sina"] = datetime.now(UTC) + timedelta(minutes=30)
+    page = logged.client.get("/admin/sources")
+    assert "采集健康" in page.text and "报价健康" in page.text
+    assert "未调用" in page.text and "失败" in page.text and "最近成功" in page.text
+    assert "Timeout" in page.text and "do-not-show" not in page.text
+    assert "连续失败 7 次" in page.text
+    assert "冷却至" in page.text, "等待冷却的源要说出到什么时候，不能只写失败"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/admin/sources/create", "/admin/sync/cancel", "/admin/sync/backfills/retry"],
+)
+def test_new_data_operations_writes_require_csrf_and_admin(logged, path):
+    response = logged.client.post(path, data={}, follow_redirects=False)
+    assert response.status_code == 403
+    _make_bob(logged.context)
+    csrf = _login(logged.client, "bob", "another-correct-horse")
+    assert _post(logged.client, path, csrf).status_code == 403
+
+
+def test_sync_management_shows_request_and_allows_pending_cancel(logged):
+    response = _post(
+        logged.client, "/admin/sync", logged.csrf,
+        market="A", job="bars", manage="1",
+    )
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/admin/sync?")
+    page = logged.client.get(response.headers["location"])
+    assert "排队中" in page.text and "req-1" in page.text
+    assert "执行台账" in page.text and "自动补数" in page.text
+    response = _post(logged.client, "/admin/sync/cancel", logged.csrf, request_id="req-1")
+    assert response.status_code == 303
+    assert logged.context.scheduler.pending_requests == 0
+    page = logged.client.get("/admin/sync")
+    assert "已取消" in page.text
+
+
+def test_sync_management_rejects_bad_filters_and_unknown_job(logged):
+    for query in ("market=BAD", "status=typo", "page=0", "page=oops", "backfill_status=bad"):
+        assert logged.client.get(f"/admin/sync?{query}").status_code == 400
+    response = _post(
+        logged.client, "/admin/sync", logged.csrf,
+        market="A", job="arbitrary", manage="1",
+    )
+    assert response.status_code == 400
+    assert logged.context.scheduler.pending_requests == 0
+
+
+def test_sync_management_lists_persisted_failure_and_retries_deferred_only(logged):
+    ctx = logged.context
+    run = ctx.task_runs.start("daily", market="US", period_key="2026-11-06")
+    ctx.task_runs.finish(run, status="failed", error="Rate limited ?token=hidden-secret")
+    ctx.backfills_store.defer("US", "AAPL", "actions", "Rate limited")
+    row = ctx.backfills_store.open_for("US", "AAPL", "actions")
+    page = logged.client.get("/admin/sync?market=US&status=failed&backfill_status=deferred")
+    assert page.status_code == 200, page.text
+    assert "AAPL" in page.text and "Rate limited" in page.text
+    assert "hidden-secret" not in page.text
+    response = _post(logged.client, "/admin/sync/backfills/retry", logged.csrf, row_id=row.id)
+    assert response.status_code == 303
+    assert ctx.backfills_store.open_for("US", "AAPL", "actions").status == "pending"
+    assert _post(
+        logged.client, "/admin/sync/backfills/retry", logged.csrf, row_id=row.id,
+    ).status_code == 400

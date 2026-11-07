@@ -5,6 +5,14 @@
 {% if saved %}<p class="flash-ok">已保存。</p>{% endif %}
 {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
 
+{% if user.is_admin %}
+<section class="card">
+  <h2>数据运维</h2>
+  <p><a href="/admin/sources">数据通道</a>：查看、添加、启用或停用市场数据源，并查看采集与报价健康。</p>
+  <p><a href="/admin/sync">同步管理</a>：提交同步请求，查看排队与执行结果，管理后台补数队列。</p>
+</section>
+{% endif %}
+
 {% if probe %}
 <section class="card">
   <h2>探针：{{ probe_label }}</h2>

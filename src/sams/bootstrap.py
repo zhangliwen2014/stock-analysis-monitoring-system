@@ -994,7 +994,7 @@ def _context_on(
         calendar_store=calendar_store,
         source_health=source_health,
         data_sources=data_sources,
-        source_admin=SourceAdminService(data_sources, cfg),
+        source_admin=SourceAdminService(data_sources, cfg, registry),
         registry=registry,
         accounts=AccountService(users, sessions),
         calendar=calendar,

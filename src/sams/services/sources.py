@@ -75,9 +75,14 @@ class ProbeResult:
 
 
 class SourceAdminService:
-    def __init__(self, repo: DataSourceRepo, settings: Settings) -> None:
+    def __init__(
+        self, repo: DataSourceRepo, settings: Settings, registry: AdapterRegistry | None = None
+    ) -> None:
         self.repo = repo
         self.settings = settings
+        #: 库里的配置在服务启动时被装配进这一份共享注册表；给了它，写操作才真正
+        #: 影响后续采集。CLI 单次命令不传，行为保持「写完下次启动生效」。
+        self.registry = registry
 
     # ---------- 只读视图 ----------
 
@@ -112,16 +117,21 @@ class SourceAdminService:
         note: str | None = None,
         enabled: bool = True,
     ) -> SourceRow:
+        if self.repo.get(name) is not None:
+            raise ValidationError(f"数据源 {name} 已存在")
         entry = self._require_kind(kind)
         targets = self._require_markets(kind, markets, entry)
         self._require_options(kind, options or {})
+        adapter = build(kind, options or {})
         row = SourceRow(
             name=name, kind=kind, enabled=enabled, options=options or {}, note=note or entry.note
         )
-        saved = self.repo.upsert(row)
-        for market in targets:
-            # 新源默认排到最后：插到第 1 位等于「我比主源熟」，那是要显式 move 的决定
-            self.repo.set_route(market, name, self._next_priority(market))
+        with self.repo.db.transaction():
+            saved = self.repo.upsert(row)
+            for market in targets:
+                # 新源默认排到最后：插到第 1 位等于「我比主源熟」，那是要显式 move 的决定
+                self.repo.set_route(market, name, self._next_priority(market))
+        self._publish({name: adapter})
         return saved
 
     def update(
@@ -160,6 +170,27 @@ class SourceAdminService:
         if not enabled:
             self._require_markets_keep_sources(name, keeping=False)
         self.repo.set_enabled(name, enabled)
+        if self.registry is not None:
+            added = {}
+            if enabled and name not in self.registry.adapters:
+                row = self.repo.get(name)
+                added[name] = build(row.kind, row.options)
+            self._publish(added)
+
+    def _publish(self, adapters: dict | None = None) -> None:
+        """把库里的链推给正在跑的那份注册表，缺哪条实现的适配器就补建。
+
+        补建而不是只推本次动过的那一个：装配时传进来的适配器清单可能只是替身
+        （测试与特殊场景的后门），而库里的链是完整的；只推新增的那一个，校验就会
+        对着「链上有、注册表里没有」的名字报错。构造适配器不发网络请求。
+        """
+        if self.registry is None:
+            return
+        added = dict(adapters or {})
+        for row in self.repo.list():
+            if row.enabled and row.name not in self.registry.adapters:
+                added.setdefault(row.name, build(row.kind, row.options or {}))
+        self.registry.reconfigure(adapters=added, market_sources=self.repo.chains())
 
     def route(self, market: str, name: str, priority: int) -> None:
         market = canonical_market(market)

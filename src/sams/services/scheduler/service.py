@@ -68,17 +68,39 @@ class RunRequest:
     requested_at: datetime
 
 
+@dataclass(frozen=True)
+class RequestView:
+    request: RunRequest
+    status: str
+    notes: tuple[str, ...] = ()
+
+
+@dataclass
+class _TrackedRequest:
+    request: RunRequest
+    status: str = "pending"
+    notes: tuple[str, ...] = ()
+
+
+#: 终态请求最多留几条：这是进程内的运维视图，不是执行台账（后者在 `task_runs`）。
+REQUEST_HISTORY = 100
+
+
 class RunRequestQueue:
     """跨线程的请求队列：Web 只排队，调度线程在下一拍执行。
 
     `task_runs` 只有一个写入方（D105），所以 Web 的「立即同步」不能另开写线程；
     它把请求放进这里，由同一条调度线程执行。id 用序号而不是时间戳：时钟可能被
     冻住（测试）或两个请求落在同一微秒，而按钮回显要求两个 id 不同。
+
+    请求状态全部在这把锁里推进：取消只对还没被 `drain` 领走的请求成立，
+    领取与取消之间因此只有先后，没有「取消了却仍在跑」的第三种结果。
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._items: deque[RunRequest] = deque()
+        self._tracked: dict[str, _TrackedRequest] = {}
         self._seq = itertools.count(1)
 
     def put(
@@ -98,13 +120,62 @@ class RunRequestQueue:
                 requested_at=requested_at,
             )
             self._items.append(request)
+            self._tracked[request.id] = _TrackedRequest(request)
+            self._trim()
             return request
 
     def drain(self) -> tuple[RunRequest, ...]:
         with self._lock:
             items = tuple(self._items)
             self._items.clear()
+            for request in items:
+                self._tracked[request.id].status = "running"
             return items
+
+    def finish(self, request_id: str, results: Sequence[RunResult]) -> None:
+        """调度线程跑完后落状态；逐项结论原样保留给管理页。"""
+        with self._lock:
+            tracked = self._tracked.get(request_id)
+            if tracked is None or tracked.status == "cancelled":
+                return
+            statuses = [result.status for result in results]
+            if not statuses or all(status == "ok" for status in statuses):
+                tracked.status = "ok"
+            elif any(status == "failed" for status in statuses):
+                tracked.status = "failed"
+            else:
+                tracked.status = "skipped"
+            tracked.notes = tuple(
+                f"{result.job}@{result.market or '全局'} {result.status}"
+                + (f"：{result.error or result.skip_reason or result.note}"[:200])
+                for result in results
+            )
+
+    def cancel(self, request_id: str) -> bool:
+        """只取消还排着的那一条；已经被领走就返回 False，不强杀在跑的任务。"""
+        with self._lock:
+            tracked = self._tracked.get(request_id)
+            if tracked is None or tracked.status != "pending":
+                return False
+            self._items = deque(item for item in self._items if item.id != request_id)
+            tracked.status = "cancelled"
+            return True
+
+    def history(self) -> tuple[RequestView, ...]:
+        with self._lock:
+            return tuple(
+                RequestView(item.request, item.status, item.notes)
+                for item in reversed(tuple(self._tracked.values()))
+            )
+
+    def _trim(self) -> None:
+        done = [
+            key
+            for key, item in self._tracked.items()
+            if item.status in {"ok", "failed", "skipped", "cancelled"}
+        ]
+        for key in done[: max(0, len(done) - REQUEST_HISTORY)]:
+            del self._tracked[key]
 
     def __len__(self) -> int:
         with self._lock:
@@ -258,6 +329,12 @@ class Scheduler:
     def pending_requests(self) -> int:
         return len(self.requests)
 
+    def request_history(self) -> tuple[RequestView, ...]:
+        return self.requests.history()
+
+    def cancel_request(self, request_id: str) -> bool:
+        return self.requests.cancel(request_id)
+
     def _run_requests(
         self,
         requests: Sequence[RunRequest],
@@ -280,6 +357,7 @@ class Scheduler:
                         universe,
                     )
                 )
+            self.requests.finish(request.id, results)
             reports.append(RequestReport(request=request, results=tuple(results)))
         return tuple(reports)
 

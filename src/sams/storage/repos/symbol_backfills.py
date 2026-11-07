@@ -169,6 +169,44 @@ class SymbolBackfillRepo:
         )
         return None if rows.is_empty() else BackfillRow(**rows.to_dicts()[0])
 
+    def list_filtered(
+        self, *, status: str | None = None, market: str | None = None,
+        page: int = 1, per_page: int = 20,
+    ) -> tuple[list[BackfillRow], int]:
+        clauses: list[str] = []
+        params: list = []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if market:
+            clauses.append("market = ?")
+            params.append(market)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        total = int(
+            self.db.scalar(f"SELECT count(*) FROM symbol_backfills{where}", params) or 0
+        )
+        rows = self.db.query(
+            f"SELECT {_OPEN_COLUMNS} FROM symbol_backfills{where}"
+            " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, per_page, (page - 1) * per_page],
+        )
+        return [BackfillRow(**row) for row in rows.to_dicts()], total
+
+    def retry_deferred(self, row_id: str) -> bool:
+        """只把这条暂缓行放回队列；已完成/已在队列的行不动。"""
+        found = self.db.scalar(
+            "SELECT id FROM symbol_backfills WHERE id = ? AND status = ?",
+            [row_id, DEFERRED],
+        )
+        if found is None:
+            return False
+        self.db.execute(
+            "UPDATE symbol_backfills SET status = ?, tries = 0, last_error = NULL"
+            " WHERE id = ? AND status = ?",
+            [PENDING, row_id, DEFERRED],
+        )
+        return True
+
     def count_done_before(self, cutoff: datetime) -> int:
         """只数结案早于 `cutoff` 的 done 行（判据 <，与 task_runs 同一族）：
         pending/deferred 带着 `open_key` 语义，保留策略永远不动它们。"""

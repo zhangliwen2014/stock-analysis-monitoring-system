@@ -22,6 +22,7 @@ M4-A 的管理员页是「运维的那一半」：账号生命周期、源启用
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime, timedelta
 
@@ -32,7 +33,7 @@ from sams.core.errors import DatabaseLocked, SamsError, ValidationError
 from sams.storage.repos.users import ACTIVE
 from sams.web.auth import audit, csrf_protect, require_admin
 from sams.web.display import moment_label
-from sams.web.forms import checked, form_data, one
+from sams.web.forms import checked, form_data, many, one
 
 router = APIRouter()
 
@@ -197,20 +198,98 @@ def reset_password(
     return RedirectResponse("/admin/users", status_code=303)
 
 
+def _health_word(record) -> str:
+    if record is None or record.ok is None:
+        return "未调用"
+    return "正常" if record.ok else "失败"
+
+
 def _sources_page(request: Request, *, status_code: int = 200, error: str = "", probe=None):
     """数据源那一屏。`probe` 不带注解：`ProbeResult` 是 services 的值对象，
     而这一层的返回值一律不做注解（同一折法见 `pages/settings.py` 的 `_page`）。"""
     ctx = request.app.state.web.contexts.current()
+    tz = ctx.settings.server.display_tz
+    health = ctx.source_health.load()
+    quote_health = ctx.quote_health.load()
+    routes: dict[str, list[str]] = {}
+    for market, name, priority in ctx.source_admin.routes():
+        routes.setdefault(name, []).append(f"{market}#{priority}")
+    rows = []
+    for source in ctx.source_admin.list():
+        collected = health.get(source.name)
+        quoted = quote_health.get(source.name)
+        cooling_until = ctx.registry.cooling_until.get(source.name)
+        rows.append(
+            {
+                "source": source,
+                "routes": "、".join(routes.get(source.name, [])) or "未路由",
+                "collected": _health_word(collected),
+                "quoted": _health_word(quoted),
+                "collect_ok_at": collected.last_ok_at if collected else None,
+                "quote_ok_at": (
+                    moment_label(quoted.last_ok_at, tz, seconds=True)
+                    if quoted and quoted.last_ok_at
+                    else None
+                ),
+                "failures": collected.consecutive_failures if collected else 0,
+                "cooling": (
+                    moment_label(cooling_until, tz, seconds=True) if cooling_until else ""
+                ),
+                "error": _error_text(
+                    "\n".join(
+                        text
+                        for text in (
+                            collected.last_error if collected else None,
+                            quoted.last_error if quoted else None,
+                        )
+                        if text
+                    )
+                ),
+            }
+        )
     return request.app.state.web.render(
         request,
         "admin_sources.html",
         status_code=status_code,
+        rows=rows,
         sources=ctx.source_admin.list(),
+        catalog=ctx.source_admin.catalog(),
         chains=ctx.source_admin.chains(),
         markets=sorted(ctx.settings.markets),
         probe=probe,
         error=error,
     )
+
+
+@router.post("/admin/sources/create")
+def source_create(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    require_admin(request)
+    ctx = request.app.state.web.contexts.current()
+    try:
+        raw = one(data, "options").strip()
+        try:
+            options = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise ValidationError("参数必须是 JSON 对象，例如 {\"timeout\": 10}") from exc
+        if not isinstance(options, dict):
+            raise ValidationError("参数必须是 JSON 对象，例如 {\"timeout\": 10}")
+        saved = ctx.source_admin.add(
+            one(data, "name").strip(),
+            one(data, "kind").strip(),
+            many(data, "markets"),
+            options=options,
+            note=one(data, "note").strip() or None,
+        )
+    except DatabaseLocked:
+        raise
+    except SamsError as exc:
+        return _sources_page(request, status_code=400, error=str(exc))
+    audit(request, action="admin.source.create", target=saved.name, ok=True)
+    return RedirectResponse("/admin/sources", status_code=303)
 
 
 @router.get("/admin/sources")
@@ -284,7 +363,9 @@ def source_probe(
 #: notifiers 把网络异常原样写进 `last_error`（`wecom.py` 那句 `f"{type(exc).__name__}:
 #: {exc}"`），而 httpx 的那句话里带着整条 URL——不隐去就是这张跨用户总览把别人那条
 #: 通道的凭据印给了每一个 admin
-_SECRET_QUERY = re.compile(r"([?&])(access_token|token|key|secret)=([^&\s'\"]+)")
+_SECRET_QUERY = re.compile(
+    r"([?&])(api_key|access_token|token|key|secret)=([^&\s'\"]+)"
+)
 #: 那一格的用处是「为什么没发出去」，不是日志全文：整段 httpx 文本能让一屏放不下
 _ERROR_KEEP = 240
 
@@ -424,9 +505,21 @@ def admin_sync(
             error=f"市场 {market!r} 没有配置：只在 settings.markets 里触发同步",
             **_health_ctx(web, ctx),
         )
-    # 只排队，不在这条线程上采：同步是调度线程的活，HTTP 线程替它起一遍会抢同一把写锁
-    queued = ctx.scheduler.request_run(market=market)
+    job = one(data, "job").strip() or None
+    manage = one(data, "manage") == "1"
+    try:
+        # 只排队，不在这条线程上采：同步是调度线程的活，HTTP 线程替它起一遍会抢同一把写锁
+        queued = ctx.scheduler.request_run(job, market)
+    except SamsError as exc:
+        if manage:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return web.render(
+            request, "admin_health.html", status_code=400, error=str(exc),
+            **_health_ctx(web, ctx),
+        )
     audit(request, action="admin.sync", target=market, ok=True, detail=queued.id)
+    if manage:
+        return RedirectResponse(f"/admin/sync?queued={queued.id}", status_code=303)
     return RedirectResponse("/admin/health?sync=queued", status_code=303)
 
 

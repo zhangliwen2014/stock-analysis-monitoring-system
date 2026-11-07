@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -311,6 +312,55 @@ class AdapterRegistry:
     #: 就把冷却重新挂上，付得起的代价只有一轮探针；而为它加一列、加一条迁移，
     #: 会把一个止损机制变成一份要维护的持久状态
     cooling_until: dict[str, datetime] = field(default_factory=dict)
+    _config_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
+
+    def reconfigure(
+        self,
+        *,
+        adapters: dict[str, BarAdapter] | None = None,
+        market_sources: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
+        """原子替换后续采集用的链；已在途调用握着的旧适配器不受影响。
+
+        旧适配器与健康记录保留：停用的通道仍要能在管理页回答「它上一次为什么失败」。
+        """
+        with self._config_lock:
+            merged = dict(self.adapters)
+            if adapters:
+                merged.update(adapters)
+            chains = (
+                {market: tuple(names) for market, names in market_sources.items()}
+                if market_sources is not None
+                else dict(self.market_sources)
+            )
+            for market, names in chains.items():
+                unknown = [name for name in names if name not in merged]
+                if unknown:
+                    raise DatasourceError(
+                        "registry", f"市场 {market} 配置了未注册的源 {unknown}"
+                    )
+                wrong = [name for name in names if market not in merged[name].markets]
+                if wrong:
+                    raise DatasourceError(
+                        "registry", f"市场 {market} 配置了不支持它的源 {wrong}"
+                    )
+            routed: dict[str, set[str]] = {}
+            for market, names in chains.items():
+                for name in names:
+                    routed.setdefault(name, set()).add(market)
+            for name in chains.values():
+                for item in name:
+                    self.records.setdefault(
+                        item,
+                        SourceRecord(
+                            name=item,
+                            markets=tuple(sorted(routed.get(item, ()))),
+                        ),
+                    )
+            self.adapters = merged
+            self.market_sources = chains
 
     def __post_init__(self) -> None:
         # 反查「这个源名被路由到哪些市场」：健康页要说的是「我把它用在哪些市场」，

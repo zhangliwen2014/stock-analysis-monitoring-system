@@ -84,6 +84,31 @@ def test_add_falls_back_to_the_implementations_own_note(admin):
     assert admin.add("tx3", "tencent", ["A"]).note
 
 
+def test_add_rejects_duplicate_names_without_changing_row_or_routes(admin, repo):
+    before = repo.get("tencent")
+    routes = repo.routes()
+    with pytest.raises(ValidationError, match="已存在"):
+        admin.add("tencent", "sina", ["A"], options={"timeout": 2}, enabled=False)
+    assert repo.get("tencent") == before
+    assert repo.routes() == routes
+
+
+def test_add_and_toggle_reach_the_running_registry(repo, settings):
+    """后台改完不用重启：新增进链尾，停用立刻退出链，再启用回到原位。"""
+    registry = AdapterRegistry(adapters={}, market_sources={})
+    admin = SourceAdminService(repo, settings, registry)
+
+    admin.add("tx_live", "tencent", ["A"], options={"timeout": 2})
+    assert registry.sources_for("A")[-1] == "tx_live"
+
+    admin.set_enabled("tx_live", False)
+    assert "tx_live" not in registry.sources_for("A")
+    assert "tx_live" in registry.adapters, "停用不删适配器：健康与在途调用还要读得到"
+
+    admin.set_enabled("tx_live", True)
+    assert registry.sources_for("A")[-1] == "tx_live"
+
+
 def test_add_can_be_registered_disabled(admin):
     row = admin.add("tx4", "tencent", ["A"], enabled=False)
     assert not row.enabled

@@ -67,6 +67,38 @@ def registry(
     )
 
 
+def test_reconfigure_swaps_the_chain_without_dropping_the_old_adapter_or_health():
+    """管理后台改完配置要立刻影响下一次采集；已在途调用握着的旧适配器不算错。"""
+    primary = FakeAdapter("akshare", ["A"], DatasourceError("akshare", "boom"))
+    reg = registry(primary)
+    with pytest.raises(DatasourceError):
+        reg.fetch_daily("A", "600519", D1, D2)
+    assert {h.name: h for h in reg.health()}["akshare"].ok is False
+
+    backup = FakeAdapter("eastmoney", ["A"], frame("eastmoney"))
+    reg.reconfigure(adapters={"eastmoney": backup}, market_sources={"A": ("eastmoney",)})
+
+    assert reg.sources_for("A") == ("eastmoney",)
+    assert reg.fetch_daily("A", "600519", D1, D2).source == "eastmoney"
+    assert reg.adapter("akshare") is primary, "停用的旧源留着，健康页才回答得了上次为什么失败"
+    assert {h.name: h for h in reg.health()}["akshare"].ok is False
+
+
+def test_reconfigure_rejects_an_unknown_or_wrong_market_source_atomically():
+    """配置写错要在发布前就拒；失败的这一次不许把半套链换上。"""
+    reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")))
+
+    with pytest.raises(DatasourceError, match="未注册"):
+        reg.reconfigure(market_sources={"A": ("ghost",)})
+    assert reg.sources_for("A") == ("akshare",)
+
+    hk_only = FakeAdapter("hk_only", ["HK"], frame("hk_only"))
+    with pytest.raises(DatasourceError, match="不支持"):
+        reg.reconfigure(adapters={"hk_only": hk_only}, market_sources={"A": ("hk_only",)})
+    assert reg.sources_for("A") == ("akshare",)
+    assert "hk_only" not in reg.adapters
+
+
 def test_primary_success_is_not_degraded():
     reg = registry(FakeAdapter("akshare", ["A"], frame("akshare")))
     result = reg.fetch_daily("A", "600519", D1, D2)

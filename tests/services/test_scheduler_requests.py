@@ -178,6 +178,73 @@ def test_a_failed_build_leaves_the_queued_request_for_the_next_tick(db, settings
     assert scheduler.pending_requests == 1
 
 
+def test_history_tracks_pickup_and_cancel_only_before_the_scheduler_takes_it():
+    """管理页读的就是这份历史：排队能被取消，领取之后的取消不许伪装成成功。"""
+    queue = RunRequestQueue()
+    queued = queue.put(job="bars", market="A", as_of=None, requested_at=MOMENT)
+
+    assert queue.history()[0].status == "pending"
+    assert queue.cancel(queued.id) is True
+    assert queue.history()[0].status == "cancelled"
+    assert queue.drain() == ()
+    assert queue.cancel(queued.id) is False, "取消过的请求不会因为再按一次又没了"
+
+    taken = queue.put(job="bars", market="A", as_of=None, requested_at=MOMENT)
+    drained = queue.drain()
+    assert [request.id for request in drained] == [taken.id]
+    assert queue.history()[0].status == "running"
+    assert queue.cancel(taken.id) is False, "已经被调度线程领走的不强杀"
+
+
+def test_finish_keeps_the_worst_outcome_and_each_item_reason():
+    queue = RunRequestQueue()
+
+    def finish(results):
+        request = queue.put(job=None, market="A", as_of=None, requested_at=MOMENT)
+        queue.drain()
+        queue.finish(request.id, results)
+        return queue.history()[0]
+
+    ok = RunResult(job="bars", market="A", period_key="2024-10-25", status="ok")
+    failed = RunResult(
+        job="valuation", market="A", period_key="2024-10-25",
+        status="failed", error="源超时",
+    )
+    skipped = RunResult(
+        job="rules", market="A", period_key="2024-10-25",
+        status="skipped", skip_reason="本周期已成功",
+    )
+
+    assert finish([]).status == "ok", "一个 job 都没选中也是一次成功的空跑"
+    assert finish([ok]).status == "ok"
+    assert finish([ok, failed]).status == "failed"
+    assert "源超时" in finish([failed]).notes[0]
+    result = finish([skipped])
+    assert result.status == "skipped" and "本周期已成功" in result.notes[0]
+
+
+def test_finishing_a_cancelled_request_does_not_revive_it():
+    queue = RunRequestQueue()
+    request = queue.put(job="bars", market="A", as_of=None, requested_at=MOMENT)
+    assert queue.cancel(request.id)
+    queue.finish(
+        request.id,
+        [RunResult(job="bars", market="A", period_key="2024-10-25", status="failed")],
+    )
+    assert queue.history()[0].status == "cancelled"
+
+
+def test_scheduler_exposes_the_same_history_and_cancel_door(db, settings):
+    runner = RecordingRunner()
+    scheduler, _ = make(db, settings, (job_spec("bars", "A"),), runner)
+
+    request = scheduler.request_run("bars", "A")
+    assert scheduler.request_history()[0].status == "pending"
+    assert scheduler.cancel_request(request.id) is True
+    assert scheduler.request_history()[0].status == "cancelled"
+    assert scheduler.pending_requests == 0
+
+
 def test_the_queue_loses_nothing_when_many_threads_enqueue():
     queue = RunRequestQueue()
     barrier = threading.Barrier(4)

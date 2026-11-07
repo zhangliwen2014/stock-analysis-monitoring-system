@@ -1,8 +1,11 @@
 {% extends "base.html" %}
 {% block title %}数据源{% endblock %}
 {% block content %}
-<h1>数据源</h1>
+<p><a href="/settings">← 返回设置</a></p>
+<h1>数据通道</h1>
 {% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+<p class="muted">列表里的启用与停用会立即影响后续采集；正在跑的那一次不会被打断。</p>
+<h2>现有通道</h2>
 
 {% if probe %}
 <section class="card">
@@ -12,14 +15,31 @@
 </section>
 {% endif %}
 
-<table>
-  <tr><th>名字</th><th>实现</th><th>状态</th><th>备注</th><th>操作</th></tr>
-  {% for source in sources %}
+<table class="admin-table">
+  <tr>
+    <th>名字</th><th>实现</th><th>市场/优先级</th><th>状态</th>
+    <th>采集健康</th><th>报价健康</th><th>最近成功</th><th>备注 / 错误</th><th>操作</th>
+  </tr>
+  {% for row in rows %}
+  {% set source = row.source %}
   <tr>
     <td>{{ source.name }}</td>
     <td class="muted">{{ source.kind }}</td>
-    <td>{{ "启用" if source.enabled else "停用" }}</td>
-    <td>{{ source.note or "—" }}</td>
+    <td>{{ row.routes }}</td>
+    <td class="nowrap">{{ "启用" if source.enabled else "停用" }}</td>
+    <td>
+      {{ row.collected }}{% if row.failures %}<span class="flash-error">，连续失败 {{ row.failures }} 次</span>{% endif %}
+      {% if row.cooling %}<br><span class="muted">冷却至 {{ row.cooling }}</span>{% endif %}
+    </td>
+    <td>{{ row.quoted }}</td>
+    <td>
+      采集 {{ row.collect_ok_at or "—" }}<br>
+      报价 {{ row.quote_ok_at or "—" }}
+    </td>
+    <td>
+      {{ source.note or "—" }}
+      {% if row.error %}<br><span class="flash-error">{{ row.error }}</span>{% endif %}
+    </td>
     <td class="row-actions">
       {# 隐藏 input 带的是「要变成什么」：这一格永远在表单里，端点读值而不是读键在不在 #}
       <form method="post" action="/admin/sources/set_enabled" class="inline-form">
@@ -31,9 +51,33 @@
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="5" class="muted">库里还没有数据源：先用命令行加一个（sams source add）</td></tr>
+  <tr><td colspan="9" class="muted">库里还没有数据源：在下面添加一条</td></tr>
   {% endfor %}
 </table>
+
+<section class="card">
+  <h2>添加通道</h2>
+  <p class="muted">只能选择系统已支持的数据源实现；新通道会排在对应市场备源链的最后。</p>
+  <form method="post" action="/admin/sources/create">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>名字 <input name="name" required maxlength="32" pattern="[a-z][a-z0-9_-]{0,31}"></label>
+    <label>实现
+      <select name="kind" required>
+        {% for entry in catalog %}
+        <option value="{{ entry.kind }}">{{ entry.kind }}（{{ entry.markets|join("、") }}）</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>市场
+      <select name="markets" multiple required>
+        {% for market in markets %}<option value="{{ market }}">{{ market }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>备注 <input name="note" maxlength="200"></label>
+    <label>参数（JSON 对象，可空） <textarea name="options" rows="2" placeholder='{"timeout": 10}'></textarea></label>
+    <button type="submit">添加通道</button>
+  </form>
+</section>
 
 <section class="card">
   <h2>单独试一个源</h2>

@@ -97,6 +97,40 @@ def test_defer_parks_a_row_without_pretending_the_consumer_tried(db):
     assert repo.defer("A", "600519", "valuation", "again") is False, "已有开放行就吸收掉"
 
 
+def test_list_filtered_combines_status_market_and_pagination(db):
+    """管理页三块筛选共用一个页码：总数与行必须是同一组条件筛出来的。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind="bars")
+    repo.enqueue("A", "000001", kind="bars")
+    repo.defer("HK", "00700", "valuation", "孤源顺延")
+
+    rows, total = repo.list_filtered()
+    assert total == 3 and len(rows) == 3
+    rows, total = repo.list_filtered(status="pending")
+    assert total == 2 and {row.code for row in rows} == {"600519", "000001"}
+    rows, total = repo.list_filtered(market="HK")
+    assert total == 1 and (rows[0].status, rows[0].kind) == ("deferred", "valuation")
+    rows, total = repo.list_filtered(page=2, per_page=2)
+    assert total == 3 and len(rows) == 1
+
+
+def test_retry_deferred_requeues_only_that_row_and_resets_its_budget(db):
+    repo = SymbolBackfillRepo(db)
+    repo.defer("A", "600519", "valuation", "孤源顺延")
+    row = repo.open_for("A", "600519", kind="valuation")
+
+    assert repo.retry_deferred(row.id) is True
+    reopened = repo.open_for("A", "600519", kind="valuation")
+    assert (reopened.status, reopened.tries, reopened.last_error) == ("pending", 0, None)
+    assert repo.retry_deferred(row.id) is False, "already pending 不再动它"
+
+    repo.enqueue("A", "000001", kind="bars")
+    done = next(row for row in repo.take_pending() if row.code == "000001")
+    repo.mark_done(done.id)
+    assert repo.retry_deferred(done.id) is False, "完成的行不许借重试回到待办"
+    assert repo.retry_deferred("missing") is False
+
+
 def test_rearm_deferred_gives_the_next_day_a_new_budget(db):
     """deferred 的原文承诺是「今天预算用光，明天再来」：跨天顺延要真的把它排回去。"""
     repo = SymbolBackfillRepo(db)

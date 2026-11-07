@@ -41,6 +41,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .up { color: var(--danger); }   /* 红涨 */
 .down { color: var(--ok); }     /* 绿跌 */
 .muted { color: var(--muted); }
+.nowrap { white-space: nowrap; }
 /* 简介与备注原样保留源里的换行（D214：清洗过的简介与源里的不是同一段话） */
 .pre-wrap { white-space: pre-wrap; }
 /* 报告币种合计下面那两段（价格 + 换汇）：同一格里换行，不挤占旁边一列 */
@@ -56,6 +57,8 @@ label { display: block; margin: 10px 0; }
 input, select, textarea { font: inherit; padding: 6px 8px; border: 1px solid var(--line);
                           border-radius: 6px; width: 100%; max-width: 420px; }
 .inline-form input { width: auto; }
+/* 行内表单里的按钮按词显示：列一窄，「停用/筛选」会被挤成竖排 */
+.inline-form button { flex: 0 0 auto; white-space: nowrap; }
 button { font: inherit; padding: 6px 14px; border: 1px solid var(--line);
          border-radius: 6px; background: #fff; cursor: pointer; }
 button:hover { background: #f0f0f3; }
@@ -132,6 +135,9 @@ button.link:hover { background: none; text-decoration: underline; }
 .percentile-mark { position: absolute; top: -2px; width: 8px; height: 14px; margin-left: -4px;
                    border-radius: 4px; background: #14141a; }
 .business-table td { vertical-align: top; }
+/* 管理页宽表：表头按词不断开，备注列让出宽度而不是把表头挤成竖排 */
+.admin-table th { white-space: nowrap; }
+.admin-table td { vertical-align: top; }
 
 /* 限额被踩：与 flash-error 同一支红，但它是表格里的一格，不铺底色 */
 .limit-breach { color: var(--danger); font-weight: 600; }

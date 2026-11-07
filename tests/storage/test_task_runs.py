@@ -166,6 +166,32 @@ def test_latest_per_period_does_not_leak_across_markets(db):
     assert [row.market for row in market_rows] == ["A", "A"]
 
 
+def test_history_filters_pages_and_counts_the_unfiltered_total(db):
+    """管理页的台账：筛选条件与总数必须来自同一组 where，否则「共 N 条」会骗人。"""
+    clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
+    repo = TaskRunRepo(db, clock=clock)
+    ids = []
+    for job, market, status in (
+        ("bars", "A", OK),
+        ("valuation", "A", FAILED),
+        ("bars", "HK", FAILED),
+    ):
+        run_id = repo.start(job, market=market, period_key="2024-10-25")
+        repo.finish(run_id, status=status, error="boom" if status == FAILED else None)
+        ids.append(run_id)
+        clock.advance(minutes=1)
+
+    rows, total = repo.history()
+    assert total == 3
+    assert [row.id for row in rows] == list(reversed(ids))
+    rows, total = repo.history(market="HK")
+    assert total == 1 and rows[0].job_name == "bars"
+    rows, total = repo.history(status=FAILED)
+    assert total == 2 and {row.market for row in rows} == {"A", "HK"}
+    rows, total = repo.history(page=2, per_page=2)
+    assert total == 3 and [row.id for row in rows] == [ids[0]]
+
+
 def test_failed_names_for_one_period_names_each_job_once(db):
     """摘要要说的是一句「哪些 job 没跑成」，不是每个重试一行。"""
     clock = Clock(datetime(2024, 10, 25, 8, 30, tzinfo=UTC))
