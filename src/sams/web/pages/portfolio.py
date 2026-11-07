@@ -447,7 +447,13 @@ def _portfolio_page(
         unclassified=UNCLASSIFIED,
         limit_kinds=KINDS,
         limit_labels=KIND_LABELS,
-        account_form=account_form or {"name": "", "cash": "", "home_market": "A"},
+        account_form=account_form
+        or {
+            "name": "",
+            "cash": "",
+            "home_market": "A",
+            "cash_currency": ctx.settings.report_currency,
+        },
     )
 
 
@@ -463,6 +469,7 @@ def open_account(
     _csrf: None = Depends(csrf_protect),
     cash: str = Form(""),
     home_market: str = Form("A"),
+    cash_currency: str = Form(""),
     data: dict[str, list[str]] = _FORM_BODY,
 ):
     """网页开户：空态那句「去跑 CLI」在 `sams serve` 独占库时是一条死路（D194）。"""
@@ -470,18 +477,32 @@ def open_account(
     web = request.app.state.web
     ctx = web.contexts.current()
     name = one(data, "name")
-    form = {"name": name, "cash": cash, "home_market": home_market}
+    form = {
+        "name": name,
+        "cash": cash,
+        "home_market": home_market,
+        "cash_currency": cash_currency,
+    }
     try:
         amount = _number(cash, "起始资金") if cash.strip() else 0.0
         if amount < 0:
             raise ValidationError("起始资金不能是负数")
+        allowed = {
+            ctx.settings.report_currency,
+            *(cfg.currency for cfg in ctx.settings.markets.values()),
+        }
+        currency = cash_currency.strip().upper() or ctx.settings.report_currency
+        if currency not in allowed:
+            raise ValidationError(
+                f"起始资金币种 {currency} 没有配置：可选 {', '.join(sorted(allowed))}"
+            )
         account = ctx.ledger.open_account(
             user.username, name.strip(), home_market=home_market
         )
         if amount:
             ctx.ledger.deposit(
                 account.id,
-                ctx.settings.report_currency,
+                currency,
                 amount,
                 username=user.username,
                 reason="起始资金",

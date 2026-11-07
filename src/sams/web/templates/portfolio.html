@@ -307,10 +307,17 @@
       </select>
     </label>
     <label>起始资金 <input name="cash" type="number" step="any" value="{{ account_form.cash }}" placeholder="可空"></label>
+    <label>资金币种
+      <select name="cash_currency">
+        {% for item in currencies %}
+        <option value="{{ item }}"{% if item == account_form.cash_currency %} selected{% endif %}>{{ item }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <button type="submit">开户</button>
   </form>
   <p class="muted">账户类型只决定录入成交时默认选哪个市场（A 股账户也能买港股通、美股）：不限制你能记什么。</p>
-  <p class="muted">起始资金记在报告币种里；要别的币种，开户后到上面「现金」里入金。</p>
+  <p class="muted">起始资金按上面选的币种入金；港股账户填 HKD、美股账户填 USD 才不会把外币记成人民币。</p>
 </section>
 
 {% if accounts %}

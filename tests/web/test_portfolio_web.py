@@ -213,6 +213,45 @@ def test_the_empty_page_opens_an_account_and_seeds_its_cash_from_the_form(logged
     assert "总资产" in page.text
 
 
+def test_opening_a_hk_account_can_seed_hkd_cash(logged):
+    """起始资金必须带币种：港股账户输 200000 不该被默默记成人民币。"""
+    page = logged.client.get("/portfolio")
+    assert 'name="cash_currency"' in page.text
+    assert "HKD" in page.text
+    response = logged.client.post(
+        "/portfolio/accounts",
+        data={
+            "csrf": logged.csrf,
+            "name": "华泰港股",
+            "home_market": "HK",
+            "cash": "200000",
+            "cash_currency": "HKD",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    (account,) = logged.context.sim_accounts.list_for(_user_id(logged))
+    assert account.home_market == "HK"
+    assert logged.context.sim_accounts.cash_balances(account.id) == {"HKD": 200000.0}
+
+
+def test_an_unknown_opening_currency_is_refused_before_the_account_is_created(logged):
+    response = logged.client.post(
+        "/portfolio/accounts",
+        data={
+            "csrf": logged.csrf,
+            "name": "错币种",
+            "home_market": "HK",
+            "cash": "200000",
+            "cash_currency": "GBP",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "GBP" in response.text
+    assert logged.context.sim_accounts.list_for(_user_id(logged)) == []
+
+
 def test_an_account_opened_without_cash_is_zero_not_a_rejection(logged):
     response = logged.client.post(
         "/portfolio/accounts",
