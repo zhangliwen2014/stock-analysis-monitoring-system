@@ -371,3 +371,24 @@ def test_capability_labels_respect_the_per_market_willingness_table(registry_wit
     assert "分时" not in labels and "分钟 K" not in labels
     assert "分钟 K" in capability_labels(registry_with_minute, "A", "tencent")
     assert "分时" in capability_labels(registry_with_minute, "HK", "tencent")
+
+
+def test_capabilities_list_what_a_source_answers_in_that_market(repo, settings):
+    """管理页那一列「能力」：日线也要算，且按 `answers` 的意愿表分市场。
+
+    与健康页的 `capability_labels` 不同：后者列的是「除日线外还能补什么」，
+    这里回答的是「这个源在这个市场能干什么」——日线是其中一项。
+    """
+    tencent = StubMinuteAdapter("tencent", ["A", "HK", "US"])
+    registry = AdapterRegistry(
+        adapters={"tencent": tencent}, market_sources={}, sleep=lambda seconds: None
+    )
+    admin = SourceAdminService(repo, settings, registry)
+
+    hk = admin.capabilities("HK", "tencent")
+    assert "日线" in hk and "分时" in hk
+    assert "分钟 K" not in hk, "腾讯的分钟 K 不答港股"
+    us = admin.capabilities("US", "tencent")
+    assert "日线" in us and "分时" not in us
+    assert admin.capabilities("HK", "ghost") == ()
+

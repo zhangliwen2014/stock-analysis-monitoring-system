@@ -204,57 +204,95 @@ def _health_word(record) -> str:
     return "正常" if record.ok else "失败"
 
 
+_MARKET_LABELS = {"A": "A 股", "HK": "港股", "US": "美股"}
+
+
+def _source_row(
+    ctx, source, health, quote_health, *, market: str | None = None, priority: int | None = None
+) -> dict:
+    tz = ctx.settings.server.display_tz
+    collected = health.get(source.name)
+    quoted = quote_health.get(source.name)
+    cooling_until = ctx.registry.cooling_until.get(source.name)
+    return {
+        "source": source,
+        "priority": priority,
+        "capabilities": (
+            ctx.source_admin.capabilities(market, source.name) if market is not None else ()
+        ),
+        "collected": _health_word(collected),
+        "quoted": _health_word(quoted),
+        "collect_ok_at": collected.last_ok_at if collected else None,
+        "quote_ok_at": (
+            moment_label(quoted.last_ok_at, tz, seconds=True)
+            if quoted and quoted.last_ok_at
+            else None
+        ),
+        "failures": collected.consecutive_failures if collected else 0,
+        "cooling": moment_label(cooling_until, tz, seconds=True) if cooling_until else "",
+        "error": _error_text(
+            "\n".join(
+                text
+                for text in (
+                    collected.last_error if collected else None,
+                    quoted.last_error if quoted else None,
+                )
+                if text
+            )
+        ),
+    }
+
+
 def _sources_page(request: Request, *, status_code: int = 200, error: str = "", probe=None):
     """数据源那一屏。`probe` 不带注解：`ProbeResult` 是 services 的值对象，
-    而这一层的返回值一律不做注解（同一折法见 `pages/settings.py` 的 `_page`）。"""
+    而这一层的返回值一律不做注解（同一折法见 `pages/settings.py` 的 `_page`）。
+
+    按市场分组而不是一张平表：管理员问的是「A 股有哪些源、谁先谁后、现在什么状态」。
+    组内顺序就是降级顺序（priority, name）；一个源路由到多个市场就在每节各出现一次。
+    """
     ctx = request.app.state.web.contexts.current()
-    tz = ctx.settings.server.display_tz
     health = ctx.source_health.load()
     quote_health = ctx.quote_health.load()
-    routes: dict[str, list[str]] = {}
-    for market, name, priority in ctx.source_admin.routes():
-        routes.setdefault(name, []).append(f"{market}#{priority}")
-    rows = []
-    for source in ctx.source_admin.list():
-        collected = health.get(source.name)
-        quoted = quote_health.get(source.name)
-        cooling_until = ctx.registry.cooling_until.get(source.name)
-        rows.append(
+    sources = {row.name: row for row in ctx.source_admin.list()}
+    routes = ctx.source_admin.routes()
+    groups = []
+    routed: set[str] = set()
+    for market in sorted(ctx.settings.markets):
+        entries = [
+            (priority, name)
+            for item_market, name, priority in routes
+            if item_market == market and name in sources
+        ]
+        rows = [
+            _source_row(
+                ctx, sources[name], health, quote_health, market=market, priority=priority
+            )
+            for priority, name in entries
+        ]
+        routed.update(name for _, name in entries)
+        groups.append(
             {
-                "source": source,
-                "routes": "、".join(routes.get(source.name, [])) or "未路由",
-                "collected": _health_word(collected),
-                "quoted": _health_word(quoted),
-                "collect_ok_at": collected.last_ok_at if collected else None,
-                "quote_ok_at": (
-                    moment_label(quoted.last_ok_at, tz, seconds=True)
-                    if quoted and quoted.last_ok_at
-                    else None
-                ),
-                "failures": collected.consecutive_failures if collected else 0,
-                "cooling": (
-                    moment_label(cooling_until, tz, seconds=True) if cooling_until else ""
-                ),
-                "error": _error_text(
-                    "\n".join(
-                        text
-                        for text in (
-                            collected.last_error if collected else None,
-                            quoted.last_error if quoted else None,
-                        )
-                        if text
-                    )
+                "market": market,
+                "label": _MARKET_LABELS.get(market, market),
+                "rows": rows,
+                "chain": " → ".join(
+                    row["source"].name for row in rows if row["source"].enabled
                 ),
             }
         )
+    unrouted = [
+        _source_row(ctx, row, health, quote_health)
+        for name, row in sorted(sources.items())
+        if name not in routed
+    ]
     return request.app.state.web.render(
         request,
         "admin_sources.html",
         status_code=status_code,
-        rows=rows,
+        groups=groups,
+        unrouted=unrouted,
         sources=ctx.source_admin.list(),
         catalog=ctx.source_admin.catalog(),
-        chains=ctx.source_admin.chains(),
         markets=sorted(ctx.settings.markets),
         probe=probe,
         error=error,

@@ -105,6 +105,31 @@ class SourceAdminService:
         """哪些已注册实现能服务这个市场——加源界面的候选列表。"""
         return catalog().supporting(market)
 
+    def capabilities(self, market: str, name: str) -> tuple[str, ...]:
+        """这个源在**这个市场**能答的数据类型（含日线），按 `CAPABILITIES` 的顺序。
+
+        与健康页的 `capability_labels` 同一判据（方法在 + 意愿表答这个市场），
+        但日线也列出来：管理页问的是「它能干什么」，不是「除日线外还能补什么」。
+        汇率不按市场路由，列在每个市场里只会重复，故不收。
+        停用或尚未装进运行中注册表的源，按 kind 现场构造——构造器不发网络。
+        """
+        row = self.repo.get(name)
+        if row is None:
+            return ()
+        adapter: object | None = None
+        if self.registry is not None:
+            adapter = self.registry.adapters.get(name)
+        if adapter is None:
+            try:
+                adapter = build(row.kind, row.options or {})
+            except DatasourceError:
+                return ()
+        return tuple(
+            cap.label
+            for key, cap in CAPABILITIES.items()
+            if key != "fx_rate" and cap.probe(adapter) and answers(adapter, key, market)
+        )
+
     # ---------- 写操作 ----------
 
     def add(

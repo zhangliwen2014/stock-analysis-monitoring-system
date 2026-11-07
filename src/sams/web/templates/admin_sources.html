@@ -1,42 +1,29 @@
 {% extends "base.html" %}
 {% block title %}数据源{% endblock %}
-{% block content %}
-<p><a href="/settings">← 返回设置</a></p>
-<h1>数据通道</h1>
-{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
-<p class="muted">列表里的启用与停用会立即影响后续采集；正在跑的那一次不会被打断。</p>
-<h2>现有通道</h2>
-
-{% if probe %}
-<section class="card">
-  <h2>探针：{{ probe.name }} · {{ probe.market }} · {{ probe.code }}</h2>
-  <p>{{ probe.verdict }}{% if probe.seconds %}（{{ probe.seconds }}s）{% endif %}</p>
-  <p class="muted">绕开降级链只打这一个源：全链跑通不代表每个源都好。</p>
-</section>
-{% endif %}
-
+{% macro source_table(rows, with_priority=True) %}
 <table class="admin-table">
   <tr>
-    <th>名字</th><th>实现</th><th>市场/优先级</th><th>状态</th>
-    <th>采集健康</th><th>报价健康</th><th>最近成功</th><th>备注 / 错误</th><th>操作</th>
+    {% if with_priority %}<th>#</th>{% endif %}
+    <th>名字 / 实现</th><th>状态</th><th>能力</th>
+    <th>运行状态</th><th>备注 / 错误</th><th>操作</th>
   </tr>
   {% for row in rows %}
   {% set source = row.source %}
   <tr>
-    <td>{{ source.name }}</td>
-    <td class="muted">{{ source.kind }}</td>
-    <td>{{ row.routes }}</td>
-    <td class="nowrap">{{ "启用" if source.enabled else "停用" }}</td>
+    {% if with_priority %}<td>{{ row.priority }}</td>{% endif %}
     <td>
-      {{ row.collected }}{% if row.failures %}<span class="flash-error">，连续失败 {{ row.failures }} 次</span>{% endif %}
+      {{ source.name }}<br>
+      <span class="muted">{{ source.kind }}</span>
+    </td>
+    <td class="nowrap">{{ "启用" if source.enabled else "停用" }}</td>
+    <td class="cell-wide">{{ row.capabilities | join("、") or "—" }}</td>
+    <td class="nowrap">
+      采集健康 {{ row.collected }}{% if row.failures %}<span class="flash-error">，连续失败 {{ row.failures }} 次</span>{% endif %}<br>
+      报价健康 {{ row.quoted }}<br>
+      <span class="muted">最近成功 采集 {{ row.collect_ok_at or "—" }} / 报价 {{ row.quote_ok_at or "—" }}</span>
       {% if row.cooling %}<br><span class="muted">冷却至 {{ row.cooling }}</span>{% endif %}
     </td>
-    <td>{{ row.quoted }}</td>
-    <td>
-      采集 {{ row.collect_ok_at or "—" }}<br>
-      报价 {{ row.quote_ok_at or "—" }}
-    </td>
-    <td>
+    <td class="cell-wide">
       {{ source.note or "—" }}
       {% if row.error %}<br><span class="flash-error">{{ row.error }}</span>{% endif %}
     </td>
@@ -51,9 +38,36 @@
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="9" class="muted">库里还没有数据源：在下面添加一条</td></tr>
+  <tr><td colspan="{{ 7 if with_priority else 6 }}" class="muted">这个市场还没有路由任何源</td></tr>
   {% endfor %}
 </table>
+{% endmacro %}
+
+{% block content %}
+<p><a href="/settings">← 返回设置</a></p>
+<h1>数据通道</h1>
+{% if error %}<p class="flash-error">{{ error }}</p>{% endif %}
+<p class="muted">按市场分组，组内顺序就是降级顺序。启用与停用会立即影响后续采集；正在跑的那一次不会被打断。</p>
+
+{% if probe %}
+<section class="card">
+  <h2>探针：{{ probe.name }} · {{ probe.market }} · {{ probe.code }}</h2>
+  <p>{{ probe.verdict }}{% if probe.seconds %}（{{ probe.seconds }}s）{% endif %}</p>
+  <p class="muted">绕开降级链只打这一个源：全链跑通不代表每个源都好。</p>
+</section>
+{% endif %}
+
+{% for group in groups %}
+<h2>{{ group.label }}</h2>
+<p class="muted">降级顺序（只含启用中的源）：{{ group.chain or "没有启用的源" }}</p>
+{{ source_table(group.rows) }}
+{% endfor %}
+
+{% if unrouted %}
+<h2>未路由</h2>
+<p class="muted">这些源没有挂到任何已配置市场，不会参与采集。</p>
+{{ source_table(unrouted, with_priority=False) }}
+{% endif %}
 
 <section class="card">
   <h2>添加通道</h2>
@@ -99,16 +113,5 @@
     <button type="submit">试跑</button>
     <div id="probe-candidates"></div>
   </form>
-</section>
-
-<section class="card">
-  <h2>降级链（只含启用中的源）</h2>
-  <ul>
-    {% for market, names in chains.items() %}
-    <li>{{ market }}：{{ names | join(" → ") }}</li>
-    {% else %}
-    <li class="muted">还没有路由</li>
-    {% endfor %}
-  </ul>
 </section>
 {% endblock %}

@@ -138,6 +138,8 @@ button.link:hover { background: none; text-decoration: underline; }
 /* 管理页宽表：表头按词不断开，备注列让出宽度而不是把表头挤成竖排 */
 .admin-table th { white-space: nowrap; }
 .admin-table td { vertical-align: top; }
+/* 能力与备注这种自由文本列给一个下限：10 列挤在 1100px 里，浏览器会优先把长文本压成竖排 */
+.admin-table .cell-wide { min-width: 14em; }
 
 /* 限额被踩：与 flash-error 同一支红，但它是表格里的一格，不铺底色 */
 .limit-breach { color: var(--danger); font-weight: 600; }

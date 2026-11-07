@@ -682,6 +682,39 @@ def test_source_page_separates_runtime_health_and_masks_errors(logged):
     assert "冷却至" in page.text, "等待冷却的源要说出到什么时候，不能只写失败"
 
 
+def _market_section(text: str, title: str) -> str:
+    """取某个市场节从标题到下一个 h2 之间的那一段：组内顺序与状态都在这里断言。"""
+    start = text.index(f"<h2>{title}")
+    rest = text[start + 1 :]
+    end = rest.find("<h2")
+    return text[start:] if end == -1 else text[start : start + 1 + end]
+
+
+def test_sources_page_groups_by_market_and_keeps_chain_order(logged):
+    """「A 股有哪些源、HK 有哪些、US 有哪些」要分节读，而不是一张平表。
+
+    组内顺序就是该市场的实际降级顺序（priority, name），停用的源仍留在组内但标「停用」；
+    一个源路由到多个市场时在每个市场各出现一次；没有路由的源单列，不混进任何市场链。
+    """
+    page = logged.client.get("/admin/sources")
+    assert page.status_code == 200
+    a = _market_section(page.text, "A 股")
+    hk = _market_section(page.text, "港股")
+    us = _market_section(page.text, "美股")
+    assert a.index("akshare") < a.index("eastmoney") < a.index("tencent")
+    assert "启用" in a and "采集健康" in a and "报价健康" in a
+    assert "能力" in a and "日线" in a, "每个源要写出它能提供哪些数据"
+    assert "yfinance" in hk and "yfinance" in us
+    assert "eastmoney_global" in hk and "eastmoney_global" in us
+
+    logged.context.data_sources.upsert(SourceRow(name="standalone", kind="sina"))
+    text = logged.client.get("/admin/sources").text
+    assert "<h2>未路由" in text
+    assert "standalone" in _market_section(text, "未路由")
+    assert "standalone" not in _market_section(text, "A 股")
+
+
+
 @pytest.mark.parametrize(
     "path",
     ["/admin/sources/create", "/admin/sync/cancel", "/admin/sync/backfills/retry"],
