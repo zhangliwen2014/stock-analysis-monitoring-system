@@ -434,7 +434,11 @@ def _items(
         if key in asked:
             items.append(percentile_score(row))
     if "roe" in asked:
-        items.append(roe_score(read.roe, period=str(read.period) if read.period else ""))
+        items.append(
+            roe_score(
+                read.roe, period=str(read.period) if read.period else "", market=read.market
+            )
+        )
     if "growth" in asked:
         items.append(growth_score(read.revenue_yoy, read.profit_yoy))
     if "ma_position" in asked:

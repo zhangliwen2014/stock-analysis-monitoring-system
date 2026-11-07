@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from sams.analysis.valuation.percentile import Percentile
 from sams.analysis.valuation.styles import Style
 from sams.core.errors import ValidationError
-from sams.core.fundamentals import RATIO_BOUNDS, out_of_caliber
+from sams.core.fundamentals import RATIO_BOUNDS, out_of_caliber, ratio_bound
 
 #: 胜率参与排序的最小样本数（spec §8.3 那句约束）。30 是需求写下的数，不是这里选的数。
 WIN_RATE_MIN_SAMPLES = 30
@@ -303,19 +303,21 @@ def percentile_score(pct: Percentile) -> Item:
     )
 
 
-def roe_score(value: float | None, *, period: str = "") -> Item:
+def roe_score(
+    value: float | None, *, period: str = "", market: str | None = None
+) -> Item:
     """ROE 水平（小数口径，D58）。口径可疑的那一个直接拒（D66）。"""
     tail = f"，报告期 {period}" if period else ""
     source = f"来源：financials.roe{tail}（小数口径，0.20 = 20%）"
     if value is None:
         return _refused("roe", source, "这一期没有 ROE")
-    if out_of_caliber("roe", value):
+    if out_of_caliber("roe", value, market=market):
         return _item(
             "roe",
             None,
             source,
             f"ROE={value:g} 在小数口径里只能读成 {value * 100:g}%，"
-            f"达到可信上界（|ROE| ≥ {RATIO_BOUNDS['roe']:g}）：这更像漏了 ÷100，"
+            f"达到可信上界（|ROE| ≥ {ratio_bound('roe', market=market):g}）：这更像漏了 ÷100，"
             "打分给 100 分是把采集错误奖励成优势",
         )
     return _item(

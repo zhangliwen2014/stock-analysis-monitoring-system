@@ -40,6 +40,7 @@ from support_valuation import (
     financial_rows,
     flow_rows,
     seed,
+    valuation,
 )
 
 from sams.analysis.valuation.percentile import MIN_SAMPLES
@@ -197,6 +198,28 @@ def test_only_the_items_the_style_asks_for_are_computed(db):
     assert [row.metric for row in value.percentiles] == ["pr", "pe_ttm", "pb"]
     assert item(value, "boll_position").ok
     assert item(value, "pe_percentile").ok and item(value, "pb_percentile").ok
+
+
+def test_us_high_roe_is_scored_instead_of_removed_from_composite(db):
+    service = build(db, market="US", code="AAPL", with_fundamentals=False)
+    FinancialRepo(db).upsert(
+        financial_rows(market="US", code="AAPL").tail(1).with_columns(
+            pl.lit(date(2023, 9, 30)).alias("report_date"),
+            pl.lit(None, dtype=pl.Date).alias("published_date"),
+            pl.lit("年报").alias("report_type"),
+            pl.lit(1.714).alias("roe"),
+        )
+    )
+    ValuationRepo(db).upsert(valuation(DAYS, market="US", code="AAPL"))
+
+    read = service.read("us", "aapl", as_of=TODAY)
+
+    assert (read.market, read.code) == ("US", "AAPL")
+    assert read.fundamental.roe == pytest.approx(1.714)
+    assert read.fundamental.pr.ok
+    assert item(read, "roe").value == pytest.approx(100.0)
+    assert "roe" not in read.composite.missing
+    assert "171.4%" in item(read, "roe").evidence
 
 
 def test_the_entry_gate_reads_pr_percentile_even_when_the_style_does_not_score_it(db):

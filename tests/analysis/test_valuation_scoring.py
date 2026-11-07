@@ -211,6 +211,34 @@ def test_roe_and_growth_gate_the_caliber_before_scoring():
     )
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(1.0, 100.0), (1.714, 100.0), (4.999, 100.0), (-1.0, 0.0), (-4.999, 0.0)],
+)
+def test_us_roe_within_its_caliber_uses_the_same_score_anchors(value, expected):
+    scored = roe_score(value, market="US", period="2023-09-30")
+    assert scored.value == pytest.approx(expected)
+    assert scored.ok and not scored.reason
+    assert "2023-09-30" in scored.evidence
+
+
+@pytest.mark.parametrize(
+    ("market", "bound"), [(None, 1.0), ("A", 1.0), ("HK", 1.0), ("US", 5.0)]
+)
+@pytest.mark.parametrize("multiple", [-2.0, -1.0, 1.0, 2.0])
+def test_roe_rejects_the_market_boundary_and_names_that_boundary(market, bound, multiple):
+    scored = roe_score(bound * multiple, market=market)
+    assert scored.value is None and not scored.ok
+    assert f"|ROE| ≥ {bound:g}" in scored.reason
+
+
+@pytest.mark.parametrize("market", [None, "A", "HK", "US"])
+def test_ordinary_and_missing_roe_keep_their_scores_in_every_market(market):
+    assert roe_score(0.20, market=market).value == pytest.approx(85.0)
+    missing = roe_score(None, market=market)
+    assert missing.value is None and "没有 ROE" in missing.reason
+
+
 def test_money_flow_scores_are_scaled_by_market_cap_not_raw_amount():
     """主力净流入 1 亿在大盘股与小微盘上不是同一件事：比率才有刻度。"""
     big = main_inflow_score(1e8, 1e11)
