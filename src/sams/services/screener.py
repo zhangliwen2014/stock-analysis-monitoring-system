@@ -21,13 +21,14 @@ from math import isnan
 
 import polars as pl
 
-from sams.analysis.fundamentals import pr_now
+from sams.analysis.fundamentals import pr, pr_now
 from sams.core.codes import canonical_market
 from sams.core.errors import ValidationError
 from sams.core.fundamentals import (
     ROE_BASIS_ANNUAL,
     UNDATED_FINANCIAL_MARKETS,
     out_of_caliber,
+    ratio_bound,
 )
 from sams.core.screener_fields import FIELDS, Condition, Field, field, validate
 from sams.services.technical import TechnicalService
@@ -68,6 +69,16 @@ ROE_DERIVATION_FAILED = (
 NONPOSITIVE_VALUATION = (
     "估值不为正（亏损或净资产为负）：估值条件默认只比正值，不计入命中"
 )
+
+#: 年报口径 PR 只算 PE 那一支（D335 + D59）：命令行默认也把 PE 不为正的票排除，
+#: `--include-pb-branch` 才进来；网页结果表没有 basis 列，两支混排不可比。
+ANNUAL_PR_NO_PE = "PE(TTM) 缺失（快照没给这一列），年报口径的 PR 没有分子"
+ANNUAL_PR_PE_NOT_POSITIVE = (
+    "PE(TTM) 不为正（亏损或源没给）：年报口径的 PR 只算 PE 那一支，"
+    "PB 那一支与它不可同列排序（D59），不计入命中"
+)
+ANNUAL_PR_ROE_NOT_POSITIVE = "年报 ROE 不为正（亏损年份）：PR 没有意义"
+ANNUAL_PR_OVERFLOW = "年报口径的 PR 溢出成无穷：分母太小，这个数没有意义"
 
 
 @dataclass(frozen=True)
@@ -242,7 +253,7 @@ class ScreenerService:
             technical_reasons = technical.reasons
             technical_coverage = (technical.computable, universe.height)
         derived_roe = 0
-        if "roe" in specs:
+        if "roe" in specs or "pr_annual" in specs:
             universe, derived_roe = _fill_derived_roe(universe, market)
         kinds: dict[str, str] = {}
         if "pr_now" in specs:
@@ -254,6 +265,20 @@ class ScreenerService:
                     kinds[code] = outcome.kind or "现值 PR 没有数"
             universe = universe.with_columns(
                 pl.Series("pr_now", values, dtype=pl.Float64)
+            )
+        if "pr_annual" in specs:
+            values = []
+            for code, pe_ttm, roe, roa, debt in universe.select(
+                "code", "pe_ttm", "roe", "roa", "debt_ratio"
+            ).iter_rows():
+                value, kind = _annual_pr(
+                    pe_ttm, roe, roa, debt, market, specs["pr_annual"]
+                )
+                values.append(value)
+                if value is None:
+                    kinds[code] = kind
+            universe = universe.with_columns(
+                pl.Series("pr_annual", values, dtype=pl.Float64)
             )
         if "peg" in specs:
             # PE 与年报净利同比都为正才有意义：负增速的 PEG 是一个看起来更便宜的负数
@@ -433,6 +458,38 @@ def _fill_derived_roe(universe: pl.DataFrame, market: str) -> tuple[pl.DataFrame
     return universe.with_columns(pl.Series("roe", values, dtype=pl.Float64)), derived
 
 
+def _annual_pr(
+    pe_ttm: float | None,
+    roe: float | None,
+    roa: float | None,
+    debt_ratio: float | None,
+    market: str,
+    spec: Field,
+) -> tuple[float | None, str]:
+    """年报口径 PR 的 PE 那一支；拒绝时给**类**而不是这只票自己的数（D180/D335）。
+
+    数仍然只由 `analysis.fundamentals.pr` 算：这里只决定「网页要不要走 PB 支」
+    （不走，D59）以及把拒绝理由归组。
+    """
+    if pe_ttm is None:
+        return None, ANNUAL_PR_NO_PE
+    if pe_ttm <= 0:
+        return None, ANNUAL_PR_PE_NOT_POSITIVE
+    outcome = pr(pe_ttm=pe_ttm, roe=roe, market=market)
+    if outcome.ok:
+        return outcome.value, ""
+    if roe is None:
+        if roa is not None or debt_ratio is not None:
+            return None, ROE_DERIVATION_FAILED
+        return None, _annual_missing_reason(spec, market)
+    if roe <= 0:
+        return None, ANNUAL_PR_ROE_NOT_POSITIVE
+    if out_of_caliber("roe", roe, market=market):
+        bound = ratio_bound("roe", market=market) or 1.0
+        return None, f"年报 ROE 达到市场口径上界（|ROE| ≥ {bound:g}）：这个数不可信"
+    return None, ANNUAL_PR_OVERFLOW
+
+
 def _st_mask(universe: pl.DataFrame) -> pl.Series:
     """A 股没有独立的 ST 标记：「名字里有 ST」是交易所口径，退市整理期看「退」。"""
     name = universe["name"].fill_null("")
@@ -504,6 +561,8 @@ def _missing_groups(
             if value is None or (isinstance(value, float) and isnan(value)):
                 if cond.field == "pr_now":
                     reason = kinds.get(row["code"], "现值 PR 没有数")
+                elif cond.field == "pr_annual":
+                    reason = kinds.get(row["code"], "年报市赚率 PR 没有数")
                 elif spec.source == "technical":
                     # 原因由 TechnicalService 逐字段给：覆盖、跳变、日线根数不是同一件事（S4-A）
                     reason = (technical or {}).get(

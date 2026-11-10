@@ -161,6 +161,24 @@ FIELDS: tuple[Field, ...] = (
         basket="pr",
     ),
     Field(
+        "pr_annual",
+        "年报市赚率 PR",
+        "小数比值（0.5 = 50%）",
+        "derived",
+        "pr_annual",
+        _A_HK_US,
+        prefer="low",
+        note=(
+            "PE(TTM) ÷ 年报 ROE ÷ 100：0.5 = 付 0.5 元买 1 元利润；"
+            "PE(TTM) 不为正时不改走 PB 那一支——两条公式算出的 PR 不可同列排序（D59），"
+            "那只票记「无数」。"
+            + _ANNUAL_NOTE
+            + "；源没给 ROE 时按同一期年报的 ROA ÷ (1−资产负债率) 估算"
+        ),
+        basket="pr",
+        needs=("roe", "roa", "debt_ratio"),
+    ),
+    Field(
         "roe",
         "年报 ROE",
         "小数比值（0.15 = 15%）",

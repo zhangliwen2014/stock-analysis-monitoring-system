@@ -186,6 +186,22 @@ def test_the_annual_quality_fields_are_shared_by_three_markets_but_two_stay_a_on
     assert by_name["roic"].markets == frozenset({"A"})
 
 
+def test_annual_pr_is_a_third_reading_and_cannot_share_a_basket_with_pr_now():
+    """D335：年报口径的 PR 与现值口径是两条公式，同篮排序会让「最便宜」只对组内成立。"""
+    annual = {item.name: item for item in FIELDS}["pr_annual"]
+    assert annual.source == "derived" and annual.column == "pr_annual"
+    assert annual.markets == frozenset({"A", "HK", "US"})
+    assert annual.prefer == "low" and annual.basket == "pr"
+    assert annual.needs == ("roe", "roa", "debt_ratio")
+    assert "PE(TTM)" in annual.note and "PB" in annual.note
+    with pytest.raises(ValidationError, match="不同口径"):
+        validate(
+            "A",
+            [Condition("pr_now", "<=", 0.5), Condition("pr_annual", "<=", 0.5)],
+        )
+    assert validate("US", [Condition("pr_annual", "<=", 0.5)])
+
+
 def test_peg_declares_its_financial_input_and_a_missing_reason():
     """PEG 是推导列：它必须先拿到净利同比，否则引擎只会算出一列 None。"""
     peg = {item.name: item for item in FIELDS}["peg"]

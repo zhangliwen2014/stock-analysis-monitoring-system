@@ -613,6 +613,95 @@ def test_validation_happens_before_the_database_is_read(db):
     with pytest.raises(ValidationError):
         service(db).run("A", [Condition("unknown", "<=", 0.5)])
 
+def test_annual_pr_is_pe_ttm_over_the_annual_roe_and_ands_with_other_conditions(db):
+    """D335：网页能写「年报口径 PR ≤ 0.5 且资产负债率 ≤ 0.6」。
+
+    PR = PE(TTM) ÷ 年报 ROE ÷ 100：20 × 0.20 → 1.0，5 × 0.25 → 0.2。
+    """
+    seed(
+        db,
+        snap("600519", pe_dyn=20.0),
+        snap("000001", pe_dyn=10.0),
+        snap("300750", pe_dyn=5.0),
+        codes=("600519", "000001", "300750"),
+    )
+    financial(db, "600519", roe=0.20, debt_ratio=0.30)
+    financial(db, "000001", roe=0.25, debt_ratio=0.70)
+    financial(db, "300750", roe=0.25, debt_ratio=0.40)
+    result = service(db).run(
+        "A",
+        [Condition("pr_annual", "<=", 0.5), Condition("debt_ratio", "<=", 0.6)],
+    )
+    assert [hit.code for hit in result.hits] == ["300750"]
+    assert result.hits[0].values["pr_annual"] == pytest.approx(0.2)
+    assert result.hits[0].values["debt_ratio"] == pytest.approx(0.40)
+    pr_counts, debt_counts = result.fields
+    assert (pr_counts.passed, pr_counts.failed, pr_counts.missing) == (2, 1, 0)
+    assert (debt_counts.passed, debt_counts.failed, debt_counts.missing) == (2, 1, 0)
+    assert result.order_note == "年报市赚率 PR 从低到高"
+
+
+def test_annual_pr_does_not_fall_through_to_the_pb_branch_when_pe_is_not_positive(db):
+    """D59：网页结果表只有一个排序列，两支公式的 PR 混排不可比。
+
+    PE 为负时命令行默认也把这只票排除（`--include-pb-branch` 才进来），网页沿用同一条规矩。
+    """
+    seed(db, snap("600519", pe_dyn=-5.0, pb=1.0))
+    financial(db, "600519", roe=0.20)
+    result = service(db).run("A", [Condition("pr_annual", "<=", 0.5)])
+    assert result.hits == () and result.fields[0].missing == 1
+    (group,) = result.missing
+    assert group.field == "pr_annual" and group.codes == ("600519",)
+    assert "PE(TTM) 不为正" in group.reason and "D59" in group.reason
+
+
+def test_annual_pr_negative_roe_is_missing_and_grouped_by_kind(db):
+    """拒绝理由带着自己的数，分组键不能也带：两只亏损票要落在同一组（D180）。"""
+    seed(db, snap("600519"), snap("000001"), codes=("600519", "000001"))
+    financial(db, "600519", roe=-0.10)
+    financial(db, "000001", roe=-0.25)
+    result = service(db).run("A", [Condition("pr_annual", "<=", 0.5)])
+    assert result.fields[0].missing == 2
+    (group,) = result.missing
+    assert group.codes == ("000001", "600519")
+    assert "ROE 不为正" in group.reason
+
+
+def test_annual_pr_without_an_annual_report_names_the_next_sync(db):
+    seed(db, snap("600519"))
+    result = service(db).run("A", [Condition("pr_annual", "<=", 0.5)])
+    (group,) = result.missing
+    assert group.field == "pr_annual"
+    assert "sams sync financials --market A --code <代码>" in group.reason
+
+
+def test_annual_pr_derives_the_roe_when_the_source_omits_it(db):
+    """与 `roe` 字段同一条兜底（D228）：PR 的分母也可以是估出来的那一期。"""
+    seed_hk(db, snap("00700", pe_dyn=12.8))
+    financial(db, "00700", market="HK", published_date=None, roa=0.09, debt_ratio=0.40)
+    result = service(db).run("HK", [Condition("pr_annual", "<=", 1.0)])
+    (hit,) = result.hits
+    assert hit.values["pr_annual"] == pytest.approx(12.8 / 0.15 / 100)
+    assert "ROA ÷ (1−资产负债率)" in result.basis_note
+
+
+def test_us_annual_pr_uses_the_market_caliber_bound(db):
+    """美股 ROE 142% 是常态（D228/D334）：PR 的分母不能撞 A 股 100% 的上界。"""
+    seed_us(db, snap("AAPL", pe_dyn=20.0))
+    financial(
+        db,
+        "AAPL",
+        market="US",
+        report_date=date(2025, 9, 27),
+        published_date=None,
+        report_type="年报",
+        roe=1.714,
+    )
+    result = service(db).run("US", [Condition("pr_annual", "<=", 0.5)])
+    (hit,) = result.hits
+    assert hit.values["pr_annual"] == pytest.approx(20 / 1.714 / 100)
+
+
 def test_preset_strategy_id_moves_only_when_the_conditions_move():
     """同名方案不再共用一个键（D257）：跨用户的「便宜」不会互相覆盖。"""
     from sams.services.screener import preset_strategy_id

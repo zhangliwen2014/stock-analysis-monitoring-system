@@ -10,6 +10,7 @@ import polars as pl
 
 from sams.core.screener_fields import Condition
 from sams.datasource.spot import SPOT_SCHEMA
+from sams.storage.repos.financials import FinancialRepo
 from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
 
@@ -230,6 +231,59 @@ def test_the_us_page_screens_on_the_columns_its_snapshot_actually_has(logged_scr
     assert '<option value="pe_ttm" disabled' not in page.text
     assert '<option value="pb" disabled' in page.text
     assert '<option value="pr_now" disabled' in page.text
+
+
+def test_the_annual_pr_condition_composes_with_another_condition(logged_screen):
+    """D335：网页能写「年报口径 PR ≤ 0.5 且资产负债率 ≤ 0.6」，结果行带两列的值。"""
+    seed(
+        logged_screen.context,
+        snap("600519", pe_dyn=20.0),
+        snap("300750", pe_dyn=5.0),
+    )
+    FinancialRepo(logged_screen.context.db).upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "A",
+                    "code": code,
+                    "report_date": date(2025, 12, 31),
+                    "published_date": date(2026, 3, 20),
+                    "roe": roe,
+                    "debt_ratio": debt,
+                    "source": "akshare",
+                }
+                for code, roe, debt in (
+                    ("600519", 0.20, 0.30),
+                    ("300750", 0.25, 0.40),
+                )
+            ]
+        )
+    )
+    response = logged_screen.client.get(
+        "/screen",
+        params=[
+            ("market", "A"),
+            ("f", "pr_annual"),
+            ("o", "<="),
+            ("v", "0.5"),
+            ("f", "debt_ratio"),
+            ("o", "<="),
+            ("v", "0.6"),
+        ],
+    )
+    assert response.status_code == 200
+    assert "通过 1 / 不通过 1 / 无数 0" in response.text
+    assert "按年报市赚率 PR 从低到高排序" in response.text
+    assert "/symbol/A/300750" in response.text
+    assert "/symbol/A/600519" not in response.text
+
+
+def test_the_annual_pr_is_offered_in_all_three_markets(logged_screen):
+    """PE(TTM) 与年报 ROE 三个市场都有；它不该像 pr_now 那样在 HK/US 灰着。"""
+    for market in ("A", "HK", "US"):
+        page = logged_screen.client.get("/screen", params={"market": market})
+        assert '<option value="pr_annual"' in page.text
+        assert '<option value="pr_annual" disabled' not in page.text
 
 
 def test_recollect_queues_the_spot_job_and_says_so(logged_screen):
