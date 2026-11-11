@@ -223,6 +223,20 @@ def test_the_cli_appends_its_own_switch_to_the_nonpositive_reason(db, settings, 
     assert "--include-negatives" in out
 
 
+def test_the_cli_appends_the_sync_command_to_a_financials_gap(db, settings, capsys):
+    """D336：共享理由只讲事实；命令行这一间房自己接上「先跑什么」。
+
+    网页那边同一组缺口给的是排队按钮——两个房间的下一步不同，串本身不偏袒。
+    """
+    container = container_for(db, settings, snap("600519"), snap("000001"))
+    FinancialRepo(db).upsert(financial_rows(code="600519"))
+    capsys.readouterr()
+    assert run(container, ["screen", "spot", "--market", "A", "--where", "roe>=0.1"]) == 0
+    out = capsys.readouterr().out
+    assert "没有已披露年报数据（年报 ROE）" in out
+    assert "sams sync financials --market A --code <代码>" in out
+
+
 def test_json_carries_three_counts_and_the_missing_groups(db, settings, capsys):
     container = container_for(
         db, settings, snap("600519", pe_dyn=5.0), snap("000001", pe_dyn=-5.0)

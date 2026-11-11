@@ -13,6 +13,7 @@ D330 之后 `kind` 又多三种：`financials` / `valuation` / `flow`。它们�
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
@@ -74,6 +75,35 @@ class SymbolBackfillRepo:
                 [uuid4().hex, market, code, key, kind],
             )
         return True
+
+    def enqueue_many(
+        self, market: str, codes: Iterable[str], kind: str
+    ) -> tuple[int, int]:
+        """一批同一种活，返回（新排, 已在队列）。
+
+        选股屏点一次按钮可能上千只：逐只 `enqueue` 就是上千次事务。开放键一次取回、
+        一个事务里把新行插完；去重键仍是 `open_key` 那一条。
+        """
+        unique = list(dict.fromkeys(code for code in codes if code))
+        if not unique:
+            return 0, 0
+        keys = {f"{market}|{code}|{kind}": code for code in unique}
+        with self.db.transaction():
+            existing = self.db.query(
+                "SELECT open_key FROM symbol_backfills"
+                " WHERE market = ? AND kind = ? AND open_key IS NOT NULL",
+                [market, kind],
+            )["open_key"].to_list()
+            open_keys = set(existing)
+            fresh = [key for key in keys if key not in open_keys]
+            for key in fresh:
+                self.db.execute(
+                    "INSERT INTO symbol_backfills"
+                    " (id, market, code, tries, status, open_key, created_at, kind)"
+                    " VALUES (?, ?, ?, 0, 'pending', ?, now(), ?)",
+                    [uuid4().hex, market, keys[key], key, kind],
+                )
+        return len(fresh), len(unique) - len(fresh)
 
     def defer(self, market: str, code: str, kind: str, reason: str) -> bool:
         """直接排成一行的 `deferred`（D330 的孤源止损）。

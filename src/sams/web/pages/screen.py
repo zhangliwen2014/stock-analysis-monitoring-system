@@ -23,6 +23,7 @@ from sams.core.screener_fields import (
 )
 from sams.core.screener_recipes import recipes_for
 from sams.services.screener import preset_strategy_id
+from sams.storage.repos.symbol_backfills import FINANCIALS
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import moment_label, price
@@ -447,6 +448,17 @@ def _notice(query) -> str:
         if capped:
             parts.append(f"{capped} 只因自选上限 {MAX_ITEMS_PER_USER} 只没加")
         return "；".join(parts)
+    if kind == "backfill":
+        queued = _count(query.get("queued"))
+        already = _count(query.get("already"))
+        parts = []
+        if queued:
+            parts.append(f"新排进补采队列 {queued} 只")
+        if already:
+            parts.append(f"{already} 只本来就在队列里")
+        return "；".join(parts) + "；后台逐只同步年报，补完刷新这一页"
+    if kind == "backfill_none":
+        return "这一组现在不在可补采的范围里（页面可能过期）：刷新后再试"
     return ""
 
 
@@ -475,6 +487,67 @@ def recollect(
         )
     return RedirectResponse(
         _url(market, rows, notice="queued", **switches), status_code=303
+    )
+
+
+@router.post("/screen/backfill")
+def queue_financials(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _FORM_BODY,
+):
+    """把一组缺年报的票排进补采队列（R3-02/D336）：网页不给命令行，后台逐只补。
+
+    代码表不带在表单里，按提交的条件重跑引擎再取那一组：页面上的代码表可能是旧的，
+    而补采这一步要补的是「此刻真的缺年报」的那批。`field` 只用来选组；分组里
+    不可补的（PE 缺失、ROE 推不出来）`fix` 为空，不会因为同名字段被一起排上。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    market = one(data, "market").strip().upper()
+    field_name = one(data, "field").strip()
+    rows = _posted_rows(data)
+    switches = _switches(data)
+    page = _page_number(one(data, "page"))
+    try:
+        result = ctx.screener.run(
+            market,
+            _conditions(rows),
+            positive_only=not switches["include_negatives"],
+            include_st=switches["include_st"],
+        )
+    except ValidationError as exc:
+        return _render(
+            request,
+            user,
+            market=market,
+            preset=None,
+            rows=rows,
+            error=str(exc),
+            **switches,
+        )
+    codes = [
+        code
+        for group in result.missing
+        if group.field == field_name and group.fix == FINANCIALS
+        for code in group.codes
+    ]
+    if not codes:
+        return RedirectResponse(
+            _url(market, rows, page=page, notice="backfill_none", **switches),
+            status_code=303,
+        )
+    queued, already = ctx.backfills_store.enqueue_many(market, codes, FINANCIALS)
+    return RedirectResponse(
+        _url(
+            market,
+            rows,
+            page=page,
+            notice="backfill",
+            extra={"queued": queued, "already": already},
+            **switches,
+        ),
+        status_code=303,
     )
 
 

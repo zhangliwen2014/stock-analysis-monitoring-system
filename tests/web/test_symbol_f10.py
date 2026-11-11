@@ -403,6 +403,61 @@ def test_us_financials_say_the_chain_has_no_source(logged_f10):
     assert "美股的这条链上还没有财务指标的源" in text
     # 不再给一条在美股上跑不通的采集命令
     assert "sams sync financials --market US" not in text
+    # 没有源就不排：排进去每一拍都只会得到「没有这个源」（D336）
+    assert logged_f10.context.backfills_store.open_for(
+        "US", "AAPL", kind="financials"
+    ) is None
+
+
+def test_the_financial_card_queues_a_backfill_instead_of_a_command(logged_f10):
+    """R3-02/D336：缺财务指标的下一步是排队，不是一条网页用户敲不了的命令。"""
+    _symbol(logged_f10.context)
+    text = logged_f10.client.get("/api/partials/f10?market=A&code=600519").text
+    assert "sams sync financials" not in text
+    assert "已排进后台补采队列" in text
+    row = logged_f10.context.backfills_store.open_for("A", "600519", kind="financials")
+    assert row is not None and row.status == "pending"
+
+
+def test_the_financials_partial_queues_the_same_way(logged_f10):
+    """htmx 只换这张卡时也得说同一句话：那句话是承诺，队列里必须有那一行。"""
+    _symbol(logged_f10.context)
+    text = logged_f10.client.get(
+        "/api/partials/f10/financials?market=A&code=600519"
+    ).text
+    assert "已排进后台补采队列" in text
+    assert logged_f10.context.backfills_store.open_for(
+        "A", "600519", kind="financials"
+    ) is not None
+
+
+def test_the_financial_card_does_not_promise_a_queue_for_an_unknown_code(logged_f10):
+    ctx = logged_f10.context
+    ctx.symbol_list_store.upsert_batch(
+        "A",
+        [
+            {
+                "code": "600519",
+                "name": "贵州茅台",
+                "py_initials": "gzmt",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            }
+        ],
+    )
+    _symbol(ctx, "A", "000996", "退市股", "CNY")
+    text = logged_f10.client.get("/api/partials/f10?market=A&code=000996").text
+    assert "已排进后台补采队列" not in text
+    assert "代码表里没有这只票" in text
+    assert ctx.backfills_store.open_for("A", "000996", kind="financials") is None
+
+
+def test_the_financial_card_does_not_queue_when_the_data_is_already_there(logged_f10):
+    ctx = logged_f10.context
+    _symbol(ctx)
+    _financials(ctx)
+    logged_f10.client.get("/api/partials/f10?market=A&code=600519")
+    assert ctx.backfills_store.open_for("A", "600519", kind="financials") is None
 
 
 # ---------- D218 / D219：五档报告期、图表与明细两种视图 ----------

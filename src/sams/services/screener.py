@@ -34,6 +34,7 @@ from sams.core.screener_fields import FIELDS, Condition, Field, field, validate
 from sams.services.technical import TechnicalService
 from sams.storage.repos.financials import FinancialRepo
 from sams.storage.repos.snapshots import SnapshotRepo
+from sams.storage.repos.symbol_backfills import FINANCIALS
 from sams.storage.repos.symbol_list import SymbolListRepo
 
 #: 上面那条放宽一旦被条件用到，结果行就必须自己说出来：屏幕上的「年报 ROE」
@@ -105,6 +106,9 @@ class MissingGroup:
     field: str
     reason: str
     codes: tuple[str, ...]
+    #: 能给这一组补数的队列 kind（D336）：今天只有 `financials`；空串表示没有任何
+    #: 队列活能补（PE 缺失、ROE 推不出来、技术面……），网页不该给按钮
+    fix: str = ""
 
 
 @dataclass(frozen=True)
@@ -516,20 +520,15 @@ def _compare(column: pl.Series, cond: Condition) -> pl.Series:
 
 
 def _annual_missing_reason(spec: Field, market: str) -> str:
-    """「没有这一列」的下一步按市场的披露规则说（D215/D228）。
+    """「没有这一列」按市场的披露规则说（D215/D228）；下一步由各房间自己附加（D336）。
 
     A 股那一行确实要用披露日挡，说「已披露」是实话；港股/美股没有披露日可核，
-    同一句话在那里就成了另一句无法验证的话。
+    同一句话在那里就成了另一句无法验证的话。串里不带命令：网页用户没有终端，
+    命令行用户要的那一条由 CLI 自己接在后面。
     """
     if market in UNDATED_FINANCIAL_MARKETS:
-        return (
-            f"没有截至快照日能取到的年报数据（{spec.label}）："
-            f"`sams sync financials --market {market} --code <代码>`"
-        )
-    return (
-        f"没有已披露年报数据（{spec.label}）："
-        f"`sams sync financials --market {market} --code <代码>`"
-    )
+        return f"没有截至快照日能取到的年报数据（{spec.label}）"
+    return f"没有已披露年报数据（{spec.label}）"
 
 
 def _missing_groups(
@@ -550,8 +549,11 @@ def _missing_groups(
 
     估值字段的负值也在这一组里点名（R-09）：它们没有参与比较，但必须和「真的无数」
     一样有名字，不能因为默认过滤而消失。
+
+    组键带上 `fix`（D336）：一个组里不许一半是「库里没有年报」、一半是「年报在库但
+    ROE 推不出来」——前一半能排队补，后一半再同步同一条源不是下一步。
     """
-    grouped: dict[tuple[str, str], list[str]] = {}
+    grouped: dict[tuple[str, str, str], list[str]] = {}
     for row in universe.iter_rows(named=True):
         if row["code"] in hit_codes:
             continue
@@ -559,10 +561,13 @@ def _missing_groups(
             spec = specs[cond.field]
             value = row[spec.column]
             if value is None or (isinstance(value, float) and isnan(value)):
+                fix = ""
                 if cond.field == "pr_now":
                     reason = kinds.get(row["code"], "现值 PR 没有数")
                 elif cond.field == "pr_annual":
                     reason = kinds.get(row["code"], "年报市赚率 PR 没有数")
+                    if reason == _annual_missing_reason(spec, market):
+                        fix = FINANCIALS
                 elif spec.source == "technical":
                     # 原因由 TechnicalService 逐字段给：覆盖、跳变、日线根数不是同一件事（S4-A）
                     reason = (technical or {}).get(
@@ -573,24 +578,26 @@ def _missing_groups(
                 elif spec.source == "financials":
                     # 补数命令按代码跑，但理由只说一次：逐票把代码拼进去，几千只票就是几千组
                     reason = _annual_missing_reason(spec, market)
+                    fix = FINANCIALS
                     if cond.field == "roe" and (
                         row.get("roa") is not None or row.get("debt_ratio") is not None
                     ):
                         # 有年报、但兜底公式的输入不齐或结果不可信：这时叫卖「去同步」
                         # 是错的下一步——那一期已经在库里，缺的是能用的 ROE
                         reason = ROE_DERIVATION_FAILED
+                        fix = ""
                 else:
                     reason = "快照这一行缺这一列"
-                grouped.setdefault((cond.field, reason), []).append(row["code"])
+                grouped.setdefault((cond.field, reason, fix), []).append(row["code"])
                 break
             if positive_only and spec.positive and value <= 0:
-                grouped.setdefault((cond.field, NONPOSITIVE_VALUATION), []).append(
+                grouped.setdefault((cond.field, NONPOSITIVE_VALUATION, ""), []).append(
                     row["code"]
                 )
                 break
     return tuple(
-        MissingGroup(field=name, reason=reason, codes=tuple(sorted(codes)))
-        for (name, reason), codes in sorted(grouped.items())
+        MissingGroup(field=name, reason=reason, codes=tuple(sorted(codes)), fix=fix)
+        for (name, reason, fix), codes in sorted(grouped.items())
     )
 
 

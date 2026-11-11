@@ -27,7 +27,7 @@ from sams.services.analysis import parse_period
 from sams.services.decision import CardQuote
 from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
 from sams.services.news import NEWS_MARKETS
-from sams.storage.repos.symbol_backfills import DEFERRED
+from sams.storage.repos.symbol_backfills import DEFERRED, FINANCIALS
 from sams.web.auth import csrf_protect, require_user
 from sams.web.back import local_back
 from sams.web.chart_prefs import CHART_PERIODS, ordered_periods, parse_windows, windows_text
@@ -541,9 +541,9 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
     拆出来的 loader 都指向同一份资料，库里的键也只有一种形态（D50）。
 
     三种「没有」在这里分开说（设计 §F）：链上没有源（US）→ 明说缺源；有源但本地
-    没数据 → 分红送转那一格改说「已排进后台补采队列」（D283，打开本页的那一刻排的），
-    其余几格暂时还给采集命令；有数据 → 照常渲染。财务与估值的空态同第二档，只是命令换成
-    它们各自的那一条。
+    没数据 → 分红送转与财务指标改说「已排进后台补采队列」（D283/D336，打开本页的
+    那一刻排的），其余几格暂时还给采集命令；有数据 → 照常渲染。估值空态仍是命令：
+    HK/US 的估值源本身没有，话术要按市场能力分支，那是 D2 的下一片。
     """
     user = require_user(request)
     web = request.app.state.web
@@ -575,10 +575,10 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
         fin_view=view,
         financial_periods=FINANCIAL_PERIODS,
         financial_views=FINANCIAL_VIEWS,
+        financials_queued=_queue_financials(ctx, market, code, read),
         profile_command=f"sams sync profile --market {market} --code {code}",
         announcement_command=f"sams sync announcements --market {market} --code {code}",
         news_command=f"sams sync news --market {market} --code {code}",
-        financials_command=f"sams sync financials --market {market} --code {code}",
         valuation_command=f"sams sync valuation --market {market} --code {code}",
     )
 
@@ -603,9 +603,23 @@ def _financial_card(request: Request, market: str, code: str, symbol: dict):
         "currency": symbol.get("currency") or "",
         "financial_periods": FINANCIAL_PERIODS,
         "financial_views": FINANCIAL_VIEWS,
-        "financials_command": f"sams sync financials --market {market} --code {code}",
         "valuation_command": f"sams sync valuation --market {market} --code {code}",
     }
+
+
+def _queue_financials(ctx, market: str, code: str, read) -> bool:
+    """缺财务指标就排进同一条补采队列（R3-02/D336，与分红卡同一条 D283 规矩）。
+
+    源都没接的市场不排：`sync financials` 在那里只会得到「没有这个源」，每一拍都白试
+    一次；代码表不认识的票也不排（D314）。只有真的把行放进了队列（或本来就在队列里），
+    模板才许说「已排进后台补采队列」。
+    """
+    if read.has_financial_data or not read.has_financials_source:
+        return False
+    if not ctx.symbol_list_store.admits(market, code):
+        return False
+    ctx.backfills_store.enqueue(market, code, FINANCIALS)
+    return True
 
 
 @router.get("/api/partials/f10/financials")
@@ -631,6 +645,7 @@ def f10_financials_partial(
         "partials/f10_financials.html",
         read=read,
         fin_view=view,
+        financials_queued=_queue_financials(ctx, market, code, read),
         **extra,
     )
 

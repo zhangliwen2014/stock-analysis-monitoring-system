@@ -60,8 +60,11 @@
   {% if not read.has_financial_data %}
   {% if not read.has_financials_source %}
   <p class="muted">{{ market_name }}的这条链上还没有财务指标的源。</p>
+  {% elif financials_queued %}
+  {# 网页用户没有终端（R3-02）：这句话是承诺，handler 真的排过才允许出现（D336） #}
+  <p class="muted">本地还没有这只票的财务指标，已排进后台补采队列：补完刷新这一页。</p>
   {% else %}
-  <p class="muted">本地还没有这只票的财务指标。采一次：<code>{{ financials_command }}</code></p>
+  <p class="muted">本地还没有这只票的财务指标；代码表里没有这只票，补采排不上——先等代码表同步。</p>
   {% endif %}
   {% else %}
 

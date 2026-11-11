@@ -36,6 +36,7 @@ from sams.core.fundamentals import (
 from sams.core.screener_fields import Condition, fields_for
 from sams.services.screen import PrHit
 from sams.services.screener import NONPOSITIVE_VALUATION
+from sams.storage.repos.symbol_backfills import FINANCIALS
 
 PR_USAGE = "例如 0.4（PR 是小数口径的比值，不是百分数：`PR ≤ 0.4` 写 0.4）"
 
@@ -247,6 +248,11 @@ def _print_spot(result, code: int) -> int:
         if reason == NONPOSITIVE_VALUATION:
             # 共享串只讲事实；命令行的下一步由 CLI 自己附加（D283）
             reason += "；命令行加 --include-negatives 可一起比较"
+        if missing_group.fix == FINANCIALS:
+            # D336：网页给排队按钮，命令行给可当场跑的命令——同一组缺口两个房间的下一步不同
+            reason += (
+                f"；先跑 `sams sync financials --market {result.market} --code <代码>`"
+            )
         print(
             f"无数 {len(missing_group.codes)} 只  {missing_group.field}：{reason}"
         )

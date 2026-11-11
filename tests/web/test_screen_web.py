@@ -286,6 +286,91 @@ def test_the_annual_pr_is_offered_in_all_three_markets(logged_screen):
         assert '<option value="pr_annual" disabled' not in page.text
 
 
+def _annual_rows(context, code="600519", roe=0.20):
+    FinancialRepo(context.db).upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "A",
+                    "code": code,
+                    "report_date": date(2025, 12, 31),
+                    "published_date": date(2026, 3, 20),
+                    "roe": roe,
+                    "source": "akshare",
+                }
+            ]
+        )
+    )
+
+
+def _roe_params():
+    return [("market", "A"), ("f", "roe"), ("o", ">="), ("v", "0.1")]
+
+
+def test_the_missing_annual_group_offers_a_queue_button_not_a_command(logged_screen):
+    """R3-02/D336：网页用户没有终端；缺年报的下一步是排进同一条补采队列。"""
+    seed(logged_screen.context, snap("600519"), snap("000001"))
+    _annual_rows(logged_screen.context)
+    page = logged_screen.client.get("/screen", params=_roe_params())
+    assert "没有已披露年报数据（年报 ROE）" in page.text
+    assert "sams sync financials" not in page.text
+    assert "把这 1 只加入补采队列" in page.text
+
+
+def test_the_queue_button_enqueues_the_group_and_the_second_press_says_it_is_queued(
+    logged_screen,
+):
+    seed(logged_screen.context, snap("600519"), snap("000001"))
+    _annual_rows(logged_screen.context)
+    form = {
+        "csrf": logged_screen.csrf,
+        "market": "A",
+        "field": "roe",
+        "f": ["roe"],
+        "o": [">="],
+        "v": ["0.1"],
+    }
+    response = logged_screen.client.post(
+        "/screen/backfill", data=form, follow_redirects=False
+    )
+    assert response.status_code == 303
+    ctx = logged_screen.context
+    row = ctx.backfills_store.open_for("A", "000001", kind="financials")
+    assert row is not None and row.status == "pending"
+    page = logged_screen.client.get(response.headers["location"])
+    assert "新排进补采队列 1 只" in page.text
+    assert "后台逐只同步年报，补完刷新这一页" in page.text
+
+    again = logged_screen.client.post(
+        "/screen/backfill", data=form, follow_redirects=False
+    )
+    page = logged_screen.client.get(again.headers["location"])
+    assert "1 只本来就在队列里" in page.text
+
+
+def test_a_group_that_cannot_be_backfilled_is_not_queued(logged_screen):
+    """页面过期（这一组已经不在了）时不许假装排过：notice 说清，队列里也不多行。"""
+    seed(logged_screen.context, snap("600519"))
+    response = logged_screen.client.post(
+        "/screen/backfill",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "field": "pr_now",
+            "f": ["roe"],
+            "o": [">="],
+            "v": ["0.1"],
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    page = logged_screen.client.get(response.headers["location"])
+    assert "现在不在可补采的范围里" in page.text
+    assert logged_screen.context.backfills_store.open_for(
+        "A", "600519", kind="financials"
+    ) is None
+
+
 def test_recollect_queues_the_spot_job_and_says_so(logged_screen):
     default_seed(logged_screen)
     response = logged_screen.client.post(

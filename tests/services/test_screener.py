@@ -275,7 +275,9 @@ def test_financial_fields_join_as_of_the_snapshot_day_and_report_the_gap(db):
     result = service(db).run("A", [Condition("roe", ">=", 0.1)])
     assert result.fields[0].passed == 1
     (group,) = result.missing
-    assert group.codes == ("000001",) and "financials" in group.reason
+    assert group.codes == ("000001",)
+    assert group.reason == "没有已披露年报数据（年报 ROE）"
+    assert group.fix == "financials"
 
 
 def test_one_missing_financial_field_is_one_group_not_one_per_code(db):
@@ -291,8 +293,8 @@ def test_one_missing_financial_field_is_one_group_not_one_per_code(db):
     result = service(db).run("A", [Condition("roe", ">=", 0.1)])
     (group,) = result.missing
     assert group.codes == ("000001", "300750")
-    assert "--code <代码>" in group.reason
     assert "000001" not in group.reason and "300750" not in group.reason
+    assert group.fix == "financials"
 
 
 def financial(db, code, **values):
@@ -506,14 +508,26 @@ def test_us_annual_fields_are_read_undated_and_the_note_names_the_fiscal_year(db
 
 
 def test_the_missing_annual_reason_matches_the_markets_disclosure_rule(db):
-    """美股没有披露日可核，理由不能说成「没有已披露年报」——那句话在这里无从验证。"""
+    """美股没有披露日可核，理由不能说成「没有已披露年报」——那句话在这里无从验证。
+
+    D336：共享串只讲事实；「下一步」由网页按钮或命令行各自附加，串里不再有 `sams `。
+    """
     seed_us(db, snap("AAPL"), snap("MSFT"), codes=("AAPL", "MSFT"))
     result = service(db).run("US", [Condition("roe", ">=", 0.10)])
     (group,) = result.missing
     assert group.codes == ("AAPL", "MSFT")
     assert "截至快照日" in group.reason
     assert "已披露" not in group.reason
-    assert "--market US --code <代码>" in group.reason
+    assert "sams " not in group.reason
+    assert group.fix == "financials"
+
+
+def test_a_missing_annual_row_is_backfillable_with_the_financials_kind(db):
+    seed(db, snap("600519"))
+    result = service(db).run("A", [Condition("roe", ">=", 0.10)])
+    (group,) = result.missing
+    assert group.reason == "没有已披露年报数据（年报 ROE）"
+    assert group.fix == "financials"
 
 
 def test_hk_missing_annual_reason_does_not_claim_a_disclosure_date(db):
@@ -667,12 +681,33 @@ def test_annual_pr_negative_roe_is_missing_and_grouped_by_kind(db):
     assert "ROE 不为正" in group.reason
 
 
-def test_annual_pr_without_an_annual_report_names_the_next_sync(db):
+def test_annual_pr_without_an_annual_report_is_a_financials_backfill(db):
+    """D336：没有年报是队列能补的缺口；理由只讲事实，下一步由各房间自己给。"""
     seed(db, snap("600519"))
     result = service(db).run("A", [Condition("pr_annual", "<=", 0.5)])
     (group,) = result.missing
     assert group.field == "pr_annual"
-    assert "sams sync financials --market A --code <代码>" in group.reason
+    assert group.reason == "没有已披露年报数据（年报市赚率 PR）"
+    assert group.fix == "financials"
+
+
+def test_annual_pr_without_a_pe_is_not_a_financials_backfill(db):
+    """PE 缺失要先补快照，不是补年报：`fix` 不许把两种缺口说成同一种（D336）。"""
+    seed(db, snap("600519", pe_dyn=None))
+    result = service(db).run("A", [Condition("pr_annual", "<=", 0.5)])
+    (group,) = result.missing
+    assert group.fix == ""
+    assert "分子" in group.reason
+
+
+def test_an_unusable_roe_from_an_existing_report_is_not_a_backfill(db):
+    """年报在库、缺的是能用的 ROE：再同步同一条源不是这一组的下一步（D336）。"""
+    seed(db, snap("600519", pe_dyn=20.0))
+    financial(db, "600519", roa=0.10, debt_ratio=1.20)
+    result = service(db).run("A", [Condition("pr_annual", "<=", 0.5)])
+    (group,) = result.missing
+    assert group.fix == ""
+    assert "估不出可信值" in group.reason
 
 
 def test_annual_pr_derives_the_roe_when_the_source_omits_it(db):
