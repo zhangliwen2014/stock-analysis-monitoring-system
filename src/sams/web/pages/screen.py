@@ -23,7 +23,7 @@ from sams.core.screener_fields import (
 )
 from sams.core.screener_recipes import recipes_for
 from sams.services.screener import preset_strategy_id
-from sams.storage.repos.symbol_backfills import FINANCIALS
+from sams.storage.repos.symbol_backfills import ACTIONS, BARS, FINANCIALS
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import moment_label, price
@@ -35,6 +35,13 @@ router = APIRouter()
 PAGE_SIZE = 50
 MISSING_CODES = 20
 STALE_DAYS = 3
+
+#: 队列里每种活在这一页的叫法（D337）：按钮旁的说明与 notice 都按它说话
+FIX_LABELS = {
+    BARS: "补日线",
+    ACTIONS: "同步公司行为",
+    FINANCIALS: "同步年报",
+}
 
 _FORM_BODY = Depends(form_data)
 
@@ -290,6 +297,7 @@ def _render(
         pager=pager,
         missing=result.missing if result is not None else (),
         missing_codes=MISSING_CODES,
+        fix_labels=FIX_LABELS,
         snapshot=snapshot,
         stale=stale,
         stale_days=STALE_DAYS,
@@ -421,24 +429,24 @@ def _preset(ctx, user_id: str, preset_id: str):
 
 
 def _notice(query) -> str:
-    kind = query.get("notice") or ""
-    if kind == "queued":
+    notice = query.get("notice") or ""
+    if notice == "queued":
         return "已把全市场快照排进下一拍：跑完刷新这一页"
-    if kind == "saved":
+    if notice == "saved":
         return "方案已保存"
-    if kind == "edited":
+    if notice == "edited":
         return "方案的名字与说明已更新"
-    if kind == "updated":
+    if notice == "updated":
         return "方案的条件已覆盖为当前这一组；下次自动运行只记基线，不推送"
-    if kind == "deleted":
+    if notice == "deleted":
         return "方案已删除（已加进自选的票不受影响）"
-    if kind == "ran":
+    if notice == "ran":
         return "方案已按今天的快照重跑"
-    if kind == "monitor_on":
+    if notice == "monitor_on":
         return "自动监控已开启：第一次运行只记基线，不推送"
-    if kind == "monitor_off":
+    if notice == "monitor_off":
         return "自动监控已关闭"
-    if kind == "added":
+    if notice == "added":
         added = _count(query.get("added"))
         already = _count(query.get("already"))
         capped = _count(query.get("capped"))
@@ -448,7 +456,7 @@ def _notice(query) -> str:
         if capped:
             parts.append(f"{capped} 只因自选上限 {MAX_ITEMS_PER_USER} 只没加")
         return "；".join(parts)
-    if kind == "backfill":
+    if notice == "backfill":
         queued = _count(query.get("queued"))
         already = _count(query.get("already"))
         parts = []
@@ -456,8 +464,9 @@ def _notice(query) -> str:
             parts.append(f"新排进补采队列 {queued} 只")
         if already:
             parts.append(f"{already} 只本来就在队列里")
-        return "；".join(parts) + "；后台逐只同步年报，补完刷新这一页"
-    if kind == "backfill_none":
+        what = FIX_LABELS.get(query.get("kind") or "", "补采")
+        return "；".join(parts) + f"；后台逐只{what}，补完刷新这一页"
+    if notice == "backfill_none":
         return "这一组现在不在可补采的范围里（页面可能过期）：刷新后再试"
     return ""
 
@@ -491,21 +500,23 @@ def recollect(
 
 
 @router.post("/screen/backfill")
-def queue_financials(
+def queue_missing(
     request: Request,
     _csrf: None = Depends(csrf_protect),
     data: dict[str, list[str]] = _FORM_BODY,
 ):
-    """把一组缺年报的票排进补采队列（R3-02/D336）：网页不给命令行，后台逐只补。
+    """把一组缺数的票排进补采队列（R3-02/D336/D337）：网页不给命令行，后台逐只补。
 
     代码表不带在表单里，按提交的条件重跑引擎再取那一组：页面上的代码表可能是旧的，
-    而补采这一步要补的是「此刻真的缺年报」的那批。`field` 只用来选组；分组里
-    不可补的（PE 缺失、ROE 推不出来）`fix` 为空，不会因为同名字段被一起排上。
+    而补采这一步要补的是「此刻真的缺这一种活」的那批。`field` 只用来选组，`kind`
+    必须与引擎给那一组的 `fix` 相同——PE 缺失、ROE 推不出来、量比遇送转这些组
+    `fix` 为空，不会因为同名字段被一起排上。
     """
     user = require_user(request)
     ctx = request.app.state.web.contexts.current()
     market = one(data, "market").strip().upper()
     field_name = one(data, "field").strip()
+    kind = one(data, "kind").strip()
     rows = _posted_rows(data)
     switches = _switches(data)
     page = _page_number(one(data, "page"))
@@ -529,22 +540,22 @@ def queue_financials(
     codes = [
         code
         for group in result.missing
-        if group.field == field_name and group.fix == FINANCIALS
+        if group.field == field_name and group.fix == kind
         for code in group.codes
-    ]
+    ] if kind in FIX_LABELS else []
     if not codes:
         return RedirectResponse(
             _url(market, rows, page=page, notice="backfill_none", **switches),
             status_code=303,
         )
-    queued, already = ctx.backfills_store.enqueue_many(market, codes, FINANCIALS)
+    queued, already = ctx.backfills_store.enqueue_many(market, codes, kind)
     return RedirectResponse(
         _url(
             market,
             rows,
             page=page,
             notice="backfill",
-            extra={"queued": queued, "already": already},
+            extra={"queued": queued, "already": already, "kind": kind},
             **switches,
         ),
         status_code=303,

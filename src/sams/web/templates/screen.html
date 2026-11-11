@@ -156,18 +156,19 @@
   {% for group in missing %}
   <p>无数 {{ group.codes|length }} 只 · {{ group.field }}：{{ group.reason }}</p>
   <p class="muted">{{ group.codes[:missing_codes]|join("、") }}{% if group.codes|length > missing_codes %}…（{{ group.codes|length - missing_codes }} 只未列）{% endif %}</p>
-  {% if group.fix == "financials" %}
-  {# 网页用户没有终端（R3-02）：缺年报的下一步是排进后台那条补采队列（D336） #}
+  {% if group.fix %}
+  {# 网页用户没有终端（R3-02）：缺数的下一步是排进后台那条补采队列（D336/D337） #}
   <form method="post" action="/screen/backfill" class="inline-form">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <input type="hidden" name="market" value="{{ market }}">
     <input type="hidden" name="page" value="{{ page }}">
     <input type="hidden" name="field" value="{{ group.field }}">
+    <input type="hidden" name="kind" value="{{ group.fix }}">
     {% include "partials/screen_switches.html" %}
     {% for row in rows %}<input type="hidden" name="f" value="{{ row.field }}"><input type="hidden" name="o" value="{{ row.op }}"><input type="hidden" name="v" value="{{ row.value }}">{% endfor %}
     <button type="submit">把这 {{ group.codes|length }} 只加入补采队列</button>
   </form>
-  <p class="muted">后台逐只同步年报，补完刷新这一页。</p>
+  <p class="muted">后台逐只{{ fix_labels.get(group.fix, "补采") }}，补完刷新这一页。</p>
   {% endif %}
   {% endfor %}
 </section>

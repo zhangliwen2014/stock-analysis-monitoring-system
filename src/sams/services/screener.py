@@ -244,6 +244,7 @@ class ScreenerService:
         )
         technical_coverage: tuple[int, int] | None = None
         technical_reasons: dict[tuple[str, str], str] = {}
+        technical_fixes: dict[tuple[str, str], str] = {}
         if any(item.source == "technical" for item in specs.values()):
             if self.technical is None:
                 raise ValidationError(
@@ -255,6 +256,7 @@ class ScreenerService:
             )
             universe = universe.join(technical.values, on="code", how="left")
             technical_reasons = technical.reasons
+            technical_fixes = technical.fixes
             technical_coverage = (technical.computable, universe.height)
         derived_roe = 0
         if "roe" in specs or "pr_annual" in specs:
@@ -374,6 +376,7 @@ class ScreenerService:
                 market,
                 positive_only,
                 technical=technical_reasons,
+                technical_fixes=technical_fixes,
             ),
             # 首批条件决定整个名单的顺序：质量/成长从高到低，估值/负债从低到高（D224）
             order_note=f"{sort_field.label} {'从高到低' if descending else '从低到高'}",
@@ -541,6 +544,7 @@ def _missing_groups(
     positive_only: bool,
     *,
     technical: dict[tuple[str, str], str] | None = None,
+    technical_fixes: dict[tuple[str, str], str] | None = None,
 ) -> tuple[MissingGroup, ...]:
     """一只票只记**第一条**让它出局的条件：同一个缺口记两次会让「无数 N 只」重复计人。
 
@@ -569,10 +573,12 @@ def _missing_groups(
                     if reason == _annual_missing_reason(spec, market):
                         fix = FINANCIALS
                 elif spec.source == "technical":
-                    # 原因由 TechnicalService 逐字段给：覆盖、跳变、日线根数不是同一件事（S4-A）
+                    # 原因与能补的活都由 TechnicalService 逐字段给：覆盖、跳变、日线根数
+                    # 不是同一件事，能补的活也不同（S4-A/D337）
                     reason = (technical or {}).get(
                         (cond.field, row["code"]), "技术面读数没有数"
                     )
+                    fix = (technical_fixes or {}).get((cond.field, row["code"]), "")
                 elif spec.missing_note:
                     reason = spec.missing_note
                 elif spec.source == "financials":

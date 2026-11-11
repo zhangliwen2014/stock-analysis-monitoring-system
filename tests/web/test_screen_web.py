@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import polars as pl
@@ -326,6 +326,7 @@ def test_the_queue_button_enqueues_the_group_and_the_second_press_says_it_is_que
         "csrf": logged_screen.csrf,
         "market": "A",
         "field": "roe",
+        "kind": "financials",
         "f": ["roe"],
         "o": [">="],
         "v": ["0.1"],
@@ -357,6 +358,7 @@ def test_a_group_that_cannot_be_backfilled_is_not_queued(logged_screen):
             "csrf": logged_screen.csrf,
             "market": "A",
             "field": "pr_now",
+            "kind": "financials",
             "f": ["roe"],
             "o": [">="],
             "v": ["0.1"],
@@ -369,6 +371,104 @@ def test_a_group_that_cannot_be_backfilled_is_not_queued(logged_screen):
     assert logged_screen.context.backfills_store.open_for(
         "A", "600519", kind="financials"
     ) is None
+
+
+_TECH_PARAMS = [("market", "A"), ("f", "ma20_gap"), ("o", ">="), ("v", "0")]
+
+
+def _seed_bars(context, code="600519", n=260):
+    from sams.storage.repos.bars import BarRepo
+
+    days = []
+    cursor = DAY
+    while len(days) < n:
+        if cursor.weekday() < 5:
+            days.append(cursor)
+        cursor -= timedelta(days=1)
+    days.reverse()
+    closes = [100.0 + i * 0.5 for i in range(n)]
+    BarRepo(context.db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * n,
+                "code": [code] * n,
+                "date": days,
+                "open": closes,
+                "high": [value + 1 for value in closes],
+                "low": [value - 1 for value in closes],
+                "close": closes,
+                "volume": [100.0] * n,
+                "amount": [value * 100 for value in closes],
+                "source": ["akshare"] * n,
+            }
+        )
+    )
+
+
+def test_a_bars_gap_offers_the_queue_button_not_a_terminal(logged_screen):
+    """D337：日线不足的下一步是排队，不是让网页用户去敲 `sams sync bars`。"""
+    seed(logged_screen.context, snap("600519"))
+    page = logged_screen.client.get("/screen", params=_TECH_PARAMS)
+    assert "日线不足 20 根" in page.text
+    assert "sams sync bars" not in page.text
+    assert "把这 1 只加入补采队列" in page.text
+    assert "后台逐只补日线，补完刷新这一页" in page.text
+
+
+def test_the_bars_button_enqueues_bars_and_the_second_press_says_it_is_queued(
+    logged_screen,
+):
+    seed(logged_screen.context, snap("600519"))
+    form = {
+        "csrf": logged_screen.csrf,
+        "market": "A",
+        "field": "ma20_gap",
+        "kind": "bars",
+        "f": ["ma20_gap"],
+        "o": [">="],
+        "v": ["0"],
+    }
+    response = logged_screen.client.post(
+        "/screen/backfill", data=form, follow_redirects=False
+    )
+    assert response.status_code == 303
+    ctx = logged_screen.context
+    row = ctx.backfills_store.open_for("A", "600519", kind="bars")
+    assert row is not None and row.status == "pending"
+    page = logged_screen.client.get(response.headers["location"])
+    assert "新排进补采队列 1 只" in page.text
+    assert "后台逐只补日线，补完刷新这一页" in page.text
+
+    again = logged_screen.client.post(
+        "/screen/backfill", data=form, follow_redirects=False
+    )
+    page = logged_screen.client.get(again.headers["location"])
+    assert "1 只本来就在队列里" in page.text
+
+
+def test_a_coverage_gap_enqueues_actions_not_bars(logged_screen):
+    seed(logged_screen.context, snap("600519"))
+    _seed_bars(logged_screen.context)
+    page = logged_screen.client.get("/screen", params=_TECH_PARAMS)
+    assert "公司行为覆盖未确认，无法复权" in page.text
+    assert "后台逐只同步公司行为，补完刷新这一页" in page.text
+    response = logged_screen.client.post(
+        "/screen/backfill",
+        data={
+            "csrf": logged_screen.csrf,
+            "market": "A",
+            "field": "ma20_gap",
+            "kind": "actions",
+            "f": ["ma20_gap"],
+            "o": [">="],
+            "v": ["0"],
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    ctx = logged_screen.context
+    assert ctx.backfills_store.open_for("A", "600519", kind="actions") is not None
+    assert ctx.backfills_store.open_for("A", "600519", kind="bars") is None
 
 
 def test_recollect_queues_the_spot_job_and_says_so(logged_screen):

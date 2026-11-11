@@ -36,9 +36,17 @@ from sams.core.fundamentals import (
 from sams.core.screener_fields import Condition, fields_for
 from sams.services.screen import PrHit
 from sams.services.screener import NONPOSITIVE_VALUATION
-from sams.storage.repos.symbol_backfills import FINANCIALS
+from sams.storage.repos.symbol_backfills import ACTIONS, BARS, FINANCIALS
 
 PR_USAGE = "例如 0.4（PR 是小数口径的比值，不是百分数：`PR ≤ 0.4` 写 0.4）"
+
+#: D337：共享理由只讲事实；命令行把「能补这一格的那种活」翻成当场能跑的一条。
+#: 网页那一边的下一步是排队按钮，两边不该互相抄措辞。
+_FIX_COMMANDS = {
+    BARS: "sams sync bars --market {market} --code <代码>",
+    ACTIONS: "sams sync actions --market {market} --code <代码>",
+    FINANCIALS: "sams sync financials --market {market} --code <代码>",
+}
 
 
 def add_to(subparsers) -> None:
@@ -248,11 +256,10 @@ def _print_spot(result, code: int) -> int:
         if reason == NONPOSITIVE_VALUATION:
             # 共享串只讲事实；命令行的下一步由 CLI 自己附加（D283）
             reason += "；命令行加 --include-negatives 可一起比较"
-        if missing_group.fix == FINANCIALS:
-            # D336：网页给排队按钮，命令行给可当场跑的命令——同一组缺口两个房间的下一步不同
-            reason += (
-                f"；先跑 `sams sync financials --market {result.market} --code <代码>`"
-            )
+        if missing_group.fix in _FIX_COMMANDS:
+            # D336/D337：网页给排队按钮；命令行给可当场跑的那一条
+            command = _FIX_COMMANDS[missing_group.fix].format(market=result.market)
+            reason += f"；先跑 `{command}`"
         print(
             f"无数 {len(missing_group.codes)} 只  {missing_group.field}：{reason}"
         )

@@ -26,6 +26,7 @@ from sams.core.errors import NotAdjustable
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
+from sams.storage.repos.symbol_backfills import ACTIONS, BARS
 from sams.storage.repos.symbols import SymbolRepo
 
 #: 一次最多取这么多根：MA250 与 52 周位置都要 250 根，留 10 根给预热
@@ -52,11 +53,10 @@ MIN_BARS = {
 
 _SHARE_CHANGING = frozenset({"split", "bonus", "transfer", "rights"})
 
-#: 选股池不是 universe：这些票没人替它们排队，能做的动作是点开那一行（D283）
-NO_COVERAGE = "公司行为覆盖未确认，无法复权：打开该股页面会登记后台补采"
-NOT_ADJUSTABLE = (
-    "公司行为无法折算或有未标记跳变，复权序列被拒绝：先补齐该票的公司行为"
-)
+#: 理由只讲事实（D337）：能补哪一种活由 `fixes` 说，命令由命令行自己附加。
+#: 选股池不是 universe，这些票没人在队列里替它们登记——选股页现在会替它们排（按钮）。
+NO_COVERAGE = "公司行为覆盖未确认，无法复权"
+NOT_ADJUSTABLE = "公司行为无法折算或有未标记跳变，复权序列被拒绝"
 VOLUME_SPLIT = "近 6 个交易日有送转/拆股，量比口径不成立"
 FLAT_52W = "最近 250 个交易日收盘没有波动：52 周位置没有分母"
 
@@ -66,6 +66,8 @@ class TechnicalSnapshot:
     values: pl.DataFrame
     #: (字段, 代码) → 这一格为什么没有数
     reasons: dict[tuple[str, str], str]
+    #: (字段, 代码) → 队列里哪种活能补上这一格（D337）；空串表示补不了
+    fixes: dict[tuple[str, str], str]
     #: 至少有一个技术字段出数的票数
     computable: int
 
@@ -89,7 +91,7 @@ class TechnicalService:
         market = canonical_market(market)
         wanted = list(codes)
         if not wanted:
-            return TechnicalSnapshot(_empty(()), {}, 0)
+            return TechnicalSnapshot(_empty(()), {}, {}, 0)
         if market != "A":
             # 港美股日线与公司行为覆盖都不够：宁可整片「无数」，也不开一个数字看着正常的口子
             reasons = {
@@ -97,14 +99,14 @@ class TechnicalService:
                 for name in FIELDS
                 for code in wanted
             }
-            return TechnicalSnapshot(_empty(()), reasons, 0)
+            return TechnicalSnapshot(_empty(()), reasons, dict.fromkeys(reasons, ""), 0)
 
         loaded = self.bars.load(market, wanted, end=day)
         if loaded.is_empty():
             reasons = {
                 (name, code): _need(name) for name in FIELDS for code in wanted
             }
-            return TechnicalSnapshot(_empty(()), reasons, 0)
+            return TechnicalSnapshot(_empty(()), reasons, dict.fromkeys(reasons, BARS), 0)
 
         by_code = {
             str(key[0]): frame
@@ -125,6 +127,7 @@ class TechnicalService:
 
         rows: list[dict] = []
         reasons: dict[tuple[str, str], str] = {}
+        fixes: dict[tuple[str, str], str] = {}
         computable = 0
         for code in wanted:
             frame = by_code.get(code)
@@ -132,14 +135,14 @@ class TechnicalService:
             if frame is None:
                 for name in FIELDS:
                     reasons[(name, code)] = _need(name)
+                    fixes[(name, code)] = BARS
                 rows.append({"code": code, **values})
                 continue
             tail = frame.sort("date").tail(WINDOW)
             last = tail["date"].to_list()[-1]
             code_spans = spans.get(code, [])
             if is_covered(code_spans, start=tail["date"].to_list()[0], end=last) is None:
-                for name in FIELDS:
-                    reasons[(name, code)] = NO_COVERAGE
+                _mark(reasons, fixes, code, NO_COVERAGE, ACTIONS)
                 rows.append({"code": code, **values})
                 continue
             try:
@@ -153,13 +156,16 @@ class TechnicalService:
                     listed_on=listed.get(code),
                 )
             except NotAdjustable:
-                for name in FIELDS:
-                    reasons[(name, code)] = NOT_ADJUSTABLE
+                _mark(reasons, fixes, code, NOT_ADJUSTABLE, ACTIONS)
                 rows.append({"code": code, **values})
                 continue
 
-            values, cell_reasons = _values(series, tail, actions_by.get(code))
-            reasons.update({(name, code): why for name, why in cell_reasons.items()})
+            values, cell_reasons, cell_fixes = _values(
+                series, tail, actions_by.get(code)
+            )
+            for name, why in cell_reasons.items():
+                reasons[(name, code)] = why
+                fixes[(name, code)] = cell_fixes.get(name, "")
             if any(value is not None for value in values.values()):
                 computable += 1
             rows.append({"code": code, **values})
@@ -170,19 +176,38 @@ class TechnicalService:
                 schema={"code": pl.Utf8, **{name: pl.Float64 for name in FIELDS}},
             ),
             reasons=reasons,
+            fixes=fixes,
             computable=computable,
         )
 
 
+def _mark(
+    reasons: dict[tuple[str, str], str],
+    fixes: dict[tuple[str, str], str],
+    code: str,
+    reason: str,
+    fix: str,
+) -> None:
+    """一只票整片没有数：六个字段同一句理由、同一种活。"""
+    for name in FIELDS:
+        reasons[(name, code)] = reason
+        fixes[(name, code)] = fix
+
+
 def _values(
     series: AdjustedSeries, raw: pl.DataFrame, actions: pl.DataFrame | None
-) -> tuple[dict[str, float | None], dict[str, str]]:
-    """一条过闸序列的末根读数。返回该票每格的值与「为什么这一格没有数」。"""
+) -> tuple[dict[str, float | None], dict[str, str], dict[str, str]]:
+    """一条过闸序列的末根读数。返回该票每格的值、「为什么这一格没有数」与能补的活。"""
     out: dict[str, float | None] = dict.fromkeys(FIELDS)
     why: dict[str, str] = {}
+    fix: dict[str, str] = {}
     closes = series.frame["close_hfq"].to_list()
     if not closes:
-        return out, {name: _need(name) for name in FIELDS}
+        return (
+            out,
+            {name: _need(name) for name in FIELDS},
+            dict.fromkeys(FIELDS, BARS),
+        )
 
     averages = ma(series, 20, 60, 250).tail(1).row(0, named=True)
     last_close = closes[-1]
@@ -190,6 +215,7 @@ def _values(
         average = averages.get(f"ma{window}")
         if average is None:
             why[name] = _need(name)
+            fix[name] = BARS
         elif average <= 0:
             why[name] = "均线算出了非正值：比值没有意义"
         else:
@@ -197,6 +223,7 @@ def _values(
 
     if len(closes) < MIN_BARS["rsi14"]:
         why["rsi14"] = _need("rsi14")
+        fix["rsi14"] = BARS
     else:
         value = rsi(series, 14).tail(1)["rsi14"].item()
         if value is None:
@@ -208,6 +235,7 @@ def _values(
         why["vol_ratio_5d"] = "日线没有成交量列"
     elif len(raw) < MIN_BARS["vol_ratio_5d"]:
         why["vol_ratio_5d"] = _need("vol_ratio_5d")
+        fix["vol_ratio_5d"] = BARS
     elif _share_change_in(raw, actions):
         why["vol_ratio_5d"] = VOLUME_SPLIT
     else:
@@ -221,6 +249,7 @@ def _values(
 
     if len(closes) < MIN_BARS["pos_52w"]:
         why["pos_52w"] = _need("pos_52w")
+        fix["pos_52w"] = BARS
     else:
         window = closes[-250:]
         low, high = min(window), max(window)
@@ -229,7 +258,7 @@ def _values(
         else:
             out["pos_52w"] = (last_close - low) / (high - low)
 
-    return out, why
+    return out, why, fix
 
 
 def _share_change_in(raw: pl.DataFrame, actions: pl.DataFrame | None) -> bool:
@@ -246,10 +275,7 @@ def _share_change_in(raw: pl.DataFrame, actions: pl.DataFrame | None) -> bool:
 
 
 def _need(name: str) -> str:
-    return (
-        f"日线不足 {MIN_BARS[name]} 根：技术面字段按快照日及之前的日线现算，"
-        "先跑 `sams sync bars --market A --code <代码>`"
-    )
+    return f"日线不足 {MIN_BARS[name]} 根：技术面字段按快照日及之前的日线现算"
 
 
 def _empty(codes: Sequence[str]) -> pl.DataFrame:

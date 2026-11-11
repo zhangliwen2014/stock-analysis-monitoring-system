@@ -11,7 +11,7 @@ PR 现值 = PE(动)² ÷ (100×PB)：PB=1 时 PE 5 / 6 / 10 分别是 0.25 / 0.3
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 from support import FrozenClock, StubAdapter
@@ -20,6 +20,7 @@ from support_valuation import financial_rows
 import sams.cli as cli
 from sams.bootstrap import build_container
 from sams.datasource.spot import SPOT_SCHEMA
+from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.financials import FinancialRepo
 from sams.storage.repos.snapshots import SnapshotRepo
 from sams.storage.repos.symbol_list import SymbolListRepo
@@ -261,3 +262,44 @@ def test_field_names_with_digits_are_not_rejected_as_bad_syntax(db, settings, ca
     assert "读不出来" not in out
     # 没有日线可算：技术面字段记「无数」，不静默丢掉
     assert "通过 0 / 不通过 0 / 无数 1" in out
+    # D337：命令行要的是能当场跑的那一条；共享理由本身只说事实
+    assert "日线不足 20 根" in out
+    assert "sams sync bars --market A --code <代码>" in out
+
+
+def _seed_bars(db, code="600519", n=260):
+    days = []
+    cursor = DAY
+    while len(days) < n:
+        if cursor.weekday() < 5:
+            days.append(cursor)
+        cursor -= timedelta(days=1)
+    days.reverse()
+    closes = [100.0 + i * 0.5 for i in range(n)]
+    BarRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * n,
+                "code": [code] * n,
+                "date": days,
+                "open": closes,
+                "high": [value + 1 for value in closes],
+                "low": [value - 1 for value in closes],
+                "close": closes,
+                "volume": [100.0] * n,
+                "amount": [value * 100 for value in closes],
+                "source": ["akshare"] * n,
+            }
+        )
+    )
+
+
+def test_a_stock_without_coverage_gets_the_actions_command(db, settings, capsys):
+    _seed_bars(db)
+    container = container_for(db, settings, snap("600519"))
+    capsys.readouterr()
+    run(container, ["screen", "spot", "--market", "A", "--where", "ma20_gap>0"])
+    out = capsys.readouterr().out
+    assert "公司行为覆盖未确认，无法复权" in out
+    assert "sams sync actions --market A --code <代码>" in out
+    assert "sams sync bars" not in out

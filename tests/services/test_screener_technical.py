@@ -200,19 +200,59 @@ def test_a_stock_without_coverage_is_named_as_missing_not_measured_on_raw_prices
     assert result.technical_coverage == (0, 1)
 
 
-def test_the_no_coverage_reason_points_at_the_page_not_at_a_terminal(db):
-    """选股页那一句「无数」不能是运维手册（D283）。
+def test_the_no_coverage_group_points_at_the_actions_queue_not_a_terminal(db):
+    """选股页那一句「无数」只能是事实（D337）：能补哪种活由 `fix` 说，命令留给命令行。
 
-    选股池不是 universe，这些票没人在队列里替它们登记；能做的动作是点开那一行——
-    个股页会把它排进后台补采队列。
+    「打开该股页面会登记后台补采」是把动作指给了一个页面；选股页自己就有按钮，
+    而按钮排的是 `actions`——消费者按全历史重拉并重写覆盖确认。
     """
     seed_snapshot(db)
     seed_bars(db)
     result = service(db).run("A", [Condition("ma20_gap", ">=", 0.02)], day=DAY)
-    seen = reasons(result, "ma20_gap")
-    assert seen  # 不然是空列表，两条断言都白过
-    assert all("sams " not in reason for reason in seen)
-    assert any("补采" in reason for reason in seen)
+    group = next(group for group in result.missing if group.field == "ma20_gap")
+    assert group.fix == "actions"
+    assert "覆盖" in group.reason
+    assert "补采" not in group.reason and "页面" not in group.reason
+    assert "sams " not in group.reason
+
+
+def test_a_stock_without_bars_asks_for_the_bars_queue_not_a_command(db):
+    seed_snapshot(db)
+    seed_coverage(db)
+    result = service(db).run("A", [Condition("ma20_gap", ">=", 0.02)], day=DAY)
+    group = next(group for group in result.missing if group.field == "ma20_gap")
+    assert group.fix == "bars"
+    assert "日线不足" in group.reason
+    assert "sams " not in group.reason
+
+
+def test_an_unadjustable_series_is_queued_as_actions_not_as_a_command(db):
+    seed_snapshot(db)
+    days, closes = seed_bars(db)
+    # 裸价一天腰斩、又没有记录在案的公司行为：复权序列被拒，能补的活只有重拉公司行为
+    closes = [*closes[:-1], closes[-2] * 0.5]
+    BarRepo(db).upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * len(days),
+                "code": [CODE] * len(days),
+                "date": days,
+                "open": closes,
+                "high": [value + 1 for value in closes],
+                "low": [value - 1 for value in closes],
+                "close": closes,
+                "volume": [100.0] * len(days),
+                "amount": [value * 100 for value in closes],
+                "source": ["akshare"] * len(days),
+            }
+        )
+    )
+    seed_coverage(db)
+    result = service(db).run("A", [Condition("ma20_gap", ">=", 0.02)], day=DAY)
+    group = next(group for group in result.missing if group.field == "ma20_gap")
+    assert group.fix == "actions"
+    assert "复权序列被拒绝" in group.reason
+    assert "sams " not in group.reason
 
 
 def test_short_windows_still_compute_when_ma250_has_too_few_bars(db):
@@ -259,6 +299,8 @@ def test_volume_ratio_is_missing_when_a_share_change_falls_in_the_window(db):
 
     assert result.total_hits == 0
     assert any("量比" in reason for reason in reasons(result, "vol_ratio_5d"))
+    group = next(item for item in result.missing if item.field == "vol_ratio_5d")
+    assert group.fix == ""  # 送转已经记录在案，再同步同一条源不是下一步
     assert result.technical_coverage == (1, 1)
 
 
