@@ -83,9 +83,23 @@ D336 写这句话时把前提当成「HK/US 没有估值源」。现在这条前
 * A 股代码表不认识的票：不说「已排进」、说「代码表里没有这只票」，队列无行。
 * 已有估值行：不排。
 
-## 验证
+## 回归结果（2026-11-12）
 
-* 串行 pytest（web 资料卡相关套件）、`ruff check src tests`。
-* 生产库副本 + 临时服务（`SAMS_DB_PATH` + `--port 8799`）：找一只 A 股无估值的票与
-  一只港股，确认空态话术、队列行与「没有源」的市场；不操作生产通道。
-* 生产 `sams serve` 重启后回归 `/healthz` 与 `/login`。
+* `tests/web/test_symbol_f10.py` 34 passed；个股页与 F10 相关套件（`test_f10_service`、
+  `test_symbol`、`test_symbol_fundamentals`、`test_symbol_inputs_have_candidates`、
+  `test_symbol_minute`、`test_symbol_search_web`、`test_f10_cli`）113 passed；
+  `ruff check src tests` 通过。串行跑，没有并行 pytest。
+* TDD 红：五条新用例先跑，四条按预期失败——A 股仍在印 `sams sync valuation`、队列里
+  没有 `valuation` 行、US 没有「没有源」那句、未入册的票没有「代码表里没有这只票」；
+  第五条（已有估值行不排）在实现前就通过，是回归保护。
+* 实机（生产库副本 + 临时服务 8799，登录后只读页面；库副本另写队列行）：
+  A/000063、HK/00005、US/AAPL 三只票的估值空态都是
+  「本地还没有这只票的估值，已排进后台补采队列：补完刷新这一页。」，页面上没有
+  `sams sync valuation`。停服后查副本库：`symbol_backfills` 里这三只各有 1 行
+  `kind=valuation`、status=pending；`valuation_daily` 对这三只仍是 0 行。
+* 「没有源」那一支在生产路由上走不到：A 有 `akshare`/`baidu_valuation`，HK 有
+  `yfinance`/`baidu_valuation`/`eastmoney_global`，US 有 `yfinance`/`eastmoney_global`，
+  三个市场都至少有一个估值源。那一支由 US 替身用例钉住（替身不实现 `valuation`）。
+* 生产 `sams serve` 当时已停（`tmp/serve.log` 10:37 完成 shutdown，8765 无监听）；
+  本次提交后重新拉起，`/healthz` 与 `/login` 200。生产通道与账号未操作。
+

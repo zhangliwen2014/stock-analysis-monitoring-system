@@ -44,6 +44,7 @@ RAW_FINANCIAL_LIMIT = 32
 
 _PROFILE_METHOD = "company_profile"
 _FINANCIAL_METHOD = "financials"
+_VALUATION_METHOD = "valuation"
 _ANNOUNCEMENT_METHOD = "announcements"
 
 
@@ -158,6 +159,8 @@ class F10Read:
     has_profile_source: bool = False
     has_financials_source: bool = False
     has_announcement_source: bool = False
+    #: 有没有源不是按市场名猜的：港美股也可能接上估值源（D338）
+    has_valuation_source: bool = False
 
 
 class F10Service:
@@ -206,6 +209,7 @@ class F10Service:
             has_profile_source=self._has(market, _PROFILE_METHOD),
             has_financials_source=self._has(market, _FINANCIAL_METHOD),
             has_announcement_source=self._has(market, _ANNOUNCEMENT_METHOD),
+            has_valuation_source=self._has(market, _VALUATION_METHOD),
         )
 
     def _has(self, market: str, method: str) -> bool:

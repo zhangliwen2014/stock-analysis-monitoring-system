@@ -53,8 +53,13 @@
     · PB {{ "%.2f"|format(read.valuation.pb) if read.valuation.pb is not none else "—" }}
     {%- if read.valuation.dividend_yield is not none %} · 股息率 {{ ratio_pct(read.valuation.dividend_yield) }}{% endif %}
     · 市值 {{ money_compact(read.valuation.market_cap, currency) }}</p>
+  {% elif not read.has_valuation_source %}
+  <p class="muted">{{ market_name }}的这条链上还没有按日估值的源。</p>
+  {% elif valuation_queued %}
+  {# 网页用户没有终端（R3-02）：这句话是承诺，handler 真的排过才允许出现（D338） #}
+  <p class="muted">本地还没有这只票的估值，已排进后台补采队列：补完刷新这一页。</p>
   {% else %}
-  <p class="muted">本地还没有这只票的估值。采一次：<code>{{ valuation_command }}</code></p>
+  <p class="muted">本地还没有这只票的估值；代码表里没有这只票，补采排不上——先等代码表同步。</p>
   {% endif %}
 
   {% if not read.has_financial_data %}

@@ -460,6 +460,72 @@ def test_the_financial_card_does_not_queue_when_the_data_is_already_there(logged
     assert ctx.backfills_store.open_for("A", "600519", kind="financials") is None
 
 
+# ---------- D338：估值空态按市场能力分支 ----------
+
+
+def test_the_valuation_card_queues_a_backfill_instead_of_a_command(logged_f10):
+    """网页用户没有终端（R3-02）：缺估值也走同一条补采队列（D283/D336 的形状）。"""
+    _symbol(logged_f10.context)
+    text = logged_f10.client.get("/api/partials/f10?market=A&code=600519").text
+    assert "sams sync valuation" not in text
+    assert "本地还没有这只票的估值，已排进后台补采队列：补完刷新这一页" in text
+    row = logged_f10.context.backfills_store.open_for("A", "600519", kind="valuation")
+    assert row is not None and row.status == "pending"
+
+
+def test_the_financials_partial_queues_valuation_too(logged_f10):
+    """htmx 只换这张卡时也得说同一句话：那句话是承诺，队列里必须有那一行。"""
+    _symbol(logged_f10.context)
+    text = logged_f10.client.get(
+        "/api/partials/f10/financials?market=A&code=600519"
+    ).text
+    assert "本地还没有这只票的估值，已排进后台补采队列" in text
+    assert logged_f10.context.backfills_store.open_for(
+        "A", "600519", kind="valuation"
+    ) is not None
+
+
+def test_a_market_without_a_valuation_source_says_so(logged_f10):
+    """有没有估值源问链，不按市场名猜：没有源就不排，也不说「已排进」。"""
+    _symbol(logged_f10.context, "US", "AAPL", "苹果", "USD")
+    text = logged_f10.client.get("/api/partials/f10?market=US&code=AAPL").text
+    assert "美股的这条链上还没有按日估值的源" in text
+    assert "sams sync valuation" not in text
+    assert "本地还没有这只票的估值" not in text
+    assert logged_f10.context.backfills_store.open_for(
+        "US", "AAPL", kind="valuation"
+    ) is None
+
+
+def test_the_valuation_card_does_not_promise_a_queue_for_an_unknown_code(logged_f10):
+    """代码表不认识的票不排（D314）：不许把「补完刷新」说给一个没人会补的格子。"""
+    ctx = logged_f10.context
+    ctx.symbol_list_store.upsert_batch(
+        "A",
+        [
+            {
+                "code": "600519",
+                "name": "贵州茅台",
+                "py_initials": "gzmt",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            }
+        ],
+    )
+    _symbol(ctx, "A", "000996", "退市股", "CNY")
+    text = logged_f10.client.get("/api/partials/f10?market=A&code=000996").text
+    assert "本地还没有这只票的估值；代码表里没有这只票" in text
+    assert ctx.backfills_store.open_for("A", "000996", kind="valuation") is None
+
+
+def test_the_valuation_card_does_not_queue_when_the_data_is_already_there(logged_f10):
+    ctx = logged_f10.context
+    _symbol(ctx)
+    _valuation(ctx)
+    logged_f10.client.get("/api/partials/f10?market=A&code=600519")
+    assert ctx.backfills_store.open_for("A", "600519", kind="valuation") is None
+
+
 # ---------- D218 / D219：五档报告期、图表与明细两种视图 ----------
 
 

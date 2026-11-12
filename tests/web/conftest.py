@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from sams.bootstrap import build_core
 from sams.core.timeutil import CalendarDay, SessionWindow
 from sams.datasource.f10 import empty_announcements, empty_profile
-from sams.datasource.fundamentals import empty_financials
+from sams.datasource.fundamentals import empty_financials, empty_valuation
 from sams.datasource.spot import SPOT_SCHEMA
 from sams.web.app import create_app
 from sams.web.context import ThreadContexts
@@ -33,10 +33,10 @@ class StubSnapshotAdapter(support.StubAdapter):
 
 
 class StubF10Adapter(support.StubAdapter):
-    """日线替身 + 公司概况/公告/财务三能力：资料块只按能力说话，局部读从不真调它。
+    """日线替身 + 公司概况/公告/财务/估值四能力：资料块只按能力说话，局部读从不真调它。
 
-    财务这条能力要挂上（D336）：个股页缺年报时的话术按「这条链上有没有财务源」分岔，
-    替身不答就等于在测「没有源」那一支。
+    财务与估值这两条能力要挂上（D336/D338）：个股页缺数据时的话术按「这条链上有没有
+    这个源」分岔，替身不答就等于在测「没有源」那一支。
     """
 
     def company_profile(self, market, code):
@@ -47,6 +47,9 @@ class StubF10Adapter(support.StubAdapter):
 
     def financials(self, market, code, start, end):
         return empty_financials()
+
+    def valuation(self, market, code, start, end):
+        return empty_valuation()
 
 
 class FakeRuntime:
