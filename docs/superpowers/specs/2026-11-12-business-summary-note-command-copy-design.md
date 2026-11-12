@@ -95,6 +95,6 @@ R3-02 点名网页里的命令行话术。个股页「核心业务」卡的第�
     越界——`cli/screen.py` 直接 `from sams.storage.repos.symbol_backfills import …`。
     令 `services/screener.py` 以 `as` 重导出 `ACTIONS/BARS/FINANCIALS` 作服务层门面
     （它本就把这三类汇成 `MissingGroup.fix`），`cli/screen.py` 改经 `services.screener` 取常量。
-  * 三处修复后上述 blast radius 全绿；最终全量复跑确认中。
+  * 三处修复后最终全量复跑确认：**5912 passed, 21 deselected**（1:03:49，0 失败 0 错误）。
 * 生产 `sams serve`（8765）重启后 `/healthz` 200、`/login` 200、登录 POST 303；线上实测
   601333 业务格已印新中性注记（重启确实加载了新码）。
