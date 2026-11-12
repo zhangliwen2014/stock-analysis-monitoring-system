@@ -34,6 +34,7 @@ from sams.core.notify import SEVERITIES
 from sams.core.rules import FILTER_KEYS, RULE_KINDS, Template, template_for
 from sams.services.rules.engine import RunReport
 from sams.storage.repos.rules import Rule
+from sams.storage.repos.symbol_backfills import BARS
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import (
     delivery_label,
@@ -245,6 +246,22 @@ def _line_notes(template: Template, values: dict[str, str], view: QuoteView) -> 
     return out
 
 
+def _queue_bars(ctx, market: str, code: str) -> bool:
+    """缺日线就排进同一条补采队列（D340，与保存即排同一条 D144 规矩）。
+
+    准入闸与个股页同一道（D314）：代码表不认识的票根本不排，返回 False 让文案别说
+    「已排进」那句假话。`enqueue` 对已有开放行返回 False，但这里仍报 True——行已经在
+    队列里，「已排进」依然是真话。未配置的市场也挡在外面：`admits` 对整表未同步的市场
+    返回 True，不先挡一道就会给 `ZZ/600519` 这种永远读不到行情的市场排一条死队。
+    """
+    if market not in ctx.settings.markets:
+        return False
+    if not ctx.symbol_list_store.admits(market, code):
+        return False
+    ctx.backfills_store.enqueue(market, code, BARS)
+    return True
+
+
 def _price_panel(ctx, reader, template: Template, values: dict[str, str]) -> dict:
     """表单上方那一格：这一屏挂的那只票此刻是多少钱，或者为什么说不清（R-22）。
 
@@ -279,11 +296,15 @@ def _price_panel(ctx, reader, template: Template, values: dict[str, str]) -> dic
     market, code = pair
     view = reader.view(market, code)
     if view.price is None:
-        # 没有价的时候说清此刻是什么状态，并把该跑的那条同步命令交出去（与示例同一句话）
+        # 没有价的时候说清此刻是什么状态，并把这只票排进补采队列（D340，与保存即排同一条
+        # D144 规矩）：网页用户没有终端，印命令只会让他对着 serve 占着的库敲出 DatabaseLocked
+        if _queue_bars(ctx, market, code):
+            gap = "已排进后台补采队列：补完刷新这一屏。"
+        else:
+            gap = "代码表里没有这只票，补采排不上——先等代码表同步。"
         return {
             "text": (
-                f"{market}/{code} 库里还没有日线：先跑 "
-                f"sams sync daily --market {market} --code {code}，或换一只票。"
+                f"{market}/{code} 库里还没有日线：{gap}"
                 f"（{state_label(view.state)}）"
             ),
             "lines": {},
@@ -1065,13 +1086,15 @@ def rule_demo(
         )
     price = ctx.bars.last_closes([(market, code)]).get((market, code))
     if not price or price <= 0:
+        # 仍然不建规则（一条永远判不了的示例更难查），但把这只票排进补采队列（D340）
+        if _queue_bars(ctx, market, code):
+            gap = "已排进后台补采队列：补完再试一次。"
+        else:
+            gap = "代码表里没有这只票，补采排不上——先等代码表同步。"
         return _list_page(
             request,
             status=400,
-            error=(
-                f"{market}/{code} 在库里还没有日线：先跑 "
-                f"sams sync daily --market {market} --code {code}，或换一只票。"
-            ),
+            error=f"{market}/{code} 在库里还没有日线：{gap}",
             demo_market=market,
             demo_code=code,
         )

@@ -974,8 +974,8 @@ def test_the_demo_builds_a_stopped_line_above_the_close_and_marks_it_a_test(
     assert 'href="/alerts/a-1"' in page.text
 
 
-def test_the_demo_without_bars_creates_nothing_and_says_what_to_run(logged, monkeypatch):
-    """没有日线时不留下一条永远判不了的示例：先把话说清楚。"""
+def test_the_demo_without_bars_creates_nothing_and_queues_the_backfill(logged, monkeypatch):
+    """没有日线时不留下一条永远判不了的示例：排进补采队列，而不是印命令（D340）。"""
     seen: dict = {}
     _fake_check(monkeypatch, _report(logged, dry_run=False), seen)
     page = logged.client.post(
@@ -983,9 +983,11 @@ def test_the_demo_without_bars_creates_nothing_and_says_what_to_run(logged, monk
     )
     assert page.status_code == 400
     assert "还没有日线" in page.text
-    assert "sams sync daily --market A --code 000001" in page.text
+    assert "sams sync daily" not in page.text
+    assert "已排进后台补采队列" in page.text
     assert seen == {}
     assert logged.context.rule_service.list(_alice_id(logged)) == ()
+    assert logged.context.backfills_store.open_for("A", "000001") is not None
 
 
 def test_the_demo_rule_can_be_removed_from_its_result_page(logged, monkeypatch):

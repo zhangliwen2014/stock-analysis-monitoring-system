@@ -67,12 +67,39 @@ def test_the_new_rule_form_shows_the_price_of_the_symbol_it_is_mounted_on(logged
     assert "akshare" in page.text
 
 
-def test_the_form_without_daily_bars_says_what_to_run(logged):
-    """没有日线时说的是下一步命令，而不是「现价 —」：后者读起来像页面坏了。"""
+def test_the_form_without_daily_bars_queues_the_backfill(logged):
+    """没有日线时排进补采队列，而不是印一条网页用户跑不了的命令（D340）。"""
     page = _new(logged, target_ref="A/000001")
     assert page.status_code == 200
-    assert "sams sync daily --market A --code 000001" in page.text
+    assert "sams sync daily" not in page.text
+    assert "已排进后台补采队列" in page.text
     assert "现价 —" not in page.text
+    assert logged.context.backfills_store.open_for("A", "000001") is not None
+
+
+def test_the_form_does_not_promise_a_queue_for_an_unknown_code(logged):
+    """代码表认识的市场里一只不在表的票：不排，也不说「已排进」（D314/D340）。"""
+    logged.context.symbol_list_store.upsert_batch(
+        "A",
+        [{"code": "600519", "name": "贵州茅台", "py_initials": "gzmt",
+          "py_full": "guizhoumaotai", "currency": "CNY"}],
+    )
+    page = _new(logged, target_ref="A/000001")
+    assert page.status_code == 200
+    assert "代码表里没有这只票" in page.text
+    assert "已排进后台补采队列" not in page.text
+    assert "sams sync daily" not in page.text
+    assert logged.context.backfills_store.open_for("A", "000001") is None
+
+
+def test_the_form_with_daily_bars_does_not_queue(logged):
+    """已有日线的票照常显示现价，不排 bars（D340）。"""
+    _seed_close(logged, close=1392.05)
+    page = _new(logged)
+    assert page.status_code == 200
+    assert "1,392.05" in page.text
+    assert "已排进后台补采队列" not in page.text
+    assert logged.context.backfills_store.open_for("A", "600519") is None
 
 
 def test_the_form_says_a_reference_without_market_is_not_a_symbol(logged):

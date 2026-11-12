@@ -77,3 +77,19 @@ D336/D338/D339「那句话是承诺，队列里必须真有那一行」的形状
 * 生产库副本 + 临时服务 8799：找一只库里没有日线的票，打开建规则屏与一键示例，确认
   话术与队列行；不操作生产通道。
 * 生产 `sams serve` 重启后回归 `/healthz` 与 `/login`。
+
+## 回归结果
+
+* `ruff check src tests`：All checks passed。
+* 串行 pytest：`test_rules_form_price.py` 17 passed、`test_rules_web.py` 59 passed。
+  实现中 `_queue_bars` 补了一道「市场已配置」闸：`admits` 对整表未同步的市场返回 True，
+  不先挡一道，现价格预览会给 `ZZ/600519` 这种未配置市场排一条死队——
+  `test_a_rule_on_an_unconfigured_market_is_refused_before_it_is_stored` 当场抓住，补闸后绿。
+* 生产库副本（`tmp/d340_verify.duckdb`）+ 临时服务 8799，登录 sp1check：
+  * 活跃但无日线的 US/GSRV：建规则屏现价格说「库里还没有日线：已排进后台补采队列：
+    补完刷新这一屏。（休市）」（state_label 括注保留），页面无 `sams sync daily`。
+  * 一键示例 US/GSRV：仍 HTTP 400、仍不建规则，错误文案「还没有日线：已排进后台补采
+    队列：补完再试一次。」，无命令。
+  * 停服查库：`symbol_backfills` 有 US/GSRV 的 `bars` pending 行（tries=0）。全程未操作
+    生产通道。
+* 生产 `sams serve` 重启后 `/healthz` 200、`/login` 200。
