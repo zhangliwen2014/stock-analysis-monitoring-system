@@ -378,7 +378,9 @@ def test_a_market_with_no_fundamental_rows_refuses_and_names_the_next_command(db
     assert not read.composite.ok
     assert read.composite.covered_weight < 0.5, "只有技术面那 23% 拿到了数，过不了覆盖地板"
     assert "sams sync" in read.composite.reason
-    assert "sams sync valuation" in reading(read, "pr").reason
+    # D350：分位拒绝注记渠道中性（read() 为 CLI/网页共用），命令由 CLI _percentile_line 补回
+    assert "sams sync valuation" not in reading(read, "pr").reason
+    assert "没有任何按日估值行" in reading(read, "pr").reason
     assert not read.plan.ok
     assert "sams analysis fundamentals" in read.plan.fair.reason
 

@@ -105,4 +105,22 @@ D349（同业，web-only）不同，必须按 D343 的渠道分流办法处理�
 
 ## 回归结果
 
-（待填）
+* **TDD**：四条改动/新增用例先 RED（4 failed）后 GREEN（4 passed）——分析层去命令后
+  `test_valuation_read` 的旧断言翻红、三条新用例（web percentiles / web 分位卡 / CLI 分位行）
+  各自因契约未实现而失败，补齐后转绿。
+* **定向串行 pytest**：`test_valuation_percentiles.py` + `test_valuation_read.py` +
+  `test_valuation_cli.py` + `test_symbol_fundamentals.py` + 分析层
+  `test_valuation_percentile.py`/`test_compose.py`/`test_scoring.py` + `test_fundamentals_cli.py` +
+  `test_symbol_f10.py`：**230 passed**。`ruff check src tests`：All checks passed。
+* **全量串行 pytest**：**5920 passed, 21 deselected**（46:03），`FULL SUITE EXIT=0`。
+  较基线 5917 增 3（新增用例；改断言的那条不计数）。论文/决策/规则/选股等共用消费者全绿，
+  分位注记去命令未回归任何下游。
+* **生产库副本 + 临时服务 8799（sp1check）**：601333（自然 NOT_COVERED，无按日估值行）
+  估值位置卡三条拒绝均为「窗口 … 内没有任何按日估值行；估值补采状态见本页「主要财务指标」卡」，
+  无 `sams` 命令；同页 F10 卡显示「已排进后台补采队列：补完刷新这一页。」——D336 诚实规矩成立
+  （指过去的那张卡真有队列行）。停临时服务释放写锁后对同票跑 `sams analysis valuation`：
+  三条分位行带「（先 `sams sync valuation --market A --code 601333`）」完整可跑命令，
+  `--json` 的 `percentiles[*].reason` 中性（无命令）。600519 对照：分位条正常出数、无命令。
+* **生产 `sams serve --port 8765` 重启**（pid 24560）：`/healthz` 200、`/login` GET 200、
+  POST 303；线上 601333 估值位置卡去命令、指给「主要财务指标」卡，F10 卡仍显「已排进后台补采队列」，
+  两张卡均无 `sams` 命令。副本与临时产物已清理（仅留 `tmp/d350_full.log`）。

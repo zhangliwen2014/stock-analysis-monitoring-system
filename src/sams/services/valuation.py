@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 
 import polars as pl
@@ -56,6 +56,7 @@ from sams.analysis.valuation.styles import Style, get_style, style_names
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.fundamentals import ROE_BASIS_ANNUAL
+from sams.core.missing import NOT_COVERED
 from sams.services._fold import (
     before_last,
     fold,
@@ -300,12 +301,15 @@ class ValuationService:
         until = as_of if as_of is not None else self.clock.today()
         rows = _valuation_days(self.valuation.series(market, code))
         periods = _disclosed_periods(self.financials.periods(market, code))
-        readings = (
-            pr_percentile(
-                rows, periods, until, basis=basis, window_years=window_years, market=market
-            ),
-            metric_percentile(rows, "pe_ttm", until, window_years=window_years),
-            metric_percentile(rows, "pb", until, window_years=window_years),
+        readings = tuple(
+            _defer_collection(row)
+            for row in (
+                pr_percentile(
+                    rows, periods, until, basis=basis, window_years=window_years, market=market
+                ),
+                metric_percentile(rows, "pe_ttm", until, window_years=window_years),
+                metric_percentile(rows, "pb", until, window_years=window_years),
+            )
         )
         return ValuationPercentiles(
             market=market,
@@ -318,6 +322,18 @@ class ValuationService:
 
 
 # --- 取哪几个数 ---------------------------------------------------------------------------
+
+def _defer_collection(row: Percentile) -> Percentile:
+    """网页分位条缺估值行时，把补采状态指给同页 F10「主要财务指标」卡（D350）。
+
+    分析层那句拒绝是渠道中性的事实（`read()` 与 CLI 共用）；网页这一头才补「指给权威卡」
+    ——那张卡顶部就是估值一行，且有无源／已排进补采队列／代码表没它三态（D338）。
+    只动 NOT_COVERED（缺估值行）：其余拒绝档各有各的下一步，不指给这张卡。
+    """
+    if row.ok or row.missing_kind != NOT_COVERED:
+        return row
+    return replace(row, reason=f"{row.reason}；估值补采状态见本页「主要财务指标」卡")
+
 
 def _coverage_note(rows: Sequence[ValuationDay], until: date, window_years: int) -> str:
     """库里最早一行晚于窗口起点时，说清这条分位不是完整的 N 年。

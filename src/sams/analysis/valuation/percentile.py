@@ -260,8 +260,7 @@ def pr_percentile(
     if not in_window:
         return _refuse(
             replace(empty, unpublished_periods=unpublished),
-            f"窗口 {window_from}~{as_of} 内没有任何按日估值行："
-            "先同步这只票的估值（`sams sync valuation`）",
+            f"窗口 {window_from}~{as_of} 内没有任何按日估值行",
             NOT_COVERED,
         )
 
@@ -354,10 +353,9 @@ def metric_percentile(
             metric,
             window_from,
             as_of,
-            reason=(
-                f"窗口 {window_from}~{as_of} 内没有任何按日估值行："
-                "先同步这只票的估值（`sams sync valuation`）"
-            ),
+            # D350：只说中性事实，不带命令——分析层为 CLI/网页共用，下一步由各渠道自己补
+            # （网页 percentiles() 指给 F10 卡，CLI _percentile_line 补回 sync valuation）
+            reason=f"窗口 {window_from}~{as_of} 内没有任何按日估值行",
             missing_kind=NOT_COVERED,
         )
     if not present:
@@ -371,8 +369,7 @@ def metric_percentile(
             as_of,
             reason=(
                 f"窗口 {window_from}~{as_of} 内没有可用的 {metric}"
-                f"（{len(pairs)} 行里 {dropped} 行缺失或不为正）："
-                "先同步估值数据（`sams sync valuation`）"
+                f"（{len(pairs)} 行里 {dropped} 行缺失或不为正）"
             ),
             missing_kind=NOT_COVERED,
         )

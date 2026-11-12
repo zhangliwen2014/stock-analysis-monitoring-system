@@ -130,6 +130,23 @@ def test_the_percentile_lines_carry_their_own_sample_count(db, settings, capsys)
     assert f"{pr['samples']} 天" in body
 
 
+def test_the_percentile_line_names_a_runnable_sync_command_when_no_valuation_rows(
+    db, settings, capsys
+):
+    """D350：缺估值行时 CLI 分位那句补回完整可跑命令（带 --market/--code）；--json 中性。
+
+    分析层注记渠道中性（网页共用），命令只在 CLI 文本这一头补；JSON 的 reason 是数据，
+    不带命令（D343）。裸 `sams sync valuation` 缺参数会报错，所以必须带 market/code。
+    """
+    container = make_container(db, settings, with_fundamentals=False)
+    _, body = out(container, capsys)
+    assert f"sams sync valuation --market A --code {CODE}" in body
+    _, data = payload(container, capsys)
+    for row in data["percentiles"]:
+        assert "没有任何按日估值行" in row["reason"]
+        assert "sams sync valuation" not in row["reason"]
+
+
 # --- 五个价位 -------------------------------------------------------------------------------
 
 

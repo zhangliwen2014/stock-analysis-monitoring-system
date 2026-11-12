@@ -204,6 +204,28 @@ def test_hk_without_valuation_rows_is_not_covered_instead_of_raising(db):
     assert all(row.missing_kind == NOT_COVERED for row in report.rows)
 
 
+def test_the_web_percentiles_defer_valuation_collection_to_the_financials_card(db):
+    """D350：percentiles() 是 web-only，缺估值行的拒绝指给同页 F10 卡，不印命令。
+
+    分析层只说中性事实（read() 共用），网页这一头才补「指给权威卡」——那张卡顶部
+    就是估值一行，且有无源／已排进补采队列／代码表没它三态（D338）。
+    """
+    service = ValuationService(
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        FinancialRepo(db),
+        ValuationRepo(db),
+        None,  # type: ignore[arg-type]
+        clock=FrozenClock(datetime(2026, 1, 1, 15)),
+    )
+    report = service.percentiles("HK", "00700", as_of=date(2026, 1, 1))
+    assert all(row.missing_kind == NOT_COVERED for row in report.rows)
+    for row in report.rows:
+        assert "没有任何按日估值行" in row.reason
+        assert "估值补采状态见本页「主要财务指标」卡" in row.reason
+        assert "sams sync valuation" not in row.reason
+
+
 def _seed(db, rows: list[ValuationDay]) -> None:
     ValuationRepo(db).upsert(
         pl.DataFrame(

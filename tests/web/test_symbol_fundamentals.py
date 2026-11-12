@@ -324,6 +324,21 @@ def test_valuation_partial_draws_the_percentile_strip_with_window_and_samples(lo
     assert "样本" in text
 
 
+def test_valuation_partial_without_rows_defers_to_the_financials_card_not_a_command(logged):
+    """D350：库里没有按日估值行时，估值位置卡指给同页「主要财务指标」卡，不印命令。
+
+    只铺主档、不铺估值行 ⇒ 三条分位都 NOT_COVERED；网页 percentiles() 给它们追加
+    「估值补采状态见本页「主要财务指标」卡」，分析层那句中性事实里没有命令。
+    """
+    _symbol(logged.context)
+
+    text = logged.client.get("/api/partials/valuation?market=A&code=600519").text
+
+    assert "没有任何按日估值行" in text
+    assert "主要财务指标" in text
+    assert "sams sync valuation" not in text
+
+
 def test_hk_peers_say_not_covered_instead_of_an_empty_table(logged):
     _symbol(logged.context, market="HK", code="00700", name="腾讯控股", currency="HKD")
 

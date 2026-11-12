@@ -35,6 +35,7 @@ from sams.core.fundamentals import (
     period_label,
     roe_basis_note,
 )
+from sams.core.missing import NOT_COVERED
 from sams.core.timeutil import gap_days
 from sams.services.analysis import (
     LISTED_ON_FROM_CLI,
@@ -813,7 +814,7 @@ def _print_valuation(read, code: int) -> int:
     print(f"  现价    {_price_line(read)}")
     print(f"  市赚率  {_pr_line(read)}")
     for row in read.percentiles:
-        print(f"  分位    {_percentile_line(row)}")
+        print(f"  分位    {_percentile_line(row, read.market, read.code)}")
     print(f"  合成分  {_composite_line(read)}")
     for item_line in _item_lines(read):
         print(f"    {item_line}")
@@ -855,13 +856,16 @@ def _pr_line(read) -> str:
     return f"PR = {pr.value:.4f} ← {pr.explain()}"
 
 
-def _percentile_line(row) -> str:
+def _percentile_line(row, market: str, code: str) -> str:
     """一行分位要能验算：排第几、跟多少天比、窗口到哪、今天那个数是多少。"""
-    head = (
-        f"{row.metric} 分位 {row.value:.0f}%"
-        if row.ok
-        else f"{row.metric} 分位 –（{row.reason}）"
-    )
+    if row.ok:
+        head = f"{row.metric} 分位 {row.value:.0f}%"
+    else:
+        reason = row.reason
+        if row.missing_kind == NOT_COVERED:
+            # D350：分析层注记渠道中性，CLI 这一头补回完整可跑命令（网页指给 F10 卡）
+            reason += f"（先 `sams sync valuation --market {market} --code {code}`）"
+        head = f"{row.metric} 分位 –（{reason}）"
     tail = (
         f"样本 {row.samples} 天，窗口 {row.window_from}~{row.window_to}，"
         f"今天 {_fmt(row.current)}"
