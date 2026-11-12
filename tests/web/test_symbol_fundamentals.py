@@ -214,6 +214,19 @@ def test_peers_partial_lists_five_peers_and_the_median_with_n(logged):
     assert "三级行业" in text and "第 1 位" in text
 
 
+def test_the_peers_snapshot_note_points_at_the_auto_job_not_a_command(logged):
+    """快照陈旧时市值列注记指向盘后自动采集，不印命令（D345）。"""
+    ctx = logged.context
+    today = ctx.clock.today()
+    _six_baijiu(ctx, snapshot_day=today - timedelta(days=20))
+
+    text = logged.client.get("/api/partials/peers?market=A&code=600519").text
+
+    assert "市值一列不出数" in text
+    assert "sams sync spot" not in text
+    assert "盘后任务会自动采集" in text
+
+
 def test_valuation_partial_draws_the_percentile_strip_with_window_and_samples(logged):
     ctx = logged.context
     today = ctx.clock.today()

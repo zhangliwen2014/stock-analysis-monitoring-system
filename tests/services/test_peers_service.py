@@ -387,7 +387,9 @@ def test_without_a_snapshot_market_cap_is_missing_and_selection_uses_revenue(db)
 
     # 没有快照时一行都不许有市值；也不许拿 valuation_daily 的元数顶上（D239）
     assert all(row.market_cap is None for row in report.rows)
-    assert "sams sync spot" in "；".join(report.notes)
+    # 注记渠道中性（D345）：快照由 run_spot 盘后全市场自动采，不印命令
+    assert "sams sync spot" not in "；".join(report.notes)
+    assert "盘后" in "；".join(report.notes)
     assert {row.code for row in report.rows[1:]} == {
         "600809",
         "000568",

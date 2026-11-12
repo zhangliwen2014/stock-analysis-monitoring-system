@@ -311,7 +311,7 @@ class PeerService:
             seen = snapshot_day if snapshot_day is not None else "无"
             notes.append(
                 f"最新快照 {seen} 距截至日超过 {SNAPSHOT_STALE_DAYS} 天或缺失："
-                "市值一列不出数（先跑 `sams sync spot`）"
+                "市值一列不出数；盘后任务会自动采集最新快照"
             )
         if fallback:
             notes.append(f"{fallback} 家同业缺市值与营收，选同业时按市值降序兜底")

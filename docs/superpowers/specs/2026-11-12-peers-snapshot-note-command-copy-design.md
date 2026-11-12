@@ -53,4 +53,17 @@ R3-02 点名网页里的命令行话术。个股详情页 `/symbol/{m}/{c}` 的�
 
 ## 回归结果
 
-（待填）
+2026-11-12 实测（TDD：先转换服务断言 + 新增网页测试见证 RED——2 failed，服务注记与
+同业卡都含 `sams sync spot`，再实现 GREEN）。
+
+* 串行 pytest：`test_peers_service.py` + `test_symbol_fundamentals.py` +
+  `test_back_links_web.py` + `test_screen_web.py` 共 **104 passed**；`ruff check src tests`
+  All checks passed。
+* 生产库副本（`tmp/d345.duckdb`）+ 临时服务 8799，登录 sp1check：生产 A 股快照新鲜
+  （最新 2026-11-11），600519 同业卡不触发陈旧注记；停服务后在副本上删除 A 股
+  `snapshot_daily` 中 day>2026-11-01 的行（最新降到 2026-10-30，距截至日 13 天 > 7），
+  重启服务后 `GET /api/partials/peers?market=A&code=600519` 印「最新快照 2026-10-30
+  距截至日超过 7 天或缺失：市值一列不出数；盘后任务会自动采集最新快照」——
+  `sams sync spot` **不在**文中，「盘后任务会自动采集」「市值一列不出数」在。
+* 该注记 web-only，无 CLI 消费者，不需 CLI 回归。验证毕清理副本；生产 `sams serve`
+  重启后 `/healthz`、`/login` 均 200。
