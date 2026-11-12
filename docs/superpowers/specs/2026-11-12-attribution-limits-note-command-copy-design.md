@@ -57,3 +57,21 @@ R3-02 点名网页里的命令行话术。D342 清了净值卡模板与汇率提
 * 生产库副本 + 临时服务 8799：新开一个空账户，归因卡与限额回撤注记都无命令；CLI
   `sams attribution` 对同一账户仍带命令（在副本上跑，不操作生产通道）。
 * 生产 `sams serve` 重启后回归 `/healthz` 与 `/login`。
+
+## 回归结果
+
+2026-11-12 实测（TDD：先转换三处断言见证 RED——3 failed / CLI 1 passed，再实现 GREEN）。
+
+* 串行 pytest：`test_portfolio_attribution_web.py` + `test_attribution_cli.py` +
+  `test_attribution.py` + `test_limits.py` + `test_portfolio_web.py` +
+  `test_portfolio_nav_web.py` 共 **124 passed**；`ruff check src tests` All checks passed。
+* 生产库副本（`tmp/d343.duckdb`）+ 临时服务 8799，登录 sp1check 新开空账户
+  `94fbf177…`（cash=0，无净值）：
+  * 归因卡空态印「还没有连续两个能算出来的净值日：盘后 job 每晚重建最近 400 天；
+    缺价/缺汇率的日子不并入」——`sams nav rebuild` **不在**文中，「盘后」在。
+  * 组合页限额回撤注记印「还没有算得出来的净值：盘后 job 每晚重建最近 400 天；
+    缺价或缺汇率的日子整日不计」——同样无命令。
+  * 停临时服务释放写锁后，对同一账户跑 `sams attribution --window 90`：文本末尾补回
+    「（也可以跑 sams nav rebuild --account 94fbf177…）」，带真账户 id；`--json` 的
+    `skipped` 字段保持中性（无命令）。
+* 验证毕清理副本；生产 `sams serve` 重启后 `/healthz`、`/login` 均 200。

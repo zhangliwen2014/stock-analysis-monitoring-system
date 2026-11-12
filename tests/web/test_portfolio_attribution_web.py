@@ -148,12 +148,12 @@ def test_portfolio_page_asks_for_the_attribution_card(logged) -> None:
 
 
 def test_the_card_gives_a_way_out_before_the_nav_is_rebuilt(logged) -> None:
-    """净值没重建 = 归因没原料：说一句「先跑 nav rebuild」，不给一张空表。"""
+    """净值没重建 = 归因没原料：说清盘后会自动重建，不在网页上印命令（D343）。"""
     account_id = _open(logged)
     text = _partial(logged, account_id)
 
     assert "还没有连续两个能算出来的净值日" in text
-    assert f"sams nav rebuild --account {account_id}" in text
+    assert "sams nav rebuild" not in text
     # 同一页的净值卡说的是「盘后 job 每晚重建」，归因卡不能只说「先跑命令」（D281）
     assert "盘后" in text
     assert "<table" not in text

@@ -125,7 +125,9 @@ def _print(report: AttributionReport, window: int) -> None:
     window_label = "全部（自台账最早一笔起）" if window == ALL else f"{window} 天"
     print(f"业绩归因 {report.account_id} · 窗口 {window_label}")
     if report.skipped:
-        print(f"  {report.skipped}")
+        # skipped 本身是渠道中立的口径（D343）：网页原样印，CLI 这一侧把命令补回来——
+        # 终端用户能直接跑，`report.account_id` 就是真账户 id，不留占位符。
+        print(f"  {report.skipped}（也可以跑 sams nav rebuild --account {report.account_id}）")
         return
     if report.rows:
         print("  标的\t区间均权\t贡献\t价格段\t换汇段\t分红")

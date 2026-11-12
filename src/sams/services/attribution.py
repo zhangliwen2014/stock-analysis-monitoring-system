@@ -139,16 +139,14 @@ class AttributionService:
             return AttributionReport(
                 account_id=account.id,
                 currency=account.report_currency,
-                # 把账户 id 写进这句话：卡片与 CLI 原样转述，用户复制就能跑，
-                # 留一个 `<账户>` 占位符等于让每个人自己回去查那个 id
+                # 这句话 web 卡与 CLI 原样共用（D343），所以只说口径、不带命令：
+                # 网页用户没有终端，命令由 CLI 那一侧（cli/attribution._print）自己补回。
                 #
                 # 先说盘后 job（D281）：净值不是「没人跑命令才没有」，`run_nav` 每晚按账户
-                # 重建最近 400 天。只交一条 CLI 出去，等于让网页用户去等一个他看不见的
-                # 手动步骤——同一页的净值卡（`partials/portfolio_nav.html`）说的就是这两层。
+                # 重建最近 400 天。同一页的净值卡（`partials/portfolio_nav.html`）说的就是这层。
                 skipped=(
                     f"这段时间还没有连续两个能算出来的净值日：盘后 job 每晚重建最近 "
-                    f"{NAV_WINDOW_DAYS} 天，也可以跑 `sams nav rebuild --account "
-                    f"{account.id}`；缺价/缺汇率的日子不并入"
+                    f"{NAV_WINDOW_DAYS} 天；缺价/缺汇率的日子不并入"
                 ),
                 dropped_days=len(points) - len(run),
             )

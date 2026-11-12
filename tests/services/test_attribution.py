@@ -545,6 +545,7 @@ def test_without_two_usable_days_the_whole_card_refuses(world) -> None:
     assert report.rows == ()
     assert report.window_return is None
     assert report.residual is None
-    assert "nav rebuild" in report.skipped
-    # 净值不是「没人跑命令才没有」：盘后 job 每晚重建（`run_nav`），只说 CLI 是假的操作指南
+    assert "nav rebuild" not in report.skipped
+    # 净值不是「没人跑命令才没有」：盘后 job 每晚重建（`run_nav`）。注记渠道中性，
+    # 命令由 CLI 那一头补回（D343），服务这层只说情况与盘后自动重建
     assert "盘后" in report.skipped

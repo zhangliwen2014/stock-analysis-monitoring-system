@@ -336,11 +336,10 @@ def test_a_drawdown_line_without_any_nav_says_how_to_build_it(world) -> None:
     row = _row(world.service.evaluate(USER, world.account.id), "drawdown")
 
     assert row.status == UNKNOWN
-    assert "sams nav rebuild" in (row.note or "")
-    # 那句话要能直接照做：说出盘后 job 每晚重建（不是「没人跑命令」），并带上真的账户 id
-    # ——`<账户>` 占位符等于让每个人自己回去查那个 id（与归因卡同一句话，D281）
+    assert "sams nav rebuild" not in (row.note or "")
+    # 那句话要说清盘后 job 每晚自己重建（不是「没人跑命令」）；注记渠道中性，不带命令
+    # 也不带账户 id（D343：命令由 CLI 那一头补，网页这一头不需要 id）
     assert "盘后" in (row.note or "")
-    assert world.account.id in (row.note or "")
 
 
 def test_the_nav_window_matches_the_rebuild_window(world) -> None:

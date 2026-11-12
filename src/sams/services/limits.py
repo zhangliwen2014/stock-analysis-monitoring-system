@@ -249,11 +249,11 @@ class LimitService:
     def _drawdown(self, account_id: str) -> tuple[float | None, str | None]:
         series = self._series(account_id)
         if series.latest is None:
-            # 与归因卡、净值卡同一句话（D281）：先说盘后 job 每晚自己重建，再把命令带上
-            # 真的账户 id 交出去——`<账户>` 占位符等于让每个人自己回去查那个 id
+            # 与归因卡、净值卡同一句话（D281/D343）：这条只在网页上出现，说清盘后 job 每晚
+            # 自己重建最近 400 天即可，不印命令——网页用户没有终端
             return None, (
-                f"还没有算得出来的净值：盘后 job 每晚重建最近 {NAV_WINDOW_DAYS} 天，"
-                f"也可以跑 `sams nav rebuild --account {account_id}`"
+                f"还没有算得出来的净值：盘后 job 每晚重建最近 {NAV_WINDOW_DAYS} 天；"
+                "缺价或缺汇率的日子整日不计"
             )
         if series.gap_days > 0:
             return None, (
