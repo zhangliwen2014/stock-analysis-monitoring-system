@@ -95,4 +95,18 @@ reason = (
 
 ## 回归结果
 
-（实施后填：TDD 红绿、定向 pytest、ruff、真数据副本验证、全量套件、生产重启。）
+* **TDD 红绿**：先改 `test_peers_service.py::test_a_stock_without_any_industry_is_not_disclosed`
+  的断言（命令 `not in` + 「还没有行业」「公司概况」`in`），并在 `test_symbol_fundamentals.py`
+  新增同业卡、业务卡行业地位格两条网页用例。三条一起跑 **RED：3 failed**（旧注记仍印命令、
+  无「还没有行业」字样，失败原因正是缺新措辞）。改 `peers.py:644` 的 `reason` 后
+  **GREEN**：`test_peers_service.py + test_business_profile.py + test_symbol_fundamentals.py`
+  共 **41 passed**，blast radius 无回归。
+* **ruff**：`ruff check peers.py + 两个测试文件` → All checks passed。
+* **真数据副本验证**：复制 `data/sams.duckdb`(+wal) 到 `tmp/d348_verify.duckdb`，
+  `SAMS_DB_PATH` 指副本、`SAMS_SECRET_KEY` 取自 `tmp/.sams_secret`，临时 `sams serve --port 8799`。
+  登录（sp1check）后取 601333（D347 定位的真实无行业票）：
+  * `/api/partials/peers?market=A&code=601333`：`sams sync profile` **不在**，渲染
+    「还没有行业（公司概况与主档都没给）：补到行业后这一卡才出数；概况补采状态见本页「公司概况」卡」。
+  * `/api/partials/business?market=A&code=601333`：行业地位格同句、命令**不在**。
+  验证毕停 8799（生产 8765 `/healthz` 仍 200）、清理副本与脚本。
+* **全量套件**：与 D349 合并复跑（两条同文件、同消费者的注记改动），定稿计数记于 D349 doc。

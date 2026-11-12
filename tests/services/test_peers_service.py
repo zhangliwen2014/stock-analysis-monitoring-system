@@ -344,7 +344,10 @@ def test_a_stock_without_any_industry_is_not_disclosed(db):
     assert report.state == "not_disclosed"
     assert report.rows == ()
     assert report.position_missing == NOT_DISCLOSED
-    assert "sams sync profile" in "；".join(report.notes)
+    # D348：网页用户没有终端，注记不印命令；概况补采状态指给同页才有三态的 F10 卡
+    joined = "；".join(report.notes)
+    assert "sams sync profile" not in joined
+    assert "还没有行业" in joined and "公司概况" in joined
 
 
 def test_missing_revenue_falls_back_to_the_market_cap_rank(db):

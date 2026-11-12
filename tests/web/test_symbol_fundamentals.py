@@ -217,6 +217,28 @@ def test_business_partial_blank_summary_says_the_source_gave_none_not_a_command(
     assert "sams sync profile" not in text
 
 
+def test_peers_without_industry_defers_to_the_profile_card_not_a_command(logged):
+    """无行业（概况与主档都没给）：同业卡说补到行业才出数、概况补采状态见本页 F10 卡，
+    不印命令（D348）。"""
+    _symbol(logged.context)  # sector=None，且无概况行
+
+    text = logged.client.get("/api/partials/peers?market=A&code=600519").text
+
+    assert "还没有行业" in text
+    assert "公司概况" in text
+    assert "sams sync profile" not in text
+
+
+def test_business_position_without_industry_defers_to_the_profile_card_not_a_command(logged):
+    """无行业时业务卡「行业地位」格取的是同业那条注记：D348 之后它也不印命令。"""
+    _symbol(logged.context)
+
+    text = logged.client.get("/api/partials/business?market=A&code=600519").text
+
+    assert "还没有行业" in text
+    assert "sams sync profile" not in text
+
+
 def test_peers_partial_lists_five_peers_and_the_median_with_n(logged):
     _six_baijiu(logged.context)
 

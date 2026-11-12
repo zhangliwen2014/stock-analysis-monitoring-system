@@ -641,7 +641,11 @@ def _not_covered(market: str, code: str, as_of: date) -> PeerComparison:
 
 
 def _not_disclosed(market: str, code: str, as_of: date) -> PeerComparison:
-    reason = "这只票没有行业（公司概况与主档都是空的）：先同步公司概况（`sams sync profile`）"
+    # D348：网页用户没有终端，不印命令；概况会不会补、补到哪了，交给同页才有三态的 F10 卡
+    reason = (
+        "这只票还没有行业（公司概况与主档都没给）："
+        "补到行业后这一卡才出数；概况补采状态见本页「公司概况」卡"
+    )
     return PeerComparison(
         market=market,
         code=code,
