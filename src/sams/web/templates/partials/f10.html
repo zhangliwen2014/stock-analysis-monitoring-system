@@ -36,8 +36,11 @@
   {% endif %}
   {% elif not read.has_profile_source %}
   <p class="muted">{{ market_name }}的这条链上还没有公司概况的源。</p>
+  {% elif profile_queued %}
+  {# 网页用户没有终端（R3-02）：这句话是承诺，handler 真的排过才允许出现（D339） #}
+  <p class="muted">本地还没有这只票的概况，已排进后台补采队列：补完刷新这一页。</p>
   {% else %}
-  <p class="muted">本地还没有这只票的概况。采一次：<code>{{ profile_command }}</code></p>
+  <p class="muted">本地还没有这只票的概况；代码表里没有这只票，补采排不上——先等代码表同步。</p>
   {% endif %}
 </section>
 
@@ -91,10 +94,12 @@
   </ul>
   {% elif not read.has_announcement_source and not news_covered %}
   <p class="muted">{{ market_name }}的新闻源未接入；这条链上也没有公告的源。</p>
-  {% elif not news_covered %}
-  <p class="muted">{{ market_name }}新闻源未接入（v0 只接 A 股）；这里只有公告。</p>
+  {% elif announcements_queued or news_queued %}
+  {# 公告或新闻任一可排就说「已排进」：那句话是承诺，handler 真的排过才允许出现（D339） #}
+  <p class="muted">本地还没有这只票的公告或新闻，已排进后台补采队列：补完刷新这一页。</p>
+  {% elif not admitted %}
+  <p class="muted">本地还没有这只票的公告或新闻；代码表里没有这只票，补采排不上——先等代码表同步。</p>
   {% else %}
-  <p class="muted">本地还没有这只票的公告或新闻。采一次：
-    <code>{{ announcement_command }}</code> 与 <code>{{ news_command }}</code></p>
+  <p class="muted">{{ market_name }}的这条链上还没有公告或新闻的源。</p>
   {% endif %}
 </section>

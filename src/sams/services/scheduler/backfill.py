@@ -8,6 +8,10 @@ D330 之后还多三种：`financials` / `valuation` / `flow`。它们只由孤�
 （`jobs.py::_collect`），所以消费者必须认识它们，否则昨晚顺延的票今天也没有人去补。
 这三种的「0 行」都是合法答复（D36）：没有披露、没有数据不代表补数失败。
 
+D339 再多三种档案活：`profile` / `announcements` / `news`。它们由打开个股资料块那一刻
+排成 pending（D283），消费者分派到 `F10SyncService` / `NewsService`，窗口与同名 job
+同口径；0 行同样是合法答复，吃完即 done。
+
 不进 task_runs 是因为那份历史回答「哪个 job 跑没跑」，这里积压的是单票属性——
 混进去之后「bars 跑成功了但三只票还欠着」两种真相分不开。失败三次转 deferred：
 今天的重试预算用光，等今晚的盘后日线任务收尾（`SyncService.sync_daily` 的结案钩子）。
@@ -24,9 +28,22 @@ from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.config import Settings
 from sams.core.errors import DatasourceError, SamsError
 from sams.core.timeutil import HISTORY_START
+from sams.services.news import NEWS_WINDOW_DAYS
 from sams.services.scheduler.due import local_today
-from sams.services.scheduler.jobs import INITIAL_SYNC_DAYS, _window
-from sams.storage.repos.symbol_backfills import ACTIONS, FINANCIALS, FLOW, VALUATION
+from sams.services.scheduler.jobs import (
+    ANNOUNCEMENTS_WINDOW_DAYS,
+    INITIAL_SYNC_DAYS,
+    _window,
+)
+from sams.storage.repos.symbol_backfills import (
+    ACTIONS,
+    ANNOUNCEMENTS,
+    FINANCIALS,
+    FLOW,
+    NEWS,
+    PROFILE,
+    VALUATION,
+)
 
 logger = logging.getLogger("sams.services.scheduler.backfill")
 
@@ -47,6 +64,8 @@ class BackfillConsumer:
         *,
         limit: int = 3,
         fundamentals=None,
+        f10=None,
+        news=None,
     ) -> None:
         self.sync = sync
         self.corp_actions = corp_actions
@@ -54,6 +73,8 @@ class BackfillConsumer:
         self.settings = settings
         self.limit = limit
         self.fundamentals = fundamentals
+        self.f10 = f10
+        self.news = news
 
     def consume(self, moment: datetime) -> int:
         processed = 0
@@ -93,6 +114,20 @@ class BackfillConsumer:
             return False
         if row.kind in (VALUATION, FLOW):
             return self._catch_up_daily_fundamental(row, end)
+        if row.kind == PROFILE:
+            # 概况一票一行，窗口对它没有意义（与 run_profile 同口径，D214）
+            self._f10().sync_profile(row.market, row.code)
+            return False
+        if row.kind == ANNOUNCEMENTS:
+            self._f10().sync_announcements(
+                row.market, row.code, end - timedelta(days=ANNOUNCEMENTS_WINDOW_DAYS), end
+            )
+            return False
+        if row.kind == NEWS:
+            self._news().sync(
+                row.market, row.code, end - timedelta(days=NEWS_WINDOW_DAYS), end
+            )
+            return False
         start = end - timedelta(days=INITIAL_SYNC_DAYS)
         return self.sync.sync_daily(row.market, row.code, start, end).empty
 
@@ -101,6 +136,16 @@ class BackfillConsumer:
             # 没接服务时不许把它当成 done：那会把一条顺延的账悄悄抹掉
             raise DatasourceError("backfill", "补数消费者没有基本面服务")
         return self.fundamentals
+
+    def _f10(self):
+        if self.f10 is None:
+            raise DatasourceError("backfill", "补数消费者没有个股资料服务")
+        return self.f10
+
+    def _news(self):
+        if self.news is None:
+            raise DatasourceError("backfill", "补数消费者没有新闻服务")
+        return self.news
 
     def _catch_up_daily_fundamental(self, row, end) -> bool:
         """估值/资金流按库内最新一天续上；已经追平就无事可做（与 job 的 `_window` 同口径）。"""

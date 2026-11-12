@@ -37,6 +37,12 @@ FINANCIALS = "financials"
 VALUATION = "valuation"
 FLOW = "flow"
 
+#: D339：个股页档案缺口（概况/公告/新闻）。名字同样跟 job 走，由打开资料块那一刻排成
+#: pending（D283），消费者吃完即 done——没有孤源止损的 deferred 账。
+PROFILE = "profile"
+ANNOUNCEMENTS = "announcements"
+NEWS = "news"
+
 
 @dataclass(frozen=True)
 class BackfillRow:

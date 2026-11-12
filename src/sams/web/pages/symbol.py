@@ -27,7 +27,14 @@ from sams.services.analysis import parse_period
 from sams.services.decision import CardQuote
 from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
 from sams.services.news import NEWS_MARKETS
-from sams.storage.repos.symbol_backfills import DEFERRED, FINANCIALS, VALUATION
+from sams.storage.repos.symbol_backfills import (
+    ANNOUNCEMENTS,
+    DEFERRED,
+    FINANCIALS,
+    NEWS,
+    PROFILE,
+    VALUATION,
+)
 from sams.web.auth import csrf_protect, require_user
 from sams.web.back import local_back
 from sams.web.chart_prefs import CHART_PERIODS, ordered_periods, parse_windows, windows_text
@@ -541,9 +548,9 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
     拆出来的 loader 都指向同一份资料，库里的键也只有一种形态（D50）。
 
     三种「没有」在这里分开说（设计 §F）：链上没有源（US）→ 明说缺源；有源但本地
-    没数据 → 分红送转、财务指标与估值改说「已排进后台补采队列」（D283/D336/D338，
-    打开本页的那一刻排的），概况与公告暂时还给采集命令；有数据 → 照常渲染。估值
-    有没有源问链（`F10Read.has_valuation_source`），不按市场名猜。
+    没数据 → 分红送转、财务指标、估值、概况、公告与新闻都改说「已排进后台补采队列」
+    （D283/D336/D338/D339，打开本页的那一刻排的）；有数据 → 照常渲染。有没有源问链
+    （`F10Read.has_*_source`），不按市场名猜。
     """
     user = require_user(request)
     web = request.app.state.web
@@ -577,9 +584,9 @@ def f10_partial(request: Request, market: str, code: str, view: str = "chart"):
         financial_views=FINANCIAL_VIEWS,
         financials_queued=_queue_financials(ctx, market, code, read),
         valuation_queued=_queue_valuation(ctx, market, code, read),
-        profile_command=f"sams sync profile --market {market} --code {code}",
-        announcement_command=f"sams sync announcements --market {market} --code {code}",
-        news_command=f"sams sync news --market {market} --code {code}",
+        profile_queued=_queue_profile(ctx, market, code, read),
+        announcements_queued=_queue_announcements(ctx, market, code, read),
+        news_queued=_queue_news(ctx, market, code, read, news_feed),
     )
 
 
@@ -633,6 +640,41 @@ def _queue_valuation(ctx, market: str, code: str, read) -> bool:
     if not ctx.symbol_list_store.admits(market, code):
         return False
     ctx.backfills_store.enqueue(market, code, VALUATION)
+    return True
+
+
+def _queue_profile(ctx, market: str, code: str, read) -> bool:
+    """缺概况就排 `profile` 活（D339，与估值卡同一条 D283 规矩）。"""
+    if read.profile is not None or not read.has_profile_source:
+        return False
+    if not ctx.symbol_list_store.admits(market, code):
+        return False
+    ctx.backfills_store.enqueue(market, code, PROFILE)
+    return True
+
+
+def _queue_announcements(ctx, market: str, code: str, read) -> bool:
+    """缺公告就排 `announcements` 活（D339）。已有公告或无公告源都不排。"""
+    if read.announcements or not read.has_announcement_source:
+        return False
+    if not ctx.symbol_list_store.admits(market, code):
+        return False
+    ctx.backfills_store.enqueue(market, code, ANNOUNCEMENTS)
+    return True
+
+
+def _queue_news(ctx, market: str, code: str, read, news_feed) -> bool:
+    """缺新闻就排 `news` 活（D339）。
+
+    新闻只在 `NEWS_MARKETS`（v0 是 A 股）且链上真有新闻源时才排：港美股不排，
+    A 股没接新闻源也不排——否则每一拍都只会得到「没有这个源」（D336 同一条规矩）。
+    资讯时间线已有内容（公告或新闻）时不排。
+    """
+    if news_feed or market not in NEWS_MARKETS or not read.has_news_source:
+        return False
+    if not ctx.symbol_list_store.admits(market, code):
+        return False
+    ctx.backfills_store.enqueue(market, code, NEWS)
     return True
 
 

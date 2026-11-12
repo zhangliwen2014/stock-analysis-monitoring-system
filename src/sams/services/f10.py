@@ -46,6 +46,7 @@ _PROFILE_METHOD = "company_profile"
 _FINANCIAL_METHOD = "financials"
 _VALUATION_METHOD = "valuation"
 _ANNOUNCEMENT_METHOD = "announcements"
+_NEWS_METHOD = "stock_news"
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,8 @@ class F10Read:
     has_announcement_source: bool = False
     #: 有没有源不是按市场名猜的：港美股也可能接上估值源（D338）
     has_valuation_source: bool = False
+    #: 新闻源同理：A 股也可能没接个股新闻源，排不排要看链（D339）
+    has_news_source: bool = False
 
 
 class F10Service:
@@ -210,6 +213,7 @@ class F10Service:
             has_financials_source=self._has(market, _FINANCIAL_METHOD),
             has_announcement_source=self._has(market, _ANNOUNCEMENT_METHOD),
             has_valuation_source=self._has(market, _VALUATION_METHOD),
+            has_news_source=self._has(market, _NEWS_METHOD),
         )
 
     def _has(self, market: str, method: str) -> bool:

@@ -909,6 +909,8 @@ def _context_on(
         backfills_store,
         cfg,
         fundamentals=fundamental_sync,
+        f10=f10_sync,
+        news=news,
     )
     deps = JobDeps(
         settings=cfg,

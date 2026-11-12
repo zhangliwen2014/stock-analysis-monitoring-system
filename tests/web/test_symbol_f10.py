@@ -221,20 +221,73 @@ def test_symbol_page_loads_the_f10_partial(logged_f10):
 
 
 def test_a_market_without_a_source_says_so_instead_of_empty_tables(logged_f10):
-    _symbol(logged_f10.context, "US", "AAPL", "苹果", "USD")
+    ctx = logged_f10.context
+    _symbol(ctx, "US", "AAPL", "苹果", "USD")
     text = logged_f10.client.get("/api/partials/f10?market=US&code=AAPL").text
     assert "美股的这条链上还没有公司概况的源" in text
     assert "美股的新闻源未接入；这条链上也没有公告的源" in text
     # 不摆一张空表：概况卡里不该出现简介那一段
     assert "公司简介" not in text
+    # 没有源就不排，也不印命令（D339）
+    assert "sams sync" not in text
+    for kind in ("profile", "announcements", "news"):
+        assert ctx.backfills_store.open_for("US", "AAPL", kind=kind) is None
 
 
-def test_a_source_without_local_data_prints_the_command(logged_f10):
-    _symbol(logged_f10.context)
+def test_a_source_without_local_data_queues_the_backfill(logged_f10):
+    """D339：概况/公告/新闻空态不再印命令，打开资料块就排（D283/D336 的形状）。"""
+    ctx = logged_f10.context
+    _symbol(ctx)
     text = logged_f10.client.get("/api/partials/f10?market=A&code=600519").text
-    assert "本地还没有这只票的概况" in text
-    assert "sams sync profile --market A --code 600519" in text
-    assert "sams sync announcements --market A --code 600519" in text
+    assert "sams sync profile" not in text
+    assert "sams sync announcements" not in text
+    assert "sams sync news" not in text
+    assert "本地还没有这只票的概况，已排进后台补采队列：补完刷新这一页" in text
+    assert "本地还没有这只票的公告或新闻，已排进后台补采队列：补完刷新这一页" in text
+    for kind in ("profile", "announcements", "news"):
+        row = ctx.backfills_store.open_for("A", "600519", kind=kind)
+        assert row is not None and row.status == "pending"
+
+
+def test_the_archive_cards_do_not_promise_a_queue_for_an_unknown_code(logged_f10):
+    """代码表不认识的票不排（D314）：概况与资讯格都不许说「已排进」。"""
+    ctx = logged_f10.context
+    ctx.symbol_list_store.upsert_batch(
+        "A",
+        [
+            {
+                "code": "600519",
+                "name": "贵州茅台",
+                "py_initials": "gzmt",
+                "py_full": "guizhoumaotai",
+                "currency": "CNY",
+            }
+        ],
+    )
+    _symbol(ctx, "A", "000996", "退市股", "CNY")
+    text = logged_f10.client.get("/api/partials/f10?market=A&code=000996").text
+    assert "本地还没有这只票的概况；代码表里没有这只票" in text
+    assert "本地还没有这只票的公告或新闻；代码表里没有这只票" in text
+    for kind in ("profile", "announcements", "news"):
+        assert ctx.backfills_store.open_for("A", "000996", kind=kind) is None
+
+
+def test_the_profile_card_does_not_queue_when_the_data_is_already_there(logged_f10):
+    ctx = logged_f10.context
+    _symbol(ctx)
+    _profile(ctx)
+    logged_f10.client.get("/api/partials/f10?market=A&code=600519")
+    assert ctx.backfills_store.open_for("A", "600519", kind="profile") is None
+
+
+def test_the_news_card_does_not_queue_when_the_feed_is_already_there(logged_f10):
+    ctx = logged_f10.context
+    _symbol(ctx)
+    _announcements(ctx)
+    logged_f10.client.get("/api/partials/f10?market=A&code=600519")
+    # 公告已经在时间线上：资讯格有数，公告与新闻都不排
+    assert ctx.backfills_store.open_for("A", "600519", kind="announcements") is None
+    assert ctx.backfills_store.open_for("A", "600519", kind="news") is None
 
 
 def test_the_dividend_card_queues_the_backfill_instead_of_a_command(logged_f10):

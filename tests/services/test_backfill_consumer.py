@@ -1,6 +1,6 @@
 """每拍至多消费 limit 条：单票失败记账不炸拍（D144）。"""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -8,11 +8,16 @@ from support import FrozenClock
 
 from sams.core.errors import DatasourceError
 from sams.core.timeutil import HISTORY_START
+from sams.services.news import NEWS_WINDOW_DAYS
 from sams.services.scheduler.backfill import BackfillConsumer, BackfillPump
+from sams.services.scheduler.jobs import ANNOUNCEMENTS_WINDOW_DAYS
 from sams.services.sync import SyncSummary
 from sams.storage.repos.symbol_backfills import (
+    ANNOUNCEMENTS,
     FINANCIALS,
     FLOW,
+    NEWS,
+    PROFILE,
     VALUATION,
     SymbolBackfillRepo,
 )
@@ -242,6 +247,113 @@ def test_without_the_service_a_new_kind_row_is_not_silently_closed(settings, db)
     row = repo.open_for("A", "600519", kind=VALUATION)
     assert (row.status, row.tries) == ("pending", 1)
     assert "没有基本面服务" in row.last_error
+
+
+class StubF10Sync:
+    """概况/公告两种档案活的最小替身：记下窗口，按需失败或答 0 行。"""
+
+    def __init__(self, *, fail: Exception | None = None, empty: bool = False):
+        self.calls: list[tuple] = []
+        self.fail = fail
+        self.empty = empty
+
+    def sync_profile(self, market, code):
+        if self.fail is not None:
+            raise self.fail
+        self.calls.append(("profile", market, code, None, None))
+        return SimpleNamespace(written=0 if self.empty else 1, empty=self.empty)
+
+    def sync_announcements(self, market, code, start, end):
+        if self.fail is not None:
+            raise self.fail
+        self.calls.append(("announcements", market, code, start, end))
+        return SimpleNamespace(written=0 if self.empty else 2, empty=self.empty)
+
+
+class StubNews:
+    def __init__(self, *, fail: Exception | None = None, empty: bool = False):
+        self.calls: list[tuple] = []
+        self.fail = fail
+        self.empty = empty
+
+    def sync(self, market, code, start, end):
+        if self.fail is not None:
+            raise self.fail
+        self.calls.append(("news", market, code, start, end))
+        return SimpleNamespace(written=0 if self.empty else 2, empty=self.empty)
+
+
+def test_a_profile_row_fetches_the_profile_without_a_window(settings, db):
+    """概况一票一行：窗口对它没有意义（与 run_profile 同口径，D214）。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=PROFILE)
+    f10 = StubF10Sync()
+    consumer = BackfillConsumer(StubSync([]), StubActions(), repo, settings, f10=f10)
+
+    assert consumer.consume(MOMENT) == 1
+    assert f10.calls == [("profile", "A", "600519", None, None)]
+    assert repo.open_for("A", "600519", kind=PROFILE) is None
+
+
+def test_an_announcements_row_uses_the_thirty_day_window(settings, db):
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=ANNOUNCEMENTS)
+    f10 = StubF10Sync()
+    consumer = BackfillConsumer(StubSync([]), StubActions(), repo, settings, f10=f10)
+
+    consumer.consume(MOMENT)
+    end = date(2026, 10, 26)
+    assert f10.calls == [
+        ("announcements", "A", "600519", end - timedelta(days=ANNOUNCEMENTS_WINDOW_DAYS), end)
+    ]
+    assert repo.open_for("A", "600519", kind=ANNOUNCEMENTS) is None
+
+
+def test_a_news_row_uses_the_thirty_day_window(settings, db):
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=NEWS)
+    news = StubNews()
+    consumer = BackfillConsumer(StubSync([]), StubActions(), repo, settings, news=news)
+
+    consumer.consume(MOMENT)
+    end = date(2026, 10, 26)
+    assert news.calls == [
+        ("news", "A", "600519", end - timedelta(days=NEWS_WINDOW_DAYS), end)
+    ]
+    assert repo.open_for("A", "600519", kind=NEWS) is None
+
+
+def test_zero_rows_is_a_legal_answer_for_the_archive_kinds(settings, db):
+    """档案没有记录是答复，不是「没补上」（D36）：0 行也记 done。"""
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=PROFILE)
+    f10 = StubF10Sync(empty=True)
+    consumer = BackfillConsumer(StubSync([]), StubActions(), repo, settings, f10=f10)
+
+    consumer.consume(MOMENT)
+    assert repo.open_for("A", "600519", kind=PROFILE) is None
+
+
+def test_without_the_f10_service_an_archive_row_is_not_silently_closed(settings, db):
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=ANNOUNCEMENTS)
+    consumer = BackfillConsumer(StubSync([]), StubActions(), repo, settings)
+
+    consumer.consume(MOMENT)
+    row = repo.open_for("A", "600519", kind=ANNOUNCEMENTS)
+    assert (row.status, row.tries) == ("pending", 1)
+    assert "没有个股资料服务" in row.last_error
+
+
+def test_without_the_news_service_a_news_row_is_not_silently_closed(settings, db):
+    repo = SymbolBackfillRepo(db)
+    repo.enqueue("A", "600519", kind=NEWS)
+    consumer = BackfillConsumer(StubSync([]), StubActions(), repo, settings)
+
+    consumer.consume(MOMENT)
+    row = repo.open_for("A", "600519", kind=NEWS)
+    assert (row.status, row.tries) == ("pending", 1)
+    assert "没有新闻服务" in row.last_error
 
 
 class SteppingMonotonic:

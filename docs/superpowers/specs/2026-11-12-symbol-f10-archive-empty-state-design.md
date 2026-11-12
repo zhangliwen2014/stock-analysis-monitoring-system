@@ -108,3 +108,21 @@ R3-02 把个股页的命令行话术逐条点了名。D336/D337/D338 已经清�
 * 生产库副本 + 临时服务 8799：找无概况/无公告的 A 股与港股，确认空态话术与队列行；
   不操作生产通道。
 * 生产 `sams serve` 重启后回归 `/healthz` 与 `/login`。
+
+## 回归结果
+
+* `ruff check src tests`：All checks passed。
+* 串行 pytest：消费者套件 19 passed、个股页 F10 套件 37 passed；更广的相关套件
+  （消费者 / F10 服务 / 新闻服务与订阅 / 调度 runner·service·jobs / 个股页·基本面·
+  分时·搜索 / F10 与新闻 CLI）一并串行跑过，无回归。
+* 生产库副本（`tmp/d339_verify.duckdb`）+ 临时服务 8799，登录 sp1check 打开资料块：
+  * A 股缺概况/公告/新闻的票（605177、301596、601333、000800、603583）：概况卡与
+    资讯卡都说「已排进后台补采队列：补完刷新这一页」，页面无 `sams sync`；库里
+    `profile`/`announcements`/`news`/`valuation`/`financials` 各落 pending 行。
+  * 港股缺概况的票（06628、01543、00384、01036）：真实链上 yfinance 有概况/估值/
+    公告源，故同样排队（验证「问链不按市场名猜」）；但 `news` 不排（HK 不在
+    `NEWS_MARKETS`）、`financials` 不排（链上无财务源）——能力分支正确。
+  * 齐全的 A/600519：概况/资讯/估值/财务卡照常渲染，`queued_count=0`，不排档案活。
+  * 队列计数与打开的票一一对应：profile/announcements/valuation 各 9（5 A + 4 HK）、
+    news/financials 各 5（仅 A）。全程未操作生产通道。
+* 生产 `sams serve` 重启后 `/healthz` 200、`/login` 可达。
