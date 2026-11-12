@@ -343,27 +343,27 @@ class AnalysisService:
         「库里 0 行」这句话有三个原因：代码写错了、这只票从没采集过、采集了但这段没有
         行情。三种情况在报告上原本长得一模一样，而该敲的命令完全不同——主档有没有这个
         代码恰好是前两种的分界线，所以这里值得多问一次。
+
+        注记渠道中性（D346）：web 图注与 CLI 共用这句话，不印命令——网页用户没有终端，
+        日线由开页排队（D283）与盘后 job 自动补。CLI 的 `NotAdjustable` 出口是多态的
+        （覆盖确认/无法折算等共用），没有安全的补回点，命令留在 `sams sync daily --help`。
         """
         total = self.bars.count(market, code)
-        sync_hint = (
-            f"`sams sync daily --market {market} --code {code} --start {start} --end {end}`"
-        )
         if total == 0:
             symbol = self.symbols.get(market, code)
             if symbol is None:
                 return (
                     f"{market}/{code} 全库一根 K 线都没有，主档里也没有这个代码："
-                    "代码多半写错了（指数、或没收录的标的也是这个形状）。"
-                    f"确认代码后再跑 {sync_hint}"
+                    "代码多半写错了（指数、或没收录的标的也是这个形状）。确认代码后再试一次"
                 )
             return (
                 f"{market}/{code}（{symbol['name'] or '未命名'}）在主档里，"
-                f"但全库一根 K 线都没有：还没采集过。先跑 {sync_hint}"
+                f"但全库一根 K 线都没有：还没采集过；盘后任务会自动补采这只票的日线"
             )
         return (
             f"{market}/{code} 在 {start}~{end} 内只有 {in_window} 根 K 线："
             f"全库有 {total} 根，最新到 {self.bars.latest_date(market, code)}。"
-            f"把区间挪到有数据的那一段，或先跑 {sync_hint}"
+            f"把区间挪到有数据的那一段；缺的日线盘后任务会自动补采"
         )
 
 

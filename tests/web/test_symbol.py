@@ -463,6 +463,15 @@ def test_bars_api_falls_back_too(logged):
     assert payload.json()["dates"] == []
 
 
+def test_bars_api_empty_note_points_at_the_auto_job_not_a_command(logged):
+    """K 线空态标题指向盘后自动补采，不印命令（D346）。"""
+    _seed_list_row(logged)
+    note = logged.client.get("/api/symbol/A/600519/bars?days=120").json()["note"]
+    assert "还没采集过" in note
+    assert "sams sync daily" not in note
+    assert "盘后" in note
+
+
 def test_bars_api_returns_dates_and_close(logged):
     _seed(logged)
     payload = logged.client.get("/api/symbol/A/600519/bars?days=120").json()

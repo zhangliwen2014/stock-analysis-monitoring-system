@@ -174,8 +174,10 @@ def test_a_code_whose_ex_rights_were_never_confirmed_is_refused(db):
 def test_a_code_the_database_has_never_seen_says_the_code_is_unknown(db):
     """「不足两根」有三条来路，下一步该敲的命令完全不同：先说清是哪一条。"""
     service, _, _ = make_service(db)
-    with pytest.raises(NotAdjustable, match="主档里也没有这个代码"):
+    with pytest.raises(NotAdjustable, match="主档里也没有这个代码") as exc:
         service.interval_return("A", "000001", START, END)
+    # 代码错那一支不印命令、也不承诺自动补（D346）：没有可补的活
+    assert "sams sync daily" not in str(exc.value)
 
 
 def test_a_registered_code_with_no_bars_says_it_has_never_been_collected(db):
@@ -189,6 +191,9 @@ def test_a_registered_code_with_no_bars_says_it_has_never_been_collected(db):
     with pytest.raises(NotAdjustable, match="还没采集过") as exc:
         service.interval_return("A", "000001", START, END)
     assert "平安银行" in str(exc.value)
+    # 渠道中性（D346）：开页已排 BARS + 盘后 job 自动补，不印命令
+    assert "sams sync daily" not in str(exc.value)
+    assert "盘后" in str(exc.value)
 
 
 def test_a_window_outside_the_collected_range_says_where_the_bars_are(db):
@@ -196,6 +201,8 @@ def test_a_window_outside_the_collected_range_says_where_the_bars_are(db):
     with pytest.raises(NotAdjustable, match="只有 0 根") as exc:
         service.interval_return("A", CODE, date(2024, 8, 1), date(2024, 8, 30))
     assert "最新到 2024-07-11" in str(exc.value)
+    assert "sams sync daily" not in str(exc.value)
+    assert "盘后" in str(exc.value)
 
 
 def test_a_reversed_window_is_refused_before_the_advice(db):

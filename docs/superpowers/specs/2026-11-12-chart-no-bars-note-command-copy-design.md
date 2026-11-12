@@ -60,4 +60,16 @@ R3-02 点名网页里的命令行话术。个股页 K 线读不出时，图表�
 
 ## 回归结果
 
-（待填）
+2026-11-12 实测（TDD：先改三处服务断言 + 新增网页测试见证 RED——4 failed，三分支与
+K 线接口 note 都含 `sams sync daily`，再实现 GREEN）。
+
+* 串行 pytest：`test_analysis.py` + `test_analysis_series.py` + `test_symbol.py` +
+  `test_cli.py` 共 **171 passed**（CLI 各 `NotAdjustable` 出口仍绿——中性注记原样打印）；
+  `ruff check src tests` All checks passed。
+* 生产库副本（`tmp/d346.duckdb`）+ 临时服务 8799，登录 sp1check：在副本上查得代码表在册
+  但无日线的 A 股 605177（东亚药业），`GET /api/symbol/A/605177/bars?days=120` 的 JSON
+  `note` 印「A/605177（东亚药业）在主档里，但全库一根 K 线都没有：还没采集过；盘后任务
+  会自动补采这只票的日线」——`sams sync daily` **不在**文中，「盘后」「还没采集过」在。
+* 该注记 web + CLI 共用，CLI 经多态 `NotAdjustable` 出口原样打印中性句（无安全补回点，
+  不补回），已由 `test_cli.py` 覆盖。验证毕清理副本；生产 `sams serve` 重启后
+  `/healthz`、`/login` 均 200。
