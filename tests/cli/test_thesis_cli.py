@@ -132,7 +132,8 @@ def test_add_on_a_stock_without_bars_still_records_the_view_but_exits_one(db, se
     code, body = out(container, capsys, "add", "--user", USER, "--market", "A", "--code", CODE)
     assert code == 1
     assert "价位" in body and "空着" in body
-    assert "sams sync daily" in body
+    # D346：取数注记渠道中性，CLI 也不补回命令（NotAdjustable 出口多态，无安全补回点）
+    assert "sams sync daily" not in body
 
 
 def test_add_honours_as_of_and_the_roe_caliber(db, settings, capsys):

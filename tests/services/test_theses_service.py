@@ -189,7 +189,9 @@ def test_add_still_records_the_thesis_when_no_price_can_be_computed(db, settings
     assert levels(report.thesis) == dict.fromkeys(levels(report.thesis))
     assert report.valuation is None
     assert "K 线" in report.unavailable
-    assert "sams sync daily" in report.unavailable
+    # D346：取数注记渠道中性，不再印命令；代码错那一支也不承诺自动补，只说下一步
+    assert "sams sync daily" not in report.unavailable
+    assert "确认代码" in report.unavailable
 
 
 # --- 对照：库里那次 vs 现在这次 --------------------------------------------------------------
