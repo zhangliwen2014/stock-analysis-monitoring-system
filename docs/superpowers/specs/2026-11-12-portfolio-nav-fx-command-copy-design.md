@@ -54,3 +54,17 @@ R3-02 点名网页里的命令行话术。D336–D341 清掉了个股页六格�
 * 生产库副本 + 临时服务 8799：找一个净值算不出的账户与一个无汇率的币种对，确认两处
   话术无命令；不操作生产通道。
 * 生产 `sams serve` 重启后回归 `/healthz` 与 `/login`。
+
+## 回归结果
+
+* `ruff check src tests`：All checks passed。
+* 串行 pytest：`test_portfolio_nav_web.py` + `test_portfolio_web.py` +
+  `test_portfolio_attribution_web.py` 合计 74 passed（归因卡共用注记未动，仍绿）。
+* 生产库副本（`tmp/d342_verify.duckdb`）+ 临时服务 8799，登录 sp1check：
+  * `/portfolio` 与两只已有账户的净值卡都不含 `sams sync fx` / `sams nav rebuild`。
+  * 在副本上新开一个空账户（D342验证户，无成交）：净值卡空态说「还没有算得出来的净值：
+    缺价或缺汇率的那一天整日不计。盘后 job 每晚重建最近 400 天；缺的价与汇率由各自的
+    盘后任务补齐，补上后净值随之重建。」，无命令。
+  * FX 无汇率那一支由单测证明（生产库已有汇率，该支在实机不触发）；实机确认 `/portfolio`
+    无 `sams sync fx`。全程未操作生产通道（新账户只落在副本）。
+* 生产 `sams serve` 重启后 `/healthz` 200、`/login` 200。

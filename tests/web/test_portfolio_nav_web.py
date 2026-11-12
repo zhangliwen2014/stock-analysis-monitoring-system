@@ -70,7 +70,7 @@ def test_the_nav_card_says_so_when_nothing_has_been_rebuilt_yet(logged):
     text = logged.client.get(f"/api/partials/portfolio/nav?account={account_id}").text
 
     assert "还没有算得出来的净值" in text
-    assert f"sams nav rebuild --account {account_id}" in text
+    assert "sams nav rebuild" not in text
     # 那个天数不是抄来的常数：卡片说的是 `NAV_WINDOW_DAYS` 那一晚覆盖的范围（D281）
     assert "盘后 job 每晚重建最近 400 天" in text
     # 没有一行可画时不挂图：一张空白画布看起来像「净值是一条直线」

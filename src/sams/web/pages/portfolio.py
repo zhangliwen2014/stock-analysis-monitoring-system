@@ -169,7 +169,7 @@ def _rate_hint(ctx: ServiceContext, base: str, quote: str) -> tuple[str, str]:
             f"{rate:.6g}",
             f"预填：由 {quote}→{base} {reverse.rate:.4f} 取倒数（{reverse.day}，{source}）",
         )
-    return "", f"库里没有 {base}→{quote} 的汇率：填券商给你的成交汇率，或先 `sams sync fx`"
+    return "", f"库里没有 {base}→{quote} 的汇率：填券商给你的成交汇率；盘后任务会自动补这一对的汇率"
 
 
 def _fx_defaults(ctx: ServiceContext, currencies: list[str]) -> dict[str, str]:

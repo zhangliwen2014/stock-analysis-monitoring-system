@@ -618,6 +618,15 @@ def test_the_fx_form_prefills_the_latest_stored_rate(logged):
     assert "取倒数" in page.text
 
 
+def test_the_fx_form_without_a_rate_points_at_the_auto_job_not_a_command(logged):
+    """两个方向都没有汇率时指向盘后自动补，而不是印一条网页用户跑不了的命令（D342）。"""
+    _open_account(logged)
+    page = logged.client.get("/portfolio")
+    assert "sams sync fx" not in page.text
+    assert "盘后任务会自动补" in page.text
+    assert "填券商给你的成交汇率" in page.text
+
+
 def test_converting_then_buying_hk_from_cny_works(logged):
     """用户原话那条路：人民币账户买港股通，先换汇再买，不再被「没有 HKD」挡死。"""
     account_id = _open_account(logged)

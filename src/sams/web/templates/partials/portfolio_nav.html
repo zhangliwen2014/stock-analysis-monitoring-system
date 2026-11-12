@@ -7,7 +7,7 @@
   </h2>
   {% if series.latest is none %}
   <p class="muted">这一区间还没有算得出来的净值：缺价或缺汇率的那一天整日不计。
-    盘后 job 每晚重建最近 {{ nav_window_days }} 天，也可以跑 <code>sams nav rebuild --account {{ account.id }}</code>。</p>
+    盘后 job 每晚重建最近 {{ nav_window_days }} 天；缺的价与汇率由各自的盘后任务补齐，补上后净值随之重建。</p>
   {% else %}
   <table>
     <tr>
