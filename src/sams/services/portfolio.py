@@ -315,8 +315,8 @@ class PortfolioService:
         if found is None:
             return base, None, True, (
                 f"{pos.market} {pos.code} 以 {pos.currency} 计价，取不到 {price_day} 或之前"
-                f"可用的 {pos.currency}→{report} 汇率：这一行不计入汇总（可运行 `sams sync fx`"
-                f"或手工补一条）"
+                f"可用的 {pos.currency}→{report} 汇率：这一行不计入汇总；"
+                f"盘后任务会自动补这一对的汇率"
             )
         if base is None:
             return None, found.rate, found.is_stale, (

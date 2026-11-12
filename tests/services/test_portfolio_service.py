@@ -164,6 +164,9 @@ def test_a_usd_position_without_a_rate_contributes_nothing(db, portfolio) -> Non
     assert row.total_report == 0.0
     assert row.convertible is False
     assert "汇率" in row.unavailable_note
+    # 注记渠道中性（D344）：网页用户没有终端，缺汇率由 run_fx 盘后自动补，不印命令
+    assert "sams sync fx" not in row.unavailable_note
+    assert "盘后" in row.unavailable_note
 
 
 def test_a_position_missing_its_base_rate_is_not_split(db, portfolio) -> None:

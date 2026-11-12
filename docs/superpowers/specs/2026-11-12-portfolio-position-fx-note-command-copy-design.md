@@ -57,4 +57,19 @@ R3-02 点名网页里的命令行话术。D342 清了汇率表单提示（`_rate
 
 ## 回归结果
 
-（待填）
+2026-11-12 实测（TDD：先加服务层断言 + 新增网页测试见证 RED——2 failed，注记与网页
+都含 `sams sync fx`，再实现 GREEN）。
+
+* 串行 pytest：`test_portfolio_service.py` + `test_portfolio_web.py` + `test_cli.py`
+  共 **164 passed**（含 `test_health_says_the_conversion_cannot_be_split_when_fx_is_empty`
+  那条钉 `sams sync fx` 的 health 测试仍绿——它与本注记无关）；`ruff check src tests`
+  All checks passed。
+* 生产库副本（`tmp/d344.duckdb`）+ 临时服务 8799，登录 sp1check 开「D344验证户」
+  （`88774a61…`），经 `/ledger/fill` 买 US AAPL 10 股 @100、fx_rate=7.0；停服务后在副本上
+  清空 USD→CNY 汇率（219 行，AAPL 日本有 511 条），重启服务：
+  * `/portfolio?account=…` 持仓行注记印「US AAPL 以 USD 计价，取不到 2026-11-10 或之前
+    可用的 USD→CNY 汇率：这一行不计入汇总；盘后任务会自动补这一对的汇率」——
+    `sams sync fx` **不在**页面，「盘后任务会自动补」「这一行不计入汇总」在。
+  * 停服务释放写锁后跑 `sams ledger positions --user sp1check --account 88774a61…`：
+    同一句中性注记，无命令。
+* 验证毕清理副本；生产 `sams serve` 重启后 `/healthz`、`/login` 均 200。

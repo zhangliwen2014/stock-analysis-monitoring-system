@@ -627,6 +627,40 @@ def test_the_fx_form_without_a_rate_points_at_the_auto_job_not_a_command(logged)
     assert "填券商给你的成交汇率" in page.text
 
 
+def test_the_position_fx_note_points_at_the_auto_job_not_a_command(logged):
+    """外币持仓换不成报告币种时，持仓行注记指向盘后自动补，不印命令（D344）。"""
+    ctx = logged.context
+    account_id = _open_account(logged)
+    today = ctx.clock.today()
+    ctx.symbols.upsert(
+        pl.DataFrame(
+            {
+                "market": ["US"], "code": ["AAPL"], "name": ["苹果"],
+                "currency": ["USD"], "sector": ["科技"],
+            }
+        )
+    )
+    ctx.ledger.buy(
+        account_id, "alice", "US", "AAPL", qty=10, price=100.0, fx_rate=7.0,
+        ts=datetime(today.year, today.month, today.day, 15, 0, tzinfo=UTC),
+    )
+    ctx.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["US"], "code": ["AAPL"], "date": [today],
+                "open": [110.0], "high": [110.0], "low": [110.0], "close": [110.0],
+                "volume": [1.0], "amount": [110.0], "source": ["test"],
+            }
+        )
+    )
+    # 不存 USD→CNY 汇率：_rates 取不到 → 这一行不计入汇总，注记落在持仓行上
+    page = logged.client.get("/portfolio")
+    assert page.status_code == 200
+    assert "这一行不计入汇总" in page.text
+    assert "sams sync fx" not in page.text
+    assert "盘后任务会自动补" in page.text
+
+
 def test_converting_then_buying_hk_from_cny_works(logged):
     """用户原话那条路：人民币账户买港股通，先换汇再买，不再被「没有 HKD」挡死。"""
     account_id = _open_account(logged)
