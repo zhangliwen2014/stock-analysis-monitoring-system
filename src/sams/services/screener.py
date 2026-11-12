@@ -34,6 +34,11 @@ from sams.core.screener_fields import FIELDS, Condition, Field, field, validate
 from sams.services.technical import TechnicalService
 from sams.storage.repos.financials import FinancialRepo
 from sams.storage.repos.snapshots import SnapshotRepo
+
+#: 选股缺数那一格的「补采活」词汇（D337）：screener 把技术面的 BARS/ACTIONS 与基本面的
+#: FINANCIALS 汇成 MissingGroup.fix。cli 经服务层拿这套常量，不直接认识 storage（分层守卫）。
+from sams.storage.repos.symbol_backfills import ACTIONS as ACTIONS
+from sams.storage.repos.symbol_backfills import BARS as BARS
 from sams.storage.repos.symbol_backfills import FINANCIALS
 from sams.storage.repos.symbol_list import SymbolListRepo
 
