@@ -402,6 +402,24 @@ def test_without_a_snapshot_market_cap_is_missing_and_selection_uses_revenue(db)
     }
 
 
+def test_position_without_revenue_or_cap_defers_to_cards_not_commands(db):
+    """有行业、但自己营收与市值都没有：行业地位拒绝那一档不印命令（D349）。
+
+    营收盘后只覆盖票池、服务自身承诺不了，指给同页「主要财务指标」卡；市值是 run_spot
+    全市场盘后横截面，照 D345 说「盘后任务自动采集」。两条命令都不该出现在屏幕上。
+    """
+    seed_baijiu(db, self_revenue=None, with_snapshot=False)
+
+    report = service(db).compare("A", "600519", as_of=DAY)
+
+    assert report.position_missing == NOT_DISCLOSED
+    assert "营收与市值都没有" in report.position
+    assert "主要财务指标" in report.position
+    assert "盘后任务自动采集" in report.position
+    assert "sams sync financials" not in report.position
+    assert "sams sync spot" not in report.position
+
+
 def test_the_card_names_the_day_of_every_number_not_the_day_it_was_read(db):
     """一屏一 as-of（D288）：卡上那一句日期只能是「那个数自己的数据日」。
 

@@ -90,4 +90,25 @@ D348（无行业）与本条（有行业但营收市值都缺）合起来，业�
 
 ## 回归结果
 
-（实施后填：TDD 红绿、定向 pytest、ruff、真数据副本验证、全量套件、生产重启。）
+* **TDD 红绿**：新增 `test_peers_service.py::test_position_without_revenue_or_cap_defers_to_cards_not_commands`
+  （`seed_baijiu(self_revenue=None, with_snapshot=False)` 首次覆盖 493 这一档）与
+  `test_symbol_fundamentals.py` 同业卡、业务卡行业地位格两条网页用例（新铺底 helper
+  `_baijiu_self_missing_revenue_and_cap`）。三条一起跑 **RED：3 failed**（旧注记仍印
+  `sams sync financials/spot`、无「主要财务指标」字样）。改 `peers.py:491` 拒绝文本后
+  **GREEN**：`test_peers_service.py + test_business_profile.py + test_symbol_fundamentals.py`
+  共 **44 passed**（含 D348 的 41），blast radius 无回归。
+* **ruff**：`ruff check peers.py + 两个测试文件` → All checks passed。
+* **真数据副本验证**：prod 库里**没有**天然的 493 票（最新快照 2026-11-11 尚新，有行业的票
+  要么有营收要么有快照市值），故在副本上构造：复制 `data/sams.duckdb`(+wal) 到
+  `tmp/d349_verify.duckdb`，删 600519 的 financials、把其 2026-11-11 快照市值置 NULL
+  （行业「食品饮料-饮料-白酒」仍在）⇒ 命中 493。`SAMS_DB_PATH` 指副本、`SAMS_SECRET_KEY`
+  取自 `tmp/.sams_secret`，临时 `sams serve --port 8799`，登录（sp1check）后取 600519：
+  * `/api/partials/peers` 与 `/api/partials/business`：`sams sync financials`、`sams sync spot`
+    均**不在**，渲染「营收与市值都没有：行业地位无法计算；财务补采状态见本页「主要财务指标」卡，
+    市值快照由盘后任务自动采集」。
+  验证毕停 8799（生产 8765 `/healthz` 仍 200）、清理副本与脚本。
+* **全量套件**：与 D348 合并复跑 **5917 passed, 21 deselected**（56:18，0 失败 0 错误；
+  较 D347 基线 5912 净增 5 条新用例：D348 两条网页 + D349 一条服务两条网页）。
+* **生产重启**：`sams serve`（8765）重启后 `/healthz` 200、`/login` 200、登录 POST 303；
+  线上实测 601333 同业卡与业务卡行业地位格均渲染 D348 新注记、`sams sync profile` 不在；
+  600519 同业卡照常出表（无回归）。D349 的 493 档 prod 无天然票，已在副本构造验证（见上）。

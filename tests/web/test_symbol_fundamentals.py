@@ -157,6 +157,21 @@ def _six_baijiu(ctx, *, valuation_day=None, snapshot_day=None):
     _snapshots(ctx, {code: cap for code, _, cap, *_ in basket}, day=snapshot_day)
 
 
+def _baijiu_self_missing_revenue_and_cap(ctx):
+    """六家都有行业；同业有营收，自己营收与市值都缺（不铺快照）⇒ 行业地位走 D349 拒绝档。"""
+    today = ctx.clock.today()
+    basket = [
+        ("600519", "贵州茅台"), ("600809", "山西汾酒"), ("000568", "泸州老窖"),
+        ("000596", "古井贡酒"), ("603369", "今世缘"), ("603198", "迎驾贡酒"),
+    ]
+    for code, name in basket:
+        _symbol(ctx, code=code, name=name, sector=BAIJIU)
+    _profiles(ctx, [("A", code, name, BAIJIU, "白酒。") for code, name in basket])
+    _valuation_rows(ctx, [(code, today, 20.0, 7.0) for code, _ in basket])
+    for code, _ in basket[1:]:  # 同业有营收，自己没有
+        _annual_reports(ctx, code, years=[today.year - 1])
+
+
 def test_the_peers_card_names_the_day_of_every_number(logged):
     """一屏一 as-of（D288）：卡头那一句必须是「那个数的日子」，不是读卡那一天。
 
@@ -237,6 +252,29 @@ def test_business_position_without_industry_defers_to_the_profile_card_not_a_com
 
     assert "还没有行业" in text
     assert "sams sync profile" not in text
+
+
+def test_peers_position_without_revenue_or_cap_defers_to_cards_not_commands(logged):
+    """有行业、自己营收与市值都没有：同业卡行业地位那句不印命令（D349）。"""
+    _baijiu_self_missing_revenue_and_cap(logged.context)
+
+    text = logged.client.get("/api/partials/peers?market=A&code=600519").text
+
+    assert "营收与市值都没有" in text
+    assert "主要财务指标" in text
+    assert "sams sync financials" not in text
+    assert "sams sync spot" not in text
+
+
+def test_business_position_without_revenue_or_cap_defers_to_cards_not_commands(logged):
+    """同一铺底取业务卡：行业地位格取同业那条注记，D349 之后也不印命令。"""
+    _baijiu_self_missing_revenue_and_cap(logged.context)
+
+    text = logged.client.get("/api/partials/business?market=A&code=600519").text
+
+    assert "营收与市值都没有" in text
+    assert "主要财务指标" in text
+    assert "sams sync financials" not in text
 
 
 def test_peers_partial_lists_five_peers_and_the_median_with_n(logged):
