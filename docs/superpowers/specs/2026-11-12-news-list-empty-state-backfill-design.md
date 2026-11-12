@@ -74,3 +74,16 @@ D336/D338/D339「那句话是承诺，队列里必须真有那一行」的形状
 * 生产库副本 + 临时服务 8799：找一个自选里有、但最近 30 天无资讯的 A 股市场，打开
   `/news` 确认空态话术与队列行；不操作生产通道。
 * 生产 `sams serve` 重启后回归 `/healthz` 与 `/login`。
+
+## 回归结果
+
+* `ruff check src tests`：All checks passed。
+* 串行 pytest：`test_news_web.py` 18 passed（含 3 个新增）、`test_alerts_news_web.py`
+  2 passed。`_empty_message` 仅 `news_page` 一处调用，已同步传 `ctx`。
+* 生产库副本（`tmp/d341_verify.duckdb`）+ 临时服务 8799，登录 sp1check，走单代码路径：
+  * 无资讯的 A/605177（`/news?market=A&code=605177`）：空态说「最近 30 天没有公告或
+    新闻。盘后任务会自动采集；已排进后台补采队列：补完刷新这一页。」，无 `sams sync news`。
+  * 有资讯的 A/600519：列表照常渲染，无排队话术。
+  * 停服查库：`symbol_backfills` 有 A/605177 的 `news` pending 行；A/600519 无 news 行。
+    全程未操作生产通道。
+* 生产 `sams serve` 重启后 `/healthz` 200、`/login` 200。

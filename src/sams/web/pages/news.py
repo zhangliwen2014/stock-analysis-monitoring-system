@@ -18,6 +18,7 @@ from fastapi.responses import RedirectResponse
 from sams.core.codes import canonical_code, canonical_market
 from sams.core.errors import Conflict, SamsError, ValidationError
 from sams.services.news import NEWS_MARKETS, NEWS_WINDOW_DAYS
+from sams.storage.repos.symbol_backfills import NEWS
 from sams.storage.repos.theses import OBSERVING
 from sams.web.auth import csrf_protect, require_user
 from sams.web.display import moment_label
@@ -199,6 +200,7 @@ def _page(
         prev_url=_page_url(base, current - 1) if current > 1 else "",
         next_url=_page_url(base, current + 1) if current < pages else "",
         empty_message=_empty_message(
+            ctx=ctx,
             market=market,
             market_label=_MARKET_LABELS.get(market, market),
             codes=codes,
@@ -251,8 +253,25 @@ def _page_url(base: dict[str, str], page: int) -> str:
     return "/news?" + urlencode({**base, "page": page})
 
 
+def _queue_news_scope(ctx, market: str, codes: list[str]) -> bool:
+    """把这一屏的标的逐只排进 news 补采队列（D341，与个股页 D339 同一意图）。
+
+    准入闸与个股页同一道（D314）：代码表不认识的票跳过。`enqueue` 幂等，列表反复刷新
+    不刷屏。一只都没排上时返回 False，让文案别说「已排进」那句假话。市场已在路由层
+    校验过（`news_page` 入口挡未配置市场），这里只需逐只 admits。
+    """
+    queued = False
+    for code in codes:
+        if not ctx.symbol_list_store.admits(market, code):
+            continue
+        ctx.backfills_store.enqueue(market, code, NEWS)
+        queued = True
+    return queued
+
+
 def _empty_message(
     *,
+    ctx,
     market: str,
     market_label: str,
     codes: list[str],
@@ -271,7 +290,10 @@ def _empty_message(
         return f"{market_label}新闻源未接入（v0 只接 A 股），这里只有公告。"
     if not codes:
         return f"自选、持仓与观察里还没有{market_label}的标的。"
-    return (
-        f"最近 {NEWS_WINDOW_DAYS} 天没有公告或新闻。盘后任务会自动采集；"
-        f"也可以按代码补一次：sams sync news --market {market} --code {codes[0]}"
-    )
+    # 最后这一支会真的排队（D341）：网页用户没有终端，印命令只会让他对着 serve 占着的
+    # 库敲出 DatabaseLocked。排上了才说「已排进」，一只都没排上就说代码表
+    if _queue_news_scope(ctx, market, codes):
+        tail = "已排进后台补采队列：补完刷新这一页。"
+    else:
+        tail = "代码表里没有这些票，补采排不上——先等代码表同步。"
+    return f"最近 {NEWS_WINDOW_DAYS} 天没有公告或新闻。盘后任务会自动采集；{tail}"

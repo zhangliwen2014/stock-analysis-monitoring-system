@@ -13,6 +13,7 @@ import polars as pl
 
 from sams.datasource.f10 import empty_announcements
 from sams.datasource.news import empty_news
+from sams.storage.repos.symbol_backfills import NEWS
 
 A_ZONE = ZoneInfo("Asia/Shanghai")
 
@@ -180,6 +181,52 @@ def test_a_market_without_a_news_source_says_so(logged) -> None:
     page = logged.client.get("/news?market=HK").text
 
     assert "港股新闻源未接入" in page
+
+
+def test_the_empty_list_queues_news_for_my_symbols(logged) -> None:
+    """空态排进补采队列，而不是印一条网页用户跑不了的命令（D341）。"""
+    ctx = logged.context
+    _symbol(ctx)
+    _watch(ctx)
+
+    page = logged.client.get("/news?market=A").text
+
+    assert "sams sync news" not in page
+    assert "已排进后台补采队列" in page
+    assert ctx.backfills_store.open_for("A", "600519", kind=NEWS) is not None
+
+
+def test_the_empty_list_does_not_promise_a_queue_for_unknown_codes(logged) -> None:
+    """代码表认识的市场里一只表外票：不排，也不说「已排进」（D314/D341）。"""
+    ctx = logged.context
+    ctx.symbol_list_store.upsert_batch(
+        "A",
+        [{"code": "600519", "name": "贵州茅台", "py_initials": "gzmt",
+          "py_full": "guizhoumaotai", "currency": "CNY"}],
+    )
+    _symbol(ctx, code="000001", name="平安银行")
+    _watch(ctx, "000001")
+
+    page = logged.client.get("/news?market=A").text
+
+    assert "代码表里没有这些票" in page
+    assert "已排进后台补采队列" not in page
+    assert "sams sync news" not in page
+    assert ctx.backfills_store.open_for("A", "000001", kind=NEWS) is None
+
+
+def test_a_list_with_news_does_not_queue(logged) -> None:
+    """已有资讯的票照常渲染，不排 news（D341）。"""
+    ctx = logged.context
+    _symbol(ctx)
+    _watch(ctx)
+    _news(ctx, "N1", title="茅台的回购")
+
+    page = logged.client.get("/news?market=A").text
+
+    assert "茅台的回购" in page
+    assert "已排进后台补采队列" not in page
+    assert ctx.backfills_store.open_for("A", "600519", kind=NEWS) is None
 
 
 def test_pagination_keeps_the_filters(logged) -> None:
