@@ -210,17 +210,24 @@ def _missing(spec: BusinessFieldSpec) -> _Draft:
 
 
 def _summary_draft(profile: dict | None) -> _Draft:
-    raw = (profile or {}).get("summary")
+    if profile is None:
+        # 行缺：业务卡不知道有无源/是否在册，不无条件承诺自动补（D336），
+        # 把补采状态指给同页才有三态的 F10「公司概况」卡
+        return _Draft(
+            missing_kind=NOT_DISCLOSED,
+            missing_reason="公司概况还没采集到；补采状态见本页「公司概况」卡",
+        )
+    raw = profile.get("summary")
     text = str(raw).strip() if raw is not None else ""
     if not text:
         return _Draft(
             missing_kind=NOT_DISCLOSED,
-            missing_reason="公司概况没有公司简介（先 `sams sync profile`）",
+            missing_reason="公司概况源没有给公司简介（可在本卡「编辑六项」自行补全）",
         )
     return _Draft(
         value=_first_sentences(text, DRAFT_CHARS),
         source=SOURCE_PROFILE_SUMMARY,
-        as_of=_as_date((profile or {}).get("fetched_at")),
+        as_of=_as_date(profile.get("fetched_at")),
     )
 
 

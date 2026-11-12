@@ -202,6 +202,21 @@ def test_business_partial_shows_the_summary_draft_and_the_missing_rows(logged):
     assert "收入构成" in text and "尚未录入" in text
 
 
+def test_business_partial_blank_summary_says_the_source_gave_none_not_a_command(logged):
+    """概况行在、简介空：业务卡说「源没有给公司简介」，不印命令（D347）。
+
+    铺满同业让「行业地位」那一格算得出草稿——否则它的缺失注记会带上 peers 的行业命令
+    （那是 D348 的另一句），把整卡「无命令」断言搅浑。这里只钉业务卡自己改的那一句。
+    """
+    _six_baijiu(logged.context)
+    _profiles(logged.context, [("A", "600519", "贵州茅台", BAIJIU, "")])
+
+    text = logged.client.get("/api/partials/business?market=A&code=600519").text
+
+    assert "源没有给公司简介" in text
+    assert "sams sync profile" not in text
+
+
 def test_peers_partial_lists_five_peers_and_the_median_with_n(logged):
     _six_baijiu(logged.context)
 

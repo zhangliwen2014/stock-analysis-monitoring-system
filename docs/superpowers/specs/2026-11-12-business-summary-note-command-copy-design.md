@@ -70,4 +70,31 @@ R3-02 点名网页里的命令行话术。个股页「核心业务」卡的第�
 
 ## 回归结果
 
-（待填）
+2026-11-12 实测（TDD：服务两条 + 网页一条先见证 RED——3 failed，旧注记
+「公司概况没有公司简介（先 `sams sync profile`）」仍在；再实现 GREEN）。网页测试改用
+「行在简介空 + 铺满同业」隔离行业地位格的 peers 命令（D348），并临时回退旧码单独见证
+该条 RED（1 failed）后复原。
+
+* 串行 pytest：`test_business_profile.py` + `test_symbol_fundamentals.py` **26 passed**；
+  扩大 blast radius（thesis / layering / screen / screener / business）**1094 passed**；
+  分层 + screener + screen cli 复验 **847 passed**；`ruff check src tests` All checks passed。
+* 生产库副本（`tmp/d347.duckdb`）+ 临时服务 8799，登录 sp1check：
+  * 601333（广深铁路，主档在册、无概况行）业务格印「公司概况还没采集到；补采状态见本页
+    「公司概况」卡」——业务格无命令；
+  * 600519（副本上构造空简介）业务格印「公司概况源没有给公司简介（可在本卡「编辑六项」
+    自行补全）」，整卡无命令（行业地位算得出草稿）。
+  * 601333 卡里残留的 `sams sync profile` 经定位在**行业地位**格（`peers.py:644`
+    「这只票没有行业…先同步公司概况」），属 D348，不在本次范围。验证毕清理副本。
+* **全量套件复跑揪出 3 处失败，均非 D347 引入**（D347 只改 `business.py`，全量复跑里
+  business 相关 0 失败）：
+  * `test_theses_service.py::test_add_still_records_the_thesis_when_no_price_can_be_computed`
+    与 `test_thesis_cli.py::test_add_on_a_stock_without_bars_still_records_the_view_but_exits_one`：
+    **D346 遗漏**——仍断言已去掉的 `sams sync daily`。改断言中性注记（`not in` + wrong-code
+    支的「确认代码」），与 D346「NotAdjustable 出口多态、不补回命令」一致。
+  * `test_layering.py::test_imports_point_downward[cli/screen.py]`：**screen 功能遗留**分层
+    越界——`cli/screen.py` 直接 `from sams.storage.repos.symbol_backfills import …`。
+    令 `services/screener.py` 以 `as` 重导出 `ACTIONS/BARS/FINANCIALS` 作服务层门面
+    （它本就把这三类汇成 `MissingGroup.fix`），`cli/screen.py` 改经 `services.screener` 取常量。
+  * 三处修复后上述 blast radius 全绿；最终全量复跑确认中。
+* 生产 `sams serve`（8765）重启后 `/healthz` 200、`/login` 200、登录 POST 303；线上实测
+  601333 业务格已印新中性注记（重启确实加载了新码）。

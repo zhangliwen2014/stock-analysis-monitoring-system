@@ -117,7 +117,20 @@ def test_a_profile_without_a_summary_leaves_business_not_disclosed(db):
 
     assert business.value is None
     assert business.missing_kind == NOT_DISCLOSED
-    assert "公司概况没有公司简介" in business.missing_reason
+    assert "公司概况源没有给公司简介" in business.missing_reason
+    assert "sams sync profile" not in business.missing_reason
+
+
+def test_a_missing_profile_row_defers_collection_status_to_the_f10_card(db):
+    """概况行根本没采到：业务卡不知道有无源/是否在册，不无条件承诺自动补（D336），
+    把补采状态指给同页那张才有三态的 F10「公司概况」卡，也不印命令。"""
+    business = service(db).read("A", "600519").fields[0]
+
+    assert business.value is None
+    assert business.missing_kind == NOT_DISCLOSED
+    assert "还没采集到" in business.missing_reason
+    assert "公司概况" in business.missing_reason
+    assert "sams sync profile" not in business.missing_reason
 
 
 def test_the_summary_draft_stops_at_a_sentence_and_at_200_chars(db):
