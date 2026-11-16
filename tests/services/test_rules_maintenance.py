@@ -197,10 +197,17 @@ def test_a_position_rule_on_a_flat_account_says_so(container, uid) -> None:
 
 
 def test_a_symbol_that_is_not_in_the_library_is_flagged(container, uid) -> None:
-    """`symbol` 永远展开成一个对象（形状决定的），所以「库里没这条标的」要单独说。"""
+    """`symbol` 永远展开成一个对象（形状决定的），所以「库里没这条标的」要单独说。
+
+    D351：这句注记渠道中性（`view()` 为 CLI/网页共用），不带命令；原文进 `symbol_gap`
+    标记字段，CLI 那一头据此补回 `sams sync daily`，网页原样印中性事实。
+    """
     view = add(container, uid, target_ref="A/600000", name="没同步的那只")
     assert view.targets == 1
     assert any("库里没有" in note for note in view.notes)
+    assert all("sams sync daily" not in note for note in view.notes)
+    assert view.symbol_gap and "库里没有" in view.symbol_gap
+    assert view.symbol_gap in view.notes
 
 
 def test_a_disabled_rule_says_it_is_not_being_evaluated(container, uid) -> None:

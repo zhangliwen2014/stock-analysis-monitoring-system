@@ -284,6 +284,16 @@ def _filters_line(rule) -> str:
     return f"开：{'、'.join(on)}" if on else "全关（默认不降噪）"
 
 
+def _gap_command(rule) -> str:
+    """缺标的 note 的下一步命令（D351）：共享层只说中性事实，CLI 这一头补回完整命令。
+    `--start 起 --end 止` 是日期占位符——上市日未知，不假装能补一个具体区间。"""
+    market, _, code = rule.target_ref.partition("/")
+    return (
+        f"（先 `sams sync daily --market {market} --code {code}"
+        " --start 起 --end 止`，那条链会顺带把主档这一行补上）"
+    )
+
+
 def _print_view(view, username: str) -> None:
     rule = view.rule
     flags = "启用" if rule.enabled else "已停用"
@@ -302,7 +312,8 @@ def _print_view(view, username: str) -> None:
         print(f"  锚    {_anchor_line(rule)}")
     print(f"  过滤  {_filters_line(rule)}")
     for note in view.notes:
-        print(f"  注意  {note}")
+        suffix = _gap_command(rule) if note == view.symbol_gap else ""
+        print(f"  注意  {note}{suffix}")
     print(f"  跑    sams rule check --user {username}"
           + (f" --rule {rule.id}" if not rule.enabled else ""))
 
@@ -367,7 +378,9 @@ def run_list(container: Container, args) -> int:
         )
         print(line)
         if view.notes:
-            print(f"        {view.notes[0]}")
+            first = view.notes[0]
+            suffix = _gap_command(rule) if first == view.symbol_gap else ""
+            print(f"        {first}{suffix}")
     return 0
 
 

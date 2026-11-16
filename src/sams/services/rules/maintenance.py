@@ -45,6 +45,8 @@ class RuleView:
     #: `expand()` 出来的对象数。0 是「这一条现在不会响」，不是「坏了」
     targets: int
     notes: tuple[str, ...] = ()
+    #: 缺标的 note 的中性原文（无缺口为 ""）。CLI 据此补回 sync 命令，网页原样印（D351）
+    symbol_gap: str = ""
 
 
 @dataclass(frozen=True)
@@ -268,8 +270,12 @@ class RuleService:
 
     def view(self, rule: Rule) -> RuleView:
         targets = self.data.expand(rule)
+        gap = self._symbol_gap(rule, len(targets))
         return RuleView(
-            rule=rule, targets=len(targets), notes=self._notes(rule, len(targets))
+            rule=rule,
+            targets=len(targets),
+            notes=self._notes(rule, len(targets), gap),
+            symbol_gap=gap,
         )
 
     # --- 那四件事 -------------------------------------------------------------------------
@@ -330,26 +336,30 @@ class RuleService:
             "存进去只会是一条看着启用、永远不响的规则。先在 [markets.*] 里配上那个市场"
         )
 
-    def _notes(self, rule: Rule, targets: int) -> tuple[str, ...]:
+    def _notes(self, rule: Rule, targets: int, gap: str) -> tuple[str, ...]:
         out: list[str] = []
         if not rule.enabled:
             out.append("已停用：任何一趟求值都不会取用它")
         if targets == 0:
             out.append(self._why_zero(rule))
-        elif rule.target_type == "symbol":
-            market, _, code = rule.target_ref.partition("/")
-            if self.data.symbols.get(market, code) is None:
-                # 下一步指日线那条链而不是一条「补主档」的命令：库里没有别的入口写
-                # `symbols`，而 `SyncService.sync_daily` 在落 K 线时顺带 upsert 它
-                out.append(
-                    f"库里没有 {rule.target_ref} 这条标的：读不到现价就不判任何价格类条件，"
-                    f"先 `sams sync daily --market {market} --code {code}"
-                    " --start 起 --end 止`（那条链会顺带把主档这一行补上）"
-                )
+        elif gap:
+            out.append(gap)
         bad = self._unusable_channels(rule.user_id, rule.channel_ids)
         if bad:
             out.append(f"通道不可用：{'、'.join(bad)} ⇒ 命中只落一条 `no_channel` 记录")
         return tuple(out)
+
+    def _symbol_gap(self, rule: Rule, targets: int) -> str:
+        """缺标的 note 的中性原文（D351）：只说事实，不带命令——`view()` 为 CLI/网页共用，
+        命令由 CLI 那一头据 `symbol_gap` 补回，网页原样印（「对象」列已链到个股页）。
+        库里没有别的入口写 `symbols`，而 `SyncService.sync_daily` 落 K 线时顺带 upsert 它。
+        零对象时不查主档：那是 `_why_zero` 的话，且 `data` 可能是只实现 `expand` 的桩。"""
+        if targets == 0 or rule.target_type != "symbol":
+            return ""
+        market, _, code = rule.target_ref.partition("/")
+        if self.data.symbols.get(market, code) is not None:
+            return ""
+        return f"库里没有 {rule.target_ref} 这条标的：读不到现价就不判任何价格类条件"
 
     def _why_zero(self, rule: Rule) -> str:
         head = f"展开成零个对象（{rule.target_type}:{rule.target_ref}），这一条不会响："

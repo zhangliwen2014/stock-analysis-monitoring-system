@@ -92,4 +92,17 @@ R3-02 点名网页里的命令行话术。规则列表页（`rules.html:39` 原�
 
 ## 回归结果
 
-（待填）
+* **全量串行 pytest**：`5924 passed, 21 deselected, 4767 warnings in 3880.69s (1:04:40)`，
+  退出码 0，无看门狗击杀、无 faulthandler dump。D351 的目标用例（`test_rules_maintenance` /
+  `test_rule_cli` / `test_rules_web` / `test_version_bumps`）都在这 5924 里全绿。
+* **ruff**：`ruff check src tests` → All checks passed。
+* **生产库副本真数据**（`tmp/d351_real.duckdb`，555 条主档）：库里本就有两条缺标的规则
+  （`A/999999` 规则 `92614d5e…`、`ZZ/600519`），正好是真实缺口。
+  * `sams rule show 92614d5e…` 文本：`已停用…` 那条不带命令；`库里没有 A/999999 这条标的…`
+    那条尾部补回完整 `（先 \`sams sync daily --market A --code 999999 --start 起 --end 止\`…）`。
+  * `sams rule show … --json`：`rule.notes = ['已停用…', '库里没有 A/999999 这条标的：读不到现价就不判任何价格类条件']`，
+    整个 JSON 里 `sams sync daily` 出现 0 次（`HAS_CMD: False`）。网页打印的就是这同一份 `view.notes`，
+    故真数据上网页也带不出命令；「对象」列既有的 `/symbol` 链接不变。
+* **旁注（非 D351 引入）**：本次全量运行前，曾有两次在一条非 live、依赖网络的 TLS 用例上挂住
+  （`_ssl__SSLSocket_do_handshake_impl`，与本次改动无关，D351 只动规则 note 文案）；网络正常后
+  一次跑完全绿，未 kill 任何用例。

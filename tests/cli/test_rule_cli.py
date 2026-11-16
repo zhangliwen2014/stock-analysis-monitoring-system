@@ -328,6 +328,34 @@ def test_show_prints_which_filters_are_on_and_why_it_cannot_fire(container, caps
     assert "库里没有" in text  # `RuleService._notes` 那一句，原样上屏
 
 
+def test_show_reappends_the_sync_daily_command_for_a_missing_symbol(container, capsys):
+    """D351：缺标的 note 共享层中性，CLI show 这一头据 `symbol_gap` 补回完整命令。"""
+    row = add_rule(container, capsys, code=BAD_CODE)
+    code, text = out(container, capsys, "show", row["id"], "--user", USER)
+    assert code == 0
+    assert "库里没有" in text
+    assert f"sams sync daily --market A --code {BAD_CODE}" in text
+
+
+def test_list_reappends_the_sync_daily_command_for_a_missing_symbol(container, capsys):
+    """D351：list 只印 `notes[0]`，缺标的那条也要带上补回的命令。"""
+    add_rule(container, capsys, code=BAD_CODE)
+    code, text = out(container, capsys, "list", "--user", USER)
+    assert code == 0
+    assert "库里没有" in text
+    assert f"sams sync daily --market A --code {BAD_CODE}" in text
+
+
+def test_the_json_gap_note_stays_neutral(container, capsys):
+    """D351：`--json` 的 notes 是数据，不带命令（D343）；命令只在 CLI 文本那一头补。"""
+    row = add_rule(container, capsys, code=BAD_CODE)
+    code, data = payload(container, capsys, "show", row["id"], "--user", USER)
+    assert code == 0
+    notes = data["rule"]["notes"]
+    assert any("库里没有" in note for note in notes)
+    assert all("sams sync daily" not in note for note in notes)
+
+
 # ---------- edit ----------
 
 

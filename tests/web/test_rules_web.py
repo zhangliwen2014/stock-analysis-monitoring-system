@@ -974,6 +974,20 @@ def test_the_demo_builds_a_stopped_line_above_the_close_and_marks_it_a_test(
     assert 'href="/alerts/a-1"' in page.text
 
 
+def test_the_rules_list_gap_note_carries_no_command(logged):
+    """D351：标的不在主档时，列表那行 note 中性、无命令；「对象」列仍链到个股页。
+
+    共享层（`RuleService.view`）那句已去命令，网页原样转述即满足 R3-02；导航不靠命令，
+    靠「对象」列既有的 `target_url`。这条钉的是网页这一端真没把命令印出来。
+    """
+    _add(logged, target_ref="A/999999", name="没同步的那只")
+    page = logged.client.get("/rules")
+    assert page.status_code == 200
+    assert "库里没有" in page.text
+    assert "sams sync daily" not in page.text
+    assert 'href="/symbol/A/999999"' in page.text
+
+
 def test_the_demo_without_bars_creates_nothing_and_queues_the_backfill(logged, monkeypatch):
     """没有日线时不留下一条永远判不了的示例：排进补采队列，而不是印命令（D340）。"""
     seen: dict = {}
