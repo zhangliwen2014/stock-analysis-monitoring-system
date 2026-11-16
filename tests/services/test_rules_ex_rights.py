@@ -236,7 +236,9 @@ def test_an_unstamped_row_is_not_judged_on_the_ex_rights_day(db, settings):
     report = Run(container).check(owner)
 
     assert len(report.skipped) == 1
-    assert "rule edit" in report.skipped[0].reason
+    # 上屏的 reason 中性；命令在 fixes 里只给 CLI（D352）
+    assert "sams " not in report.skipped[0].reason
+    assert any("rule edit" in fix for fix in report.skipped[0].fixes)
 
 
 # --- 成本的锚在另一头（`positions.open_ts`）------------------------------------------------

@@ -522,7 +522,9 @@ def test_a_line_without_a_date_stamp_is_skipped_and_names_the_command(h) -> None
 
     assert report.raised == () and len(report.skipped) == 1
     assert report.judged == 1
-    assert "rule edit" in report.skipped[0].reason
+    # 上屏/JSON 的 reason 是中性事实；命令在 fixes 里只给 CLI（D352）
+    assert "sams " not in report.skipped[0].reason
+    assert any("rule edit" in fix for fix in report.skipped[0].fixes)
 
 
 def test_a_move_shows_up_in_the_body_and_the_event(h) -> None:
@@ -544,6 +546,22 @@ def test_a_move_shows_up_in_the_body_and_the_event(h) -> None:
     assert moved[0]["after"] == pytest.approx(9.9)
     assert moved[0]["on"] == "2024-03-01"
     assert moved[0]["ex_dates"] == ["2024-10-26"]
+
+
+def test_a_display_only_gap_keeps_its_command_off_the_alert_body(h) -> None:
+    """「只是显示」那一列搬不动时，注明的句子进告警正文，但不带命令（D352）。
+
+    正文是一份字符串，同时给网页告警页与外部通知器（读的人都没有终端），所以那一路
+    只能整体中性；下一步命令只在 CLI 的 `rule check` 里由 `fixes` 补回。
+    """
+    h.snapshot = snap(**MOVED, target_price=20.0, target_on=None)
+    h.add(params={"price": 11.0}, params_on=STAMPED)
+    report = h.engine().check(USER)
+
+    assert len(report.raised) == 1
+    body = h.sender.sent[0].body
+    assert "目标价" in body
+    assert "sams " not in body and "thesis revise" not in body
 
 
 def test_a_row_missing_its_param_is_reported_not_a_crash(h) -> None:
@@ -594,7 +612,9 @@ def test_two_gaps_report_both_commands(h) -> None:
 
     assert report.raised == () and len(report.skipped) == 1
     reason = report.skipped[0].reason
-    assert "ledger buy" in reason and "thesis revise" in reason
+    fixes = "；".join(report.skipped[0].fixes)
+    assert "sams " not in reason
+    assert "ledger buy" in fixes and "thesis revise" in fixes
 
 
 def test_a_draft_is_judged_with_the_same_numbers_and_writes_no_rows(h) -> None:

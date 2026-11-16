@@ -900,6 +900,8 @@ def test_the_result_page_speaks_each_exit(logged, monkeypatch):
             Skipped(
                 rule_id=rule_id, rule_name="止损", market="A", code="600519",
                 reason="没有 A/600519 过闸的现价：这一趟不判任何价格类条件",
+                # 命令只给 CLI，网页上不许出现（D343/D352）
+                fixes=("跑一次 `sams rule edit` 重填它，日期戳就盖上了",),
             )
         ],
         blocked=[Blocked(rule_id=rule_id, rule_name="止损", reason="这条规则没有账户")],
@@ -912,6 +914,8 @@ def test_the_result_page_speaks_each_exit(logged, monkeypatch):
     assert "冷却：上一条 hit" in page.text
     assert "没有 A/600519 过闸的现价" in page.text
     assert "这条规则没有账户" in page.text
+    # fixes（命令）只给 CLI：网页这一屏原样印中性 reason，不印命令（D343/D352）
+    assert "sams rule edit" not in page.text
     assert "没到" in page.text and "2" in page.text
 
 

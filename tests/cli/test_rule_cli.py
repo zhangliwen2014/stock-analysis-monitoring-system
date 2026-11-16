@@ -587,6 +587,34 @@ def test_a_code_that_is_not_in_the_library_is_skipped_not_fatal(container, capsy
     assert row["raised"] == []
 
 
+def test_check_json_keeps_the_gap_reason_neutral():
+    """`rule check --json` 的 skipped.reason 是中性事实，命令不进退机器可读输出（D343/D352）。"""
+    from datetime import UTC, date, datetime
+
+    from sams.cli.rule import _check_payload
+    from sams.services.rules.engine import RunReport, Skipped
+
+    report = RunReport(
+        as_of=date(2024, 10, 26),
+        now=datetime(2024, 10, 26, tzinfo=UTC),
+        dry_run=False,
+        rules=1,
+        skipped=(
+            Skipped(
+                rule_id="r1",
+                rule_name="线",
+                market="A",
+                code="600519",
+                reason="参数价 不知道是哪天写下的：搬它会少搬，这一条不判。",
+                fixes=("跑一次 `sams rule edit` 重填它，日期戳就盖上了",),
+            ),
+        ),
+    )
+    row = _check_payload(report, "trader", 1)
+    reason = row["skipped"][0]["reason"]
+    assert "sams " not in reason and "rule edit" not in reason
+
+
 def test_one_bad_rule_does_not_stop_the_good_one(container, capsys):
     add_rule(container, capsys)
     add_rule(container, capsys, "--name", "查无此码", code=BAD_CODE)

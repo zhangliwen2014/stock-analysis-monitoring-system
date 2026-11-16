@@ -628,6 +628,9 @@ def _print_check(container: Container, report: RunReport, user, code: int) -> No
         print(f"  压住  {item.rule_name}（{item.market}/{item.code}，{item.stage}）：{item.reason}")
     for item in report.skipped:
         print(f"  判不了  {item.rule_name}（{item.market}/{item.code}）：{item.reason}")
+        # 命令只在这一头补回：网页与 JSON 读到的是中性事实（D343/D352）
+        if item.fixes:
+            print(f"        （{'；'.join(item.fixes)}）")
     for item in report.blocked:
         print(f"  这条规则没跑  {item.rule_name}：{item.reason}")
     if report.rules == 0:

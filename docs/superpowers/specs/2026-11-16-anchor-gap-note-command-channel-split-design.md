@@ -98,3 +98,19 @@ D343 定下的做法是**渠道分流**——共享层（服务、JSON、网页�
   里补回命令，需要把缺口结构随告警一起入库，另起一步。
 * `_verdict` 的 `KeyError` 网、`_no_impl` 等**非 anchor 来源**、但同样含命令的 skipped
   理由，不在本步；它们各自有自己的「下一步」措辞，另案处理。
+
+## 回归结果
+
+* **全量串行 pytest**：`5926 passed, 21 deselected, 4768 warnings in 4055.19s (1:07:35)`，
+  退出码 0，无挂起/看门狗击杀。
+* **ruff**：`ruff check src tests` → All checks passed。
+* **目标子集**（anchor / engine / ex-rights / intraday / web rules / CLI rule）：194 passed。
+* **真数据**（生产库副本 + `sams rule check --dry-run --user sp2expert4`）：4 条规则、判了
+  4 个对象、0 skipped，端到端跑通不崩；真实规则都盖了日期戳，故未触发搬运缺口（那条路由
+  anchor/engine 的单测覆盖）。
+* **渠道分流落地**：
+  * CLI `rule check` 文本在 reason 后补 `（…）` 命令，`--json` 与网页/告警正文只印中性
+    reason（新增 `test_check_json_keeps_the_gap_reason_neutral`、web fake `fixes` 不渲染、
+    engine `test_a_display_only_gap_keeps_its_command_off_the_alert_body` 佐证）。
+  * 告警正文由 `snapshot.missing` 拼出，已整体中性：网页告警页与外部通知器都不再带命令。
+* **旁注**：收尾处有 `nanobind` 引用计数警告，是依赖的环境噪声，不影响退出码（D351 同样出现）。

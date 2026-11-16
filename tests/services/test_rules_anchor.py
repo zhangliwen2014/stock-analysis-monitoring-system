@@ -127,7 +127,8 @@ def test_an_unknown_fill_day_refuses_to_judge_a_price_rule() -> None:
     assert got.params == {"price": 10.0}
     assert got.moves == ()
     assert len(got.blocked) == 1
-    assert "rule edit" in got.blocked[0]
+    # 上屏的那句是中性事实，命令只在 fixes 里给 CLI（D352）
+    assert "sams " not in got.blocked[0] and "rule edit" in got.fixes[0]
 
 
 def test_a_number_older_than_the_local_history_refuses_to_judge() -> None:
@@ -138,7 +139,8 @@ def test_a_number_older_than_the_local_history_refuses_to_judge() -> None:
     rule = make_rule({"price": 10.0}, params_on=date(2023, 5, 6))
     got = move_prices(rule, template_for("stop.fixed"), snap())
     assert got.params == {"price": 10.0}
-    assert got.blocked and "sync daily" in got.blocked[0]
+    assert got.blocked and "sams " not in got.blocked[0]
+    assert "sync daily" in got.fixes[0]
 
 
 def test_the_cost_moves_when_the_position_precedes_the_dividend() -> None:
@@ -170,7 +172,8 @@ def test_a_cost_without_a_fill_day_blocks_only_rules_that_judge_it() -> None:
     )
     assert len(judging.blocked) == 1 and judging.snapshot.avg_cost == 12.0
     # 缺的是建仓日，补 K 线修不好它：那句话指错命令，人就白跑一趟
-    assert "ledger buy" in judging.blocked[0] and "sync daily" not in judging.blocked[0]
+    assert "sams " not in judging.blocked[0]
+    assert "ledger buy" in judging.fixes[0] and "sync daily" not in judging.fixes[0]
     display = move_prices(
         make_rule({}, kind="stop.thesis_drift"), template_for("stop.thesis_drift"), stuck
     )
@@ -192,7 +195,8 @@ def test_a_cost_older_than_the_local_history_points_at_the_bars() -> None:
     )
     assert got.snapshot.avg_cost == 12.0
     assert len(got.blocked) == 1
-    assert "sync daily" in got.blocked[0] and "ledger buy" not in got.blocked[0]
+    assert "sams " not in got.blocked[0]
+    assert "sync daily" in got.fixes[0] and "ledger buy" not in got.fixes[0]
 
 
 def test_the_thesis_line_moves_when_it_has_a_reading_day() -> None:
@@ -219,7 +223,9 @@ def test_a_hand_typed_thesis_line_is_annotated_not_blocked() -> None:
     assert got.blocked == ()
     assert got.snapshot.stop_line == 8.556
     assert got.snapshot.missing and "止损" in got.snapshot.missing[0]
-    assert "thesis revise" in got.snapshot.missing[0]
+    # 注明的句子也去命令：它要上告警正文（D352），下一步不在这一段念
+    assert "sams " not in got.snapshot.missing[0]
+    assert "thesis revise" not in got.snapshot.missing[0]
 
 
 def test_the_target_price_copied_from_the_thesis_moves_too() -> None:
@@ -265,7 +271,8 @@ def test_a_hand_typed_target_blocks_the_rule_that_judges_it() -> None:
     )
     assert got.snapshot.target_price == 20.0
     assert len(got.blocked) == 1
-    assert "--target" in got.blocked[0] and "不判" in got.blocked[0]
+    assert "不判" in got.blocked[0] and "sams " not in got.blocked[0]
+    assert "--target" in got.fixes[0]
 
 
 def test_a_hand_typed_target_is_only_annotated_for_a_rule_that_does_not_judge_it() -> None:
@@ -324,5 +331,6 @@ def test_a_refusal_sentence_names_its_own_fix() -> None:
         template_for("stop.fixed"),
         snap(),
     )
-    assert "rule edit" in no_anchor.blocked[0] and "sync daily" not in no_anchor.blocked[0]
-    assert "sync daily" in too_old.blocked[0] and "rule edit" not in too_old.blocked[0]
+    assert "sams " not in no_anchor.blocked[0] and "sams " not in too_old.blocked[0]
+    assert "rule edit" in no_anchor.fixes[0] and "sync daily" not in no_anchor.fixes[0]
+    assert "sync daily" in too_old.fixes[0] and "rule edit" not in too_old.fixes[0]

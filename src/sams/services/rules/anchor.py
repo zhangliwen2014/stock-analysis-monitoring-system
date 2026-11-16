@@ -81,8 +81,10 @@ class Relocation:
 
     snapshot: Snapshot
     params: dict
-    #: 每一条都是一个「不判」的理由（口径 1）
+    #: 每一条都是一个「不判」的理由（口径 1）；**不含命令**，要上网页/告警正文（D352）
     blocked: tuple[str, ...] = ()
+    #: 与 `blocked` 同位：每一条「不判」下一步要跑的命令。只给 CLI 补回（D343/D352）
+    fixes: tuple[str, ...] = ()
 
     @property
     def moves(self) -> tuple[Moved, ...]:
@@ -108,6 +110,7 @@ def move_prices(rule: Rule, built: Template, snapshot: Snapshot) -> Relocation:
     moved: list[Moved] = []
     annotated: list[str] = []
     blocked: list[str] = []
+    fixes: list[str] = []
     changes: dict[str, object] = {}
 
     def carry(
@@ -144,11 +147,15 @@ def move_prices(rule: Rule, built: Template, snapshot: Snapshot) -> Relocation:
         )
         return arrived, "", ""
 
-    def consequence(reason: str, fix: str, *, judged: bool) -> str:
-        """那两种「搬不动」的后果各是哪句话（口径 1）。"""
+    def consequence(reason: str, *, judged: bool) -> str:
+        """那两种「搬不动」的后果各是哪句话（口径 1）。
+
+        只写后果，**不写命令**：这些话要上网页与告警正文（D352/D343），命令由 CLI
+        据 `Relocation.fixes` 补回——同一件事在两端各念各的渠道该念的那一半。
+        """
         if judged:
-            return f"{reason}：搬它会少搬，这一条不判。{fix}"
-        return f"{reason}：搬它会少搬，屏幕上那一列按原值显示，可能偏高。{fix}"
+            return f"{reason}：搬它会少搬，这一条不判。"
+        return f"{reason}：搬它会少搬，屏幕上那一列按原值显示，可能偏高。"
 
     for param in built.money_params():
         raw = params.get(param.name)
@@ -166,7 +173,8 @@ def move_prices(rule: Rule, built: Template, snapshot: Snapshot) -> Relocation:
             refill="跑一次 `sams rule edit` 重填它，日期戳就盖上了",
         )
         if reason:
-            blocked.append(consequence(reason, fix, judged=True))
+            blocked.append(consequence(reason, judged=True))
+            fixes.append(fix)
         else:
             params[param.name] = arrived
 
@@ -198,8 +206,12 @@ def move_prices(rule: Rule, built: Template, snapshot: Snapshot) -> Relocation:
             float(value), on=on, label=label, column=column, refill=refill
         )
         if reason:
-            sentence = consequence(reason, fix, judged=judged)
-            (blocked if judged else annotated).append(sentence)
+            sentence = consequence(reason, judged=judged)
+            if judged:
+                blocked.append(sentence)
+                fixes.append(fix)
+            else:
+                annotated.append(sentence)
         else:
             changes[column] = arrived
 
@@ -207,4 +219,6 @@ def move_prices(rule: Rule, built: Template, snapshot: Snapshot) -> Relocation:
         snapshot = replace(
             snapshot, moved=tuple(moved), missing=snapshot.missing + tuple(annotated), **changes
         )
-    return Relocation(snapshot=snapshot, params=params, blocked=tuple(blocked))
+    return Relocation(
+        snapshot=snapshot, params=params, blocked=tuple(blocked), fixes=tuple(fixes)
+    )

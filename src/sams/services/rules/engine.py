@@ -152,7 +152,10 @@ class Skipped:
     rule_name: str
     market: str
     code: str
+    #: 中性事实：进网页、JSON、告警正文（D352）
     reason: str
+    #: 只给 CLI `rule check` 补回的下一步命令（D343/D352）；网页/JSON 不读
+    fixes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -520,7 +523,8 @@ class RuleEngine:
             # 两处（成本太老加线没有日期戳），而每一句后面跟着的是**它自己**那条下一步命令，
             # 所以全部带上，只并成一条结论：屏幕上分两行写会让读的人以为是两条规则
             return self._skipped(
-                rule, snapshot.market, snapshot.code, "；".join(placed.blocked)
+                rule, snapshot.market, snapshot.code, "；".join(placed.blocked),
+                fixes=placed.fixes,
             )
         snapshot = placed.snapshot  # 从这一行起，`_one` 往后只认搬完的那一份
         verdict = self._verdict(rule, target, snapshot, evaluate, placed.params)
@@ -825,7 +829,15 @@ class RuleEngine:
             data_on=snapshot.price_on,
         )
 
-    def _skipped(self, rule: Rule, market: str, code: str, reason: str) -> Skipped:
+    def _skipped(
+        self,
+        rule: Rule,
+        market: str,
+        code: str,
+        reason: str,
+        *,
+        fixes: tuple[str, ...] = (),
+    ) -> Skipped:
         """「这一条这一趟没有结论」的共同形状：判不了、搬不动、送不出去，屏幕上同一摞。
 
         合成一摞是刻意的：多一摞就要多一份 CLI、多一份 JSON 字段、多一条退出码规则，
@@ -840,6 +852,7 @@ class RuleEngine:
             market=market,
             code=code,
             reason=reason,
+            fixes=fixes,
         )
 
     def _suppressed(
