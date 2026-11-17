@@ -59,6 +59,7 @@
           <input type="hidden" name="csrf" value="{{ csrf }}">
           <button type="submit">{{ "停用" if row.rule.enabled else "启用" }}</button>
         </form>
+        <a class="muted" href="/rules/{{ row.rule.id }}/delete">删除</a>
       </td>
     </tr>
     {% endfor %}

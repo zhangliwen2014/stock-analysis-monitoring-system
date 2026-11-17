@@ -1139,9 +1139,29 @@ def rule_demo(
     )
 
 
+@router.get("/rules/{rule_id}/delete")
+def rule_delete_page(request: Request, rule_id: str):
+    """删除前的确认屏（R3-12）：修订史跟着一起没，值得当面问一句。
+
+    派生规则删不掉是 §9.2 的刻意设计：这一屏进门就说清，不摆一个必然被拒的按钮。
+    """
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    rule = _own_view(ctx, user, rule_id).rule
+    return request.app.state.web.render(
+        request,
+        "rule_delete.html",
+        title="删除规则",
+        rule=rule,
+        condition=_condition(rule),
+        target=_target_text(ctx, rule),
+        derived=bool(rule.thesis_id),
+    )
+
+
 @router.post("/rules/{rule_id}/remove")
 def rule_remove(request: Request, rule_id: str, _csrf: None = Depends(csrf_protect)):
-    """删除（D231）。网页上只从示例结果页调用；普通规则的删除仍走命令行。
+    """删除。列表与确认屏、示例结果页都走这里。
 
     派生规则删不掉（服务层 `remove` 的那句话，§9.2）：它们只能停用，留一条能查到的
     记录。这里不替它降级成「停用」——那会把用户点的一个动作悄悄换成另一个。

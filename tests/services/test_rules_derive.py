@@ -264,8 +264,10 @@ def test_a_derived_rule_cannot_be_removed_but_can_be_disabled(theses, rules) -> 
     thesis = make_thesis(theses)
     made = RuleDeriver(rules, theses).derive(USER, thesis.id).created
     stop = one(made, "stop.fixed")
-    with pytest.raises(ValidationError, match="不能删除"):
+    with pytest.raises(ValidationError, match="不能删除") as raised:
         rules.remove(stop.id, user_id=USER)
+    # 共享层这句要中性：网页与 JSON 都读它，命令由 CLI 补（D354）
+    assert "sams " not in str(raised.value)
     assert rules.set_enabled(stop.id, False, user_id=USER).enabled is False
 
 

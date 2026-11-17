@@ -520,8 +520,8 @@ def test_remove_wants_yes_and_says_what_it_takes_with_it(container, capsys):
     assert kinds_of(container, capsys) == {}
 
 
-def test_a_derived_rule_cannot_be_removed_and_points_at_disable(container, capsys):
-    """§9.2 那句「不可删除，只能停用」在命令行上的样子：拒绝里要给出那条能走的路。"""
+def test_a_derived_rule_cannot_be_removed_and_the_json_stays_neutral(container, capsys):
+    """§9.2 的拒绝在 JSON 里只讲事实：命令由命令行文本那一头补回（D354）。"""
     thesis = make_thesis(container)
     derive(container, capsys, thesis.id)
     stop = kinds_of(container, capsys)["stop.fixed"]
@@ -529,7 +529,17 @@ def test_a_derived_rule_cannot_be_removed_and_points_at_disable(container, capsy
         container, capsys, "remove", stop["id"], "--user", USER, "--yes"
     )
     assert code == 2
-    assert "不能删除" in got["reason"] and "rule disable" in got["reason"]
+    assert "不能删除" in got["reason"] and "sams " not in got["reason"]
+
+
+def test_a_derived_rule_remove_text_points_at_disable(container, capsys):
+    """终端里仍要给得出那条能走的路：命令是 CLI 自己补的。"""
+    thesis = make_thesis(container)
+    derive(container, capsys, thesis.id)
+    stop = kinds_of(container, capsys)["stop.fixed"]
+    code, text = out(container, capsys, "remove", stop["id"], "--user", USER, "--yes")
+    assert code == 2
+    assert f"`sams rule disable {stop['id']}`" in text
 
 
 # ---------- derive ----------

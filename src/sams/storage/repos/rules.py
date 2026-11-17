@@ -502,8 +502,8 @@ class RuleRepo:
         row = self._require(rule_id, user_id=user_id)
         if row.thesis_id:
             raise ValidationError(
-                f"规则 {row.name} 是从一条观点派生出来的，不能删除，只能停用"
-                "（`sams rule disable`）：「悄悄关掉止损提醒」必须留下一条能查到的记录（§9.2）"
+                f"规则 {row.name} 是从一条观点派生出来的，不能删除，只能停用："
+                "「悄悄关掉止损提醒」必须留下一条能查到的记录（§9.2）"
             )
         with self.db.transaction():
             self.db.execute("DELETE FROM rule_revisions WHERE rule_id = ?", [row.id])

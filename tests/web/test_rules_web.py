@@ -66,6 +66,20 @@ def _add(logged, **overrides) -> str:
     return logged.context.rule_service.add(_alice_id(logged), **kwargs).rule.id
 
 
+def _add_derived(logged, name="赔率不够") -> str:
+    """一条挂在论上的规则：`remove` 对它的拒绝是 §9.2 的那一条。"""
+    ctx = logged.context
+    alice_id = _alice_id(logged)
+    thesis = ctx.theses_store.create(
+        user_id=alice_id, market="A", code="600519", style="value",
+        actor_id=alice_id, now=logged.core.clock.now_utc(),
+    )
+    return _add(
+        logged, kind="thesis.odds_below", name=name, target_type="thesis",
+        target_ref=thesis.id, thesis_id=thesis.id, params={"threshold": 1.5},
+    )
+
+
 def _new_rule_data(logged, **overrides) -> dict:
     data = {
         "csrf": logged.csrf, "kind": "stop.fixed", "name": "茅台止损",
@@ -1020,6 +1034,59 @@ def test_the_demo_rule_can_be_removed_from_its_result_page(logged, monkeypatch):
     assert logged.context.rule_service.list(_alice_id(logged)) == ()
     page = logged.client.get(response.headers["location"])
     assert "规则已删除。" in page.text
+
+
+def test_the_list_offers_a_delete_link_on_every_row(logged):
+    """R3-12：删除入口要在列表上找得到，而不是只留给示例结果页。"""
+    rule_id = _add(logged)
+    text = logged.client.get("/rules").text
+    assert f'href="/rules/{rule_id}/delete"' in text
+
+
+def test_the_delete_page_asks_before_removing(logged):
+    rule_id = _add(logged, name="茅台止损")
+    page = logged.client.get(f"/rules/{rule_id}/delete")
+    assert page.status_code == 200
+    assert "茅台止损" in page.text
+    assert f'action="/rules/{rule_id}/remove"' in page.text
+    assert f'name="csrf" value="{logged.csrf}"' in page.text
+    assert 'href="/rules"' in page.text
+    # 确认屏只读：进一次门不删任何东西
+    assert len(logged.context.rule_service.list(_alice_id(logged))) == 1
+
+
+def test_the_delete_page_confirms_and_removes(logged):
+    rule_id = _add(logged, name="要删的")
+    response = logged.client.post(
+        f"/rules/{rule_id}/remove", data={"csrf": logged.csrf}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/rules?notice=removed"
+    assert logged.context.rule_service.list(_alice_id(logged)) == ()
+    assert "要删的" not in logged.client.get("/rules").text
+
+
+def test_a_derived_rule_gets_an_explanation_not_a_delete_button(logged):
+    """§9.2：派生规则只能停用。确认屏进门就说清，且不带命令行。"""
+    rule_id = _add_derived(logged)
+    page = logged.client.get(f"/rules/{rule_id}/delete")
+    assert page.status_code == 200
+    assert "不能删除" in page.text
+    assert "停用" in page.text
+    assert "sams " not in page.text
+    assert f'action="/rules/{rule_id}/remove"' not in page.text
+
+
+def test_removing_a_derived_rule_directly_stays_neutral(logged):
+    """绕过确认屏直接 POST 也删不掉：拒绝句在网页上是中性事实（D354）。"""
+    rule_id = _add_derived(logged)
+    page = logged.client.post(
+        f"/rules/{rule_id}/remove", data={"csrf": logged.csrf}
+    )
+    assert page.status_code == 400
+    assert "不能删除" in page.text
+    assert "sams " not in page.text
+    assert len(logged.context.rule_service.list(_alice_id(logged))) == 1
 
 
 def test_check_remove_and_demo_are_behind_csrf(logged):

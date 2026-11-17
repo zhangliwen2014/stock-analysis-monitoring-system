@@ -104,3 +104,20 @@ CLI `sams rule remove --yes` 也一直能删。缺的是网页上一条人找得
 * 示例结果页那个直达删除按钮不在本步改道，理由见「方案 1」。
 * `/rules/{id}/delete` 的 POST 别名：只保留 R3-12 提到的直觉地址作 GET 确认屏，
   执行端点继续只有 `/remove` 一个。
+
+## 回归结果
+
+* **全量串行 pytest**：`5936 passed, 21 deselected, 4785 warnings in 3779.66s (1:02:59)`，
+  退出码 0，无挂起/看门狗击杀。
+* **ruff**：`ruff check src tests` → All checks passed。
+* **目标子集**（web rules / CLI rule / services derive）：285 passed。
+* **真数据**（生产库副本 `tmp/d354`，`SAMS_DB_PATH` 指向副本，临时服务 19524/19665）：
+  * `/rules` 每行出现「删除」链接；打开普通规则的确认页 200，含规则名、条件、
+    POST `/rules/{id}/remove`、csrf 与取消链接，页面无任何写操作的 GET 语义。
+  * 副本上造一条临时规则走完确认页删除：303 → `/rules?notice=removed`，列表中消失。
+  * 派生规则确认页 200：只有「不能删除，只能停用」的解释与（启用时的）「回列表点停用」，
+    没有删除按钮/表单，文本不含 `` `sams ``。
+  * 对派生规则直接 POST `/remove`：400，理由中性（含「不能删除」，无 `` `sams ``）。
+  * CLI：派生规则 `rule remove --yes` 文本在拒绝句后补
+    `` （`sams rule disable <id>`） ``，退出码 2；`--json` 的 `reason` 不含 `` `sams ``。
+* **生产重启**：`sams serve` 重启后 `/healthz`、`/login` 均 200。

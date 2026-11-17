@@ -479,7 +479,16 @@ def run_remove(container: Container, args) -> int:
                 f"删除 {view.rule.name} 需要 --yes：修订史跟着一起没，"
                 "此后没人能回答「这条线曾经在哪」。只想让它别响就用 `sams rule disable`"
             )
-        container.rule_service.remove(user.id, args.rule_id)
+        try:
+            container.rule_service.remove(user.id, args.rule_id)
+        except SamsError as exc:
+            # 派生规则的拒绝句在共享层是中性事实；命令只补在命令行文本这一头，
+            # JSON 收原句（D343/D354）
+            if view.rule.thesis_id and not args.json:
+                raise ValidationError(
+                    f"{exc}（`sams rule disable {view.rule.id}`）"
+                ) from exc
+            raise
     except SamsError as exc:
         return refused(args, exc, exit_for(exc))
     if args.json:

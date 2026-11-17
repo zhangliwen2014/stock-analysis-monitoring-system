@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>删除这条规则？</h1>
+  <table>
+    <tr><th>名称</th><td>{{ rule.name }}</td></tr>
+    <tr><th>条件</th><td>{{ condition }}</td></tr>
+    <tr><th>对象</th><td>{{ target }}</td></tr>
+    <tr><th>状态</th><td>{{ "启用" if rule.enabled else "停用" }}</td></tr>
+  </table>
+  {% if derived %}
+  <p><strong>这条规则是从一条观点派生出来的，不能删除，只能停用</strong>：「悄悄关掉止损提醒」必须留下一条能查到的记录。</p>
+  {% if rule.enabled %}<p class="muted">要让它不再响，回列表点「停用」即可。</p>{% endif %}
+  {% else %}
+  <p><strong>删除之后：修订史一起消失</strong>，此后没人能回答「这条线曾经在哪」。</p>
+  <p class="muted">只想让它暂时别响，回列表点「停用」。</p>
+  <form method="post" action="/rules/{{ rule.id }}/remove" class="inline-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">删除这条规则</button>
+  </form>
+  {% endif %}
+  <p><a href="/rules">先不删，回规则列表</a></p>
+</section>
+{% endblock %}
