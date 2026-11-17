@@ -124,6 +124,31 @@ def test_a_failure_is_retried_only_after_the_gap(db):
     assert runs.count() == 2  # 中间那轮等待同样不留行
 
 
+def test_a_retry_inside_the_same_period_is_not_the_first_attempt(db):
+    """同一周期的重试不是「这一周期的第一个结论」：顺延只该在第一次尝试时翻。
+
+    `run_actions` 靠这一格决定要不要把昨天的 deferred 翻回 pending；重试也翻，
+    队头那几条一直失败的老行就会把自己反复翻回队首（D355）。
+    """
+    seen = []
+
+    def job(ctx):
+        seen.append(ctx.first_attempt)
+        raise TransientError("akshare", "boom")
+
+    runner, _, clock, _, spec = harness(db, job)
+    runner.execute(spec, DUE, UNIVERSE)
+    assert seen == [True]
+
+    clock.advance(minutes=RETRY_GAP_MIN)
+    runner.execute(spec, DUE, UNIVERSE)
+    assert seen == [True, False]
+
+    tomorrow = Due(period_key="2024-10-26", as_of=date(2024, 10, 26))
+    runner.execute(spec, tomorrow, UNIVERSE)
+    assert seen == [True, False, True]
+
+
 def test_a_crashed_running_row_is_replaced_only_after_the_limit(db):
     def job(ctx):
         return JobOutcome()

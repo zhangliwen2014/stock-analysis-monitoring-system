@@ -281,6 +281,7 @@ def ctx(
     *codes: str,
     deadline: float | None = None,
     started_at: datetime | None = None,
+    first_attempt: bool = True,
 ) -> JobContext:
     return JobContext(
         period_key="2024-10-25",
@@ -289,6 +290,7 @@ def ctx(
         universe=Universe(by_market={"A": codes}, fx_pairs=()),
         deadline=deadline,
         started_at=started_at,
+        first_attempt=first_attempt,
     )
 
 
@@ -547,6 +549,30 @@ def test_actions_job_rearms_yesterday_deferred_rows(db, settings):
     rearmed = backfills.open_for("A", "601299", kind=ACTIONS)
     assert (rearmed.status, rearmed.tries) == (PENDING, 0)
     assert "1 条" in outcome.note
+
+
+def test_a_retry_in_the_same_period_does_not_rearm_deferred_rows(db, settings):
+    """同一周期的重试不翻顺延：翻了，队头那几条老失败行就会霸住队首（D355）。
+
+    首跑的 note 里「N 条顺延的补采重新排队」只该出现一次；重试再说一遍，说的还是
+    同一批行，而它们下一趟仍排在最前面。
+    """
+    backfills = SymbolBackfillRepo(db)
+    backfills.enqueue("A", "601299", ACTIONS)
+    row = backfills.open_for("A", "601299", kind=ACTIONS)
+    for _ in range(3):
+        backfills.note_failure(row.id, "源链全断")
+    d = replace(deps(db, settings), backfills=backfills)
+
+    retry = run_actions(d, ctx(first_attempt=False))
+    row = backfills.open_for("A", "601299", kind=ACTIONS)
+    assert (row.status, row.tries) == (DEFERRED, 3)
+    assert "顺延的补采重新排队" not in retry.note
+
+    first = run_actions(d, ctx(first_attempt=True))
+    row = backfills.open_for("A", "601299", kind=ACTIONS)
+    assert (row.status, row.tries) == (PENDING, 0)
+    assert "1 条顺延的补采重新排队" in first.note
 
 
 def test_actions_job_bumps_the_gate_because_factors_moved(db, settings):
@@ -1056,6 +1082,18 @@ def test_the_valuation_job_rearms_yesterdays_deferred_rows(db, settings):
     row = backfills.open_for("A", "601299", kind=VALUATION)
     assert (row.status, row.tries) == (PENDING, 0)
     assert "1 条" in outcome.note
+
+
+def test_a_retry_in_the_same_period_does_not_rearm_valuation_rows(db, settings):
+    """四个 job 共用 `_rearm`：这条钉的是「重试不翻」不是 `run_actions` 自己的一行。"""
+    backfills = SymbolBackfillRepo(db)
+    backfills.defer("A", "601299", VALUATION, "孤源 yfinance 连败 10 次")
+    d = replace(deps(db, settings), backfills=backfills)
+    outcome = run_valuation(d, ctx("600519", first_attempt=False))
+
+    row = backfills.open_for("A", "601299", kind=VALUATION)
+    assert (row.status, row.tries) == (DEFERRED, 0)
+    assert "顺延的补采重新排队" not in outcome.note
 
 
 def test_a_truncated_round_asks_a_different_batch_next_time(db, settings):

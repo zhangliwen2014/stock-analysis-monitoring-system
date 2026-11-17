@@ -68,6 +68,10 @@ class JobContext:
     #: 本轮的墙钟截止点，与 `deps.monotonic` 同一把尺（`runner` 算成
     #: `monotonic() + spec.max_wall_s`）。`None` = 不设预算。
     deadline: float | None = None
+    #: 这一轮是不是本周期第一个结论。`run_actions` 那几处用它决定要不要把顺延的
+    #: 补采翻回队列：重试也翻的话，队头那几条一直失败的老行会把自己反复翻回队首，
+    #: 后面的行永远轮不到（D355）。没走 `runner` 的调用方（CLI、测试）默认算首跑。
+    first_attempt: bool = True
 
 
 @dataclass(frozen=True)

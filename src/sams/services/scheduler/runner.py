@@ -116,6 +116,8 @@ class JobRunner:
             # 起跑时刻往下传：它既是按只循环的洗牌种子，也是那条 job 自己的截止点的起点
             started_at=now,
             deadline=None if spec.max_wall_s is None else self.monotonic() + spec.max_wall_s,
+            # 同一周期的重试不是首跑：补采的顺延只在第一个结论那一轮翻（D355）
+            first_attempt=first_verdict,
         )
         try:
             outcome = spec.run(context)

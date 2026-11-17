@@ -254,8 +254,15 @@ def run_bars(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     return outcome
 
 
-def _rearm(deps: JobDeps, kind: str) -> int:
-    """上一趟顺延下来的行今天重新有预算（D330；与 `run_actions` 同一条规矩）。"""
+def _rearm(deps: JobDeps, kind: str, *, first: bool) -> int:
+    """上一趟顺延下来的行今天重新有预算（D330；与 `run_actions` 同一条规矩）。
+
+    只在本周期第一次尝试时翻（D355）：每 10 分钟的重试也翻，队头那几条一直失败的
+    老行会被反复翻回 `pending`/`tries=0`，而它们仍是最早创建的，泵每次取到的还是
+    它们——后面的行（打开页面刚排进来的那种）永远轮不到。
+    """
+    if not first:
+        return 0
     return deps.backfills.rearm_deferred(kind) if deps.backfills is not None else 0
 
 
@@ -273,7 +280,7 @@ def _note_rearmed(outcome: JobOutcome, rearmed: int) -> JobOutcome:
 
 def run_actions(deps: JobDeps, ctx: JobContext) -> JobOutcome:
     # 昨天没补上的行今天重新有预算：这一下是 consumer 那句「等今晚」唯一的兑现（D283）
-    rearmed = _rearm(deps, ACTIONS)
+    rearmed = _rearm(deps, ACTIONS, first=ctx.first_attempt)
     covered = deps.corp_actions.coverage
 
     def one(market: str, code: str) -> int:
@@ -305,7 +312,7 @@ def _bump_fundamentals(deps: JobDeps, outcome: JobOutcome) -> JobOutcome:
 
 
 def run_financials(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    rearmed = _rearm(deps, FINANCIALS)
+    rearmed = _rearm(deps, FINANCIALS, first=ctx.first_attempt)
 
     def one(market: str, code: str) -> int:
         written = deps.fundamentals.sync_financials(
@@ -327,7 +334,7 @@ def run_financials(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
 
 def run_valuation(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    rearmed = _rearm(deps, VALUATION)
+    rearmed = _rearm(deps, VALUATION, first=ctx.first_attempt)
 
     def one(market: str, code: str) -> int:
         start = _window(deps.fundamentals.valuation.latest_date(market, code), ctx.as_of)
@@ -351,7 +358,7 @@ def run_valuation(deps: JobDeps, ctx: JobContext) -> JobOutcome:
 
 
 def run_flow(deps: JobDeps, ctx: JobContext) -> JobOutcome:
-    rearmed = _rearm(deps, FLOW)
+    rearmed = _rearm(deps, FLOW, first=ctx.first_attempt)
 
     def one(market: str, code: str) -> int:
         start = _window(deps.fundamentals.flow.latest_date(market, code), ctx.as_of)

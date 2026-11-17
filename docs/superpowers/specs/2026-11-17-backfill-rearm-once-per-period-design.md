@@ -98,3 +98,22 @@ D43（「查无记录」要每个有能力的源都答）、D279（源冷却）�
 * 不给补采队列加优先级/队首插队（D283 §3.17 的开放问题），本步只修「队头被反复
   翻回」这一条。
 * `_collect` 的按只循环、泵的 20 秒节流、每拍 3 条的吞吐都不改。
+
+## 回归结果
+
+* `ruff check src tests`：All checks passed。
+* 目标三组（`test_scheduler_runner.py`、`test_scheduler_jobs_data.py`、
+  `test_backfill_consumer.py`）：92 passed（1:53）。
+* 全量串行 `pytest -q -p no:cacheprovider`：5939 passed, 21 deselected（1:12:25）。
+* 生产库副本 `tmp/d355`（2026-11-17 14:23 拷贝，不外呼网络）：
+  * 改前快照：`actions` 的 `deferred` 15 条；队头三条（HK 03690 / US AAPL / HK 01021，
+    11-03 创建）全是 `pending/tries=0`，正是被每趟重试翻过面的样子；最近几趟 note
+    分别是 `9/6/3 条顺延的补采重新排队`（14:19 A / 14:08 A / 14:10 US）。
+  * 真 `SymbolBackfillRepo` + 空 universe 跑 `run_actions`：
+    `ctx(first_attempt=False)` 的 note 只有 `0/0 只公司行为`，15 条 `deferred` 原样
+    留在 `deferred`；`ctx(first_attempt=True)` 的 note 变成
+    `0/0 只公司行为，15 条顺延的补采重新排队`，行全部回到 `pending/tries=0`。
+  * 泵算术：每拍 `take_pending(3)`、每条三次失败后转 `deferred`，逐拍取到
+    `[03690,AAPL,01021] → [920162,001246,02495] → [03388,02590,00068] →
+    [00100,02513,NVDA]`，HK/00100 在第 4 拍被取到；改前它永远排在同一批被翻回
+    的行后面。
