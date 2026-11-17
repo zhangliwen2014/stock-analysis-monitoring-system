@@ -626,6 +626,9 @@ def _print_check(container: Container, report: RunReport, user, code: int) -> No
         print(f"        sams alert show {hit.alert_id} --user {user.username}")
     for item in report.suppressed:
         print(f"  压住  {item.rule_name}（{item.market}/{item.code}，{item.stage}）：{item.reason}")
+        # 命令只在这一头补回：网页与 JSON 读到的是中性事实（D343/D353）
+        if item.fixes:
+            print(f"        （{'；'.join(item.fixes)}）")
     for item in report.skipped:
         print(f"  判不了  {item.rule_name}（{item.market}/{item.code}）：{item.reason}")
         # 命令只在这一头补回：网页与 JSON 读到的是中性事实（D343/D352）

@@ -179,6 +179,8 @@ def test_an_empty_watchlist_shows_up_as_a_rule_that_cannot_fire(container, uid) 
     )
     assert view.targets == 0
     assert "自选股清单是空的" in view.notes[0]
+    # 这句注记网页也印（规则详情/试算）：不能带终端里的命令（D353）
+    assert "sams " not in view.notes[0]
 
 
 def test_a_position_rule_on_a_flat_account_says_so(container, uid) -> None:

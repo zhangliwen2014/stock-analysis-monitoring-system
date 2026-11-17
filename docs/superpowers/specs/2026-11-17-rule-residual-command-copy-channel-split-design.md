@@ -108,4 +108,20 @@ D352 的设计文档把非 anchor 来源的残余留在「范围外，另案处�
 
 ## 回归结果
 
-（待填）
+* **全量串行 pytest**：`5930 passed, 21 deselected, 4769 warnings in 4723.30s (1:18:43)`，
+  退出码 0，无挂起/看门狗击杀。
+* **ruff**：`ruff check src tests` → All checks passed。
+* **目标子集**（filters / maintenance / engine / CLI rule / web rules）：206 passed。
+* **真数据**（生产库副本 `tmp/d353`，`SAMS_DB_PATH` 指向副本）：
+  * 副本上造两条规则 + 一条未处理告警：`stop.fixed` 带 `no_open_alert`、`stop.fixed`
+    参数为空（老模板）。
+  * CLI `rule check --user sp2expert4 --dry-run` 文本：`压住 …先处理那一条` 后补
+    `（`sams alert handle` 处理掉那一条）`；`判不了 …请按当前模板重填这条规则。` 后补
+    `（`sams rule edit` 改它（…见 `sams rule kinds`））`；退出码 1。
+  * 同一条命令的 `--json`：两处理由均无 `sams `（`HAS_CMD: False`），且 suppressed 的键
+    仍是 `rule_id/rule_name/market/code/stage/reason`，未新增命令字段。
+  * `rule list --json` 全部 `notes` 无 `sams `（`command-bearing notes: []`）。
+* **网页**：模板只读 `reason`（`partials/rule_outcome.html`），新增用例给假 `Suppressed`
+  带 `fixes` 后断言页面既无 `sams rule edit` 也无 `sams alert handle`。
+* **调度器**：只计数，未改；现有计数用例不变即证没被带歪。
+* **旁注**：`nanobind` 引用计数警告是依赖环境噪声（D351/D352 同样出现），不影响退出码。

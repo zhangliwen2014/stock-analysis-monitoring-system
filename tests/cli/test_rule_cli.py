@@ -615,6 +615,72 @@ def test_check_json_keeps_the_gap_reason_neutral():
     assert "sams " not in reason and "rule edit" not in reason
 
 
+def test_check_json_keeps_the_suppressed_reason_neutral():
+    """「压住」那一摞同理：命令只在文本出口补回，`--json` 只给中性理由（D353）。"""
+    from datetime import UTC, date, datetime
+
+    from sams.cli.rule import _check_payload
+    from sams.services.rules.engine import RunReport, Suppressed
+
+    report = RunReport(
+        as_of=date(2024, 10, 26),
+        now=datetime(2024, 10, 26, tzinfo=UTC),
+        dry_run=False,
+        rules=1,
+        suppressed=(
+            Suppressed(
+                rule_id="r1",
+                rule_name="线",
+                market="A",
+                code="600519",
+                stage="hit",
+                reason=(
+                    "已有一条未处理的 weak 告警在这一只票上；"
+                    "这一条 hit 不比它更响 ⇒ 先处理那一条"
+                ),
+                fixes=("`sams alert handle` 处理掉那一条",),
+            ),
+        ),
+    )
+    row = _check_payload(report, "trader", 0)
+    reason = row["suppressed"][0]["reason"]
+    assert "先处理那一条" in reason
+    assert "sams " not in reason and "alert handle" not in reason
+
+
+def test_check_text_re_appends_the_suppressed_next_step(container, capsys):
+    """文本出口反过来：理由之后要补得出那条命令，否则人就只看见「先处理那一条」（D353）。"""
+    from datetime import UTC, date, datetime
+
+    from sams.cli.rule import _print_check
+    from sams.services.rules.engine import RunReport, Suppressed
+
+    report = RunReport(
+        as_of=date(2024, 10, 26),
+        now=datetime(2024, 10, 26, tzinfo=UTC),
+        dry_run=False,
+        rules=1,
+        suppressed=(
+            Suppressed(
+                rule_id="r1",
+                rule_name="线",
+                market="A",
+                code="600519",
+                stage="hit",
+                reason=(
+                    "已有一条未处理的 weak 告警在这一只票上；"
+                    "这一条 hit 不比它更响 ⇒ 先处理那一条"
+                ),
+                fixes=("`sams alert handle` 处理掉那一条",),
+            ),
+        ),
+    )
+    capsys.readouterr()
+    _print_check(container, report, container.users.get_by_username(USER), 0)
+    text = capsys.readouterr().out
+    assert "先处理那一条" in text and "sams alert handle" in text
+
+
 def test_one_bad_rule_does_not_stop_the_good_one(container, capsys):
     add_rule(container, capsys)
     add_rule(container, capsys, "--name", "查无此码", code=BAD_CODE)

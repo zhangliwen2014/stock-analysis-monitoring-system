@@ -367,7 +367,7 @@ class RuleService:
             return (
                 head
                 + f"{rule.user_id} 的自选股清单是空的：等清单里有标的，这一条自己就响"
-                "（M3-C 没有 `sams watch` 命令，清单的写入口在 M4 那一头）"
+                "（自选清单的维护入口还没上线）"
             )
         if rule.target_type == "position":
             return head + f"账户 {rule.account_id} 现在没有持仓（清仓之后静默，不是坏了）"

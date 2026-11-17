@@ -345,6 +345,9 @@ def test_no_open_alert_suppresses_a_quieter_repeat_on_the_same_symbol(h) -> None
     h.seed_hit(minutes_ago=5, stage="urgent")
     report = h.engine().check(USER)
     assert "未处理" in report.suppressed[0].reason
+    # 同 D353：下一步命令只给 CLI，网页/JSON 读到的理由是中性的
+    assert "sams " not in report.suppressed[0].reason
+    assert any("sams alert handle" in fix for fix in report.suppressed[0].fixes)
 
 
 def test_the_gate_asks_the_calendar_for_the_targets_own_market(h) -> None:
@@ -584,6 +587,9 @@ def test_a_row_missing_its_param_is_reported_not_a_crash(h) -> None:
 
     assert report.raised == () and len(report.skipped) == 1
     assert "那一行是老模板写的" in report.skipped[0].reason
+    # 命令只给 CLI：reason 进网页与 JSON（D353）
+    assert "sams " not in report.skipped[0].reason
+    assert any("sams rule edit" in fix for fix in report.skipped[0].fixes)
 
 
 def test_two_gaps_report_both_commands(h) -> None:

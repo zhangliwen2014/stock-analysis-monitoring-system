@@ -141,7 +141,10 @@ class Suppressed:
     market: str
     code: str
     stage: str
+    #: 中性事实：进网页「压住」、JSON 与文本理由（D353）
     reason: str
+    #: 只给 CLI `rule check` 补回的下一步命令（D343/D353）；网页/JSON 不读
+    fixes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -539,16 +542,16 @@ class RuleEngine:
                     snapshot.account_id,
                 )
             return None
-        reason = run_filters(
+        hit = run_filters(
             rule.filters,
             snapshot=snapshot,
             gate=self._gate(rule, target, snapshot, now, cache),
             verdict=verdict,
             built=built,
         )
-        if reason:
+        if hit.reason:
             # 过滤器挡下的那次确实命中了；不写状态，窗口过后还能再判一次
-            return self._suppressed(rule, snapshot, verdict, reason)
+            return self._suppressed(rule, snapshot, verdict, hit.reason, fixes=hit.fixes)
         # 演练（D231）绕过状态与静音：人点了「示例」，就该看见一条真的送出去
         if is_test:
             if dry_run:
@@ -634,7 +637,12 @@ class RuleEngine:
                 snapshot.market,
                 snapshot.code,
                 f"这条规则用不了 {exc.args[0]!r}：那一行是老模板写的，"
-                "`sams rule edit` 改它（要哪几个、能取哪些值见 `sams rule kinds`）",
+                "请按当前模板重填这条规则。",
+                # 命令只给 CLI：这一句同时进网页「判不了」与 `--json`（D353）
+                fixes=(
+                    "`sams rule edit` 改它"
+                    "（要哪几个、能取哪些值见 `sams rule kinds`）",
+                ),
             )
         # 判「命中」看 `hit is not None` 而不是 `verdict.ok`：状态型命中（`stop.thesis_drift`
         # 那类只报状态、不比数值）的 `Verdict.ok` 是 False，用 `.ok` 会让那一类告警永不投出。
@@ -856,7 +864,13 @@ class RuleEngine:
         )
 
     def _suppressed(
-        self, rule: Rule, snapshot: Snapshot, verdict: Verdict, reason: str
+        self,
+        rule: Rule,
+        snapshot: Snapshot,
+        verdict: Verdict,
+        reason: str,
+        *,
+        fixes: tuple[str, ...] = (),
     ) -> Suppressed:
         return Suppressed(
             rule_id=rule.id,
@@ -865,6 +879,7 @@ class RuleEngine:
             code=snapshot.code,
             stage=verdict.stage,
             reason=reason,
+            fixes=fixes,
         )
 
     def _message(

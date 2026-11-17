@@ -116,7 +116,7 @@ def no_open_alert(snapshot: Snapshot, gate: Gate, verdict: Verdict, built: Templ
     return (
         f"已有一条未处理的 {open_alert.stage} 告警（{open_alert.id}，"
         f"{open_alert.on}）在这一只票上；这一条 {verdict.stage} 不比它更响 ⇒ "
-        "先处理那一条（`sams alert handle`）"
+        "先处理那一条"
     )
 
 
@@ -127,6 +127,23 @@ FILTERS: dict[str, Callable[[Snapshot, Gate, Verdict, Template], str]] = {
     "no_open_alert": no_open_alert,
 }
 
+#: 每个开关挡下时，CLI 那一头补回的下一步。句子本身保持中性：它同时进网页与
+#: `rule check --json`，而那两个出口的读者没有终端（R3-02 / D343 / D353）。
+FILTER_FIXES: dict[str, tuple[str, ...]] = {
+    "no_open_alert": ("`sams alert handle` 处理掉那一条",),
+}
+
+
+@dataclass(frozen=True)
+class FilterHit:
+    """一次压制：中性理由 + 只给 CLI 的下一步（D353）。
+
+    全过开关时 `reason` 为空串、`fixes` 为空元组，调用处照旧用真值判断。
+    """
+
+    reason: str = ""
+    fixes: tuple[str, ...] = ()
+
 
 def run_filters(
     filters: Mapping[str, object],
@@ -135,8 +152,8 @@ def run_filters(
     gate: Gate,
     verdict: Verdict,
     built: Template,
-) -> str:
-    """按 `FILTER_KEYS` 的顺序过一遍**被打开**的开关，第一个命中的那句返回；全过 ⇒ 空串。
+) -> FilterHit:
+    """按 `FILTER_KEYS` 的顺序过一遍**被打开**的开关，第一个命中的那句返回；全过 ⇒ 空理由。
 
     顺序走 `FILTER_KEYS` 而不是 `filters` 的键序：库里那串 JSON 的键序是历史（用户改过
     两次开关，最后一次写进去的顺序谁都没在意），而压制理由要能复算。
@@ -146,5 +163,5 @@ def run_filters(
             continue
         reason = FILTERS[key](snapshot, gate, verdict, built)
         if reason:
-            return reason
-    return ""
+            return FilterHit(reason, FILTER_FIXES.get(key, ()))
+    return FilterHit()

@@ -64,7 +64,7 @@ def run(
         gate=gate,
         verdict=verdict or hit(),
         built=template_for(kind),
-    )
+    ).reason
 
 
 def test_all_four_switches_off_suppresses_nothing() -> None:
@@ -184,6 +184,33 @@ def test_no_open_alert_passes_on_a_stage_word_it_does_not_know() -> None:
     """
     gate = Gate(open_alert=OpenAlert(id="al-legacy", stage="入池", on=date(2026, 10, 20)))
     assert run({"no_open_alert": True}, gate) == ""
+
+
+def test_the_open_alert_filter_names_its_own_next_step_for_the_cli() -> None:
+    """压制的理由进网页与 JSON，命令只给 CLI（D353）：两条渠道各拿各的。"""
+    gate = Gate(open_alert=OpenAlert(id="al-1", stage=HIT, on=date(2026, 10, 20)))
+    got = run_filters(
+        {"no_open_alert": True},
+        snapshot=snap(),
+        gate=gate,
+        verdict=hit(HIT),
+        built=template_for("stop.fixed"),
+    )
+    assert "先处理那一条" in got.reason
+    assert "sams " not in got.reason
+    assert any("sams alert handle" in fix for fix in got.fixes)
+
+
+def test_a_filter_without_a_command_carries_no_fix() -> None:
+    """其余的开关只挡，不给命令：`fixes` 空着，CLI 也就不会凭空印一句下一步。"""
+    got = run_filters(
+        {"time_window": True},
+        snapshot=snap(),
+        gate=at(3),
+        verdict=hit(),
+        built=template_for("stop.fixed"),
+    )
+    assert got.reason and got.fixes == ()
 
 
 def test_the_first_matching_switch_wins_and_says_which() -> None:

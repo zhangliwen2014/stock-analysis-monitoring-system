@@ -894,6 +894,8 @@ def test_the_result_page_speaks_each_exit(logged, monkeypatch):
             Suppressed(
                 rule_id=rule_id, rule_name="止损", market="A", code="600519",
                 stage="hit", reason="冷却：上一条 hit 推出于 10-30 12:00 UTC",
+                # 命令只给 CLI，网页「压住」那一行只印中性理由（D353）
+                fixes=("`sams alert handle` 处理掉那一条",),
             )
         ],
         skipped=[
@@ -914,8 +916,8 @@ def test_the_result_page_speaks_each_exit(logged, monkeypatch):
     assert "冷却：上一条 hit" in page.text
     assert "没有 A/600519 过闸的现价" in page.text
     assert "这条规则没有账户" in page.text
-    # fixes（命令）只给 CLI：网页这一屏原样印中性 reason，不印命令（D343/D352）
-    assert "sams rule edit" not in page.text
+    # fixes（命令）只给 CLI：网页这一屏原样印中性 reason，不印命令（D343/D352/D353）
+    assert "sams rule edit" not in page.text and "sams alert handle" not in page.text
     assert "没到" in page.text and "2" in page.text
 
 
