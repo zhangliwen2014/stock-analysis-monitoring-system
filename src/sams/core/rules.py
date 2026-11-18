@@ -120,6 +120,16 @@ def _choice(name: str, label: str, choices: tuple[str, ...], default: str) -> Pa
     return Param(name=name, label=label, shape="choice", default=default, choices=choices)
 
 
+#: `stop.ma` 的 basis → (屏幕上的名字, 读哪一档周期, 哪条均线)。
+#: 表单的取值表、判定的取列、表单旁「这条线在哪」都读它，三处不各写一份：
+#: 名字写在这里而不是拼出来——「日 MA20」是给人读的词，字段名是给代码读的。
+MA_BASES: dict[str, tuple[str, str, int]] = {
+    "weekly_ma20": ("周 MA20", "week", 20),
+    "daily_ma20": ("日 MA20", "day", 20),
+    "daily_ma60": ("日 MA60", "day", 60),
+}
+
+
 #: 每个 kind 一行。`stop.*` 的严重级别都是 strong：止损是「现在就要动」的事，
 #: 把它配成 mid 就等于让默认路由绕开语音通道（§11 的 DEFAULT_ROUTE）。
 TEMPLATES: dict[str, Template] = {
@@ -153,7 +163,7 @@ TEMPLATES: dict[str, Template] = {
     ),
     "stop.ma": Template(
         "stop.ma", "跌破均线",
-        (_choice("basis", "哪条线", ("weekly_ma20", "daily_ma60"), "weekly_ma20"),),
+        (_choice("basis", "哪条线", tuple(MA_BASES), "weekly_ma20"),),
         severity="strong", stages=True, targets=("symbol", "watchlist", "position", "thesis"),
         intraday=True,
     ),

@@ -167,4 +167,25 @@ def line_at(table: pl.DataFrame, column: str, price: float | None) -> float | No
 
 ## 回归结果
 
-（实现与验证完成后填写。）
+* ruff：改动文件全部 `All checks passed`。
+* 目标四组（core 契约 / rules templates / rules snapshot / rules_web）148 passed；
+  `tests/web/test_rules_form_price.py` 21 passed。
+* 全量（按目录分段，2026-11-18）：analysis 303、core 269、storage 797、datasource 660
+  （21 deselected）、cli 468、services 1560、web 786、monitor 120，顶层 11 个文件 990
+  （adversarial 6 件 165、bootstrap 37、layering 781、migration 5、scheduler 2），合计
+  5953 passed、0 failed、21 deselected，与 `--collect-only` 的 5953/5974 一致。
+  `tests/web` 整段在一个进程里跑到退出时触发 DuckDB/nanobind 的泄漏告警并中止（环境问题，
+  与 D356 记过的 polars spill 清理线程同类），改按 43 个文件逐个进程重跑，全部 rc=0。
+* 生产库副本（`tmp/d357`，`sams serve --port 8766`）：
+  * `/rules/new?kind=stop.ma&target_type=symbol&target_ref=A/600519` 200，基准框旁
+    `周 MA20（后复权均线折回现价）1,316.765 元：这条线在现价下方 8.73%`，并带
+    「最后一根周 K 还没走完」的提醒。
+  * POST `/rules/preview`（`param_basis=daily_ma20`）200：`日 MA20（后复权均线折回现价）
+    1,409.6395 元：这条线在现价下方 2.29%`；与 `/api/symbol/A/600519/bars` 的
+    `main.ma.ma20` 末值按 `close_hfq/price` 折回一致（1519.813178 × 1442.66 ÷
+    1555.414473 = 1409.6395）。
+  * `/rules/new?kind=stop.ma&target_ref=HK/00700` 200：`周 MA20 … 425.9116 港元 …
+    上方 14.43%`。
+  * 以上各页 `sams ` 出现次数均为 0。
+* 生产（8765）重启后：`/healthz` 200、`/login` 200，`/rules`、`/rules/new?kind=stop.ma`
+  未登录时 303 跳登录。

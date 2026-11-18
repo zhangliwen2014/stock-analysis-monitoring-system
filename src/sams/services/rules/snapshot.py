@@ -24,7 +24,14 @@ from sams.core.codes import canonical_code, canonical_market
 from sams.core.config import Settings
 from sams.core.errors import ValidationError
 from sams.core.quotes import Quote, cross_baseline, local_day
-from sams.services._fold import before_last, fold, fold_to_price_basis, high_water, last
+from sams.services._fold import (
+    before_last,
+    fold,
+    fold_to_price_basis,
+    high_water,
+    last,
+    line_at,
+)
 from sams.services.analysis import AnalysisService, SeriesRead
 from sams.services.valuation import ValuationService
 from sams.storage.repos.assumptions import Assumption, AssumptionRepo
@@ -49,11 +56,9 @@ TRAILING_MIN_BARS = 3
 #: 收成常量是因为「盖完报价之后它必须消失」——`apply_quote` 靠字面匹配把它挑出去
 NO_PRICE_MISSING = "没有过闸的现价：这一趟不判任何价格类条件"
 
-#: MA60 要哪一列：`indicators=("ma",)` 产出 ma5/ma10/ma20/ma60/ma120/ma250
-_MA_COLUMN = "ma60"
-
 #: 这一路要算的指标组。ATR 不在这里：它给自己留了一条别人没有的失败闸（最高/最低价
 #: 缺数），与均线同批算的话，一根脏 K 会让整趟读取对这条规则全线不响。单独一路见 `_atr`。
+#: `("ma",)` 一次产出 ma5/ma10/ma20/ma60/ma120/ma250，`stop.ma` 的三条线各取一列。
 _DAILY_INDICATORS = ("ma",)
 
 
@@ -102,6 +107,7 @@ class Snapshot:
     holding_high: float | None = None
     #: 折回现价口径的技术位
     weekly_ma20: float | None = None
+    daily_ma20: float | None = None
     daily_ma60: float | None = None
     atr: float | None = None
     #: 论上那几列 + 本次合成的结论
@@ -287,7 +293,8 @@ class RuleData:
             holding_days=_holding_days(position, as_of),
             holding_high=_holding_high(daily.series.frame, valuation.price, position),
             weekly_ma20=valuation.weekly_ma20,
-            daily_ma60=_fold_line(daily.table, _MA_COLUMN, valuation.price),
+            daily_ma20=line_at(daily.table, "ma20", valuation.price),
+            daily_ma60=line_at(daily.table, "ma60", valuation.price),
             atr=atr,
             stop_line=stop_line,
             target_price=target_price,
@@ -350,11 +357,6 @@ class RuleData:
 
 
 # --- 纯算式（没有 IO，所以模块级）-------------------------------------------------------------
-
-
-def _fold_line(table: pl.DataFrame, column: str, price: float | None) -> float | None:
-    """把后复权口径的一条指标折到现价口径：因子来自**这条**日线序列的当日两个收盘。"""
-    return fold_to_price_basis(last(table, column), fold(price, last(table, "close_hfq")))
 
 
 def _atr(read: SeriesRead, price: float | None, missing: list[str]) -> float | None:

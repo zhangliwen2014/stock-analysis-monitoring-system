@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from sams.analysis.valuation.scoring import item_label
 from sams.core.assumptions import REFUTED, format_value, metric_label, op_label
-from sams.core.rules import HIT, PRE, URGENT, Verdict, tier_of
+from sams.core.rules import HIT, MA_BASES, PRE, URGENT, Verdict, tier_of
 from sams.services.rules.snapshot import Snapshot
 from sams.storage.repos.assumptions import Assumption
 from sams.storage.repos.theses import HIT_STOP, INVALIDATED, Thesis
@@ -210,21 +210,15 @@ def stop_atr(ask: Ask) -> Outcome:
     )
 
 
-#: `basis` 那两个取值 → (取 `Snapshot` 的哪个字段, 那句话里的名字)
-#: 名字写在这里而不是拼出来：「日 MA60」是给人读的词，字段名是给代码读的，
-#: 把 `daily_ma60` 直接上屏等于让用户去猜那是什么意思。
-_MA_LINES = {
-    "weekly_ma20": ("weekly_ma20", "周 MA20"),
-    "daily_ma60": ("daily_ma60", "日 MA60"),
-}
-
-
+#: `basis` 的取值表、屏幕名与读哪条均线都在 `core.rules.MA_BASES`：
+#: 表单下拉、判定取列、表单旁那句「这条线在哪」读的是同一份。
 def stop_ma(ask: Ask) -> Outcome:
-    """`stop.ma`：跌破均线。两条线都在 T-6 折回过，用哪一条由参数说。"""
+    """`stop.ma`：跌破均线。三条线都折回过，用哪一条由参数说。"""
     snapshot = ask.snapshot
     if snapshot.price is None:
         return Outcome(why_not=_no_price(snapshot))
-    field, label = _MA_LINES[str(ask.params["basis"])]
+    field = str(ask.params["basis"])
+    label = MA_BASES[field][0]
     line = getattr(snapshot, field)
     if line is None:
         return Outcome(

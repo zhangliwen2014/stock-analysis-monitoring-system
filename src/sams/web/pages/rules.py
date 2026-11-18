@@ -24,14 +24,23 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
 from sams.core.codes import canonical_code, canonical_market
-from sams.core.errors import DatabaseLocked, SamsError, StorageError, ValidationError
+from sams.core.errors import (
+    CoverageMissing,
+    DatabaseLocked,
+    NotAdjustable,
+    SamsError,
+    StorageError,
+    ValidationError,
+)
 from sams.core.notify import SEVERITIES
-from sams.core.rules import FILTER_KEYS, RULE_KINDS, Template, template_for
+from sams.core.rules import FILTER_KEYS, MA_BASES, RULE_KINDS, Template, template_for
+from sams.services._fold import line_at
 from sams.services.rules.engine import RunReport
 from sams.storage.repos.rules import Rule
 from sams.storage.repos.symbol_backfills import BARS
@@ -246,6 +255,54 @@ def _line_notes(template: Template, values: dict[str, str], view: QuoteView) -> 
     return out
 
 
+def _ma_basis_note(
+    ctx, market: str, code: str, basis: str, view: QuoteView
+) -> str:
+    """`stop.ma` 选的那条均线落在现价哪一侧（R3-13）：值与距离都从过闸序列折回。
+
+    与图表/判停同一条取数路径（`AnalysisService.series`），折回用 `_fold.line_at`：
+    均线在后复权序列上算，这一屏的现价是裸价，不折回来的数不能并排印。说的是位置，
+    不是「会不会触发」——后者归试算的结论。算不出来时只说算不出来，不拿裸价兜底。
+    """
+    if view.price is None or view.price <= 0:
+        return ""
+    entry = MA_BASES.get(basis)
+    if entry is None:
+        # 老值或敲坏的值由引擎的「判不了」那一行说；这一格没有可画的线
+        return ""
+    label, period, window = entry
+    today = ctx.clock.today()
+    try:
+        read = ctx.analysis.series(
+            market,
+            code,
+            start=today - timedelta(days=400),
+            end=today,
+            period=period,
+            indicators=("ma",),
+            windows={"ma": (window,)},
+        )
+    except CoverageMissing:
+        return f"{label}：公司行为覆盖未确认，均线暂时没有数"
+    except NotAdjustable:
+        return f"{label}：复权序列被拒绝，均线暂时没有数"
+    line = line_at(read.table, f"ma{window}", view.price)
+    if line is None:
+        unit = "周 K" if period == "week" else "日线"
+        return f"{label}：{unit}不足 {window} 根，这条线还没有数"
+    gap = (line - view.price) / view.price * 100
+    if abs(gap) < 0.005:
+        where = "这条线就是现价"
+    elif gap > 0:
+        where = f"这条线在现价上方 {gap:.2f}%"
+    else:
+        where = f"这条线在现价下方 {abs(gap):.2f}%"
+    note = f"{label}（后复权均线折回现价）{price(line, view.unit)}：{where}"
+    if period == "week" and read.pending_periods:
+        note += "（最后一根周 K 还没走完，这个读数会跟着它变）"
+    return note
+
+
 def _queue_bars(ctx, market: str, code: str) -> bool:
     """缺日线就排进同一条补采队列（D340，与保存即排同一条 D144 规矩）。
 
@@ -262,7 +319,13 @@ def _queue_bars(ctx, market: str, code: str) -> bool:
     return True
 
 
-def _price_panel(ctx, reader, template: Template, values: dict[str, str]) -> dict:
+def _price_panel(
+    ctx,
+    reader,
+    template: Template,
+    values: dict[str, str],
+    hints: dict[str, str] | None = None,
+) -> dict:
     """表单上方那一格：这一屏挂的那只票此刻是多少钱，或者为什么说不清（R-22）。
 
     读的是 `web/quotes.py` 那一份统一模型——盘中是过闸的报价，休市回落库内最后一根
@@ -312,9 +375,17 @@ def _price_panel(ctx, reader, template: Template, values: dict[str, str]) -> dic
     master = ctx.symbols.get(market, code) or {}
     name = str(master.get("name") or "")
     head = f"{name} {market}/{code}" if name else f"{market}/{code}"
+    lines = _line_notes(template, values, view)
+    if template.kind == "stop.ma":
+        # 编辑页的下拉按约定不预选，库里那份只以提示出现：这一格必须读同一份，
+        # 否则「当前：daily_ma60」旁边会印着周线那条线的距离
+        basis = values.get("param_basis") or (hints or {}).get("basis") or "weekly_ma20"
+        note = _ma_basis_note(ctx, market, code, basis, view)
+        if note:
+            lines["basis"] = note
     return {
         "text": f"{head} 现价 {price(view.price, view.unit)}｜{view.label}｜{view.detail}",
-        "lines": _line_notes(template, values, view),
+        "lines": lines,
     }
 
 
@@ -640,7 +711,7 @@ def _form_page(
     # 现价那一格：与列表、看板、个股页同一份读模型，进这一屏读一次（R-22）
     reader = quote_reader(ctx, web.core, web.core.clock.now_utc())
     # 只敲代码没带市场前缀时不猜：那一格解释的是为什么这一屏给不出价
-    panel = _price_panel(ctx, reader, template, values)
+    panel = _price_panel(ctx, reader, template, values, hints)
     # 模板不收的那一格连名单都不读：`stop.fixed` 那一屏既不要账户也不要论，
     # 那两次查询读回来没人看
     given: dict[str, object] = {

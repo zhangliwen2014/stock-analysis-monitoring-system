@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
+
+from sams.web.display import price as display_price
 
 
 def _alice_id(logged) -> str:
@@ -169,6 +171,98 @@ def test_a_percent_parameter_never_gets_a_line_computed_from_the_price(logged):
     assert page.status_code == 400
     assert 'name="param_pct"' in page.text
     assert "这条线在现价" not in page.text
+
+
+def _seed_history(logged, *, code: str = "600519", n: int = 160, base: float = 100.0,
+                  step: float = 0.5, covered: bool = True) -> list[float]:
+    """整段日线：MA20 与周 MA20 要的根数都够，默认把覆盖确认也记上。
+
+    `covered=False` 是「有日线但没人确认过公司行为」：这种情况下表单旁那句说明
+    必须说读不出，而不是拿裸价算一个看起来正常的数。
+    """
+    today = logged.core.clock.today()
+    days = [today - timedelta(days=n - 1 - i) for i in range(n)]
+    closes = [base + step * i for i in range(n)]
+    if covered:
+        logged.context.corp_actions_coverage.record(
+            "A", code, covered_from=date(2000, 1, 1), covered_to=today,
+            full_history=True, src="akshare",
+        )
+    logged.context.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * n, "code": [code] * n, "date": days,
+                "open": closes, "high": [value * 1.01 for value in closes],
+                "low": [value * 0.98 for value in closes], "close": closes,
+                "volume": [100.0] * n, "amount": [value * 100 for value in closes],
+                "source": ["akshare"] * n,
+            }
+        )
+    )
+    return closes
+
+
+# --- 均线基准线的那一格（R3-13 / D357）------------------------------------------------
+
+
+def test_the_ma_basis_box_shows_the_line_and_its_distance_from_the_price(logged):
+    """R3-13 的另一半：选了日线 MA20 之后，屏幕上要看得见那条线在哪、离现价多远。
+
+    值与距离都按「后复权均线折回现价」算：没有除权时折回因子是 1，所以这里就是
+    末 20 根收盘的均值——引擎判的那条线与表单印的这条必须是同一个数。
+    """
+    closes = _seed_history(logged)
+    ma20 = sum(closes[-20:]) / 20
+    gap = (ma20 - closes[-1]) / closes[-1] * 100
+    page = logged.client.post(
+        "/rules/preview",
+        data=_draft_post(
+            logged, kind="stop.ma", param_price="", param_basis="daily_ma20"
+        ),
+    )
+    assert page.status_code == 200
+    assert "日 MA20（后复权均线折回现价）" in page.text
+    assert display_price(ma20, "元") in page.text
+    assert "这条线在现价下方" in page.text
+    assert f"{abs(gap):.2f}%" in page.text
+    assert "sams " not in page.text
+
+
+def test_the_new_stop_ma_form_shows_the_default_weekly_line(logged):
+    _seed_history(logged)
+    page = _new(logged, kind="stop.ma")
+    assert page.status_code == 200
+    assert "周 MA20（后复权均线折回现价）" in page.text
+    assert "这条线在现价" in page.text
+
+
+def test_the_edit_form_shows_the_line_the_stored_basis_points_at(logged):
+    """编辑页的下拉不预选，库里的选择以提示出现；那条说明必须跟着同一份，不能默认周线。"""
+    _seed_history(logged)
+    view = logged.context.rule_service.add(
+        _alice_id(logged), kind="stop.ma", name="跌破日线", target_type="symbol",
+        target_ref="A/600519", params={"basis": "daily_ma60"},
+    )
+    page = logged.client.get(f"/rules/{view.rule.id}/edit")
+    assert page.status_code == 200
+    assert "日 MA60（后复权均线折回现价）" in page.text
+    assert "周 MA20（后复权均线折回现价）" not in page.text
+
+
+def test_a_line_that_cannot_be_computed_says_so_instead_of_showing_a_number(logged):
+    """有日线、没有覆盖确认：裸价算得出 MA20，但那个数不是技术面读数（D36/D49）。"""
+    first = _seed_history(logged, covered=False)
+    page = logged.client.post(
+        "/rules/preview",
+        data=_draft_post(
+            logged, kind="stop.ma", param_price="", param_basis="daily_ma20"
+        ),
+    )
+    assert page.status_code == 200
+    assert "日 MA20：公司行为覆盖未确认，均线暂时没有数" in page.text
+    assert "后复权均线折回现价" not in page.text
+    assert "sams " not in page.text
+    assert first  # 日线确实在库里，这句拒绝不是「没数据」碰巧撞出来的
 
 
 # --- 保存前试算 --------------------------------------------------------------------------

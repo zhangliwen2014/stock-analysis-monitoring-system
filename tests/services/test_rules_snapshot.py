@@ -350,6 +350,7 @@ def test_the_technical_lines_are_folded_when_a_dividend_sits_inside_the_window(d
     snap = data.read(Target("u1", "A", CODE, None, None), as_of=AS_OF)
     assert snap.price == pytest.approx(10.0)
     assert snap.prev_close == pytest.approx(10.0)
+    assert snap.daily_ma20 == pytest.approx(10.0)
     assert snap.daily_ma60 == pytest.approx(10.0)
     assert snap.weekly_ma20 == pytest.approx(10.0)
     assert snap.atr == pytest.approx(0.2)

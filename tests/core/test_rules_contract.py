@@ -85,8 +85,9 @@ def test_a_stray_param_is_refused_instead_of_being_silently_ignored() -> None:
 
 
 def test_a_choice_param_only_takes_the_listed_values() -> None:
-    with pytest.raises(ValidationError, match="daily_ma60"):
+    with pytest.raises(ValidationError, match="daily_ma20"):
         validate_params("stop.ma", {"basis": "hourly"})
+    assert validate_params("stop.ma", {"basis": "daily_ma20"}) == {"basis": "daily_ma20"}
     assert validate_params("stop.ma", {}) == {"basis": "weekly_ma20"}
 
 

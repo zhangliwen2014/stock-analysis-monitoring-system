@@ -77,12 +77,18 @@ def pct_change(table: pl.DataFrame, column: str) -> float | None:
     return now / prior - 1.0
 
 
+def line_at(table: pl.DataFrame, column: str, price: float | None) -> float | None:
+    """一条后复权均线折到 `price` 这一侧：因子取自它**自己那条序列**的当日两个收盘。
+
+    `price` 是调用方要落脚的那个价（判停用当日裸收盘，表单旁用这一屏的现价）：
+    后复权的绝对水平跟着读取窗口的锚走，只有同一个序列内的比值才与锚无关。
+    """
+    return fold_to_price_basis(last(table, column), fold(price, last(table, "close_hfq")))
+
+
 def weekly_line(weekly_table: pl.DataFrame) -> float | None:
     """周 MA20 折回现价口径：用它**自己那条序列**的当日因子，不借日线的。"""
-    return fold_to_price_basis(
-        last(weekly_table, "ma20"),
-        fold(last(weekly_table, "close"), last(weekly_table, "close_hfq")),
-    )
+    return line_at(weekly_table, "ma20", last(weekly_table, "close"))
 
 
 def steps_after(factors: Sequence[DayFactor], *, after: date) -> tuple[DayFactor, ...]:

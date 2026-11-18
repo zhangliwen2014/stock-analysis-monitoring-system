@@ -490,6 +490,22 @@ def test_an_untouched_choice_leaves_the_value_to_the_template(logged):
     assert rule.params == {"basis": "weekly_ma20"}
 
 
+def test_the_ma_stop_can_be_saved_on_the_daily_twenty(logged):
+    """R3-13：取值表里补上 daily_ma20，提交后库里存的就是它（不是回落到默认周线）。"""
+    page = logged.client.get("/rules/new?kind=stop.ma")
+    assert page.status_code == 200
+    assert 'value="daily_ma20"' in page.text
+    response = logged.client.post(
+        "/rules/new",
+        data=_new_rule_data(logged, kind="stop.ma", name="跌破日线", param_price="",
+                            param_basis="daily_ma20"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+    rule = logged.context.rule_service.list(_alice_id(logged))[0].rule
+    assert rule.params == {"basis": "daily_ma20"}
+
+
 def test_blank_means_unchanged_on_edit_and_default_on_create(logged):
     """同一句「留空」在两张屏上说的是两件事：新建时按配置的来，编辑时是不动这一项。
     措辞跟着 `rule_id` 分头走，否则编辑那一屏上这句话会把人骗去清空一个他不想动的数。"""

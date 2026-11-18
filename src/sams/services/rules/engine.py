@@ -628,7 +628,7 @@ class RuleEngine:
             )
         except KeyError as exc:
             # 那一行是**上一个版本的模板**写的：老行要么缺了模板要的那个键，要么带着模板
-            # 词表里已经没有了的取值（`stop_ma` 查 `_MA_LINES` 就是后面那种）。
+            # 词表里已经没有了的取值（`stop_ma` 查 `MA_BASES` 就是后面那种）。
             # `KeyError` 不是 `SamsError`，命令层那句 `except SamsError` 兜不住它——
             # 折成一句带名字的 skipped，屏幕上出现的是一句话而不是一段栈。
             # 名字取自 `exc.args[0]`：两种情况都是它，所以这里不说是「参数」还是「取值」。

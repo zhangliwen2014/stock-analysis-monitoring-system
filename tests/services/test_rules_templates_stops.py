@@ -174,6 +174,21 @@ def test_ma_stop_can_take_the_daily_sixty() -> None:
     assert got == Outcome()  # quiet 路径只有真正读到日线且三档全不报才会返回
 
 
+def test_ma_stop_can_take_the_daily_twenty() -> None:
+    """R3-13：最常用的一条线是日线 MA20，它不该只因为「没列在取值表里」就判不了。"""
+    got = stop_ma(ask({"basis": "daily_ma20"}, daily_ma20=11.0))
+    assert got.hit is not None
+    assert got.hit.threshold == pytest.approx(11.0)
+    assert got.hit.stage == HIT
+    assert "日 MA20" in got.hit.why
+
+
+def test_a_missing_daily_twenty_names_that_line() -> None:
+    got = stop_ma(ask({"basis": "daily_ma20"}, daily_ma20=None))
+    assert got.hit is None
+    assert "日 MA20" in got.why_not
+
+
 def test_a_missing_ma_names_which_line_is_missing() -> None:
     got = stop_ma(ask({"basis": "daily_ma60"}, daily_ma60=None))
     assert got.hit is None
