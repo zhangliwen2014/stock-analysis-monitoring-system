@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 import polars as pl
 
@@ -23,6 +23,7 @@ from sams.analysis.guard import is_covered
 from sams.analysis.indicators import ma, rsi
 from sams.core.codes import canonical_market
 from sams.core.errors import NotAdjustable
+from sams.services.analysis import SeriesRead
 from sams.storage.repos.bars import BarRepo
 from sams.storage.repos.corp_actions import CorpActionRepo
 from sams.storage.repos.corp_actions_coverage import CorpActionsCoverageRepo
@@ -51,6 +52,19 @@ MIN_BARS = {
     "pos_52w": 250,
 }
 
+#: 个股页那张卡要的九个数（D356）：前四个是均线**水平**，选股那六个是相对均线的偏离。
+CARD_FIELDS: tuple[str, ...] = (
+    "ma5",
+    "ma10",
+    "ma20",
+    "ma60",
+    "chg_20d",
+    "chg_60d",
+    "rsi14",
+    "vol_ratio_5d",
+    "pos_52w",
+)
+
 _SHARE_CHANGING = frozenset({"split", "bonus", "transfer", "rights"})
 
 #: 理由只讲事实（D337）：能补哪一种活由 `fixes` 说，命令由命令行自己附加。
@@ -70,6 +84,19 @@ class TechnicalSnapshot:
     fixes: dict[tuple[str, str], str]
     #: 至少有一个技术字段出数的票数
     computable: int
+
+
+@dataclass(frozen=True)
+class SymbolMetrics:
+    """个股页技术面卡的读数，连同它自己的 as-of 与本地写入时刻（D356）。"""
+
+    values: dict[str, float | None]
+    #: 缺数的那几格为什么没有数
+    reasons: dict[str, str]
+    #: 表里末根 K 线的日期
+    as_of: date
+    #: 那根 K 线本地最后写入的时刻（`bars_daily.updated_at`）；老库没这列时为 None
+    written_at: datetime | None
 
 
 class TechnicalService:
@@ -179,6 +206,63 @@ class TechnicalService:
             fixes=fixes,
             computable=computable,
         )
+
+
+def symbol_metrics(read: SeriesRead, actions: pl.DataFrame) -> SymbolMetrics:
+    """个股页那张技术面卡（D356）：从页面已经拿到的 `SeriesRead` 里取九个数。
+
+    与图表同基：均线直接读 `read.table` 的末行——那是图上那条线的同一列，不是另起
+    一次预热算出来的第二个数。价格类字段一律用后复权列；量比用**不复权**成交量，
+    因为送转那天的「股」与新股的「股」不是同一个单位。
+
+    调用方要用 `series(..., indicators=("ma", "rsi"), windows={"ma": (5, 10, 20, 60)})`
+    拿这份读数——卡片只读已经算好的列，不自己再算一遍。
+    """
+    row = read.table.sort("date").row(-1, named=True)
+    frame = read.series.frame.sort("date")
+    closes = frame["close_hfq"].to_list()
+    out: dict[str, float | None] = dict.fromkeys(CARD_FIELDS)
+    why: dict[str, str] = {}
+
+    for name, window in (("ma5", 5), ("ma10", 10), ("ma20", 20), ("ma60", 60)):
+        value = row.get(name)
+        if value is None:
+            why[name] = f"日线不足 {window} 根：均线按库内全部日线递推"
+        else:
+            out[name] = float(value)
+
+    for name, back, window in (("chg_20d", 21, 20), ("chg_60d", 61, 60)):
+        if len(closes) < back:
+            why[name] = f"日线不足 {back} 根：{window} 日涨跌要末根与第 {back} 根收盘"
+        elif closes[-back] <= 0:
+            why[name] = f"第 {back} 根后复权收盘不是正数：比值没有意义"
+        else:
+            out[name] = closes[-1] / closes[-back] - 1
+
+    # 这三格与选股共用同一套算术（送转/拆股后的量比、52 周位置的分母、RSI 的涨跌）
+    shared, cell_why, _ = _values(read.series, frame, actions)
+    for name in ("rsi14", "vol_ratio_5d", "pos_52w"):
+        out[name] = shared[name]
+        if shared[name] is None:
+            why[name] = _card_reason(name, cell_why[name])
+
+    return SymbolMetrics(
+        values=out,
+        reasons=why,
+        as_of=row["date"],
+        written_at=frame.row(-1, named=True).get("updated_at"),
+    )
+
+
+def _card_reason(name: str, why: str) -> str:
+    """选股那句「按快照日」在个股页没有快照：同一件事换成页面上的说法。"""
+    if why != _need(name):
+        return why
+    return {
+        "rsi14": f"日线不足 {MIN_BARS['rsi14']} 根：RSI14 至少要 15 根收盘",
+        "vol_ratio_5d": f"日线不足 {MIN_BARS['vol_ratio_5d']} 根：量比要末根与前 5 日均量",
+        "pos_52w": f"日线不足 {MIN_BARS['pos_52w']} 根：52 周位置要 250 根后复权收盘",
+    }[name]
 
 
 def _mark(

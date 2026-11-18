@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from urllib.parse import urlencode
 
 import polars as pl
@@ -22,11 +22,12 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from sams.core.business import BUSINESS_FIELD_KEYS
 from sams.core.codes import canonical_code, canonical_market, looks_like_index_code
-from sams.core.errors import NotAdjustable, ValidationError
+from sams.core.errors import CoverageMissing, NotAdjustable, ValidationError
 from sams.services.analysis import parse_period
 from sams.services.decision import CardQuote
 from sams.services.minute import MINUTE_LOOKBACK_DAYS, MINUTE_SCALES
 from sams.services.news import NEWS_MARKETS
+from sams.services.technical import symbol_metrics
 from sams.storage.repos.symbol_backfills import (
     ANNOUNCEMENTS,
     DEFERRED,
@@ -38,7 +39,14 @@ from sams.storage.repos.symbol_backfills import (
 from sams.web.auth import csrf_protect, require_user
 from sams.web.back import local_back
 from sams.web.chart_prefs import CHART_PERIODS, ordered_periods, parse_windows, windows_text
-from sams.web.display import moment_label, pct_class, ratio_num, state_label
+from sams.web.display import (
+    moment_label,
+    pct,
+    pct_class,
+    percent,
+    ratio_num,
+    state_label,
+)
 from sams.web.feed import feed_rows
 from sams.web.forms import form_data, one
 from sams.web.quotes import quote_reader
@@ -108,6 +116,83 @@ def _ref_matches(target_ref: str, market: str, code: str) -> bool:
     ref_market, _, ref_code = target_ref.partition("/")
     ref_market = canonical_market(ref_market)
     return ref_market == market and canonical_code(ref_market, ref_code) == code
+
+
+#: 技术面卡上的九行（D356）：字段 → 屏幕名字 → 这一行的口径。
+#: 口径写在每行自己的说明列里：一句总注挡不住「哪几个数是后复权」这种误读。
+_TECH_ROWS: tuple[tuple[str, str, str], ...] = (
+    ("ma5", "MA5", "后复权均线"),
+    ("ma10", "MA10", "后复权均线"),
+    ("ma20", "MA20", "后复权均线"),
+    ("ma60", "MA60", "后复权均线"),
+    ("chg_20d", "20 日涨跌", "后复权收盘"),
+    ("chg_60d", "60 日涨跌", "后复权收盘"),
+    ("rsi14", "RSI14", "后复权收盘 · Wilder"),
+    ("vol_ratio_5d", "量比（5 日）", "不复权成交量"),
+    ("pos_52w", "52 周位置", "后复权收盘 · 250 交易日区间"),
+)
+
+
+def _tech_text(name: str, value: float | None) -> str:
+    if value is None:
+        return "—"
+    if name.startswith("ma"):
+        return f"{value:,.2f}"
+    if name.startswith("chg_"):
+        return pct(value * 100)
+    if name == "rsi14":
+        return f"{value:.1f}"
+    if name == "vol_ratio_5d":
+        return f"{value:.2f}×"
+    return percent(value, 1)
+
+
+def _technical_card(ctx, market: str, code: str, day: date, no_bars: bool):
+    """技术面卡（D356）：和图表吃同一条过闸序列，没有第二套复权口径。
+
+    只在 A 股出表；港美股与「库里一根都没有」各说各的。复权闸拒数时整张卡退成
+    一句状态，不把页面拖走（R3-01），也不转述异常原文——那段原文里有命令行。
+    """
+    if market != "A":
+        return {"state": "market"}
+    if no_bars:
+        return None
+    latest = ctx.bars.latest_date(market, code)
+    start = min(day, latest) - timedelta(days=400)
+    try:
+        read = ctx.analysis.series(
+            market,
+            code,
+            start=start,
+            end=day,
+            indicators=("ma", "rsi"),
+            windows={"ma": (5, 10, 20, 60)},
+        )
+    except CoverageMissing:
+        return {"state": "coverage"}
+    except NotAdjustable:
+        return {"state": "rejected"}
+    metrics = symbol_metrics(read, ctx.corp_actions.list_for(market, code, until=day))
+    written = (
+        moment_label(metrics.written_at, ctx.settings.server.display_tz)
+        if metrics.written_at
+        else "未知"
+    )
+    return {
+        "state": "",
+        "rows": [
+            {
+                "label": label,
+                "text": _tech_text(name, metrics.values[name]),
+                "note": metrics.reasons.get(name, basis),
+            }
+            for name, label, basis in _TECH_ROWS
+        ],
+        "foot": (
+            f"K 线截至 {metrics.as_of}（本地最后写入 {written}）；"
+            "量比用不复权成交量，均线与涨跌用后复权收盘，不是头部现价"
+        ),
+    }
 
 
 @router.get("/symbol/{market}/{code}")
@@ -194,6 +279,10 @@ def symbol_page(request: Request, market: str, code: str):
         else:
             backfill_note = "已排队，下一拍自动开始（一拍至多三只，前面的队首先走）。"
 
+    # 技术面卡（D356）：图表之后那块读数。与图表同一份过闸序列，所以只在渲染时读一次，
+    # 不进 htmx 局部——它不会随着用户换周期而变（固定看日线末根）。
+    technical = _technical_card(ctx, market, code, core.clock.today(), no_bars)
+
     return web.render(
         request,
         "symbol.html",
@@ -209,6 +298,7 @@ def symbol_page(request: Request, market: str, code: str):
         quote_unit=quote.unit,
         quote_detail=quote.detail,
         decision=decision,
+        technical=technical,
         rules=rules,
         theses=theses,
         alerts=alerts,

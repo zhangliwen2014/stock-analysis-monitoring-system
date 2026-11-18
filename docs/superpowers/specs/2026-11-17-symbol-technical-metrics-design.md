@@ -134,3 +134,23 @@ metrics = symbol_metrics(read, ctx.corp_actions.list_for(market, code, until=day
 * 港美股技术面：日线与公司行为覆盖都不足，v0 维持「只对 A 股」。
 * 图上悬停读数与卡片联动（前端交互）：本步只做服务端卡片。
 * 用户自定义均线窗口是否同步到卡片：本步固定 5/10/20/60，与 R3-15 点名的四个窗口一致。
+
+## 回归结果
+
+* `ruff check` 四个改动文件：All checks passed。
+* 目标三组（`test_technical_metrics` / `test_screener_technical` / `test_symbol`）65 passed（2:02）。
+* 全量串行按目录分 19 段跑完，合计 **5946 passed, 21 deselected**，与 `--collect-only`
+  的 5946/5967 一致，无 failed/error。分段不是为了替这次改动放行：单进程整跑时
+  polars 2.0 的 spill cleaner 偶发死锁（同一用例单独跑能过，采样栈停在
+  `spill_file::CleanRequest::recv`），分段只把这种环境抖动限制在一小段，收集口径与
+  逐段结果都没有变。各段：analysis 303、core 269、storage 797、datasource 660、
+  cli 468、services 1558、web 781、monitor 120、顶层 990（adversarial_* 165、
+  bootstrap 37、layering 781、migration 5、scheduler_acceptance 2）。
+* 生产库副本（`tmp/d356`，`sams serve --port 8766`）：
+  * `/symbol/A/600519` 200。卡片 MA20 = `1,512.65`；`/api/symbol/A/600519/bars` 的
+    `main.ma.ma20` 末值 = `1512.645049…`（同一个数）。`K 线截至 2026-11-17` 与库内
+    `max(date) = 2026-11-17` 一致；「本地最后写入 11-17 15:31」非空。整页无 `sams `。
+  * `/symbol/HK/00700` 200，卡片写「技术面字段 v0 只对 A 股开放」，页内没有 `MA20`。
+* 生产重启后：`/symbol/A/600519` 200（0.36s，卡片有 MA20 与 as-of）、`/healthz` 200、
+  `/login` 200。
+

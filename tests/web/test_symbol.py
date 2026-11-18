@@ -841,6 +841,79 @@ def test_a_coverage_refusal_degrades_the_card_not_the_whole_page(logged):
     # 页面其余部分照常：这只票确实有日线、有主档
     assert _NAME in text
     assert "决策" in text
+    # 技术面卡把「无数」换成一句现在就能兑现的下一步（D356）
+    assert "已把它排进后台补采队列，补完这里自动出数" in text
     # 那句承诺此刻是真的：这一趟渲染走完，队列里就有一条待补的公司行为
     row = logged.context.backfills_store.open_for("A", "600519", kind="actions")
     assert row is not None
+
+
+def _seed_technical(logged, *, n=70, closes=None):
+    """A 股 + 一长串日线 + 覆盖确认：技术面卡要 20/60 根才出得了 MA20/MA60。"""
+    last = date.today() - timedelta(days=4)
+    closes = closes or [1000.0 + i for i in range(n)]
+    logged.context.symbols.upsert(
+        pl.DataFrame(
+            {"market": ["A"], "code": ["600519"], "name": [_NAME], "currency": ["CNY"]}
+        )
+    )
+    logged.context.bars.upsert(
+        pl.DataFrame(
+            {
+                "market": ["A"] * n,
+                "code": ["600519"] * n,
+                "date": [last - timedelta(days=offset) for offset in reversed(range(n))],
+                "close": closes,
+                "volume": [100.0] * n,
+                "source": ["akshare"] * n,
+            }
+        )
+    )
+    logged.context.corp_actions_coverage.record(
+        "A",
+        "600519",
+        covered_from=date(2000, 1, 1),
+        covered_to=last,
+        full_history=True,
+        src="akshare",
+    )
+    return last, closes
+
+
+def test_the_symbol_page_shows_the_technical_readings_on_the_adjusted_basis(logged):
+    """R3-15：图上那条均线要落成数，并且标清基与 as-of（D356）。"""
+    last, closes = _seed_technical(logged)
+
+    page = logged.client.get("/symbol/A/600519")
+    assert page.status_code == 200, page.text[:600]
+    text = page.text
+
+    assert "技术面" in text
+    assert "后复权" in text
+    assert "MA20" in text
+    assert f"{sum(closes[-20:]) / 20:,.2f}" in text
+    assert f"K 线截至 {last}" in text
+    # D283：网页不教人敲命令
+    assert "sams " not in text
+
+
+def test_an_unrecorded_jump_degrades_the_card_not_the_page(logged):
+    """复权序列被拒时卡片说「等它恢复」，不转述异常原文（原文里有命令行）。"""
+    closes = [1000.0 + i for i in range(69)] + [2000.0]
+    _seed_technical(logged, closes=closes)
+
+    page = logged.client.get("/symbol/A/600519")
+
+    assert page.status_code == 200, page.text[:600]
+    assert "复权序列被拒绝" in page.text
+    assert "sams " not in page.text
+
+
+def test_a_hk_symbol_page_says_technical_fields_are_a_only(logged):
+    _seed(logged, market="HK", code="00700")
+
+    page = logged.client.get("/symbol/HK/00700")
+
+    assert page.status_code == 200
+    assert "技术面字段 v0 只对 A 股开放" in page.text
+    assert "MA20" not in page.text

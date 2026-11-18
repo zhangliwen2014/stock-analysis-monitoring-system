@@ -80,6 +80,33 @@
   </ul>
 </section>
 
+{# 技术面读数（D356）：与图上那条均线共用同一条后复权序列。每行自己说口径，
+   缺数的那一格说「为什么没有数」，不让一个无解释的横杠冒充读数。 #}
+{% if technical %}
+<section class="card" id="technical">
+  <h2>技术面{% if not technical.state %} <span class="muted">后复权 · 与图中的均线同基</span>{% endif %}</h2>
+  {% if technical.state == "coverage" %}
+  <p class="muted">公司行为覆盖未确认：打开本页已把它排进后台补采队列，补完这里自动出数。</p>
+  {% elif technical.state == "rejected" %}
+  <p class="muted">复权序列被拒绝：原因见图表上方那一段，技术面读数等它恢复后自动出现。</p>
+  {% elif technical.state == "market" %}
+  <p class="muted">技术面字段 v0 只对 A 股开放。</p>
+  {% else %}
+  <table>
+    <tr><th>读数</th><th>数值</th><th>口径 / 为什么没有数</th></tr>
+    {% for row in technical.rows %}
+    <tr>
+      <td>{{ row.label }}</td>
+      <td class="num">{{ row.text }}</td>
+      <td class="muted">{{ row.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">{{ technical.foot }}</p>
+  {% endif %}
+</section>
+{% endif %}
+
 {# 资料块在图之后、空态之前（D214）：四张表四条读法，不让 K 线等它 #}
 <div hx-get="/api/partials/f10?market={{ market }}&code={{ code }}" hx-trigger="load"
      hx-swap="outerHTML"><p class="muted">资料加载中…</p></div>
