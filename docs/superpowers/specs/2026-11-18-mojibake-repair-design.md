@@ -144,4 +144,24 @@ sams db repair-encoding --apply   # 写回
 
 ## 回归结果
 
-（验证后填）
+* `ruff check`：新增与改动文件全部通过（含 `bootstrap.py` 的 import 排序）。
+* targeted：`tests/core/test_text.py` + `tests/services/test_text_repair.py` +
+  `tests/cli/test_repair_encoding_cli.py` + `tests/web/test_forms_web.py` 共 16 passed；
+  另有跑容器的 `test_prune_cli` / `test_cli` / `test_serve` 102 passed（确认 `ServiceContext`
+  多一个字段没有把装配打散）。
+* 全量分批（`tmp/full_d360_run.sh`，按目录 + web 逐文件 + 根文件共 61 个 chunk）：
+  5916 passed，0 failed，21 deselected（live 标记）。
+  其中 analysis 305、core 273、storage 797、datasource 660（21 deselected）、
+  cli 470、services 1563、monitor 120、web 732、根目录 996。
+  唯一的非 0 返回码是 `tests/web/conftest.py` 的 rc=5——它被 glob 扫进来但没有测试用例，
+  不是失败。
+* 生产库副本 `tmp/d360`：干跑恰好命中两行——
+  `watchlists.note 9d28…/HK/03690: 'éª\x8cæ\x94¶-æ··æ\x8e\x92' -> 验收-混排`、
+  `thesis_events.note b49d…: 'ç\x8e°å\x9cºéª\x8cè¯\x81' -> 现场验证`；
+  `--apply` 后读回两条正确中文，再扫输出「没有可修复的乱码」。
+  两列都是用户私有数据，副本上的 HTTP 页面对他人按 404 处理（不是修复问题），
+  所以副本验证以库内读回为准。
+* 正式库：停 `serve` → 干跑同样两行 → `--apply` 输出「已修复 2 处」→ 再扫
+  「没有可修复的乱码」→ 重启 `serve`（PID 75993），`/healthz` 200。
+  全程未打印密钥、未动通道与账号配置。
+

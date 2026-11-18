@@ -1,4 +1,4 @@
-"""`sams db` —— 建库、迁移状态与保留策略。"""
+"""`sams db` —— 建库、迁移状态、保留策略与存量乱码修复。"""
 
 from __future__ import annotations
 
@@ -82,6 +82,17 @@ def add_to(subparsers) -> None:
     parser.add_argument("--dry-run", action="store_true", help="只打印将删行数，不动库")
     parser.set_defaults(handler=prune)
 
+    parser = actions.add_parser(
+        "repair-encoding",
+        help="把用户输入文本里「UTF-8 被当 latin-1 读」的存量乱码折回正确字符（默认干跑）",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="确认后写回；不加只列出将要改的行",
+    )
+    parser.set_defaults(handler=repair_encoding)
+
 
 def migrate(container, args) -> int:
     newly = container.migrate()
@@ -118,4 +129,18 @@ def prune(container, args) -> int:
     if report.files or report.file_bytes:
         print(f"文件: {verb} {report.files} 个（{report.file_bytes} 字节）")
     print(f"{'预计' if report.dry_run else '合计'}: {report.total} 行")
+    return 0
+
+
+def repair_encoding(container, args) -> int:
+    found = container.text_repair.apply() if args.apply else container.text_repair.scan()
+    for item in found:
+        # before 用 repr：乱码本身常带会被终端吞掉的控制字节，原样印出来对不上行
+        print(f"{item.table}.{item.column} {item.key}: {item.before!r} -> {item.after}")
+    if not found:
+        print("没有可修复的乱码")
+    elif args.apply:
+        print(f"已修复 {len(found)} 处")
+    else:
+        print(f"预计修复 {len(found)} 处；确认后加 --apply 写回")
     return 0

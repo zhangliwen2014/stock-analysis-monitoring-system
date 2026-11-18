@@ -89,6 +89,7 @@ from sams.services.symbol_master import SymbolMasterSyncService
 from sams.services.symbol_search import SymbolSearchService
 from sams.services.sync import SyncService
 from sams.services.technical import TechnicalService
+from sams.services.text_repair import TextRepairService
 from sams.services.theses import ThesisService
 from sams.services.valuation import ValuationService
 from sams.storage.crypto import Cipher, cipher_for
@@ -370,6 +371,8 @@ class ServiceContext:
     heartbeats: HeartbeatRepo
     #: 保留策略（D116）：CLI 与 serve 的常驻维护（以及计划 3 的 admin 健康页）共用这一份
     prune: PruneService
+    #: 存量乱码修复（D360）：`sams db repair-encoding` 与一次性修复共用同一张白名单
+    text_repair: TextRepairService
     #: 常驻调度器（spec §12）：`sams run start|once|jobs` 与健康页的 `[调度]` 读的是同一台
     scheduler: Scheduler
 
@@ -885,6 +888,7 @@ def _context_on(
         annotations=annotation_pruner,
         clock=clock,
     )
+    text_repair = TextRepairService(database)
     # 证伪台账（D232 P0-3b）：调度与论点页读的是同一个服务，判一天的口径只有一份
     assumption_service = AssumptionService(
         assumptions_store, theses_store, fundamentals, users, clock=clock
@@ -1073,6 +1077,7 @@ def _context_on(
         digest=digest,
         heartbeats=heartbeats,
         prune=prune,
+        text_repair=text_repair,
         scheduler=scheduler,
         cipher=cipher,
         notify=notify,

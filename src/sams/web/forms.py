@@ -14,6 +14,7 @@ from __future__ import annotations
 from fastapi import Request
 
 from sams.core.rules import FILTER_KEYS, Template
+from sams.core.text import repair_mojibake
 
 
 def _latin1_defaulted(request: Request) -> bool:
@@ -26,20 +27,6 @@ def _latin1_defaulted(request: Request) -> bool:
         content_type.startswith("application/x-www-form-urlencoded")
         and "charset" not in content_type
     )
-
-
-def _repair_utf8(value: str) -> str:
-    """把 latin-1 读出来的裸 UTF-8 字节折回正确字符：整串能编回 latin-1（每字符
-    < U+0100）且那些字节是**合法** UTF-8 才折，严格失败就原样保留。
-    浏览器一律 percent-encode，解出来是 > U+00FF 的字符会撞 UnicodeEncodeError
-    原样返回；真 latin-1 的裸字节（如 lone 0xE9）过不了 UTF-8 校验，也原样返回。
-    """
-    if value.isascii():
-        return value
-    try:
-        return value.encode("latin-1").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return value
 
 
 async def form_data(request: Request) -> dict[str, list[str]]:
@@ -55,7 +42,7 @@ async def form_data(request: Request) -> dict[str, list[str]]:
         text = value if isinstance(value, str) else ""
         # 只折值不折键：键是代码里的字段名，永远该是 ASCII，出现乱码是请求错不是编码问题
         if repair:
-            text = _repair_utf8(text)
+            text = repair_mojibake(text)
         data.setdefault(key, []).append(text)
     return data
 
