@@ -301,6 +301,17 @@ def test_a_preview_judges_the_draft_and_leaves_the_library_untouched(logged):
     assert logged.context.alert_states.get(uid, "draft", "A", "600519", None) is None
 
 
+def test_the_preview_says_what_it_read_and_that_saving_does_not_enable(logged):
+    """R3-14：试算按收盘口径判，且保存不是启用。"""
+    _seed_close(logged, close=1100.0)
+    page = logged.client.post("/rules/preview", data=_draft_post(logged, param_price="1250"))
+    assert page.status_code == 200
+    assert "收盘口径" in page.text
+    assert "最新一根日线收盘" in page.text
+    assert "没读盘中报价" in page.text
+    assert "保存后规则默认不启用" in page.text
+
+
 def test_the_preview_cannot_be_told_to_write(logged, monkeypatch):
     """只读写在引擎里，不是一个能被网页忘传的开关：网页交不出 `dry_run`，也交不出 `is_test`。
 

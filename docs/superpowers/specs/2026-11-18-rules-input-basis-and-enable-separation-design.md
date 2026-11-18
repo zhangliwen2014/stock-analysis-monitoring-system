@@ -112,4 +112,24 @@ D231（判一次 / 示例演练）、D283（网页不出现命令行）、D357�
 
 ## 回归结果
 
-（实现与验证完成后填写。）
+* ruff：改动文件全部 `All checks passed`。
+* 目标两组：`tests/web/test_rules_web.py` + `tests/web/test_rules_form_price.py` 共 91 passed；
+  新增 5 支测试先红后绿（保存默认停用、勾启用才启用、表单勾选框默认不勾、
+  检查页与预览页的输入基说明）。
+* 全量（按目录/文件分段，2026-11-18）：analysis 303、core 269、storage 797、datasource 660
+  （21 deselected）、cli 468、services 1560、web 790、monitor 120，顶层 11 个文件 990，
+  合计 5957 passed、0 failed、21 deselected，与 `--collect-only` 的 5957/5978 一致。
+  单进程跑整段 `tests/web` 会在退出时触发 DuckDB/nanobind 泄漏告警并截断输出（环境问题，
+  与 D357 同类），本轮起 `web` 与顶层文件从一开始就逐文件分段，各段 rc=0。
+* 生产库副本（`tmp/d358`，`sams serve --port 8766`）：
+  * `POST /rules/new` 不勾启用 → 303 落在 `notice=created_off#<id>`，列表提示
+    「规则已保存，尚未启用：在列表那一行点『启用』。」，该行归在「已停用（1）」组；
+  * 同屏勾启用再建一条 → 303 落在 `notice=created#<id>`，提示「规则已保存并启用。」，
+    该行归在「启用」组；
+  * `/rules/{id}/check`（试算）200：`这一趟按收盘口径判：读每只标的库里最新一根日线
+    收盘，没读盘中报价。启用中的规则在盘中由调度器按实时报价判。`
+  * `POST /rules/preview` 200：`这次试算按收盘口径判：读库里最新一根日线收盘，没读盘中
+    报价。保存后规则默认不启用；启用后调度器会在盘中按实时报价继续看。`
+  * 以上各页 `sams ` 出现次数均为 0。
+* 生产（8765）重启后：`/healthz` 200、`/login` 200，`/rules`、`/rules/new?kind=stop.fixed`
+  未登录时 303 跳登录。

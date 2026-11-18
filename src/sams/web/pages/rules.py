@@ -68,6 +68,8 @@ _form_body = Depends(form_data)
 _SCALARS = (
     "name", "target_type", "target_ref", "severity", "cooldown_min",
     "account_id", "thesis_id",
+    # 保存不是启用：试算回来后那一格还得勾着，人才不用再点一次
+    "enabled",
 )
 
 #: 存不上的挂载对象：`_validate` 见 `portfolio` 就拒（组合级这一层还没有输入，U28），
@@ -81,12 +83,24 @@ _CHANNELS_OFFERED = "channels_offered"
 
 #: 列表顶部那一句只可能是应用自己发的 303：`?notice=` 的原文不进屏幕
 _NOTICES = {
-    "created": "规则已保存。",
+    "created": "规则已保存并启用。",
+    "created_off": "规则已保存，尚未启用：在列表那一行点「启用」。",
     "updated": "规则已更新。",
     "on": "规则已启用。",
     "off": "规则已停用。",
     "removed": "规则已删除。",
 }
+
+#: 两个求值入口的输入基说明（R3-14）：网页这一层都不给行情板，引擎走收盘口径。
+#: 检查页那句要连带说清「盘中是谁在判」，试算那句要连带说清「保存不改启用」。
+_CHECK_BASIS = (
+    "这一趟按收盘口径判：读每只标的库里最新一根日线收盘，没读盘中报价。"
+    "启用中的规则在盘中由调度器按实时报价判。"
+)
+_PREVIEW_BASIS = (
+    "这次试算按收盘口径判：读库里最新一根日线收盘，没读盘中报价。"
+    "保存后规则默认不启用；启用后调度器会在盘中按实时报价继续看。"
+)
 
 #: 阶段的中文名：`STAGES` 那三个词是引擎的词汇，屏幕上要让不看代码的人读得懂
 _STAGE_LABELS = {"pre": "临近", "hit": "命中", "urgent": "紧急"}
@@ -640,7 +654,7 @@ def _check_page(
     """
     web = request.app.state.web
     ctx = web.contexts.current()
-    outcome = _outcome_rows(ctx, request.state.sams_user, report)
+    outcome = _outcome_rows(ctx, request.state.sams_user, report, lead=_CHECK_BASIS)
     return web.render(
         request,
         "rule_check.html",
@@ -870,10 +884,7 @@ def _preview(request: Request, data: dict[str, list[str]], rule_id: str | None =
             ctx,
             user,
             report,
-            lead=(
-                "这次试算读的是最新一根日线收盘，没读盘中报价："
-                "保存后调度器会按实时报价继续看。"
-            ),
+            lead=_PREVIEW_BASIS,
         ),
     )
 
@@ -928,6 +939,8 @@ def rule_create(
     target_type = one(data, "target_type").strip()
     target_ref = one(data, "target_ref").strip()
     thesis_id = one(data, "thesis_id") or None
+    # 保存不是启用（R3-14）：这一格不勾，存下来的是一条停用规则，列表里再点启用
+    enabled = bool(one(data, "enabled").strip())
     if target_type == "thesis" and thesis_id:
         # 挂在论上时，下拉里选中的那一条就是挂载对象：`_validate` 在归一之前先按形状查
         # `target_ref`，要人再把那串 uuid 敲进引用框等于让这个下拉只剩一种用法——产 400
@@ -950,6 +963,7 @@ def rule_create(
             severity=one(data, "severity") or None,
             channel_ids=many(data, "channel_ids"),
             cooldown_min=_cooldown(one(data, "cooldown_min")),
+            enabled=enabled,
         )
     except DatabaseLocked:
         # 库被调度线程握着：那是「过一会儿再建」，不是「你填错了」，交给全局 handler 答 503
@@ -975,7 +989,8 @@ def rule_create(
         if ref_market in ctx.settings.markets:
             ctx.symbol_interest.ensure(ref_market, ref_code, actor=user.username)
     # 回到列表并带上这一条：闪一句「已保存」不够，人得看见它落在哪一行
-    return RedirectResponse(f"/rules?notice=created#{created.rule.id}", status_code=303)
+    notice = "created" if enabled else "created_off"
+    return RedirectResponse(f"/rules?notice={notice}#{created.rule.id}", status_code=303)
 
 
 @router.get("/rules/{rule_id}/edit")

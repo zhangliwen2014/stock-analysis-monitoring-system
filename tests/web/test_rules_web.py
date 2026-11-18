@@ -776,8 +776,27 @@ def test_saving_says_so_on_the_list_it_returns_to(logged):
     assert location.endswith(f"#{rule_id}")
 
     page = logged.client.get(location)
-    assert "规则已保存。" in page.text
+    # R3-14：保存与启用分开——不带启用那一格，存下来的是一条停用规则
+    assert "规则已保存，尚未启用" in page.text
     assert f'id="{rule_id}"' in page.text
+    assert logged.context.rule_service.show(_alice_id(logged), rule_id).rule.enabled is False
+
+
+def test_the_new_form_leaves_enablement_for_a_separate_step(logged):
+    """R3-14：新建那一屏不替人按下「启用」；勾选框在，默认不勾。"""
+    page = logged.client.get("/rules/new?kind=stop.fixed")
+    assert 'name="enabled"' in page.text
+    assert 'name="enabled" value="1" checked' not in page.text
+
+
+def test_saving_with_the_enable_tick_turns_the_rule_on(logged):
+    data = {**_new_rule_data(logged), "enabled": "on"}
+    response = logged.client.post("/rules/new", data=data, follow_redirects=False)
+    assert response.status_code == 303
+    rule = logged.context.rule_service.list(_alice_id(logged))[0].rule
+    assert rule.enabled is True
+    page = logged.client.get(response.headers["location"])
+    assert "规则已保存并启用" in page.text
 
 
 def test_toggling_says_which_way_it_went(logged):
@@ -888,6 +907,19 @@ def test_a_trial_run_says_it_wrote_nothing_and_has_no_alert_link(logged, monkeyp
     assert "试运行" in page.text
     assert 'href="/alerts/' not in page.text
     assert "真跑会写一条告警" in page.text
+
+
+def test_a_trial_run_names_the_close_it_read(logged, monkeypatch):
+    """R3-14：试算读的是收盘，不是盘中报价；这一句要在结果屏上。"""
+    rule_id = _add(logged)
+    _fake_check(monkeypatch, _report(logged, dry_run=True), {})
+    page = logged.client.post(
+        f"/rules/{rule_id}/check", data={"csrf": logged.csrf, "mode": "dry"}
+    )
+    assert page.status_code == 200
+    assert "最新一根日线收盘" in page.text
+    assert "没读盘中报价" in page.text
+    assert "sams " not in page.text
 
 
 def test_each_hit_shows_the_day_its_price_belongs_to(logged, monkeypatch):

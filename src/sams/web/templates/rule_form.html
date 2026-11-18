@@ -135,6 +135,12 @@
       {% endfor %}
     </fieldset>
     {% endif %}
+    {% if not rule_id %}
+    {# R3-14：保存与启用分开。默认不勾：人按「保存」那一刻，调度器不该开始看它。 #}
+    <label class="inline">
+      <input type="checkbox" name="enabled" value="1"{% if values.get("enabled") %} checked{% endif %}> 保存后立即启用（不勾：先存成停用，确认后再启用）
+    </label>
+    {% endif %}
     {# 试算排在保存前面：回车落在第一个提交按钮上，落的是「不写任何东西的那一次」 #}
     <button type="submit" formaction="{{ "/rules/" + rule_id + "/edit/preview" if rule_id else "/rules/preview" }}">试算（不保存）</button>
     <button type="submit">保存</button>
