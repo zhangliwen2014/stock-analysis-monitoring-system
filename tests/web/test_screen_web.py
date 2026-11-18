@@ -1110,3 +1110,42 @@ def test_the_list_says_when_the_current_version_last_ran(logged_screen):
     )
     page = logged_screen.client.get("/screen")
     assert "没跑过" not in page.text
+
+
+def test_result_cells_follow_the_unit_each_field_declares(logged_screen):
+    """R3-25：条件摘要说「0.15 = 15%」，结果格就不能把 0.20 原样印出来。"""
+    seed(logged_screen.context, snap("600519"))
+    FinancialRepo(logged_screen.context.db).upsert(
+        pl.DataFrame(
+            [
+                {
+                    "market": "A",
+                    "code": "600519",
+                    "report_date": date(2025, 12, 31),
+                    "published_date": date(2026, 3, 20),
+                    "roe": 0.20,
+                    "debt_ratio": 0.30,
+                    "source": "akshare",
+                }
+            ]
+        )
+    )
+    page = logged_screen.client.get(
+        "/screen",
+        params=[
+            ("market", "A"),
+            ("f", "roe"),
+            ("o", ">="),
+            ("v", "0.1"),
+            ("f", "debt_ratio"),
+            ("o", "<="),
+            ("v", "0.9"),
+            ("f", "pct_chg"),
+            ("o", ">="),
+            ("v", "0"),
+        ],
+    )
+    assert page.status_code == 200
+    assert '<td class="num">20.00%</td>' in page.text
+    assert '<td class="num">30.00%</td>' in page.text
+    assert '<td class="num">1.00%</td>' in page.text

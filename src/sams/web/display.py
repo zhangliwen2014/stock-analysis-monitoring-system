@@ -117,6 +117,22 @@ def ratio_pct(value: float | None, digits: int = 2) -> str:
     return f"{ratio_num(value, digits):.{digits}f}%"
 
 
+def screen_value(unit: str, value: float | None) -> str:
+    """选股结果格按字段自述的口径印（R3-25）。
+
+    `Field.unit` 已经写明「小数比值（0.15 = 15%）」或「百分数（1.85 = 1.85%）」，
+    同一页的条件摘要也照着它说；结果格再按引擎原值印 0.2315 就是两个口径。
+    倍 / 元 / 亿元 / 0–100 保持原值：它们没有这一层换算。
+    """
+    if value is None:
+        return "—"
+    if unit.startswith("小数比值"):
+        return ratio_pct(value, 2)
+    if unit.startswith("百分数"):
+        return f"{value:.2f}%"
+    return f"{value:g}"
+
+
 def money(value: float | None, currency: str = "") -> str:
     if value is None:
         return "—"

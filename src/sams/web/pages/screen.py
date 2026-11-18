@@ -26,7 +26,7 @@ from sams.services.screener import preset_strategy_id
 from sams.storage.repos.symbol_backfills import ACTIONS, BARS, FINANCIALS
 from sams.storage.repos.watchlists import MAX_ITEMS_PER_USER
 from sams.web.auth import csrf_protect, require_user
-from sams.web.display import moment_label, price
+from sams.web.display import moment_label, price, screen_value
 from sams.web.forms import form_data, many, one
 from sams.web.quotes import QuoteView, price_unit, quote_reader
 
@@ -35,6 +35,9 @@ router = APIRouter()
 PAGE_SIZE = 50
 MISSING_CODES = 20
 STALE_DAYS = 3
+
+#: 结果格按每个字段自己在词表里声明的单位印（R3-25）
+_SPECS = {item.name: item for item in FIELDS}
 
 #: 队列里每种活在这一页的叫法（D337）：按钮旁的说明与 notice 都按它说话
 FIX_LABELS = {
@@ -586,7 +589,7 @@ def _hit_row(
         "code": hit.code,
         "name": hit.name or "—",
         "cells": [
-            "—" if hit.values.get(item.field) is None else f"{hit.values[item.field]:g}"
+            screen_value(_SPECS[item.field].unit, hit.values.get(item.field))
             for item in conditions
         ],
         "price": price_text,

@@ -469,3 +469,25 @@ def test_trade_plan_labels_the_lookback_the_caller_actually_used():
     assert f"过去 {VALUE.param('target_lookback_days'):g} 日高点" in wide.target.evidence, (
         "不传就按模板那个数说，别在调用方留一个必须记得传的暗参数"
     )
+
+
+def test_the_percentile_in_evidence_is_rounded_to_a_readable_position():
+    """R3-25：分位是 0–100 的位置，句子里只留一位小数。"""
+    got = entry_zone(
+        rule="near_fair_low",
+        price=30.0,
+        fair_low=24.0,
+        weekly_ma20=None,
+        pr_percentile=87.0902,
+        entry_band_pct=0.05,
+        percentile_entry_max=20.0,
+    )
+    assert "分位 87.1%" in got.reason
+    assert "87.0902" not in got.reason
+
+
+def test_a_penny_fair_price_is_not_printed_with_machine_precision():
+    """R3-25：合理区间算出来的仙股价也不能把 0.0092859… 原样印出来。"""
+    got = fair_band(price=1.0, pr=53.85, fair_pr_low=0.5, fair_pr_high=1.0, basis=BASIS_PE)
+    assert "0.0093" in got.evidence
+    assert "0.0092859" not in got.evidence

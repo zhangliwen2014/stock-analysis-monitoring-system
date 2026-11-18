@@ -140,4 +140,29 @@ def _fmt(value: float | None) -> str:
 
 ## 回归结果
 
-（验证后填）
+**ruff**：`ruff check` 对改动的五个文件全部通过。
+
+**targeted**：
+
+* `tests/analysis/test_valuation_compose.py` + `tests/web/test_screen_web.py`
+  合计 92 passed；
+* 加上 `tests/analysis`、`tests/services/test_valuation_percentiles.py`、
+  `tests/services/test_valuation_read.py`、`tests/services/test_decision_service.py`、
+  `tests/web/test_symbol.py`、`tests/web/test_theses_web.py` 合计 430 passed。
+
+**全量**（分批串行，2026-11-18）：
+
+* 60 段全部 `rc=0`：`tests/analysis` 305、`tests/core` 269、`tests/storage` 797、
+  `tests/datasource` 660（21 deselected）、`tests/cli` 468、`tests/services` 1560、
+  `tests/web` 逐文件合计 791、`tests/monitor` 120、根目录各文件 990；
+* 合计 5960 passed、0 failed，与收集数一致（比上一轮多 3 条：本轮新增的两个
+  compose 用例 + 一个选股页用例）。
+
+**生产库副本**（`tmp/d359`，8766 端口，验证用户 `verify-d359`）：
+
+* `/screen?market=A&f=pr_annual<=0.5&f=debt_ratio<=0.9`：
+  100 个结果格全部带 `%`（如 `9.16%`、`29.88%`），没有 5 位以上的裸小数；
+* `/symbol/A/601318`：证据句「分位 79.8% 不在「便宜的那一档」里（闸门 20%）」，
+  整页没有 `0.xxxxx` 式的机器精度；
+* 两页都不含 `sams ` 命令串（D283）；
+* 验证完已停掉 8766 上的副本进程，未写生产库、未动生产通道。

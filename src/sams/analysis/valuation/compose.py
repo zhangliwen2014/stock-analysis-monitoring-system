@@ -104,7 +104,11 @@ class Plan:
 
 
 def _fmt(value: float | None) -> str:
-    return "无" if value is None else f"{value:g}"
+    """句子里的数最多 4 位小数（R3-25）：`:g` 会把 0.00929805 原样印出来。"""
+    if value is None:
+        return "无"
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
 
 
 def _refused(key: str, formula: str, why: str) -> Level:
@@ -152,8 +156,8 @@ def fair_band(
         "fair",
         min(low, high),
         max(low, high),
-        f"{formula}：现价 {price:g} ÷ 现在的 PR {pr:g} × 目标 PR "
-        f"{fair_pr_low:g}~{fair_pr_high:g} ⇒ {min(low, high):g}~{max(low, high):g}"
+        f"{formula}：现价 {_fmt(price)} ÷ 现在的 PR {_fmt(pr)} × 目标 PR "
+        f"{_fmt(fair_pr_low)}~{_fmt(fair_pr_high)} ⇒ {_fmt(min(low, high))}~{_fmt(max(low, high))}"
         f"（{_BASIS_NOTES[basis]}）",
     )
 
@@ -220,7 +224,7 @@ def _entry_near_fair_low(
             None,
             None,
             formula,
-            f"没有历史分位读数，闸门（< {percentile_entry_max:g}%）无法判断："
+            f"没有历史分位读数，闸门（< {percentile_entry_max:.0f}%）无法判断："
             "先算 PR 分位（`pr_percentile`）",
         )
     if pr_percentile >= percentile_entry_max:
@@ -229,7 +233,8 @@ def _entry_near_fair_low(
             None,
             None,
             formula,
-            f"分位 {pr_percentile:g}% 不在「便宜的那一档」里（闸门 {percentile_entry_max:g}%）："
+            f"分位 {pr_percentile:.1f}% 不在「便宜的那一档」里"
+            f"（闸门 {percentile_entry_max:.0f}%）："
             "这一档的入场条件没到，不是给出一个买入区让你追",
         )
     low, high = _ordered_band(
@@ -237,12 +242,12 @@ def _entry_near_fair_low(
     )
     ready = price <= high
     tail = (
-        f"现价 {price:g} 已在买入区上限 {high:g} 之下 ⇒ 条件已到"
+        f"现价 {_fmt(price)} 已在买入区上限 {_fmt(high)} 之下 ⇒ 条件已到"
         if ready
-        else f"现价 {price:g} 还在买入区上限 {high:g} 之上"
+        else f"现价 {_fmt(price)} 还在买入区上限 {_fmt(high)} 之上"
     )
     under = (
-        f"（现价低于合理下限 {low:g}：这是「比下限还便宜」，不是等跌到 {low:g} 才买）"
+        f"（现价低于合理下限 {_fmt(low)}：这是「比下限还便宜」，不是等跌到 {_fmt(low)} 才买）"
         if price < low
         else ""
     )
@@ -250,11 +255,14 @@ def _entry_near_fair_low(
         "entry",
         low,
         high,
-        f"{formula}：合理下限 {fair_low:g} ± {entry_band_pct:.0%} ⇒ {low:g}~{high:g}；"
-        f"分位 {pr_percentile:g}% 通过闸门 {percentile_entry_max:g}%；{tail}{under}",
+        f"{formula}：合理下限 {_fmt(fair_low)} ± {entry_band_pct:.0%} ⇒ {_fmt(low)}~{_fmt(high)}；"
+        f"分位 {pr_percentile:.1f}% 通过闸门 {percentile_entry_max:.0f}%；{tail}{under}",
         ""
         if ready
-        else f"现价 {price:g} 还在买入区上限 {high:g} 之上：这一档要等回落到 {high:g} 以下",
+        else (
+            f"现价 {_fmt(price)} 还在买入区上限 {_fmt(high)} 之上："
+            f"这一档要等回落到 {_fmt(high)} 以下"
+        ),
         ready,
     )
 
@@ -275,13 +283,13 @@ def _entry_pullback(
     ready = low <= price <= high
     if ready:
         reason = ""
-        tail = f"现价 {price:g} 落在回踩区里 ⇒ 条件已到"
+        tail = f"现价 {_fmt(price)} 落在回踩区里 ⇒ 条件已到"
     elif price > high:
-        reason = f"现价 {price:g} 还悬在周MA20 {high:g} 上方：这一档等的是回踩，不追高"
+        reason = f"现价 {_fmt(price)} 还悬在周MA20 {_fmt(high)} 上方：这一档等的是回踩，不追高"
         tail = reason
     else:
         reason = (
-            f"现价 {price:g} 已跌破回踩区下沿 {low:g}（周MA20 {high:g}）："
+            f"现价 {_fmt(price)} 已跌破回踩区下沿 {_fmt(low)}（周MA20 {_fmt(high)}）："
             "回踩「不破」才是这条规则，跌穿它不是便宜，是信号变了"
         )
         tail = reason
@@ -289,7 +297,8 @@ def _entry_pullback(
         "entry",
         low,
         high,
-        f"{formula}：周MA20 {high:g} − 带宽 {entry_band_pct:.0%} ⇒ {low:g}~{high:g}；{tail}",
+        f"{formula}：周MA20 {_fmt(high)} − 带宽 {entry_band_pct:.0%} ⇒ "
+        f"{_fmt(low)}~{_fmt(high)}；{tail}",
         reason,
         ready,
     )
@@ -321,12 +330,12 @@ def stop_level(
                 "stop", "止损（fixed）", "止损种类是 fixed，但没给定价：固定要有人给那个数"
             )
         value = fixed
-        evidence = f"止损（fixed）：给定的价 {value:g}（来源是人给的建仓/离场位，不是这里算的）"
+        evidence = f"止损（fixed）：给定的价 {_fmt(value)}（来源是人给的建仓/离场位，不是这里算的）"
     elif kind == "pct":
         if stop_pct is None or stop_pct <= 0:
             return _refused("stop", "止损（pct）", f"止损百分比没有数或不为正（{_fmt(stop_pct)}）")
         value = price * (1.0 - stop_pct)
-        evidence = f"止损（pct）：现价 {price:g} × (1 - {stop_pct:.0%}) = {value:g}"
+        evidence = f"止损（pct）：现价 {_fmt(price)} × (1 - {stop_pct:.0%}) = {_fmt(value)}"
     elif kind == "atr2":
         if atr is None or atr <= 0 or atr_multiplier is None or atr_multiplier <= 0:
             return _refused(
@@ -335,19 +344,25 @@ def stop_level(
                 f"ATR（{_fmt(atr)}）或倍数（{_fmt(atr_multiplier)}）没有数或不为正：这一种要两根数都齐",
             )
         value = price - atr_multiplier * atr
-        evidence = f"止损（atr2）：现价 {price:g} - {atr_multiplier:g}×ATR {atr:g} = {value:g}"
+        evidence = (
+            f"止损（atr2）：现价 {_fmt(price)} - {_fmt(atr_multiplier)}×ATR {_fmt(atr)}"
+            f" = {_fmt(value)}"
+        )
     else:  # weekly_ma20
         if weekly_ma20 is None or weekly_ma20 <= 0:
             return _refused(
                 "stop", "止损（weekly_ma20）", f"周MA20 没有数或不为正（{_fmt(weekly_ma20)}）"
             )
         value = weekly_ma20
-        evidence = f"止损（weekly_ma20）：离场位=周MA20 {value:g}（收盘跌破即走，现价 {price:g}）"
+        evidence = (
+            f"止损（weekly_ma20）：离场位=周MA20 {_fmt(value)}"
+            f"（收盘跌破即走，现价 {_fmt(price)}）"
+        )
     if value <= 0:
         return _refused(
             "stop",
             f"止损（{kind}）",
-            f"算出来是 {value:g}：止损位不为正，那是这几个数凑不出离场位，不是「止损在 0」",
+            f"算出来是 {_fmt(value)}：止损位不为正，那是这几个数凑不出离场位，不是「止损在 0」",
         )
     return Level("stop", value, value, evidence)
 
@@ -382,7 +397,7 @@ def pick_target(
             None,
             None,
             formula,
-            f"现价 {price:g} 不比合理上限 {_fmt(fair_high)} 与前高 {_fmt(recent_high)} 低："
+            f"现价 {_fmt(price)} 不比合理上限 {_fmt(fair_high)} 与前高 {_fmt(recent_high)} 低："
             "上涨空间没有参照物，这一行给不出赔率",
         )
     label, value = min(pool, key=lambda item: item[1])
@@ -391,12 +406,13 @@ def pick_target(
         missing = f"合理上限没有数（合理区间没算出来），只有前高 {_fmt(recent_high)}；"
     elif recent_high is None:
         missing = f"过去 {lookback_days} 日无前高（窗口内没成交），只用合理上限 {_fmt(fair_high)}；"
-    shown = "、".join(f"{item[0]} {item[1]:g}" for item in pool)
+    shown = "、".join(f"{item[0]} {_fmt(item[1])}" for item in pool)
     return Level(
         "target",
         value,
         value,
-        f"{formula}：{missing}现价 {price:g} 之上的候选 {shown} ⇒ 取更近的 {label} {value:g}",
+        f"{formula}：{missing}现价 {_fmt(price)} 之上的候选 {shown} ⇒ "
+        f"取更近的 {label} {_fmt(value)}",
     )
 
 
@@ -415,14 +431,14 @@ def reward_risk(*, price: float | None, stop: float | None, target: float | None
         return Odds(
             None,
             formula,
-            f"现价 {price:g} 已经在止损 {stop:g} 上或下方：分母不大于 0，"
+            f"现价 {_fmt(price)} 已经在止损 {_fmt(stop)} 上或下方：分母不大于 0，"
             "那不是无穷大的赔率，是这笔交易已经不成立",
         )
     value = (target - price) / risk
     return Odds(
         value,
-        f"{formula}：(目标 {target:g} - 现价 {price:g}) ÷ "
-        f"(现价 {price:g} - 止损 {stop:g}) = {value:g}",
+        f"{formula}：(目标 {_fmt(target)} - 现价 {_fmt(price)}) ÷ "
+        f"(现价 {_fmt(price)} - 止损 {_fmt(stop)}) = {_fmt(value)}",
     )
 
 
