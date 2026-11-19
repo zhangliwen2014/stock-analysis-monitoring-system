@@ -4,14 +4,18 @@
 `all` 覆盖价格规则、资讯与摘要；`rule` / `news` / `digest` 各管一路。
 旧表 `alert_mutes` 的行按 `all` 读，新写入只落 `alert_mute_scopes`。
 
-重复静音是幂等的：保留第一次的时刻与备注；已经有 `all` 时再按某一类也不新起一行。
+静音必须有到期（D361）：到期是读规则——`get()` 看见过期行就当没有，行仍留在
+`list_for(include_expired=True)` 的台账里。迁移前的行与旧表没有到期列，继续生效，
+台账标「历史（无到期）」；迁移不替人补一个他从没按过的期限。
+
+重复静音是幂等的：保留第一次的时刻、到期与备注；已经有 `all` 时再按某一类也不新起一行。
 解除后不补发静音期间的历史——状态表在静音期间照常记录跃迁（见 `RuleEngine`）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sams.core.clock import SYSTEM_CLOCK, Clock
 from sams.core.errors import ValidationError
@@ -27,7 +31,7 @@ MUTE_KIND_LABELS = {
     "digest": "摘要",
 }
 
-_SCOPE_COLUMNS = "user_id, market, code, kind, note, created_at"
+_SCOPE_COLUMNS = "user_id, market, code, kind, note, created_at, expires_at"
 _LEGACY_COLUMNS = "user_id, market, code, note, created_at"
 
 
@@ -47,6 +51,11 @@ class Mute:
     note: str
     created_at: datetime
     kind: str = "all"
+    #: `None` = 迁移前的行或旧表：没有到期，继续生效（台账里单独标出来）
+    expires_at: datetime | None = None
+
+    def expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and self.expires_at <= now
 
 
 class MuteRepo:
@@ -55,14 +64,18 @@ class MuteRepo:
         self.clock = clock
 
     def get(self, user_id: str, market: str, code: str, *, kind: str = "all") -> Mute | None:
-        """这一类是否静着；`all` 与旧表都算数，所以返回的 `kind` 可能是 `all`。"""
+        """这一类是否静着；`all` 与旧表都算数，所以返回的 `kind` 可能是 `all`。
+
+        过期行在这条读规则里消失：它不再遮住同票仍生效的 `all`，也不再算这一类静着。
+        """
         kind = _kind(kind)
+        now = self.clock.now_utc()
         found = self._row(user_id, market, code, kind)
-        if found is not None:
+        if found is not None and not found.expired(now):
             return found
         if kind != "all":
             found = self._row(user_id, market, code, "all")
-            if found is not None:
+            if found is not None and not found.expired(now):
                 return found
         return self._legacy(user_id, market, code)
 
@@ -74,15 +87,20 @@ class MuteRepo:
         *,
         note: str = "",
         kind: str = "all",
+        days: int = 7,
     ) -> Mute:
         kind = _kind(kind)
+        if days < 1:
+            raise ValidationError(f"静音天数要大于 0，收到 {days}：静音到过去等于没静音")
         existing = self.get(user_id, market, code, kind=kind)
         if existing is not None:
             return existing
+        now = self.clock.now_utc()
         self.db.execute(
-            "INSERT INTO alert_mute_scopes (user_id, market, code, kind, note, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            [user_id, market, code, kind, (note or "").strip(), self.clock.now_utc()],
+            "INSERT INTO alert_mute_scopes"
+            " (user_id, market, code, kind, note, created_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [user_id, market, code, kind, (note or "").strip(), now, now + timedelta(days=days)],
         )
         got = self._row(user_id, market, code, kind)
         assert got is not None  # 刚写完，同一条连接里一定读得回来
@@ -106,7 +124,8 @@ class MuteRepo:
         )
         return changed is not None or legacy is not None
 
-    def list_for(self, user_id: str) -> list[Mute]:
+    def list_for(self, user_id: str, *, include_expired: bool = False) -> list[Mute]:
+        """默认只给生效中的：摘要与收件箱徽标不各写一次到期判断；台账传 True。"""
         rows = self.db.query(
             f"SELECT {_SCOPE_COLUMNS} FROM alert_mute_scopes WHERE user_id = ?",
             [user_id],
@@ -122,6 +141,9 @@ class MuteRepo:
             for row in legacy.to_dicts()
             if (str(row["market"]), str(row["code"]), "all") not in seen
         )
+        if not include_expired:
+            now = self.clock.now_utc()
+            found = [mute for mute in found if not mute.expired(now)]
         found.sort(key=lambda mute: (mute.created_at, mute.market, mute.code, mute.kind))
         return found
 
@@ -157,4 +179,5 @@ class MuteRepo:
             note=str(row["note"] or ""),
             created_at=row["created_at"],
             kind=str(row["kind"] if kind is None else kind),
+            expires_at=row.get("expires_at"),
         )

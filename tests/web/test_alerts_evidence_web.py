@@ -229,3 +229,81 @@ def test_detail_lists_each_muted_kind_with_its_own_button(logged):
     assert 'name="kind" value="digest"' in detail
     assert "解除资讯静音" in detail
     assert "解除摘要静音" in detail
+
+
+def test_the_mute_form_asks_for_an_expiry_and_the_detail_shows_it(logged):
+    """静音必须带到期（D361）：表单有 1/3/7/30 天，存进去的到期要回到详情页。"""
+    ctx = logged.context
+    alice = _alice(ctx)
+    alert = _seed(ctx, user_id=alice.id)
+
+    detail = logged.client.get(f"/alerts/{alert.id}").text
+    assert 'name="days"' in detail
+    for days in ("1", "3", "7", "30"):
+        assert f'value="{days}"' in detail
+
+    resp = logged.client.post(
+        f"/alerts/{alert.id}/mute",
+        data={"csrf": logged.csrf, "note": "财报前别吵", "days": "3"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    mute = ctx.alert_mutes.get(alice.id, "A", "600519")
+    assert mute is not None and mute.expires_at is not None
+
+    detail = logged.client.get(f"/alerts/{alert.id}").text
+    assert "到期" in detail and "财报前别吵" in detail
+
+
+def test_the_alerts_page_has_a_ledger_and_it_can_unmute(logged):
+    """台账回答「静着什么、到何时」；解除不必回到一条仍在列表里的告警（R3-10）。"""
+    ctx = logged.context
+    alice = _alice(ctx)
+    ctx.alert_mutes.add(alice.id, "A", "600519", kind="rule", note="财报前别吵", days=7)
+
+    inbox = logged.client.get("/alerts").text
+    assert "静音台账" in inbox
+    assert "A/600519" in inbox
+    assert "价格规则" in inbox
+    assert "财报前别吵" in inbox
+    assert "到期" in inbox
+
+    resp = logged.client.post(
+        "/alerts/mutes/off",
+        data={"csrf": logged.csrf, "market": "A", "code": "600519", "kind": "rule"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert ctx.alert_mutes.get(alice.id, "A", "600519", kind="rule") is None
+    assert "静音台账" not in logged.client.get("/alerts").text
+
+
+def test_an_expired_mute_is_not_active_but_stays_in_the_ledger(logged):
+    ctx = logged.context
+    alice = _alice(ctx)
+    past = datetime(2026, 1, 1, tzinfo=UTC)
+    ctx.db.execute(
+        "INSERT INTO alert_mute_scopes"
+        " (user_id, market, code, kind, note, created_at, expires_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [alice.id, "A", "600519", "all", "早就过期", past, past],
+    )
+
+    inbox = logged.client.get("/alerts").text
+    assert "已静音" not in inbox
+    assert "静音台账" in inbox and "已过期" in inbox
+
+
+def test_a_legacy_mute_has_no_expiry_and_the_ledger_says_so(logged):
+    ctx = logged.context
+    alice = _alice(ctx)
+    ctx.db.execute(
+        "INSERT INTO alert_mutes (user_id, market, code, note, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [alice.id, "A", "600519", "迁过来的", datetime(2026, 1, 1, tzinfo=UTC)],
+    )
+
+    inbox = logged.client.get("/alerts").text
+    assert "静音台账" in inbox
+    assert "历史（无到期）" in inbox
+    assert "已静音" in inbox

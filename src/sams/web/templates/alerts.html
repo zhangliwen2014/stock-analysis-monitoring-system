@@ -7,6 +7,36 @@
 {# 批量已读的回显只由两个整数拼出来（pages/alerts.py 的 _count），原文不上屏 #}
 {% if ack_notice %}<p class="flash-ok">{{ ack_notice }}</p>{% endif %}
 
+{# 静音台账（D361）：回答「静着什么、到过何时」。过期行留着是证据，不是噪声 #}
+{% if mutes_ledger %}
+<section class="card">
+  <h2>静音台账</h2>
+  <p class="muted">静音到期后自动失效；「历史（无到期）」是迁移前按下的，需要手动解除。</p>
+  <table>
+    <tr><th>标的</th><th>类别</th><th>理由</th><th>静音于</th><th>到期</th><th>状态</th><th></th></tr>
+    {% for m in mutes_ledger %}
+    <tr>
+      <td><a href="/symbol/{{ m.market }}/{{ m.code }}">{{ m.market }}/{{ m.code }}</a></td>
+      <td>{{ m.label }}</td>
+      <td>{{ m.note or "—" }}</td>
+      <td class="muted">{{ m.at }}</td>
+      <td>{% if m.expires %}{{ m.expires }}{% else %}历史（无到期）{% endif %}</td>
+      <td>{{ m.status }}</td>
+      <td>
+        <form method="post" action="/alerts/mutes/off" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="market" value="{{ m.market }}">
+          <input type="hidden" name="code" value="{{ m.code }}">
+          <input type="hidden" name="kind" value="{{ m.kind }}">
+          <button type="submit">解除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+
 <form method="get" action="/alerts" class="panel grid">
   <label>状态
     {# 名单来自 STATUS_CHOICES（仓库那三个状态 + 全部）：检查与下拉同一份，不会各漂一边 #}

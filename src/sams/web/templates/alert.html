@@ -159,7 +159,9 @@
     {% for m in mutes %}
     <li>
       <span class="badge">{{ m.label }}</span>
-      已静音{% if m.at %}：{{ m.at }}{% endif %}{% if m.note %} —— {{ m.note }}{% endif %}
+      已静音{% if m.at %}：{{ m.at }}{% endif %}；
+      {% if m.expires %}到期 {{ m.expires }}{% else %}历史（无到期）{% endif %}
+      {% if m.note %} —— {{ m.note }}{% endif %}
       <form method="post" action="/alerts/{{ alert.id }}/unmute" class="inline-form">
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <input type="hidden" name="kind" value="{{ m.kind }}">
@@ -173,6 +175,9 @@
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>类别 <select name="kind">
       {% for value, label in mute_kinds %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+    </select></label>
+    <label>到期 <select name="days">
+      {% for value, label in mute_days %}<option value="{{ value }}"{% if value == mute_days_default %} selected{% endif %}>{{ label }}</option>{% endfor %}
     </select></label>
     <label>备注（可空） <input name="note" size="24" placeholder="比如：财报前别吵"></label>
     <button type="submit">静音这类提醒</button>

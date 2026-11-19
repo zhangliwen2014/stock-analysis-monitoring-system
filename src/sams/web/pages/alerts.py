@@ -89,11 +89,23 @@ DEFER_HOURS = {"1h": 1, "3h": 3}
 DEFER_OPEN = "open"
 DEFER_CHOICES = (("1h", "1 小时"), ("3h", "3 小时"), (DEFER_OPEN, "明天开盘"))
 
+#: 静音的四个到期档（D361）：不给「永久」——那正是 R3-10 本身。
+#: 默认 7 天覆盖一个财报窗口；页面只给这四档，仓库仍拒绝 0 与负数。
+MUTE_DAY_CHOICES: tuple[tuple[int, str], ...] = (
+    (1, "1 天"),
+    (3, "3 天"),
+    (7, "7 天"),
+    (30, "30 天"),
+)
+MUTE_DAYS_DEFAULT = 7
+_MUTE_DAY_VALUES = {days for days, _ in MUTE_DAY_CHOICES}
+MUTE_OFF_NOTICE = "已解除这条静音"
+
 #: 收件箱唯一肯上屏的提醒原文（与 admin 的 `_FEEDBACK` 同一道白名单纪律：query 里的
 #: 原文不名单就不出现，否则 `/alerts?notice=` 就是一个自由文本框）。发件人是
 #: `/settings/test-alert` 的 303——成功不再整页重渲染，刷新也就不会重提交
 INBOX_TEST_ALERT_NOTICE = "已发出这条测试告警：详情里看得见投递记录"
-_INBOX_NOTICES = frozenset({INBOX_TEST_ALERT_NOTICE})
+_INBOX_NOTICES = frozenset({INBOX_TEST_ALERT_NOTICE, MUTE_OFF_NOTICE})
 
 
 def _local_next(raw: str) -> str:
@@ -252,6 +264,28 @@ def _page_url(target: int, chosen: dict[str, str]) -> str:
     return f"/alerts?{urlencode(pairs)}"
 
 
+def _mute_ledger(ctx, user_id: str, tz: str) -> list[dict]:
+    """台账读全量（含过期与历史行）：这一卡回答「静着什么、到过何时」（D361）。
+
+    `muted_keys` 只给生效中的（分组徽标），两者不是同一次读取：徽标问「现在还静着吗」，
+    台账问「按过什么」，过期行在前者是噪声、在后者是证据。
+    """
+    now = ctx.clock.now_utc()
+    return [
+        {
+            "market": mute.market,
+            "code": mute.code,
+            "kind": mute.kind,
+            "label": MUTE_KIND_LABELS[mute.kind],
+            "note": mute.note,
+            "at": moment_label(mute.created_at, tz, seconds=True),
+            "expires": moment_label(mute.expires_at, tz) if mute.expires_at else "",
+            "status": "已过期" if mute.expired(now) else "已静音",
+        }
+        for mute in ctx.alert_mutes.list_for(user_id, include_expired=True)
+    ]
+
+
 def _list_page(
     request: Request,
     *,
@@ -263,6 +297,7 @@ def _list_page(
     notice: str = "",
     ack_notice: str = "",
     muted_keys: frozenset[tuple[str, str]] = frozenset(),
+    mutes_ledger: list[dict] | None = None,
     ack_next: str = "/alerts",
 ):
     web = request.app.state.web
@@ -277,6 +312,7 @@ def _list_page(
         ack_notice=ack_notice,
         # 分组标题的「已静音」徽标：一次取全、页内比对，不逐组查库
         muted_keys=muted_keys,
+        mutes_ledger=mutes_ledger or [],
         # 批量已读后回这一页：筛过的列表不该因为标了几条已读就被洗回全量
         ack_next=ack_next,
         prev_url=_page_url(page - 1, chosen) if page > 1 else "",
@@ -431,6 +467,7 @@ def _detail_page(
                 "kind": mute.kind,
                 "label": MUTE_KIND_LABELS[mute.kind],
                 "at": moment_label(mute.created_at, tz, seconds=True),
+                "expires": moment_label(mute.expires_at, tz) if mute.expires_at else "",
                 "note": mute.note,
                 "button": (
                     "取消静音"
@@ -441,6 +478,8 @@ def _detail_page(
             for mute in mutes
         ],
         mute_kinds=[(kind, MUTE_KIND_LABELS[kind]) for kind in MUTE_KINDS],
+        mute_days=MUTE_DAY_CHOICES,
+        mute_days_default=MUTE_DAYS_DEFAULT,
         # 闭环动作区：已读只在 new 出现；处置/忽略/稍后在 new 与 acknowledged 都可按（§6.3）
         can_act=alert.status in (NEW, ACKNOWLEDGED),
         can_ack=alert.status == NEW,
@@ -551,6 +590,7 @@ def inbox(request: Request):
         muted_keys=frozenset(
             (mute.market, mute.code) for mute in ctx.alert_mutes.list_for(user.id)
         ),
+        mutes_ledger=_mute_ledger(ctx, user.id, tz),
         ack_next=_page_url(page, chosen),
     )
 
@@ -805,15 +845,25 @@ def mute(
     alert = _require_own(ctx, request.path_params["alert_id"], user.id)
     note = one(data, "note").strip()
     kind = one(data, "kind").strip() or "all"
-    ctx.alert_mutes.add(user.id, alert.market, alert.code, note=note, kind=kind)
+    days = _mute_days(one(data, "days"))
+    ctx.alert_mutes.add(user.id, alert.market, alert.code, note=note, kind=kind, days=days)
     audit(
         request,
         action="alert.mute",
         target=alert.id,
         ok=True,
-        detail=f"{alert.market}/{alert.code}/{kind}",
+        detail=f"{alert.market}/{alert.code}/{kind}/{days}d",
     )
     return RedirectResponse(f"/alerts/{alert.id}", status_code=303)
+
+
+def _mute_days(raw: str) -> int:
+    """下拉只给四档；原文字段被手改时回默认 7 天，不把 0/负数交给仓库去炸。"""
+    try:
+        value = int((raw or "").strip())
+    except ValueError:
+        return MUTE_DAYS_DEFAULT
+    return value if value in _MUTE_DAY_VALUES else MUTE_DAYS_DEFAULT
 
 
 @router.post("/alerts/{alert_id}/unmute")
@@ -836,6 +886,31 @@ def unmute(
         detail=f"{alert.market}/{alert.code}/{kind}",
     )
     return RedirectResponse(f"/alerts/{alert.id}", status_code=303)
+
+
+@router.post("/alerts/mutes/off")
+def unmute_from_ledger(
+    request: Request,
+    _csrf: None = Depends(csrf_protect),
+    data: dict[str, list[str]] = _form_body,
+):
+    """台账里解除：不需要一条仍在列表里的告警——那正是 R3-10 说的走不通的路。"""
+    user = require_user(request)
+    ctx = request.app.state.web.contexts.current()
+    market = one(data, "market").strip()
+    code = one(data, "code").strip()
+    kind = one(data, "kind").strip() or "all"
+    ctx.alert_mutes.remove(user.id, market, code, kind=kind)
+    audit(
+        request,
+        action="alert.unmute",
+        target=f"{market}/{code}",
+        ok=True,
+        detail=f"{kind}/ledger",
+    )
+    return RedirectResponse(
+        f"/alerts?{urlencode({'notice': MUTE_OFF_NOTICE})}", status_code=303
+    )
 
 
 def _defer_until(ctx, alert: Alert, choice: str) -> datetime:

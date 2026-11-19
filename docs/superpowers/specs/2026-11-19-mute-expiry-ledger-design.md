@@ -99,3 +99,22 @@ ALTER TABLE alert_mute_scopes ADD COLUMN expires_at TIMESTAMPTZ;
 * 代他人静音与 `created_by`：功能尚不存在；
 * 静音到期前提醒：多一条通知通道，不是本次要回答的问题；
 * 把过期行自动清理：台账需要它们。
+
+## 回归结果
+
+* `ruff check`：仓库、页面与两处测试全部通过。
+* targeted：`tests/storage/test_alert_mutes_repo.py` 16 passed、
+  `tests/web/test_alerts_evidence_web.py` 15 passed；再加收件箱/闭环/资讯三份网页测试
+  共 62 passed（静音徽标与详情页旧行为未回退）。
+* 全量分批（`tmp/full_d361_run.sh`，61 个 chunk）：5924 passed，0 failed，
+  21 deselected（live 标记）。其中 analysis 305、core 273、storage 801、
+  datasource 660（21 deselected）、cli 470、services 1563、monitor 120、
+  web 736、根目录 996。唯一的非 0 返回码仍是 `tests/web/conftest.py` 的 rc=5
+  （glob 扫到无测试文件），不是失败。
+* 生产库副本 `tmp/d361`：`db migrate` 只应用 0054，库内原有静音 0 行（生产目前
+  没有按过静音），迁移不替任何人补期限；补种一条 3 天静音与一条已过期静音后，
+  `/alerts` 台账同屏显示「静音台账 / 价格规则 / 到期 / 已静音」与「已过期」，
+  在台账里 POST `/alerts/mutes/off` 后生效行消失、过期行保留；验证用 8766 已停。
+* 正式库：停 `serve`（PID 75993）→ `db migrate` 应用 0054（已应用 54、待应用 0）
+  → 重启 `serve`（PID 97100），`/healthz` 200。生产没有静音行，按设计不在正式库
+  新建静音，台账要等用户第一次按下才会出现。

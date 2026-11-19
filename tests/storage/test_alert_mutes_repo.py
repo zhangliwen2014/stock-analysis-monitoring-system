@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from support import FrozenClock
@@ -120,3 +120,43 @@ def test_an_unknown_kind_is_rejected(db):
         repo(db).add("u1", "A", "600000", kind="weekly")
     with pytest.raises(ValidationError):
         repo(db).get("u1", "A", "600000", kind="weekly")
+
+
+def test_a_mute_carries_an_expiry_and_zero_days_is_rejected(db):
+    with pytest.raises(ValidationError):
+        repo(db).add("u1", "A", "600000", days=0)
+
+    got = repo(db).add("u1", "A", "600000", days=3)
+    assert got.expires_at == NOW + timedelta(days=3)
+
+
+def test_an_expired_mute_stops_counting_but_stays_in_the_ledger(db):
+    repo(db).add("u1", "A", "600000", days=1)
+    later = MuteRepo(db, clock=FrozenClock(NOW + timedelta(days=2)))
+
+    assert later.get("u1", "A", "600000") is None
+    assert later.list_for("u1") == []
+    rows = later.list_for("u1", include_expired=True)
+    assert len(rows) == 1 and rows[0].expired(later.clock.now_utc())
+
+
+def test_an_expired_rule_mute_does_not_shadow_a_live_all(db):
+    repo(db).add("u1", "A", "600000", kind="all", days=30)
+    repo(db).add("u1", "A", "600000", kind="rule", days=1)
+    later = MuteRepo(db, clock=FrozenClock(NOW + timedelta(days=2)))
+
+    got = later.get("u1", "A", "600000", kind="rule")
+    assert got is not None and got.kind == "all"
+
+
+def test_a_legacy_row_has_no_expiry_and_is_listed_as_history(db):
+    db.execute(
+        "INSERT INTO alert_mutes (user_id, market, code, note, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ["u1", "A", "600000", "迁过来的", NOW],
+    )
+
+    rows = repo(db).list_for("u1", include_expired=True)
+    assert len(rows) == 1
+    assert rows[0].expires_at is None
+    assert not rows[0].expired(NOW)
